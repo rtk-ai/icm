@@ -1,0 +1,12 @@
+[package]
+name = "icm-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+icm-core = { path = "../icm-core" }
+icm-store = { path = "../icm-store" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

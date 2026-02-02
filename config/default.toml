@@ -1,0 +1,19 @@
+[store]
+# SQLite database path (default: ~/.icm/memories.db)
+# path = "~/.icm/memories.db"
+
+[memory]
+default_importance = "medium"
+
+# Decay rate per day (0.95 = loses 5% per day)
+decay_rate = 0.95
+
+# Weight threshold for automatic pruning
+prune_threshold = 0.1
+
+# Decay multipliers per importance level
+[memory.decay_multipliers]
+critical = 0.0    # No decay
+high = 0.5        # 2x slower decay
+medium = 1.0      # Normal decay
+low = 2.0         # 2x faster decay

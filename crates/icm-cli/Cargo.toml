@@ -1,0 +1,15 @@
+[package]
+name = "icm-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+icm-core = { path = "../icm-core" }
+icm-store = { path = "../icm-store" }
+icm-mcp = { path = "../icm-mcp" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

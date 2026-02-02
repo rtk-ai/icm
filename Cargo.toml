@@ -7,6 +7,13 @@ members = [
     "crates/icm-cli",
 ]
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [workspace.dependencies]
 # Database
 rusqlite = { version = "0.34", features = ["bundled", "modern_sqlite"] }

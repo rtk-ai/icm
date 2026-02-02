@@ -1,7 +1,16 @@
 [package]
 name = "icm-cli"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
+description = "Permanent memory for AI agents"
+license = "MIT"
+repository = "https://github.com/rtk-ai/icm"
+keywords = ["memory", "ai-agents", "mcp", "llm", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "icm"
+path = "src/main.rs"
 
 [dependencies]
 icm-core = { path = "../icm-core" }

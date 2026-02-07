@@ -1153,6 +1153,7 @@ dependencies = [
  "icm-core",
  "icm-mcp",
  "icm-store",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

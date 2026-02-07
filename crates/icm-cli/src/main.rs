@@ -699,6 +699,7 @@ fn cmd_init() -> Result<()> {
     println!();
     println!("Restart Claude Code to activate ICM memory.");
     println!("All sessions will share the same memory database.");
+    println!("Instructions are built into the MCP server — no CLAUDE.md changes needed.");
 
     Ok(())
 }

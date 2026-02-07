@@ -107,6 +107,17 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Consolidate all memories of a topic into a single summary
+    Consolidate {
+        /// Topic to consolidate
+        #[arg(short, long)]
+        topic: String,
+
+        /// Keep original memories after consolidation
+        #[arg(long)]
+        keep_originals: bool,
+    },
+
     /// Memoir commands — permanent knowledge layer
     Memoir {
         #[command(subcommand)]
@@ -332,6 +343,10 @@ fn main() -> Result<()> {
         Commands::Stats => cmd_stats(&store),
         Commands::Decay { factor } => cmd_decay(&store, factor),
         Commands::Prune { threshold, dry_run } => cmd_prune(&store, threshold, dry_run),
+        Commands::Consolidate {
+            topic,
+            keep_originals,
+        } => cmd_consolidate(&store, &topic, keep_originals),
         Commands::Memoir { command } => match command {
             MemoirCommands::Create { name, description } => {
                 cmd_memoir_create(&store, name, description)
@@ -521,6 +536,59 @@ fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
     } else {
         let pruned = store.prune(threshold)?;
         println!("Pruned {pruned} memories (threshold={threshold}).");
+    }
+    Ok(())
+}
+
+fn cmd_consolidate(store: &SqliteStore, topic: &str, keep_originals: bool) -> Result<()> {
+    let memories = store.get_by_topic(topic)?;
+    if memories.is_empty() {
+        bail!("no memories found in topic: {topic}");
+    }
+
+    // Build consolidated summary from all memories in the topic
+    let summaries: Vec<&str> = memories.iter().map(|m| m.summary.as_str()).collect();
+    let merged_summary = summaries.join(" | ");
+
+    // Collect all keywords
+    let mut all_keywords: Vec<String> = Vec::new();
+    for mem in &memories {
+        for kw in &mem.keywords {
+            if !all_keywords.contains(kw) {
+                all_keywords.push(kw.clone());
+            }
+        }
+    }
+
+    // Use highest importance from the set
+    let best_importance = memories
+        .iter()
+        .map(|m| &m.importance)
+        .min_by_key(|i| match i {
+            Importance::Critical => 0,
+            Importance::High => 1,
+            Importance::Medium => 2,
+            Importance::Low => 3,
+        })
+        .cloned()
+        .unwrap_or(Importance::Medium);
+
+    let mut consolidated = Memory::new(topic.to_string(), merged_summary, best_importance);
+    consolidated.keywords = all_keywords;
+
+    if keep_originals {
+        // Just add the consolidated memory without removing originals
+        let id = store.store(consolidated)?;
+        println!(
+            "Consolidated {} memories from '{topic}' into {id} (originals kept).",
+            memories.len()
+        );
+    } else {
+        store.consolidate_topic(topic, consolidated)?;
+        println!(
+            "Consolidated {} memories from '{topic}' into 1 (originals removed).",
+            memories.len()
+        );
     }
     Ok(())
 }

@@ -140,8 +140,12 @@ enum Commands {
         command: MemoirCommands,
     },
 
-    /// Configure ICM as MCP server for Claude Code
-    Init,
+    /// Configure ICM integration for Claude Code / Claude Desktop
+    Init {
+        /// Integration mode: mcp, cli, skill, or all (default: mcp)
+        #[arg(short, long, default_value = "mcp")]
+        mode: InitMode,
+    },
 
     /// Launch MCP server (stdio transport for Claude Code)
     Serve,
@@ -321,6 +325,18 @@ enum SortField {
     Accessed,
 }
 
+#[derive(Clone, ValueEnum)]
+enum InitMode {
+    /// MCP server plugin (Claude calls icm tools natively)
+    Mcp,
+    /// CLAUDE.md instructions (Claude calls icm via Bash)
+    Cli,
+    /// Claude Code slash commands /recall and /remember
+    Skill,
+    /// All integration modes
+    All,
+}
+
 fn default_db_path() -> PathBuf {
     directories::ProjectDirs::from("dev", "icm", "icm")
         .map(|dirs| dirs.data_dir().join("memories.db"))
@@ -452,7 +468,7 @@ fn main() -> Result<()> {
                 cmd_memoir_distill(&store, &from_topic, &into)
             }
         },
-        Commands::Init => cmd_init(),
+        Commands::Init { mode } => cmd_init(mode),
         Commands::Serve => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -648,44 +664,119 @@ fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_init() -> Result<()> {
+fn cmd_init(mode: InitMode) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = icm_bin.to_string_lossy().to_string();
     let home = std::env::var("HOME").context("HOME not set")?;
 
-    let icm_server_entry = serde_json::json!({
-        "command": icm_bin_str,
-        "args": ["serve"],
-        "env": {}
-    });
+    let do_mcp = matches!(mode, InitMode::Mcp | InitMode::All);
+    let do_cli = matches!(mode, InitMode::Cli | InitMode::All);
+    let do_skill = matches!(mode, InitMode::Skill | InitMode::All);
 
-    // 1. Claude Code: ~/.claude.json
-    let claude_code_path = PathBuf::from(&home).join(".claude.json");
-    let code_status = inject_mcp_server(&claude_code_path, "icm", &icm_server_entry)?;
+    // --- MCP mode: configure MCP server ---
+    if do_mcp {
+        let icm_server_entry = serde_json::json!({
+            "command": icm_bin_str,
+            "args": ["serve"],
+            "env": {}
+        });
 
-    // 2. Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json
-    let claude_desktop_path =
-        PathBuf::from(&home).join("Library/Application Support/Claude/claude_desktop_config.json");
-    let desktop_status = inject_mcp_server(&claude_desktop_path, "icm", &icm_server_entry)?;
+        let claude_code_path = PathBuf::from(&home).join(".claude.json");
+        let code_status = inject_mcp_server(&claude_code_path, "icm", &icm_server_entry)?;
 
-    println!("ICM configured!");
+        let claude_desktop_path = PathBuf::from(&home)
+            .join("Library/Application Support/Claude/claude_desktop_config.json");
+        let desktop_status = inject_mcp_server(&claude_desktop_path, "icm", &icm_server_entry)?;
+
+        println!("[mcp] Claude Code:    {code_status}");
+        println!("[mcp] Claude Desktop: {desktop_status}");
+    }
+
+    // --- CLI mode: inject CLAUDE.md instructions ---
+    if do_cli {
+        let cwd = std::env::current_dir().context("failed to get current directory")?;
+        let claude_md_path = cwd.join("CLAUDE.md");
+
+        let icm_block = "\
+<!-- icm:start -->\n\
+## Persistent memory (ICM)\n\
+\n\
+This project uses [ICM](https://github.com/rtk-ai/icm) for persistent memory.\n\
+\n\
+After completing a significant task, store a summary:\n\
+```bash\n\
+icm store -t \"project\" -c \"Short summary of what was done\"\n\
+```\n\
+\n\
+Before starting work, recall relevant context:\n\
+```bash\n\
+icm recall \"topic keywords\"\n\
+```\n\
+<!-- icm:end -->";
+
+        if claude_md_path.exists() {
+            let content = std::fs::read_to_string(&claude_md_path)
+                .context("failed to read CLAUDE.md")?;
+            if content.contains("<!-- icm:start -->") {
+                println!("[cli] CLAUDE.md already configured.");
+            } else {
+                let new_content = format!("{}\n\n{}\n", content.trim_end(), icm_block);
+                std::fs::write(&claude_md_path, new_content)
+                    .context("failed to write CLAUDE.md")?;
+                println!("[cli] CLAUDE.md configured with ICM instructions.");
+            }
+        } else {
+            std::fs::write(&claude_md_path, format!("{icm_block}\n"))
+                .context("failed to create CLAUDE.md")?;
+            println!("[cli] CLAUDE.md created with ICM instructions.");
+        }
+    }
+
+    // --- Skill mode: create /recall and /remember slash commands ---
+    if do_skill {
+        let skills_dir = PathBuf::from(&home).join(".claude/commands");
+        std::fs::create_dir_all(&skills_dir).ok();
+
+        let recall_path = skills_dir.join("recall.md");
+        if recall_path.exists() {
+            println!("[skill] /recall already configured.");
+        } else {
+            std::fs::write(
+                &recall_path,
+                "Search ICM memory for: $ARGUMENTS\n\
+                 \n\
+                 Use the icm_recall MCP tool if available, otherwise run:\n\
+                 ```bash\n\
+                 icm recall \"$ARGUMENTS\"\n\
+                 ```\n",
+            )
+            .context("cannot write recall skill")?;
+            println!("[skill] /recall command created.");
+        }
+
+        let remember_path = skills_dir.join("remember.md");
+        if remember_path.exists() {
+            println!("[skill] /remember already configured.");
+        } else {
+            std::fs::write(
+                &remember_path,
+                "Store the following in ICM memory: $ARGUMENTS\n\
+                 \n\
+                 Use the icm_store MCP tool if available, otherwise run:\n\
+                 ```bash\n\
+                 icm store -t \"note\" -c \"$ARGUMENTS\"\n\
+                 ```\n",
+            )
+            .context("cannot write remember skill")?;
+            println!("[skill] /remember command created.");
+        }
+    }
+
     println!();
-    println!("  binary:  {icm_bin_str}");
-    println!("  db:      {}", default_db_path().display());
+    println!("  binary: {icm_bin_str}");
+    println!("  db:     {}", default_db_path().display());
     println!();
-    println!(
-        "  Claude Code:    {} ({})",
-        claude_code_path.display(),
-        code_status
-    );
-    println!(
-        "  Claude Desktop: {} ({})",
-        claude_desktop_path.display(),
-        desktop_status
-    );
-    println!();
-    println!("Restart Claude Code / Claude Desktop to activate ICM memory.");
-    println!("All sessions share the same memory database.");
+    println!("Restart Claude Code / Claude Desktop to activate.");
 
     Ok(())
 }

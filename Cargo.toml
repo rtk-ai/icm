@@ -17,6 +17,11 @@ strip = true
 [workspace.dependencies]
 # Database
 rusqlite = { version = "0.34", features = ["bundled", "modern_sqlite"] }
+sqlite-vec = "0.1"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# Embeddings (optional)
+fastembed = "4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

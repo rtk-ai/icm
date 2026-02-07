@@ -3,6 +3,10 @@ name = "icm-mcp"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+embeddings = ["icm-core/embeddings"]
+
 [dependencies]
 icm-core = { path = "../icm-core" }
 icm-store = { path = "../icm-store" }

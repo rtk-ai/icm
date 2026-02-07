@@ -1,8 +1,10 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Once;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+use zerocopy::IntoBytes;
 
 use icm_core::{
     Concept, ConceptLink, IcmError, IcmResult, Importance, Label, Memoir, MemoirStats, MemoirStore,
@@ -11,12 +13,26 @@ use icm_core::{
 
 use crate::schema::init_db;
 
+static SQLITE_VEC_INIT: Once = Once::new();
+
+fn ensure_sqlite_vec() {
+    SQLITE_VEC_INIT.call_once(|| {
+        unsafe {
+            #[allow(clippy::missing_transmute_annotations)]
+            sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
+
 pub struct SqliteStore {
     conn: Connection,
 }
 
 impl SqliteStore {
     pub fn new(path: &Path) -> IcmResult<Self> {
+        ensure_sqlite_vec();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| IcmError::Database(format!("cannot create db directory: {e}")))?;
@@ -30,6 +46,7 @@ impl SqliteStore {
     }
 
     pub fn in_memory() -> IcmResult<Self> {
+        ensure_sqlite_vec();
         let conn = Connection::open_in_memory()
             .map_err(|e| IcmError::Database(format!("cannot open in-memory db: {e}")))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
@@ -67,6 +84,16 @@ fn parse_source(source_type_str: &str, source_data_str: Option<String>) -> Memor
     }
 }
 
+fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
+    embedding.as_bytes().to_vec()
+}
+
+fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     let keywords_json: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
     let keywords: Vec<String> = serde_json::from_str(&keywords_json).unwrap_or_default();
@@ -80,6 +107,10 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
 
     let related_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
     let related_ids: Vec<String> = serde_json::from_str(&related_json).unwrap_or_default();
+
+    let embedding: Option<Vec<f32>> = row
+        .get::<_, Option<Vec<u8>>>(13)?
+        .map(|b| blob_to_embedding(&b));
 
     let created_at_str: String = row.get(1)?;
     let last_accessed_str: String = row.get(2)?;
@@ -101,12 +132,13 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         importance,
         source,
         related_ids,
+        embedding,
     })
 }
 
 const SELECT_COLS: &str = "id, created_at, last_accessed, access_count, weight, \
                            topic, summary, raw_excerpt, keywords, \
-                           importance, source_type, source_data, related_ids";
+                           importance, source_type, source_data, related_ids, embedding";
 
 // ---------------------------------------------------------------------------
 // MemoryStore impl
@@ -118,13 +150,14 @@ impl MemoryStore for SqliteStore {
         let related_json = serde_json::to_string(&memory.related_ids)?;
         let st = source_type(&memory.source);
         let sd = source_data(&memory.source);
+        let emb_blob = memory.embedding.as_deref().map(embedding_to_blob);
 
         self.conn
             .execute(
                 "INSERT INTO memories (id, created_at, last_accessed, access_count, weight,
                  topic, summary, raw_excerpt, keywords,
-                 importance, source_type, source_data, related_ids)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 importance, source_type, source_data, related_ids, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     memory.id,
                     memory.created_at.to_rfc3339(),
@@ -139,9 +172,21 @@ impl MemoryStore for SqliteStore {
                     st,
                     sd,
                     related_json,
+                    emb_blob,
                 ],
             )
             .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        // Sync to vec_memories for KNN search
+        if let Some(ref emb) = memory.embedding {
+            let blob = embedding_to_blob(emb);
+            self.conn
+                .execute(
+                    "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
+                    params![memory.id, blob],
+                )
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+        }
 
         Ok(memory.id)
     }
@@ -165,6 +210,7 @@ impl MemoryStore for SqliteStore {
         let related_json = serde_json::to_string(&memory.related_ids)?;
         let st = source_type(&memory.source);
         let sd = source_data(&memory.source);
+        let emb_blob = memory.embedding.as_deref().map(embedding_to_blob);
 
         let changed = self
             .conn
@@ -172,7 +218,8 @@ impl MemoryStore for SqliteStore {
                 "UPDATE memories SET
                  last_accessed = ?2, access_count = ?3, weight = ?4,
                  topic = ?5, summary = ?6, raw_excerpt = ?7, keywords = ?8,
-                 importance = ?9, source_type = ?10, source_data = ?11, related_ids = ?12
+                 importance = ?9, source_type = ?10, source_data = ?11, related_ids = ?12,
+                 embedding = ?13
                  WHERE id = ?1",
                 params![
                     memory.id,
@@ -187,6 +234,7 @@ impl MemoryStore for SqliteStore {
                     st,
                     sd,
                     related_json,
+                    emb_blob,
                 ],
             )
             .map_err(|e| IcmError::Database(e.to_string()))?;
@@ -194,10 +242,35 @@ impl MemoryStore for SqliteStore {
         if changed == 0 {
             return Err(IcmError::NotFound(memory.id.clone()));
         }
+
+        // Sync vec_memories
+        if let Some(ref emb) = memory.embedding {
+            let blob = embedding_to_blob(emb);
+            // Delete old entry then insert new
+            let _ = self
+                .conn
+                .execute("DELETE FROM vec_memories WHERE memory_id = ?1", params![memory.id]);
+            self.conn
+                .execute(
+                    "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
+                    params![memory.id, blob],
+                )
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+        } else {
+            // No embedding — remove from vec table
+            let _ = self
+                .conn
+                .execute("DELETE FROM vec_memories WHERE memory_id = ?1", params![memory.id]);
+        }
+
         Ok(())
     }
 
     fn delete(&self, id: &str) -> IcmResult<()> {
+        let _ = self
+            .conn
+            .execute("DELETE FROM vec_memories WHERE memory_id = ?1", params![id]);
+
         let changed = self
             .conn
             .execute("DELETE FROM memories WHERE id = ?1", params![id])
@@ -282,6 +355,106 @@ impl MemoryStore for SqliteStore {
         Ok(results)
     }
 
+    fn search_by_embedding(&self, embedding: &[f32], limit: usize) -> IcmResult<Vec<(Memory, f32)>> {
+        let query_blob = embedding_to_blob(embedding);
+
+        // First get the KNN results from vec_memories
+        let mut knn_stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, distance
+                 FROM vec_memories
+                 WHERE embedding MATCH ?1
+                 ORDER BY distance
+                 LIMIT ?2",
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let knn_rows: Vec<(String, f32)> = knn_stmt
+            .query_map(params![query_blob, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+            })
+            .map_err(|e| IcmError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Then fetch the full memory for each result
+        let mut results = Vec::new();
+        for (id, distance) in &knn_rows {
+            if let Some(memory) = self.get(id)? {
+                let similarity = 1.0 - distance;
+                results.push((memory, similarity));
+            }
+        }
+        Ok(results)
+    }
+
+    fn search_hybrid(&self, query: &str, embedding: &[f32], limit: usize) -> IcmResult<Vec<(Memory, f32)>> {
+        let pool_size = limit * 4;
+
+        // 1. Get FTS results with rank scores
+        let fts_sql =
+            "SELECT m.id, m.created_at, m.last_accessed, m.access_count, m.weight, \
+                    m.topic, m.summary, m.raw_excerpt, m.keywords, \
+                    m.importance, m.source_type, m.source_data, m.related_ids, m.embedding, \
+                    fts.rank \
+             FROM memories_fts fts \
+             JOIN memories m ON m.id = fts.id \
+             WHERE memories_fts MATCH ?1 \
+             ORDER BY fts.rank \
+             LIMIT ?2";
+
+        let mut fts_scores: HashMap<String, f32> = HashMap::new();
+        let mut all_memories: HashMap<String, Memory> = HashMap::new();
+
+        if let Ok(mut stmt) = self.conn.prepare(fts_sql) {
+            if let Ok(rows) = stmt.query_map(params![query, pool_size as i64], |row| {
+                let memory = row_to_memory(row)?;
+                let rank: f32 = row.get(14)?;
+                Ok((memory, rank))
+            }) {
+                for row in rows.flatten() {
+                    let (memory, rank) = row;
+                    // Normalize FTS rank (lower is better, typically negative)
+                    // Convert to 0..1 score where higher is better
+                    let score = 1.0 / (1.0 + rank.abs());
+                    fts_scores.insert(memory.id.clone(), score);
+                    all_memories.insert(memory.id.clone(), memory);
+                }
+            }
+        }
+
+        // 2. Get vector results
+        let vec_results = self.search_by_embedding(embedding, pool_size)?;
+        let mut vec_scores: HashMap<String, f32> = HashMap::new();
+        for (memory, similarity) in vec_results {
+            vec_scores.insert(memory.id.clone(), similarity);
+            all_memories.entry(memory.id.clone()).or_insert(memory);
+        }
+
+        // 3. Combine scores: 30% FTS + 70% vector
+        let mut scored: Vec<(String, f32)> = Vec::new();
+        for id in all_memories.keys() {
+            let fts_score = fts_scores.get(id).copied().unwrap_or(0.0);
+            let vec_score = vec_scores.get(id).copied().unwrap_or(0.0);
+            let combined = 0.3 * fts_score + 0.7 * vec_score;
+            scored.push((id.clone(), combined));
+        }
+
+        // Sort by combined score descending
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        let results: Vec<(Memory, f32)> = scored
+            .into_iter()
+            .filter_map(|(id, score)| {
+                all_memories.remove(&id).map(|mem| (mem, score))
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     fn update_access(&self, id: &str) -> IcmResult<()> {
         let now = Utc::now().to_rfc3339();
         let changed = self
@@ -311,6 +484,14 @@ impl MemoryStore for SqliteStore {
     }
 
     fn prune(&self, weight_threshold: f32) -> IcmResult<usize> {
+        // Clean vec_memories for entries about to be pruned
+        let _ = self.conn.execute(
+            "DELETE FROM vec_memories WHERE memory_id IN (
+                SELECT id FROM memories WHERE weight < ?1 AND importance != 'critical'
+            )",
+            params![weight_threshold],
+        );
+
         let changed = self
             .conn
             .execute(
@@ -361,6 +542,14 @@ impl MemoryStore for SqliteStore {
     }
 
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()> {
+        // Clean vec_memories for entries about to be deleted
+        let _ = self.conn.execute(
+            "DELETE FROM vec_memories WHERE memory_id IN (
+                SELECT id FROM memories WHERE topic = ?1
+            )",
+            params![topic],
+        );
+
         self.conn
             .execute("DELETE FROM memories WHERE topic = ?1", params![topic])
             .map_err(|e| IcmError::Database(e.to_string()))?;
@@ -1026,6 +1215,19 @@ impl MemoirStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// Test helpers (visible to other modules in crate for test use)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::ensure_sqlite_vec;
+
+    pub fn ensure_vec_init() {
+        ensure_sqlite_vec();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1537,5 +1739,160 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "es");
+    }
+
+    // === Vector search tests ===
+
+    #[test]
+    fn test_store_with_embedding() {
+        let store = test_store();
+        let mut mem = make_memory("test", "vector enabled");
+        mem.embedding = Some(vec![0.1; 384]);
+        let id = store.store(mem).unwrap();
+
+        let retrieved = store.get(&id).unwrap().unwrap();
+        assert!(retrieved.embedding.is_some());
+        assert_eq!(retrieved.embedding.as_ref().unwrap().len(), 384);
+    }
+
+    #[test]
+    fn test_store_without_embedding() {
+        let store = test_store();
+        let mem = make_memory("test", "no vector");
+        let id = store.store(mem).unwrap();
+
+        let retrieved = store.get(&id).unwrap().unwrap();
+        assert!(retrieved.embedding.is_none());
+    }
+
+    #[test]
+    fn test_search_by_embedding() {
+        let store = test_store();
+
+        // Store 3 memories with different embeddings
+        let mut m1 = make_memory("rust", "Rust systems programming");
+        m1.embedding = Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0]);
+        store.store(m1).unwrap();
+
+        let mut m2 = make_memory("python", "Python scripting");
+        // Very different embedding
+        let mut emb2 = vec![0.0; 384];
+        emb2[1] = 1.0;
+        m2.embedding = Some(emb2);
+        store.store(m2).unwrap();
+
+        // Store one without embedding
+        store.store(make_memory("go", "Go programming")).unwrap();
+
+        // Search with a query vector close to m1
+        let mut query = vec![0.0; 384];
+        query[0] = 0.9;
+        let results = store.search_by_embedding(&query, 5).unwrap();
+
+        assert!(!results.is_empty());
+        // First result should be closest to query
+        assert_eq!(results[0].0.topic, "rust");
+    }
+
+    #[test]
+    fn test_delete_cleans_vec_table() {
+        let store = test_store();
+        let mut mem = make_memory("test", "to delete with vec");
+        mem.embedding = Some(vec![0.5; 384]);
+        let id = store.store(mem).unwrap();
+
+        store.delete(&id).unwrap();
+
+        // Verify vec_memories is also cleaned
+        let query = vec![0.5; 384];
+        let results = store.search_by_embedding(&query, 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_hybrid() {
+        let store = test_store();
+
+        // Store memory with both text and embedding
+        let mut mem = make_memory("rust", "Rust is great for systems programming");
+        mem.embedding = Some(vec![0.8; 384]);
+        store.store(mem).unwrap();
+
+        let mut mem2 = make_memory("python", "Python is great for scripting");
+        let mut emb2 = vec![0.0; 384];
+        emb2[1] = 1.0;
+        mem2.embedding = Some(emb2);
+        store.store(mem2).unwrap();
+
+        // Hybrid search with both text match and close embedding
+        let query_emb = vec![0.7; 384]; // close to m1's embedding
+        let results = store.search_hybrid("rust programming", &query_emb, 5).unwrap();
+
+        assert!(!results.is_empty());
+        // Rust should rank first (matches both FTS and vector)
+        assert_eq!(results[0].0.topic, "rust");
+        // Score should be > 0
+        assert!(results[0].1 > 0.0);
+    }
+
+    #[test]
+    fn test_update_syncs_embedding() {
+        let store = test_store();
+        let mut mem = make_memory("test", "before update");
+        let id = mem.id.clone();
+        store.store(mem.clone()).unwrap();
+
+        // Initially no embedding
+        assert!(store.get(&id).unwrap().unwrap().embedding.is_none());
+
+        // Update with embedding
+        mem.embedding = Some(vec![0.3; 384]);
+        store.update(&mem).unwrap();
+
+        let retrieved = store.get(&id).unwrap().unwrap();
+        assert!(retrieved.embedding.is_some());
+
+        // Should be findable via vector search
+        let results = store.search_by_embedding(&vec![0.3; 384], 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.id, id);
     }
 }

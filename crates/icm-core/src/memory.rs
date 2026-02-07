@@ -19,6 +19,9 @@ pub struct Memory {
     pub source: MemorySource,
 
     pub related_ids: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl Memory {
@@ -37,6 +40,7 @@ impl Memory {
             importance,
             source: MemorySource::Manual,
             related_ids: Vec::new(),
+            embedding: None,
         }
     }
 }

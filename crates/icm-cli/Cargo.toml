@@ -12,6 +12,10 @@ categories = ["command-line-utilities"]
 name = "icm"
 path = "src/main.rs"
 
+[features]
+default = ["embeddings"]
+embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
+
 [dependencies]
 icm-core = { path = "../icm-core" }
 icm-store = { path = "../icm-store" }

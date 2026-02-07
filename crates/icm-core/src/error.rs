@@ -13,6 +13,9 @@ pub enum IcmError {
 
     #[error("config error: {0}")]
     Config(String),
+
+    #[error("embedding error: {0}")]
+    Embedding(String),
 }
 
 pub type IcmResult<T> = Result<T, IcmError>;

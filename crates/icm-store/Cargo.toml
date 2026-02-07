@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 icm-core = { path = "../icm-core" }
 rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
+zerocopy = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }

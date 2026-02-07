@@ -157,15 +157,47 @@ pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
         .map_err(|e| IcmError::Database(e.to_string()))?;
     }
 
+    // Migration: add embedding column if missing (existing DBs)
+    let has_embedding: bool = conn
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='embedding'")
+        .and_then(|mut s| s.query_row([], |row| row.get(0)))
+        .map_err(|e| IcmError::Database(e.to_string()))?;
+
+    if !has_embedding {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN embedding BLOB")
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+    }
+
+    // sqlite-vec virtual table for vector search
+    let vec_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_memories'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| IcmError::Database(e.to_string()))?;
+
+    if !vec_exists {
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE vec_memories USING vec0(
+                memory_id TEXT PRIMARY KEY,
+                embedding float[384] distance_metric=cosine
+            )",
+        )
+        .map_err(|e| IcmError::Database(e.to_string()))?;
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::test_helpers::ensure_vec_init;
 
     #[test]
     fn test_init_db() {
+        ensure_vec_init();
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         // Second call should be idempotent
@@ -174,6 +206,7 @@ mod tests {
 
     #[test]
     fn test_memoir_tables_exist() {
+        ensure_vec_init();
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
@@ -192,5 +225,6 @@ mod tests {
         assert!(tables.contains(&"concepts".to_string()));
         assert!(tables.contains(&"concept_links".to_string()));
         assert!(tables.contains(&"concepts_fts".to_string()));
+        assert!(tables.contains(&"vec_memories".to_string()));
     }
 }

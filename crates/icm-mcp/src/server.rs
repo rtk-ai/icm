@@ -3,6 +3,7 @@ use std::io::{self, BufRead, Write};
 use serde_json::{json, Value};
 use tracing::{debug, error};
 
+use icm_core::Embedder;
 use icm_store::SqliteStore;
 
 use crate::protocol::{JsonRpcMessage, JsonRpcResponse};
@@ -13,7 +14,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Run the MCP server on stdio. Blocks until stdin is closed.
-pub fn run_server(store: &SqliteStore) -> anyhow::Result<()> {
+pub fn run_server(store: &SqliteStore, embedder: Option<&dyn Embedder>) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -54,8 +55,8 @@ pub fn run_server(store: &SqliteStore) -> anyhow::Result<()> {
         let response = match method {
             "initialize" => handle_initialize(id),
             "ping" => JsonRpcResponse::ok(id, json!({})),
-            "tools/list" => handle_tools_list(id),
-            "tools/call" => handle_tools_call(id, &msg.params, store),
+            "tools/list" => handle_tools_list(id, embedder.is_some()),
+            "tools/call" => handle_tools_call(id, &msg.params, store, embedder),
             other => JsonRpcResponse::method_not_found(id, other),
         };
 
@@ -88,11 +89,16 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
     )
 }
 
-fn handle_tools_list(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::ok(id, tools::tool_definitions())
+fn handle_tools_list(id: Value, has_embedder: bool) -> JsonRpcResponse {
+    JsonRpcResponse::ok(id, tools::tool_definitions(has_embedder))
 }
 
-fn handle_tools_call(id: Value, params: &Option<Value>, store: &SqliteStore) -> JsonRpcResponse {
+fn handle_tools_call(
+    id: Value,
+    params: &Option<Value>,
+    store: &SqliteStore,
+    embedder: Option<&dyn Embedder>,
+) -> JsonRpcResponse {
     let params = match params {
         Some(p) => p,
         None => {
@@ -109,6 +115,6 @@ fn handle_tools_call(id: Value, params: &Option<Value>, store: &SqliteStore) -> 
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    let result = tools::call_tool(store, tool_name, &args);
+    let result = tools::call_tool(store, embedder, tool_name, &args);
     JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap_or(json!(null)))
 }

@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
-use icm_core::{Concept, ConceptLink, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation};
+use icm_core::{
+    Concept, ConceptLink, Embedder, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation,
+};
 use icm_store::SqliteStore;
 
 use crate::protocol::ToolResult;
@@ -9,295 +11,317 @@ use crate::protocol::ToolResult;
 // Tool schemas for tools/list
 // ---------------------------------------------------------------------------
 
-pub fn tool_definitions() -> Value {
-    json!({
-        "tools": [
-            // --- Memory tools ---
-            {
-                "name": "icm_store",
-                "description": "Store important information in ICM long-term memory. Use to save decisions, preferences, project context, resolved errors — anything that should persist between sessions.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "topic": {
-                            "type": "string",
-                            "description": "Category/namespace (e.g. 'projet-kexa', 'preferences', 'decisions-architecture', 'erreurs-resolues')"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Information to memorize — be concise but complete"
-                        },
-                        "importance": {
-                            "type": "string",
-                            "enum": ["critical", "high", "medium", "low"],
-                            "default": "medium",
-                            "description": "critical=never forgotten, high=slow decay, medium=normal, low=fast decay"
-                        },
-                        "keywords": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Keywords to improve search"
-                        },
-                        "raw_excerpt": {
-                            "type": "string",
-                            "description": "Optional verbatim (code, exact error message, etc.)"
-                        }
+pub fn tool_definitions(has_embedder: bool) -> Value {
+    let mut tools = vec![
+        // --- Memory tools ---
+        json!({
+            "name": "icm_store",
+            "description": "Store important information in ICM long-term memory. Use to save decisions, preferences, project context, resolved errors — anything that should persist between sessions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Category/namespace (e.g. 'projet-kexa', 'preferences', 'decisions-architecture', 'erreurs-resolues')"
                     },
-                    "required": ["topic", "content"]
-                }
-            },
-            {
-                "name": "icm_recall",
-                "description": "Search ICM long-term memory. Use to find past decisions, project context, preferences, or solutions to previously encountered problems.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Natural language search query"
-                        },
-                        "topic": {
-                            "type": "string",
-                            "description": "Filter by specific topic (optional)"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "default": 5,
-                            "minimum": 1,
-                            "maximum": 20,
-                            "description": "Max number of results"
-                        }
+                    "content": {
+                        "type": "string",
+                        "description": "Information to memorize — be concise but complete"
                     },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "icm_forget",
-                "description": "Delete a specific memory by its ID. Use when information is obsolete or incorrect.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "id": {
-                            "type": "string",
-                            "description": "Memory ID to delete"
-                        }
+                    "importance": {
+                        "type": "string",
+                        "enum": ["critical", "high", "medium", "low"],
+                        "default": "medium",
+                        "description": "critical=never forgotten, high=slow decay, medium=normal, low=fast decay"
                     },
-                    "required": ["id"]
-                }
-            },
-            {
-                "name": "icm_consolidate",
-                "description": "Consolidate all memories of a topic into a single summary. Useful when a topic accumulates too many entries.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "topic": {
-                            "type": "string",
-                            "description": "Topic to consolidate"
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "Consolidated summary to replace all memories in the topic"
-                        }
+                    "keywords": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Keywords to improve search"
                     },
-                    "required": ["topic", "summary"]
-                }
-            },
-            {
-                "name": "icm_list_topics",
-                "description": "List all available topics in memory with their counts.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "icm_stats",
-                "description": "Get global ICM memory statistics.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            // --- Memoir tools ---
-            {
-                "name": "icm_memoir_create",
-                "description": "Create a new memoir — a permanent knowledge container. Memoirs hold concepts that never decay.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Unique human-readable name for the memoir"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Description of what this memoir is for"
-                        }
+                    "raw_excerpt": {
+                        "type": "string",
+                        "description": "Optional verbatim (code, exact error message, etc.)"
+                    }
+                },
+                "required": ["topic", "content"]
+            }
+        }),
+        json!({
+            "name": "icm_recall",
+            "description": "Search ICM long-term memory. Use to find past decisions, project context, preferences, or solutions to previously encountered problems.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query"
                     },
-                    "required": ["name"]
-                }
-            },
-            {
-                "name": "icm_memoir_list",
-                "description": "List all memoirs with their concept counts.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "icm_memoir_show",
-                "description": "Show a memoir's stats, labels, and all its concepts.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Memoir name"
-                        }
+                    "topic": {
+                        "type": "string",
+                        "description": "Filter by specific topic (optional)"
                     },
-                    "required": ["name"]
-                }
-            },
-            {
-                "name": "icm_memoir_add_concept",
-                "description": "Add a permanent concept to a memoir. Concepts are knowledge nodes that get refined, never decayed.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "memoir": {
-                            "type": "string",
-                            "description": "Memoir name"
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Concept name (unique within memoir)"
-                        },
-                        "definition": {
-                            "type": "string",
-                            "description": "Dense description of the concept"
-                        },
-                        "labels": {
-                            "type": "string",
-                            "description": "Comma-separated labels (namespace:value or plain tag). E.g. 'domain:arch,type:decision'"
-                        }
+                    "limit": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Max number of results"
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "icm_forget",
+            "description": "Delete a specific memory by its ID. Use when information is obsolete or incorrect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Memory ID to delete"
+                    }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
+            "name": "icm_consolidate",
+            "description": "Consolidate all memories of a topic into a single summary. Useful when a topic accumulates too many entries.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic to consolidate"
                     },
-                    "required": ["memoir", "name", "definition"]
-                }
-            },
-            {
-                "name": "icm_memoir_refine",
-                "description": "Refine an existing concept with a new, improved definition. Bumps revision and boosts confidence.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "memoir": {
-                            "type": "string",
-                            "description": "Memoir name"
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Concept name"
-                        },
-                        "definition": {
-                            "type": "string",
-                            "description": "New, refined definition"
-                        }
+                    "summary": {
+                        "type": "string",
+                        "description": "Consolidated summary to replace all memories in the topic"
+                    }
+                },
+                "required": ["topic", "summary"]
+            }
+        }),
+        json!({
+            "name": "icm_list_topics",
+            "description": "List all available topics in memory with their counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "icm_stats",
+            "description": "Get global ICM memory statistics.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        // --- Memoir tools ---
+        json!({
+            "name": "icm_memoir_create",
+            "description": "Create a new memoir — a permanent knowledge container. Memoirs hold concepts that never decay.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Unique human-readable name for the memoir"
                     },
-                    "required": ["memoir", "name", "definition"]
-                }
-            },
-            {
-                "name": "icm_memoir_search",
-                "description": "Full-text search concepts within a memoir.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "memoir": {
-                            "type": "string",
-                            "description": "Memoir name"
-                        },
-                        "query": {
-                            "type": "string",
-                            "description": "Search query"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "default": 10,
-                            "description": "Max results"
-                        }
+                    "description": {
+                        "type": "string",
+                        "description": "Description of what this memoir is for"
+                    }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "icm_memoir_list",
+            "description": "List all memoirs with their concept counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "icm_memoir_show",
+            "description": "Show a memoir's stats, labels, and all its concepts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Memoir name"
+                    }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "icm_memoir_add_concept",
+            "description": "Add a permanent concept to a memoir. Concepts are knowledge nodes that get refined, never decayed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memoir": {
+                        "type": "string",
+                        "description": "Memoir name"
                     },
-                    "required": ["memoir", "query"]
-                }
-            },
-            {
-                "name": "icm_memoir_link",
-                "description": "Create a directed, typed edge between two concepts in the same memoir.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "memoir": {
-                            "type": "string",
-                            "description": "Memoir name"
-                        },
-                        "from": {
-                            "type": "string",
-                            "description": "Source concept name"
-                        },
-                        "to": {
-                            "type": "string",
-                            "description": "Target concept name"
-                        },
-                        "relation": {
-                            "type": "string",
-                            "enum": ["part_of", "depends_on", "related_to", "contradicts", "refines", "alternative_to", "caused_by", "instance_of"],
-                            "description": "Relation type"
-                        }
+                    "name": {
+                        "type": "string",
+                        "description": "Concept name (unique within memoir)"
                     },
-                    "required": ["memoir", "from", "to", "relation"]
-                }
-            },
-            {
-                "name": "icm_memoir_inspect",
-                "description": "Inspect a concept and its graph neighborhood (BFS).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "memoir": {
-                            "type": "string",
-                            "description": "Memoir name"
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Concept name"
-                        },
-                        "depth": {
-                            "type": "integer",
-                            "default": 1,
-                            "description": "BFS depth"
-                        }
+                    "definition": {
+                        "type": "string",
+                        "description": "Dense description of the concept"
                     },
-                    "required": ["memoir", "name"]
+                    "labels": {
+                        "type": "string",
+                        "description": "Comma-separated labels (namespace:value or plain tag). E.g. 'domain:arch,type:decision'"
+                    }
+                },
+                "required": ["memoir", "name", "definition"]
+            }
+        }),
+        json!({
+            "name": "icm_memoir_refine",
+            "description": "Refine an existing concept with a new, improved definition. Bumps revision and boosts confidence.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memoir": {
+                        "type": "string",
+                        "description": "Memoir name"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Concept name"
+                    },
+                    "definition": {
+                        "type": "string",
+                        "description": "New, refined definition"
+                    }
+                },
+                "required": ["memoir", "name", "definition"]
+            }
+        }),
+        json!({
+            "name": "icm_memoir_search",
+            "description": "Full-text search concepts within a memoir.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memoir": {
+                        "type": "string",
+                        "description": "Memoir name"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Max results"
+                    }
+                },
+                "required": ["memoir", "query"]
+            }
+        }),
+        json!({
+            "name": "icm_memoir_link",
+            "description": "Create a directed, typed edge between two concepts in the same memoir.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memoir": {
+                        "type": "string",
+                        "description": "Memoir name"
+                    },
+                    "from": {
+                        "type": "string",
+                        "description": "Source concept name"
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "Target concept name"
+                    },
+                    "relation": {
+                        "type": "string",
+                        "enum": ["part_of", "depends_on", "related_to", "contradicts", "refines", "alternative_to", "caused_by", "instance_of"],
+                        "description": "Relation type"
+                    }
+                },
+                "required": ["memoir", "from", "to", "relation"]
+            }
+        }),
+        json!({
+            "name": "icm_memoir_inspect",
+            "description": "Inspect a concept and its graph neighborhood (BFS).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memoir": {
+                        "type": "string",
+                        "description": "Memoir name"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Concept name"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "default": 1,
+                        "description": "BFS depth"
+                    }
+                },
+                "required": ["memoir", "name"]
+            }
+        }),
+    ];
+
+    if has_embedder {
+        tools.push(json!({
+            "name": "icm_embed_all",
+            "description": "Generate embeddings for all memories that don't have one yet. Use this to backfill vector search capability.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Only embed memories in this topic (optional)"
+                    }
                 }
             }
-        ]
-    })
+        }));
+    }
+
+    json!({ "tools": tools })
 }
 
 // ---------------------------------------------------------------------------
 // Tool dispatch
 // ---------------------------------------------------------------------------
 
-pub fn call_tool(store: &SqliteStore, name: &str, args: &Value) -> ToolResult {
+pub fn call_tool(
+    store: &SqliteStore,
+    embedder: Option<&dyn Embedder>,
+    name: &str,
+    args: &Value,
+) -> ToolResult {
     match name {
         // Memory tools
-        "icm_store" => tool_store(store, args),
-        "icm_recall" => tool_recall(store, args),
+        "icm_store" => tool_store(store, embedder, args),
+        "icm_recall" => tool_recall(store, embedder, args),
         "icm_forget" => tool_forget(store, args),
         "icm_consolidate" => tool_consolidate(store, args),
         "icm_list_topics" => tool_list_topics(store),
         "icm_stats" => tool_stats(store),
+        "icm_embed_all" => tool_embed_all(store, embedder, args),
         // Memoir tools
         "icm_memoir_create" => tool_memoir_create(store, args),
         "icm_memoir_list" => tool_memoir_list(store),
@@ -334,7 +358,11 @@ fn resolve_memoir(store: &SqliteStore, name: &str) -> Result<Memoir, ToolResult>
 // Memory tool handlers
 // ---------------------------------------------------------------------------
 
-fn tool_store(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_store(
+    store: &SqliteStore,
+    embedder: Option<&dyn Embedder>,
+    args: &Value,
+) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -361,13 +389,26 @@ fn tool_store(store: &SqliteStore, args: &Value) -> ToolResult {
         memory.raw_excerpt = Some(raw.into());
     }
 
+    // Auto-embed if embedder is available
+    if let Some(emb) = embedder {
+        let text = format!("{topic} {content}");
+        match emb.embed(&text) {
+            Ok(vec) => memory.embedding = Some(vec),
+            Err(e) => tracing::warn!("embedding failed: {e}"),
+        }
+    }
+
     match store.store(memory) {
         Ok(id) => ToolResult::text(format!("Stored memory: {id}")),
         Err(e) => ToolResult::error(format!("failed to store: {e}")),
     }
 }
 
-fn tool_recall(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_recall(
+    store: &SqliteStore,
+    embedder: Option<&dyn Embedder>,
+    args: &Value,
+) -> ToolResult {
     let query = match get_str(args, "query") {
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
@@ -375,7 +416,44 @@ fn tool_recall(store: &SqliteStore, args: &Value) -> ToolResult {
     let limit = get_i64(args, "limit", 5) as usize;
     let topic = get_str(args, "topic");
 
-    // Try FTS first, fallback to keywords
+    // Try hybrid search if embedder is available
+    if let Some(emb) = embedder {
+        if let Ok(query_emb) = emb.embed(query) {
+            if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
+                let mut scored_results = results;
+                if let Some(t) = topic {
+                    scored_results.retain(|(m, _)| m.topic == t);
+                }
+
+                // Update access counts
+                for (mem, _) in &scored_results {
+                    let _ = store.update_access(&mem.id);
+                }
+
+                if scored_results.is_empty() {
+                    return ToolResult::text("No memories found.".into());
+                }
+
+                let mut output = String::new();
+                for (mem, score) in &scored_results {
+                    output.push_str(&format!(
+                        "--- {} [score: {:.3}] ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
+                        mem.id, score, mem.topic, mem.importance, mem.weight, mem.summary
+                    ));
+                    if !mem.keywords.is_empty() {
+                        output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
+                    }
+                    if let Some(ref raw) = mem.raw_excerpt {
+                        output.push_str(&format!("  raw: {raw}\n"));
+                    }
+                    output.push('\n');
+                }
+                return ToolResult::text(output);
+            }
+        }
+    }
+
+    // Fallback: FTS then keywords
     let mut results = match store.search_fts(query, limit) {
         Ok(r) => r,
         Err(e) => return ToolResult::error(format!("search error: {e}")),
@@ -483,6 +561,71 @@ fn tool_stats(store: &SqliteStore) -> ToolResult {
         }
         Err(e) => ToolResult::error(format!("failed to get stats: {e}")),
     }
+}
+
+fn tool_embed_all(
+    store: &SqliteStore,
+    embedder: Option<&dyn Embedder>,
+    args: &Value,
+) -> ToolResult {
+    let embedder = match embedder {
+        Some(e) => e,
+        None => return ToolResult::error("embeddings not available".into()),
+    };
+
+    let topic_filter = get_str(args, "topic");
+
+    // Get all memories, filtered by topic if specified
+    let memories = if let Some(t) = topic_filter {
+        match store.get_by_topic(t) {
+            Ok(m) => m,
+            Err(e) => return ToolResult::error(format!("failed to list memories: {e}")),
+        }
+    } else {
+        // Get all by listing topics
+        let topics = match store.list_topics() {
+            Ok(t) => t,
+            Err(e) => return ToolResult::error(format!("failed to list topics: {e}")),
+        };
+        let mut all = Vec::new();
+        for (t, _) in &topics {
+            if let Ok(mems) = store.get_by_topic(t) {
+                all.extend(mems);
+            }
+        }
+        all
+    };
+
+    // Filter to only those without embeddings
+    let to_embed: Vec<&Memory> = memories.iter().filter(|m| m.embedding.is_none()).collect();
+
+    if to_embed.is_empty() {
+        return ToolResult::text("All memories already have embeddings.".into());
+    }
+
+    let total = to_embed.len();
+    let mut embedded = 0;
+    let mut errors = 0;
+
+    for mem in &to_embed {
+        let text = format!("{} {}", mem.topic, mem.summary);
+        match embedder.embed(&text) {
+            Ok(vec) => {
+                let mut updated = (*mem).clone();
+                updated.embedding = Some(vec);
+                if store.update(&updated).is_ok() {
+                    embedded += 1;
+                } else {
+                    errors += 1;
+                }
+            }
+            Err(_) => errors += 1,
+        }
+    }
+
+    ToolResult::text(format!(
+        "Embedded {embedded}/{total} memories ({errors} errors)"
+    ))
 }
 
 // ---------------------------------------------------------------------------

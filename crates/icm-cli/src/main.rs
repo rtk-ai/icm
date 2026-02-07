@@ -367,7 +367,15 @@ fn main() -> Result<()> {
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
-            cmd_store(&store, emb_ref, topic, content, importance.into(), keywords, raw)
+            cmd_store(
+                &store,
+                emb_ref,
+                topic,
+                content,
+                importance.into(),
+                keywords,
+                raw,
+            )
         }
         Commands::Recall {
             query,

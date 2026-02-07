@@ -649,67 +649,88 @@ fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
 }
 
 fn cmd_init() -> Result<()> {
-    // Find the icm binary path
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = icm_bin.to_string_lossy().to_string();
-
-    // Locate ~/.claude.json
     let home = std::env::var("HOME").context("HOME not set")?;
-    let claude_config_path = PathBuf::from(&home).join(".claude.json");
 
+    let icm_server_entry = serde_json::json!({
+        "command": icm_bin_str,
+        "args": ["serve"],
+        "env": {}
+    });
+
+    // 1. Claude Code: ~/.claude.json
+    let claude_code_path = PathBuf::from(&home).join(".claude.json");
+    let code_status = inject_mcp_server(&claude_code_path, "icm", &icm_server_entry)?;
+
+    // 2. Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json
+    let claude_desktop_path =
+        PathBuf::from(&home).join("Library/Application Support/Claude/claude_desktop_config.json");
+    let desktop_status = inject_mcp_server(&claude_desktop_path, "icm", &icm_server_entry)?;
+
+    println!("ICM configured!");
+    println!();
+    println!("  binary:  {icm_bin_str}");
+    println!("  db:      {}", default_db_path().display());
+    println!();
+    println!(
+        "  Claude Code:    {} ({})",
+        claude_code_path.display(),
+        code_status
+    );
+    println!(
+        "  Claude Desktop: {} ({})",
+        claude_desktop_path.display(),
+        desktop_status
+    );
+    println!();
+    println!("Restart Claude Code / Claude Desktop to activate ICM memory.");
+    println!("All sessions share the same memory database.");
+
+    Ok(())
+}
+
+/// Inject ICM MCP server into a Claude config file. Returns a status string.
+fn inject_mcp_server(config_path: &PathBuf, name: &str, entry: &Value) -> Result<String> {
     // Read existing config or create empty object
-    let mut config: Value = if claude_config_path.exists() {
-        let content =
-            std::fs::read_to_string(&claude_config_path).context("cannot read ~/.claude.json")?;
-        serde_json::from_str(&content).context("invalid JSON in ~/.claude.json")?
+    let mut config: Value = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("invalid JSON in {}", config_path.display()))?
     } else {
+        // Create parent dirs if needed
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
         serde_json::json!({})
     };
 
-    // Ensure mcpServers object exists
     let mcp_servers = config
         .as_object_mut()
-        .context("~/.claude.json is not a JSON object")?
+        .context("config is not a JSON object")?
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}));
 
-    // Check if already configured
-    if mcp_servers.get("icm").is_some() {
-        let existing_cmd = mcp_servers["icm"]["command"].as_str().unwrap_or("");
-        if existing_cmd == icm_bin_str {
-            println!("ICM is already configured in Claude Code.");
-            println!("  binary: {icm_bin_str}");
-            println!("\nRestart Claude Code to pick up any changes.");
-            return Ok(());
+    // Check if already configured with same binary
+    if let Some(existing) = mcp_servers.get(name) {
+        if existing.get("command").and_then(|v| v.as_str())
+            == entry.get("command").and_then(|v| v.as_str())
+        {
+            return Ok("already configured".into());
         }
-        println!("Updating ICM configuration (was: {existing_cmd})");
     }
 
-    // Set icm MCP server config
-    mcp_servers.as_object_mut().unwrap().insert(
-        "icm".to_string(),
-        serde_json::json!({
-            "command": icm_bin_str,
-            "args": ["serve"],
-            "env": {}
-        }),
-    );
+    mcp_servers
+        .as_object_mut()
+        .unwrap()
+        .insert(name.to_string(), entry.clone());
 
-    // Write back
     let output = serde_json::to_string_pretty(&config)?;
-    std::fs::write(&claude_config_path, output).context("cannot write ~/.claude.json")?;
+    std::fs::write(config_path, output)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
 
-    println!("ICM configured for Claude Code!");
-    println!();
-    println!("  binary:  {icm_bin_str}");
-    println!("  config:  {}", claude_config_path.display());
-    println!("  db:      {}", default_db_path().display());
-    println!();
-    println!("Restart Claude Code to activate ICM memory.");
-    println!("All sessions will share the same memory database.");
-    println!("Instructions are built into the MCP server — no CLAUDE.md changes needed.");
-
-    Ok(())
+    Ok("configured".into())
 }
 
 fn cmd_consolidate(store: &SqliteStore, topic: &str, keep_originals: bool) -> Result<()> {

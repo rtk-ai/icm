@@ -33,7 +33,7 @@ ICM gives your AI agent a real memory — not a note-taking tool, not a context 
 Two memory models:
 
 - **Topics** — store/recall with temporal decay by importance. Critical memories never fade, low-importance ones decay naturally. Auto-decay triggers on recall (every 24h). Consolidate when a topic grows too large.
-- **Memoirs** — permanent knowledge graphs. Concepts linked by typed relations (`depends_on`, `contradicts`, `refines`, `part_of`, ...). The agent builds structured knowledge it can traverse and reason over.
+- **Memories** — permanent knowledge graphs. Concepts linked by typed relations (`depends_on`, `contradicts`, `refines`, `part_of`, ...). The agent builds structured knowledge it can traverse and reason over.
 
 ## How it works
 
@@ -50,7 +50,7 @@ Two memory models:
 
 Decay is applied automatically when you recall memories (if >24h since last decay), so there's no cron job needed.
 
-**Semantic memory (Memoirs)** captures structured knowledge as a graph. Concepts are permanent — they get refined, never decayed. Relations between concepts form a traversable knowledge graph the agent can reason over.
+**Semantic memory (Memories)** captures structured knowledge as a graph. Concepts are permanent — they get refined, never decayed. Relations between concepts form a traversable knowledge graph the agent can reason over.
 
 ### Hybrid search
 
@@ -228,27 +228,27 @@ icm extract -p my-project --dry-run -t "some text to extract from"
 icm recall-context "database choice" --limit 10
 ```
 
-### Memoirs (knowledge graphs)
+### Memory (knowledge graphs)
 
 ```bash
-# Create a memoir
-icm memoir create "system-architecture"
+# Create a memory
+icm memory create "system-architecture"
 
 # Add concepts
-icm memoir add-concept "system-architecture" "auth-service" "Handles JWT tokens and OAuth2 flows"
-icm memoir add-concept "system-architecture" "api-gateway" "Routes requests, rate limiting"
+icm memory add-concept "system-architecture" "auth-service" "Handles JWT tokens and OAuth2 flows"
+icm memory add-concept "system-architecture" "api-gateway" "Routes requests, rate limiting"
 
 # Link concepts
-icm memoir link "system-architecture" "api-gateway" "depends_on" "auth-service"
+icm memory link "system-architecture" "api-gateway" "depends_on" "auth-service"
 
 # Inspect a concept and its neighborhood
-icm memoir inspect "system-architecture" "auth-service" --depth 2
+icm memory inspect "system-architecture" "auth-service" --depth 2
 
-# Search within a memoir
-icm memoir search "system-architecture" "authentication"
+# Search within a memory
+icm memory search "system-architecture" "authentication"
 
-# Search across ALL memoirs
-icm memoir search-all "authentication"
+# Search across ALL memories
+icm memory search-all "authentication"
 ```
 
 ## MCP Tools (16)
@@ -265,19 +265,19 @@ icm memoir search-all "authentication"
 | `icm_memory_stats` | Global memory statistics |
 | `icm_memory_embed_all` | Backfill embeddings for vector search (requires embeddings feature) |
 
-### Memoir tools
+### Memory tools (knowledge graphs)
 
 | Tool | Description |
 |------|-------------|
-| `icm_memoir_create` | Create a new memoir (knowledge container) |
-| `icm_memoir_list` | List all memoirs |
-| `icm_memoir_show` | Show memoir details and all concepts |
-| `icm_memoir_add_concept` | Add a concept to a memoir |
-| `icm_memoir_refine` | Update a concept's definition |
-| `icm_memoir_search` | Full-text search within a memoir |
-| `icm_memoir_search_all` | Full-text search across all memoirs |
-| `icm_memoir_link` | Create typed relation between concepts |
-| `icm_memoir_inspect` | Inspect a concept and its graph neighborhood (BFS) |
+| `icm_memory_create` | Create a new memory (knowledge container) |
+| `icm_memory_list` | List all memories |
+| `icm_memory_show` | Show memory details and all concepts |
+| `icm_memory_add_concept` | Add a concept to a memory |
+| `icm_memory_refine` | Update a concept's definition |
+| `icm_memory_search` | Full-text search within a memory |
+| `icm_memory_search_all` | Full-text search across all memories |
+| `icm_memory_link` | Create typed relation between concepts |
+| `icm_memory_inspect` | Inspect a concept and its graph neighborhood (BFS) |
 
 ## Relation types
 

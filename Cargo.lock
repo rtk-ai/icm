@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "icm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fastembed",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "icm-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "icm-core",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "icm-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "icm-core",

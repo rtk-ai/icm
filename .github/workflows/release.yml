@@ -129,3 +129,103 @@ jobs:
           files: release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew formula
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download checksums
+        run: |
+          gh release download "${{ steps.version.outputs.tag }}" \
+            --repo rtk-ai/icm \
+            --pattern checksums.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse checksums
+        id: sha
+        run: |
+          echo "arm=$(grep aarch64-apple-darwin checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "intel=$(grep x86_64-apple-darwin checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "linux=$(grep x86_64-unknown-linux-gnu checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "linux_arm=$(grep aarch64-unknown-linux-gnu checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Update formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          cat > icm.rb << 'FORMULA'
+          class Icm < Formula
+            desc "Permanent memory for AI agents — MCP server with hybrid search"
+            homepage "https://github.com/rtk-ai/icm"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              on_intel do
+                url "https://github.com/rtk-ai/icm/releases/download/TAG_PLACEHOLDER/icm-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_INTEL_PLACEHOLDER"
+              end
+              on_arm do
+                url "https://github.com/rtk-ai/icm/releases/download/TAG_PLACEHOLDER/icm-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_ARM_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/rtk-ai/icm/releases/download/TAG_PLACEHOLDER/icm-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_PLACEHOLDER"
+              end
+              on_arm do
+                url "https://github.com/rtk-ai/icm/releases/download/TAG_PLACEHOLDER/icm-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_ARM_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "icm"
+            end
+
+            test do
+              assert_match "icm #{version}", shell_output("#{bin}/icm --version")
+            end
+          end
+          FORMULA
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" icm.rb
+          sed -i "s/TAG_PLACEHOLDER/$TAG/g" icm.rb
+          sed -i "s/SHA_INTEL_PLACEHOLDER/${{ steps.sha.outputs.intel }}/g" icm.rb
+          sed -i "s/SHA_ARM_PLACEHOLDER/${{ steps.sha.outputs.arm }}/g" icm.rb
+          sed -i "s/SHA_LINUX_PLACEHOLDER/${{ steps.sha.outputs.linux }}/g" icm.rb
+          sed -i "s/SHA_LINUX_ARM_PLACEHOLDER/${{ steps.sha.outputs.linux_arm }}/g" icm.rb
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' icm.rb
+
+      - name: Push to homebrew-tap
+        run: |
+          CONTENT=$(base64 -w 0 icm.rb)
+          SHA=$(gh api repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb --jq '.sha' 2>/dev/null || echo "")
+          if [ -n "$SHA" ]; then
+            gh api -X PUT repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb \
+              -f message="icm ${{ steps.version.outputs.version }}" \
+              -f content="$CONTENT" \
+              -f sha="$SHA"
+          else
+            gh api -X PUT repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb \
+              -f message="icm ${{ steps.version.outputs.version }}" \
+              -f content="$CONTENT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

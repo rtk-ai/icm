@@ -43,6 +43,45 @@ impl SqliteStore {
         Ok(Self { conn })
     }
 
+    /// Apply decay if more than 24 hours since last decay.
+    /// Called automatically on recall to avoid manual `icm decay` cron.
+    pub fn maybe_auto_decay(&self) -> IcmResult<()> {
+        let now = Utc::now();
+
+        let last: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'last_decay_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let should_decay = match last {
+            Some(ts) => {
+                let last_dt = DateTime::parse_from_rfc3339(&ts)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| now - chrono::Duration::hours(25));
+                (now - last_dt).num_hours() >= 24
+            }
+            None => true,
+        };
+
+        if should_decay {
+            self.apply_decay(0.95)?;
+            self.conn
+                .execute(
+                    "INSERT INTO icm_metadata (key, value) VALUES ('last_decay_at', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = ?1",
+                    params![now.to_rfc3339()],
+                )
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
     pub fn in_memory() -> IcmResult<Self> {
         ensure_sqlite_vec();
         let conn = Connection::open_in_memory()
@@ -137,6 +176,38 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
 const SELECT_COLS: &str = "id, created_at, last_accessed, access_count, weight, \
                            topic, summary, raw_excerpt, keywords, \
                            importance, source_type, source_data, related_ids, embedding";
+
+/// Sanitize a query string for FTS5 MATCH.
+///
+/// FTS5 treats characters like `-`, `*`, `"`, `:`, `^`, `+`, `~` as operators.
+/// A query like `"sqlite-vec"` makes FTS5 interpret `-` as NOT and `vec` as a
+/// column name, causing "no such column: vec".
+///
+/// This function strips special chars and wraps each token in double quotes.
+fn sanitize_fts_query(query: &str) -> String {
+    // Replace FTS5 operator chars with spaces, then quote each resulting token.
+    // FTS5 tokenizer (unicode61) splits on `-` too, so we must keep tokens separate.
+    let cleaned: String = query
+        .chars()
+        .map(|c| {
+            if matches!(
+                c,
+                '-' | '*' | '"' | '(' | ')' | '{' | '}' | ':' | '^' | '+' | '~' | '\\'
+            ) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    let tokens: Vec<String> = cleaned
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\"{w}\""))
+        .collect();
+    tokens.join(" ")
+}
 
 // ---------------------------------------------------------------------------
 // MemoryStore impl
@@ -326,7 +397,8 @@ impl MemoryStore for SqliteStore {
     }
 
     fn search_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Memory>> {
-        if query.trim().is_empty() {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -345,7 +417,7 @@ impl MemoryStore for SqliteStore {
             .map_err(|e| IcmError::Database(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![query, limit as i64], row_to_memory)
+            .query_map(params![sanitized, limit as i64], row_to_memory)
             .map_err(|e| IcmError::Database(e.to_string()))?;
 
         let mut results = Vec::new();
@@ -400,6 +472,7 @@ impl MemoryStore for SqliteStore {
         limit: usize,
     ) -> IcmResult<Vec<(Memory, f32)>> {
         let pool_size = limit * 4;
+        let sanitized = sanitize_fts_query(query);
 
         // 1. Get FTS results with rank scores
         let fts_sql = "SELECT m.id, m.created_at, m.last_accessed, m.access_count, m.weight, \
@@ -415,22 +488,24 @@ impl MemoryStore for SqliteStore {
         let mut fts_scores: HashMap<String, f32> = HashMap::new();
         let mut all_memories: HashMap<String, Memory> = HashMap::new();
 
-        if let Ok(mut stmt) = self.conn.prepare(fts_sql) {
-            if let Ok(rows) = stmt.query_map(params![query, pool_size as i64], |row| {
-                let memory = row_to_memory(row)?;
-                let rank: f32 = row.get(14)?;
-                Ok((memory, rank))
-            }) {
-                for row in rows.flatten() {
-                    let (memory, rank) = row;
-                    // Normalize FTS rank (lower is better, typically negative)
-                    // Convert to 0..1 score where higher is better
-                    let score = 1.0 / (1.0 + rank.abs());
-                    fts_scores.insert(memory.id.clone(), score);
-                    all_memories.insert(memory.id.clone(), memory);
+        if !sanitized.is_empty() {
+            if let Ok(mut stmt) = self.conn.prepare(fts_sql) {
+                if let Ok(rows) = stmt.query_map(params![sanitized, pool_size as i64], |row| {
+                    let memory = row_to_memory(row)?;
+                    let rank: f32 = row.get(14)?;
+                    Ok((memory, rank))
+                }) {
+                    for row in rows.flatten() {
+                        let (memory, rank) = row;
+                        // Normalize FTS rank (lower is better, typically negative)
+                        // Convert to 0..1 score where higher is better
+                        let score = 1.0 / (1.0 + rank.abs());
+                        fts_scores.insert(memory.id.clone(), score);
+                        all_memories.insert(memory.id.clone(), memory);
+                    }
                 }
             }
-        }
+        } // sanitized.is_empty()
 
         // 2. Get vector results
         let vec_results = self.search_by_embedding(embedding, pool_size)?;
@@ -898,7 +973,8 @@ impl MemoirStore for SqliteStore {
         query: &str,
         limit: usize,
     ) -> IcmResult<Vec<Concept>> {
-        if query.trim().is_empty() {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -916,7 +992,36 @@ impl MemoirStore for SqliteStore {
             .map_err(|e| IcmError::Database(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![memoir_id, query, limit as i64], row_to_concept)
+            .query_map(params![memoir_id, sanitized, limit as i64], row_to_concept)
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn search_all_concepts_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sql = format!(
+            "SELECT {CONCEPT_COLS} FROM concepts
+             WHERE id IN (SELECT id FROM concepts_fts WHERE concepts_fts MATCH ?1)
+             ORDER BY confidence DESC
+             LIMIT ?2"
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![sanitized, limit as i64], row_to_concept)
             .map_err(|e| IcmError::Database(e.to_string()))?;
 
         let mut results = Vec::new();
@@ -1865,6 +1970,71 @@ mod tests {
         assert_eq!(results[0].0.topic, "rust");
         // Score should be > 0
         assert!(results[0].1 > 0.0);
+    }
+
+    #[test]
+    fn test_sanitize_fts_query() {
+        // Normal words get quoted
+        assert_eq!(sanitize_fts_query("hello world"), "\"hello\" \"world\"");
+
+        // Special chars become spaces, splitting into separate tokens
+        assert_eq!(sanitize_fts_query("sqlite-vec"), "\"sqlite\" \"vec\"");
+        assert_eq!(sanitize_fts_query("foo*bar"), "\"foo\" \"bar\"");
+        assert_eq!(sanitize_fts_query("col:value"), "\"col\" \"value\"");
+
+        // Empty/whitespace returns empty
+        assert_eq!(sanitize_fts_query(""), "");
+        assert_eq!(sanitize_fts_query("  "), "");
+        assert_eq!(sanitize_fts_query("---"), "");
+
+        // Mixed content
+        assert_eq!(
+            sanitize_fts_query("no-such column:vec"),
+            "\"no\" \"such\" \"column\" \"vec\""
+        );
+    }
+
+    #[test]
+    fn test_search_fts_special_chars() {
+        let store = test_store();
+        store
+            .store(make_memory(
+                "tools",
+                "sqlite-vec is a vector search extension",
+            ))
+            .unwrap();
+
+        // This query used to crash with "no such column: vec"
+        let results = store.search_fts("sqlite-vec", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].topic, "tools");
+
+        // Pure special chars should return empty, not error
+        let results = store.search_fts("---", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_concepts_fts_special_chars() {
+        let store = test_store();
+        let m_id = store.create_memoir(make_memoir("proj")).unwrap();
+
+        store
+            .add_concept(make_concept(
+                &m_id,
+                "sqlite-vec",
+                "Vector search extension for SQLite",
+            ))
+            .unwrap();
+
+        // Should not crash with special chars in query
+        let results = store.search_concepts_fts(&m_id, "sqlite-vec", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "sqlite-vec");
+
+        // Pure special chars should return empty
+        let results = store.search_concepts_fts(&m_id, "***", 10).unwrap();
+        assert!(results.is_empty());
     }
 
     #[test]

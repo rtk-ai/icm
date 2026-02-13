@@ -15,7 +15,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
     let mut tools = vec![
         // --- Memory tools ---
         json!({
-            "name": "icm_store",
+            "name": "icm_memory_store",
             "description": "Store important information in ICM long-term memory. Use to save decisions, preferences, project context, resolved errors — anything that should persist between sessions.",
             "inputSchema": {
                 "type": "object",
@@ -48,7 +48,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
-            "name": "icm_recall",
+            "name": "icm_memory_recall",
             "description": "Search ICM long-term memory. Use to find past decisions, project context, preferences, or solutions to previously encountered problems.",
             "inputSchema": {
                 "type": "object",
@@ -73,7 +73,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
-            "name": "icm_forget",
+            "name": "icm_memory_forget",
             "description": "Delete a specific memory by its ID. Use when information is obsolete or incorrect.",
             "inputSchema": {
                 "type": "object",
@@ -87,7 +87,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
-            "name": "icm_consolidate",
+            "name": "icm_memory_consolidate",
             "description": "Consolidate all memories of a topic into a single summary. Useful when a topic accumulates too many entries.",
             "inputSchema": {
                 "type": "object",
@@ -105,7 +105,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
-            "name": "icm_list_topics",
+            "name": "icm_memory_list_topics",
             "description": "List all available topics in memory with their counts.",
             "inputSchema": {
                 "type": "object",
@@ -113,7 +113,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
-            "name": "icm_stats",
+            "name": "icm_memory_stats",
             "description": "Get global ICM memory statistics.",
             "inputSchema": {
                 "type": "object",
@@ -282,11 +282,30 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["memoir", "name"]
             }
         }),
+        json!({
+            "name": "icm_memoir_search_all",
+            "description": "Full-text search concepts across all memoirs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Max results"
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
     ];
 
     if has_embedder {
         tools.push(json!({
-            "name": "icm_embed_all",
+            "name": "icm_memory_embed_all",
             "description": "Generate embeddings for all memories that don't have one yet. Use this to backfill vector search capability.",
             "inputSchema": {
                 "type": "object",
@@ -315,13 +334,13 @@ pub fn call_tool(
 ) -> ToolResult {
     match name {
         // Memory tools
-        "icm_store" => tool_store(store, embedder, args),
-        "icm_recall" => tool_recall(store, embedder, args),
-        "icm_forget" => tool_forget(store, args),
-        "icm_consolidate" => tool_consolidate(store, args),
-        "icm_list_topics" => tool_list_topics(store),
-        "icm_stats" => tool_stats(store),
-        "icm_embed_all" => tool_embed_all(store, embedder, args),
+        "icm_memory_store" => tool_store(store, embedder, args),
+        "icm_memory_recall" => tool_recall(store, embedder, args),
+        "icm_memory_forget" => tool_forget(store, args),
+        "icm_memory_consolidate" => tool_consolidate(store, args),
+        "icm_memory_list_topics" => tool_list_topics(store),
+        "icm_memory_stats" => tool_stats(store),
+        "icm_memory_embed_all" => tool_embed_all(store, embedder, args),
         // Memoir tools
         "icm_memoir_create" => tool_memoir_create(store, args),
         "icm_memoir_list" => tool_memoir_list(store),
@@ -329,6 +348,7 @@ pub fn call_tool(
         "icm_memoir_add_concept" => tool_memoir_add_concept(store, args),
         "icm_memoir_refine" => tool_memoir_refine(store, args),
         "icm_memoir_search" => tool_memoir_search(store, args),
+        "icm_memoir_search_all" => tool_memoir_search_all(store, args),
         "icm_memoir_link" => tool_memoir_link(store, args),
         "icm_memoir_inspect" => tool_memoir_inspect(store, args),
         _ => ToolResult::error(format!("unknown tool: {name}")),
@@ -401,6 +421,9 @@ fn tool_store(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value
 }
 
 fn tool_recall(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
+    // Auto-decay if >24h since last decay
+    let _ = store.maybe_auto_decay();
+
     let query = match get_str(args, "query") {
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
@@ -834,6 +857,52 @@ fn tool_memoir_search(store: &SqliteStore, args: &Value) -> ToolResult {
         output.push_str(&format!(
             "--- {} [r{} c{:.2}] ---\n  {}\n",
             c.name, c.revision, c.confidence, c.definition
+        ));
+        if !labels_str.is_empty() {
+            output.push_str(&format!("  labels: {labels_str}\n"));
+        }
+        output.push('\n');
+    }
+
+    ToolResult::text(output)
+}
+
+fn tool_memoir_search_all(store: &SqliteStore, args: &Value) -> ToolResult {
+    let query = match get_str(args, "query") {
+        Some(q) => q,
+        None => return ToolResult::error("missing required field: query".into()),
+    };
+    let limit = get_i64(args, "limit", 10) as usize;
+
+    let results = match store.search_all_concepts_fts(query, limit) {
+        Ok(r) => r,
+        Err(e) => return ToolResult::error(format!("search error: {e}")),
+    };
+
+    if results.is_empty() {
+        return ToolResult::text("No concepts found.".into());
+    }
+
+    // Group by memoir for readable output
+    let memoirs: std::collections::HashMap<String, String> = store
+        .list_memoirs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m.id.clone(), m.name))
+        .collect();
+
+    let mut output = String::new();
+    for c in &results {
+        let memoir_name = memoirs.get(&c.memoir_id).map(|s| s.as_str()).unwrap_or("?");
+        let labels_str = c
+            .labels
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "--- {} ({}) [r{} c{:.2}] ---\n  {}\n",
+            c.name, memoir_name, c.revision, c.confidence, c.definition
         ));
         if !labels_str.is_empty() {
             output.push_str(&format!("  labels: {labels_str}\n"));

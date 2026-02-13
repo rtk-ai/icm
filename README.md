@@ -1,15 +1,157 @@
 # icm
 
+[![CI](https://github.com/rtk-ai/icm/actions/workflows/ci.yml/badge.svg)](https://github.com/rtk-ai/icm/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Permanent memory for AI agents. Single binary, zero dependencies, MCP native.
 
 ## What is ICM?
 
 ICM gives your AI agent a real memory — not a note-taking tool, not a context manager, a **memory**.
 
+```
+                         ICM (Infinite Context Memory)
+              ┌──────────────────────┬─────────────────────────┐
+              │     MEMORY (Topic)   │     MEMOIR (Knowledge)  │
+              │                      │                         │
+              │  Episodic, temporal  │  Permanent, structured  │
+              │                      │                         │
+              │  ┌───┐ ┌───┐ ┌───┐  │    ┌───┐               │
+              │  │ m │ │ m │ │ m │  │    │ C │──depends_on──┐ │
+              │  └─┬─┘ └─┬─┘ └─┬─┘  │    └───┘              │ │
+              │    │decay │     │    │      │ refines      ┌─▼─┐│
+              │    ▼      ▼     ▼    │    ┌─▼─┐            │ C ││
+              │  weight decreases    │    │ C │──part_of──>└───┘│
+              │  over time unless    │    └───┘                 │
+              │  accessed/critical   │  Concepts + Relations    │
+              ├──────────────────────┴─────────────────────────┤
+              │              SQLite + FTS5 + sqlite-vec         │
+              │          Hybrid search: BM25 (30%) + cosine (70%)│
+              └────────────────────────────────────────────────┘
+```
+
 Two memory models:
 
-- **Topics** — store/recall with temporal decay by importance. Critical memories never fade, low-importance ones decay naturally. Consolidate when a topic grows too large.
+- **Topics** — store/recall with temporal decay by importance. Critical memories never fade, low-importance ones decay naturally. Auto-decay triggers on recall (every 24h). Consolidate when a topic grows too large.
 - **Memoirs** — permanent knowledge graphs. Concepts linked by typed relations (`depends_on`, `contradicts`, `refines`, `part_of`, ...). The agent builds structured knowledge it can traverse and reason over.
+
+## How it works
+
+### Dual memory model
+
+**Episodic memory (Topics)** captures decisions, errors, preferences — things that happen during work. Each memory has a weight that decays over time based on importance level:
+
+| Importance | Decay | Behavior |
+|-----------|-------|----------|
+| `critical` | none | Never forgotten |
+| `high` | slow (0.5x rate) | Fades slowly |
+| `medium` | normal | Standard decay |
+| `low` | fast (2x rate) | Quickly forgotten |
+
+Decay is applied automatically when you recall memories (if >24h since last decay), so there's no cron job needed.
+
+**Semantic memory (Memoirs)** captures structured knowledge as a graph. Concepts are permanent — they get refined, never decayed. Relations between concepts form a traversable knowledge graph the agent can reason over.
+
+### Hybrid search
+
+When you have embeddings enabled, ICM uses hybrid search combining:
+- **FTS5 BM25** (30% weight) — full-text keyword matching
+- **Cosine similarity** (70% weight) — semantic vector search via sqlite-vec
+
+Without embeddings, it falls back to FTS5 then keyword LIKE search.
+
+### Storage
+
+Everything lives in a single SQLite file (`~/Library/Application Support/dev.icm.icm/memories.db` on macOS). No external services, no network dependency.
+
+## Performance
+
+```
+ICM Benchmark (1000 memories, 384d embeddings)
+──────────────────────────────────────────────────────────
+Store (no embeddings)      1000 ops      34.2 ms      34.2 µs/op
+Store (with embeddings)    1000 ops      51.6 ms      51.6 µs/op
+FTS5 search                 100 ops       4.7 ms      46.6 µs/op
+Vector search (KNN)         100 ops      59.0 ms     590.0 µs/op
+Hybrid search               100 ops      95.1 ms     951.1 µs/op
+Decay (batch)                 1 ops       5.8 ms       5.8 ms/op
+──────────────────────────────────────────────────────────
+```
+
+In-memory SQLite, Apple M1 Pro, single-threaded, release build. Reproduce on your machine:
+
+```bash
+icm bench --count 1000
+```
+
+### Agent benchmark
+
+Measures AI agent efficiency with and without ICM across multi-session workflows. The test project is a Rust math library (12 files, ~550 lines) with expression parsing, matrix ops, statistics, and complex numbers.
+
+```
+ICM Agent Benchmark (10 sessions, model: haiku)
+══════════════════════════════════════════════════════════════════
+                            Without ICM         With ICM      Delta
+Session 1 (explore)
+  Turns                              14               12       -14%
+  Context (input)                173.1k           147.1k       -15%
+  Cost                          $0.0617          $0.0455       -26%
+
+Session 2 (recall)
+  Turns                               5                3       -40%
+  Context (input)                 76.1k            50.5k       -34%
+  Cost                          $0.0263          $0.0223       -15%
+
+Session 3 (recall)
+  Turns                               4                2       -50%
+  Context (input)                 98.3k            50.2k       -49%
+  Cost                          $0.0273          $0.0224       -18%
+  ...
+──────────────────────────────────────────────────────────────────
+Total (10 sessions)
+  Turns                              67               41       -39%
+  Context (input)                  1.0M           804.2k       -23%
+  Cost                          $0.3243          $0.2734       -16%
+══════════════════════════════════════════════════════════════════
+```
+
+Session 1 explores and stores context. Sessions 2+ pay it back: ICM recalls instead of re-reading files. With auto-extraction (Layer 0+2), turns drop **-39%** and context **-23%**.
+
+```bash
+icm bench-agent --sessions 10 --model haiku
+```
+
+### Knowledge retention benchmark
+
+Measures how well an agent recalls specific facts from a dense technical document across sessions. Session 1 reads and memorizes; sessions 2+ answer 10 factual questions **without** the source text.
+
+```
+ICM Recall Benchmark (10 questions, model: haiku)
+══════════════════════════════════════════════════════════════════════
+Question                                       No ICM     With ICM
+──────────────────────────────────────────────────────────────────────
+Who proposed the Meridian Protocol,...       0/5 (0%)    2/5 (67%)
+What are the three phases of Meridi...       0/6 (0%)   4/6 (100%)
+What is the maximum cluster size fo...       0/3 (0%)   3/3 (100%)
+What ports does the Meridian gossip...       0/4 (0%)     0/4 (0%)
+What throughput did Meridian achiev...       0/3 (0%)     0/3 (0%)
+What is the Byzantine fault toleran...      1/4 (50%)   2/4 (100%)
+Name the three implementations of M...       0/6 (0%)   4/6 (100%)
+Which companies deployed Meridian i...       0/3 (0%)     0/3 (0%)
+What was Dr. Tanaka's prior work th...       0/4 (0%)   4/4 (100%)
+What is the BLAME threshold and wha...       0/5 (0%)   4/5 (100%)
+──────────────────────────────────────────────────────────────────────
+Average score                                      5%          67%
+Questions passed                                 0/10         6/10
+══════════════════════════════════════════════════════════════════════
+```
+
+Without ICM: 0/10 questions passed (agent has no memory of previous session).
+With ICM: **6/10 questions passed, 67% average score** — the agent recalls specific names, numbers, and technical details from a document it read in a previous session.
+
+```bash
+icm bench-recall --model haiku
+```
 
 ## Install
 
@@ -24,43 +166,37 @@ curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
 cargo install --path crates/icm-cli
 ```
 
-## Usage with Claude Code
+## Setup
 
-### 1. Add ICM as an MCP server
+### Auto-detect and configure all tools
 
 ```bash
+icm init
+```
+
+Detects and configures: **Claude Code**, **Claude Desktop**, **Cursor**, **Windsurf**. Uses the MCP protocol — any tool that supports MCP servers works out of the box.
+
+### Manual setup
+
+```bash
+# Claude Code
 claude mcp add icm -- icm serve
+
+# Cursor: add to ~/.cursor/mcp.json
+# Windsurf: add to ~/.codeium/windsurf/mcp_config.json
+# Any MCP client: command = "icm", args = ["serve"]
 ```
 
-### 2. Add the prompt to your project
+### Configuration
 
-Add this to your project's `CLAUDE.md`:
+```bash
+# Show active config
+icm config
 
-```markdown
-## ICM — Persistent memory
-
-When the `icm` MCP server is available, use long-term memory contextually:
-
-### Recall
-- Do an `icm_recall` when the current task might have past context (decisions, resolved errors, preferences)
-- Do NOT dump everything at startup — only search for what's relevant to the current task
-
-### Proactive store
-Automatically store:
-- Important architecture decisions
-- Resolved errors and their solutions
-- User preferences discovered during the session
-- Project context when finishing significant work
-
-Do NOT store:
-- Trivial or temporary details
-- What's already in the project's CLAUDE.md
-- Ephemeral info (build state, etc.)
+# Edit: ~/.config/icm/config.toml (or $ICM_CONFIG)
 ```
 
-### 3. That's it
-
-Claude Code now has persistent memory across sessions. It remembers your decisions, your preferences, your resolved errors — and forgets what doesn't matter.
+See [config/default.toml](config/default.toml) for all options.
 
 ## CLI
 
@@ -83,6 +219,13 @@ icm topics
 
 # Stats
 icm stats
+
+# Extract facts from text (rule-based, zero LLM cost)
+echo "The parser uses Pratt algorithm" | icm extract -p my-project
+icm extract -p my-project --dry-run -t "some text to extract from"
+
+# Recall context for prompt injection
+icm recall-context "database choice" --limit 10
 ```
 
 ### Memoirs (knowledge graphs)
@@ -101,26 +244,38 @@ icm memoir link "system-architecture" "api-gateway" "depends_on" "auth-service"
 # Inspect a concept and its neighborhood
 icm memoir inspect "system-architecture" "auth-service" --depth 2
 
-# Search
+# Search within a memoir
 icm memoir search "system-architecture" "authentication"
+
+# Search across ALL memoirs
+icm memoir search-all "authentication"
 ```
 
-## MCP Tools (14)
+## MCP Tools (16)
+
+### Memory tools
 
 | Tool | Description |
 |------|-------------|
-| `icm_store` | Store a memory with topic, importance, keywords |
-| `icm_recall` | Search memories by query, optionally filtered by topic |
-| `icm_forget` | Delete a memory by ID |
-| `icm_consolidate` | Merge all memories of a topic into one summary |
-| `icm_list_topics` | List all topics with counts |
-| `icm_stats` | Global memory statistics |
+| `icm_memory_store` | Store a memory with topic, importance, keywords |
+| `icm_memory_recall` | Search memories by query, optionally filtered by topic |
+| `icm_memory_forget` | Delete a memory by ID |
+| `icm_memory_consolidate` | Merge all memories of a topic into one summary |
+| `icm_memory_list_topics` | List all topics with counts |
+| `icm_memory_stats` | Global memory statistics |
+| `icm_memory_embed_all` | Backfill embeddings for vector search (requires embeddings feature) |
+
+### Memoir tools
+
+| Tool | Description |
+|------|-------------|
 | `icm_memoir_create` | Create a new memoir (knowledge container) |
 | `icm_memoir_list` | List all memoirs |
 | `icm_memoir_show` | Show memoir details and all concepts |
 | `icm_memoir_add_concept` | Add a concept to a memoir |
 | `icm_memoir_refine` | Update a concept's definition |
 | `icm_memoir_search` | Full-text search within a memoir |
+| `icm_memoir_search_all` | Full-text search across all memoirs |
 | `icm_memoir_link` | Create typed relation between concepts |
 | `icm_memoir_inspect` | Inspect a concept and its graph neighborhood (BFS) |
 
@@ -128,12 +283,85 @@ icm memoir search "system-architecture" "authentication"
 
 `part_of` · `depends_on` · `related_to` · `contradicts` · `refines` · `alternative_to` · `caused_by` · `instance_of`
 
-## How it works
+## Auto-extraction
 
-- **Storage**: SQLite with FTS5 full-text search
-- **Decay**: Configurable per importance level — `critical` never decays, `low` decays fast
-- **Single binary**: ~4 MB, no runtime dependencies
-- **MCP transport**: stdio (native Claude Code integration)
+ICM extracts memories automatically via three layers — no need to rely on the LLM calling `icm_store` proactively.
+
+```
+  Layer 0: Pattern hooks              Layer 1: PreCompact           Layer 2: SessionStart
+  (zero LLM cost)                     (cheap LLM, ~500 tok)         (zero LLM cost)
+  ┌──────────────────┐                ┌──────────────────┐          ┌──────────────────┐
+  │ PostToolUse hook  │                │ PreCompact hook   │          │ SessionStart hook │
+  │                   │                │                   │          │                   │
+  │ • Bash exit != 0  │                │ Context about to  │          │ Read cwd project  │
+  │   → store error   │                │ be compressed →   │          │ → icm recall      │
+  │ • git commit      │                │ extract memories  │          │ → inject as       │
+  │   → store commit  │                │ before they're    │          │   additionalContext│
+  │ • Edit CLAUDE.md  │                │ lost forever      │          │                   │
+  │   → store context │                │                   │          │ Agent starts with  │
+  │                   │                │ This is the #1    │          │ relevant memories  │
+  │ Pure pattern      │                │ extraction point   │          │ already loaded     │
+  │ matching, no LLM  │                │ nobody else does  │          │                   │
+  └──────────────────┘                └──────────────────┘          └──────────────────┘
+```
+
+### Layer 0: `icm extract` — rule-based capture (implemented)
+
+Keyword scoring extracts facts from text without any LLM call:
+
+```bash
+# Extract from text
+echo "The parser uses Pratt algorithm for precedence" | icm extract -p my-project
+
+# Preview without storing
+icm extract -p my-project --dry-run -t "some text..."
+```
+
+Scores sentences by architecture, algorithm, decision, and technical keywords. Deduplicates via Jaccard similarity. Configurable in `config.toml`:
+
+```toml
+[extraction]
+enabled = true
+min_score = 3.0
+max_facts = 10
+```
+
+### Layer 1: PreCompact extraction (planned)
+
+When an agent's context fills up, compaction **destroys information forever**. A `PreCompact` hook captures context before it's lost:
+
+```bash
+icm extract --from-transcript ~/.claude/projects/.../transcript.jsonl
+```
+
+This is what makes ICM unique — **no other memory system captures context before compaction**.
+
+### Layer 2: `icm recall-context` — session injection (implemented)
+
+Auto-inject relevant memories before a session starts:
+
+```bash
+# Recall and format context for a query
+icm recall-context "database architecture" --limit 10
+```
+
+Uses FTS5 search to find relevant memories and formats them as a context preamble. Configurable:
+
+```toml
+[recall]
+enabled = true
+limit = 15
+```
+
+### Comparison with alternatives
+
+| System | Method | LLM cost | Latency | Captures compaction? |
+|--------|--------|----------|---------|---------------------|
+| **ICM** | 3-layer extraction | 0 to ~500 tok/session | 0ms | **Yes (PreCompact)** |
+| Mem0 | 2 LLM calls/message | ~2k tok/message | 200-2000ms | No |
+| claude-mem | PostToolUse + async worker | ~1-5k tok/session | 8ms hook | No |
+| MemGPT/Letta | Agent self-manages | 0 marginal | 0ms | No |
+| DiffMem | Git-based diffs | 0 | 0ms | No |
 
 ## License
 

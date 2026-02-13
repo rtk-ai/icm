@@ -1,4 +1,10 @@
+mod bench_data;
+mod bench_knowledge;
+mod config;
+mod extract;
+
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -147,6 +153,59 @@ enum Commands {
         mode: InitMode,
     },
 
+    /// Run performance benchmark on in-memory store
+    Bench {
+        /// Number of memories to seed
+        #[arg(short, long, default_value = "1000")]
+        count: usize,
+    },
+
+    /// Extract facts from text and store in ICM (rule-based, zero LLM cost)
+    Extract {
+        /// Project name for topic namespacing
+        #[arg(short, long, default_value = "project")]
+        project: String,
+
+        /// Text to extract from (reads stdin if omitted)
+        #[arg(short, long)]
+        text: Option<String>,
+
+        /// Don't store, just print extracted facts
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Output recalled context formatted for prompt injection
+    RecallContext {
+        /// Search query for relevant context
+        query: String,
+
+        /// Maximum memories to include
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Benchmark memory recall accuracy with and without ICM
+    BenchRecall {
+        /// Model to use
+        #[arg(short, long, default_value = "sonnet")]
+        model: String,
+    },
+
+    /// Benchmark Claude Code efficiency with and without ICM
+    BenchAgent {
+        /// Number of sessions per mode
+        #[arg(short, long, default_value = "10")]
+        sessions: usize,
+
+        /// Model to use
+        #[arg(short, long, default_value = "sonnet")]
+        model: String,
+    },
+
+    /// Show current configuration
+    Config,
+
     /// Launch MCP server (stdio transport for Claude Code)
     Serve,
 }
@@ -219,6 +278,16 @@ enum MemoirCommands {
         #[arg(short, long)]
         memoir: String,
 
+        /// Search query
+        query: String,
+
+        /// Maximum results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Search concepts across all memoirs
+    SearchAll {
         /// Search query
         query: String,
 
@@ -453,6 +522,9 @@ fn main() -> Result<()> {
                 query,
                 limit,
             } => cmd_memoir_search(&store, &memoir, &query, limit),
+            MemoirCommands::SearchAll { query, limit } => {
+                cmd_memoir_search_all(&store, &query, limit)
+            }
             MemoirCommands::Link {
                 memoir,
                 from,
@@ -469,6 +541,16 @@ fn main() -> Result<()> {
             }
         },
         Commands::Init { mode } => cmd_init(mode),
+        Commands::Extract {
+            project,
+            text,
+            dry_run,
+        } => cmd_extract(&store, &project, text, dry_run),
+        Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
+        Commands::Config => cmd_config(),
+        Commands::Bench { count } => cmd_bench(count),
+        Commands::BenchRecall { model } => cmd_bench_recall(&model),
+        Commands::BenchAgent { sessions, model } => cmd_bench_agent(sessions, &model),
         Commands::Serve => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -519,6 +601,9 @@ fn cmd_recall(
     topic: Option<&str>,
     limit: usize,
 ) -> Result<()> {
+    // Auto-decay if >24h since last decay
+    let _ = store.maybe_auto_decay();
+
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
         if let Ok(query_emb) = emb.embed(query) {
@@ -673,7 +758,7 @@ fn cmd_init(mode: InitMode) -> Result<()> {
     let do_cli = matches!(mode, InitMode::Cli | InitMode::All);
     let do_skill = matches!(mode, InitMode::Skill | InitMode::All);
 
-    // --- MCP mode: configure MCP server ---
+    // --- MCP mode: configure MCP servers for all detected tools ---
     if do_mcp {
         let icm_server_entry = serde_json::json!({
             "command": icm_bin_str,
@@ -681,15 +766,25 @@ fn cmd_init(mode: InitMode) -> Result<()> {
             "env": {}
         });
 
-        let claude_code_path = PathBuf::from(&home).join(".claude.json");
-        let code_status = inject_mcp_server(&claude_code_path, "icm", &icm_server_entry)?;
+        // Tool configs: (name, config_path)
+        let tools: Vec<(&str, PathBuf)> = vec![
+            ("Claude Code", PathBuf::from(&home).join(".claude.json")),
+            (
+                "Claude Desktop",
+                PathBuf::from(&home)
+                    .join("Library/Application Support/Claude/claude_desktop_config.json"),
+            ),
+            ("Cursor", PathBuf::from(&home).join(".cursor/mcp.json")),
+            (
+                "Windsurf",
+                PathBuf::from(&home).join(".codeium/windsurf/mcp_config.json"),
+            ),
+        ];
 
-        let claude_desktop_path = PathBuf::from(&home)
-            .join("Library/Application Support/Claude/claude_desktop_config.json");
-        let desktop_status = inject_mcp_server(&claude_desktop_path, "icm", &icm_server_entry)?;
-
-        println!("[mcp] Claude Code:    {code_status}");
-        println!("[mcp] Claude Desktop: {desktop_status}");
+        for (name, config_path) in &tools {
+            let status = inject_mcp_server(config_path, "icm", &icm_server_entry)?;
+            println!("[mcp] {name:<16} {status}");
+        }
     }
 
     // --- CLI mode: inject CLAUDE.md instructions ---
@@ -715,8 +810,8 @@ icm recall \"topic keywords\"\n\
 <!-- icm:end -->";
 
         if claude_md_path.exists() {
-            let content = std::fs::read_to_string(&claude_md_path)
-                .context("failed to read CLAUDE.md")?;
+            let content =
+                std::fs::read_to_string(&claude_md_path).context("failed to read CLAUDE.md")?;
             if content.contains("<!-- icm:start -->") {
                 println!("[cli] CLAUDE.md already configured.");
             } else {
@@ -745,7 +840,7 @@ icm recall \"topic keywords\"\n\
                 &recall_path,
                 "Search ICM memory for: $ARGUMENTS\n\
                  \n\
-                 Use the icm_recall MCP tool if available, otherwise run:\n\
+                 Use the icm_memory_recall MCP tool if available, otherwise run:\n\
                  ```bash\n\
                  icm recall \"$ARGUMENTS\"\n\
                  ```\n",
@@ -762,7 +857,7 @@ icm recall \"topic keywords\"\n\
                 &remember_path,
                 "Store the following in ICM memory: $ARGUMENTS\n\
                  \n\
-                 Use the icm_store MCP tool if available, otherwise run:\n\
+                 Use the icm_memory_store MCP tool if available, otherwise run:\n\
                  ```bash\n\
                  icm store -t \"note\" -c \"$ARGUMENTS\"\n\
                  ```\n",
@@ -824,6 +919,41 @@ fn inject_mcp_server(config_path: &PathBuf, name: &str, entry: &Value) -> Result
     Ok("configured".into())
 }
 
+fn cmd_config() -> Result<()> {
+    let cfg = config::load_config()?;
+    println!("Config: {}", config::show_config_path());
+    println!();
+    println!("[store]");
+    println!(
+        "  path = {}",
+        cfg.store
+            .path
+            .as_deref()
+            .unwrap_or("(default platform path)")
+    );
+    println!();
+    println!("[memory]");
+    println!("  default_importance = {}", cfg.memory.default_importance);
+    println!("  decay_rate = {}", cfg.memory.decay_rate);
+    println!("  prune_threshold = {}", cfg.memory.prune_threshold);
+    println!();
+    println!("[extraction]");
+    println!("  enabled = {}", cfg.extraction.enabled);
+    println!("  min_score = {}", cfg.extraction.min_score);
+    println!("  max_facts = {}", cfg.extraction.max_facts);
+    println!();
+    println!("[recall]");
+    println!("  enabled = {}", cfg.recall.enabled);
+    println!("  limit = {}", cfg.recall.limit);
+    println!();
+    println!("[mcp]");
+    println!("  transport = {}", cfg.mcp.transport);
+    if let Some(ref instr) = cfg.mcp.instructions {
+        println!("  instructions = {instr}");
+    }
+    Ok(())
+}
+
 fn cmd_consolidate(store: &SqliteStore, topic: &str, keep_originals: bool) -> Result<()> {
     let memories = store.get_by_topic(topic)?;
     if memories.is_empty() {
@@ -869,6 +999,52 @@ fn cmd_consolidate(store: &SqliteStore, topic: &str, keep_originals: bool) -> Re
             "Consolidated {} memories from '{topic}' into 1 (originals removed).",
             memories.len()
         );
+    }
+    Ok(())
+}
+
+fn cmd_extract(
+    store: &SqliteStore,
+    project: &str,
+    text: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    let input = match text {
+        Some(t) => t,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("failed to read stdin")?;
+            buf
+        }
+    };
+
+    if dry_run {
+        // Just show what would be extracted
+        let facts = extract::extract_facts_public(&input, project);
+        if facts.is_empty() {
+            println!("No facts extracted.");
+        } else {
+            println!("Would extract {} facts:", facts.len());
+            for (topic, content, importance) in &facts {
+                println!("  [{importance}] ({topic}) {content}");
+            }
+        }
+    } else {
+        let stored = extract::extract_and_store(store, &input, project)?;
+        println!("Extracted and stored {stored} facts.");
+    }
+    Ok(())
+}
+
+fn cmd_recall_context(store: &SqliteStore, query: &str, limit: usize) -> Result<()> {
+    let ctx = extract::recall_context(store, query, limit)?;
+    if ctx.is_empty() {
+        eprintln!("No relevant context found.");
+    } else {
+        print!("{ctx}");
     }
     Ok(())
 }
@@ -986,6 +1162,754 @@ fn print_memory_scored(mem: &Memory, score: f32) {
         println!("  raw:        {raw}");
     }
     println!();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark
+// ---------------------------------------------------------------------------
+
+fn cmd_bench(count: usize) -> Result<()> {
+    const DIMS: usize = 384;
+    const SEARCH_ITERS: usize = 100;
+
+    let topics = [
+        "architecture",
+        "preferences",
+        "errors-resolved",
+        "context-project",
+        "decisions",
+    ];
+    let queries = [
+        "database architecture",
+        "authentication flow",
+        "error handling",
+        "user preferences",
+        "deployment config",
+    ];
+
+    // --- Seed without embeddings ---
+    let store_plain = SqliteStore::in_memory()?;
+    let t0 = Instant::now();
+    for i in 0..count {
+        let topic = topics[i % topics.len()].to_string();
+        let content = format!(
+            "Benchmark memory number {i} about {topic} with some extra words for FTS matching"
+        );
+        let importance = match i % 4 {
+            0 => Importance::Critical,
+            1 => Importance::High,
+            2 => Importance::Medium,
+            _ => Importance::Low,
+        };
+        let mut mem = Memory::new(topic, content, importance);
+        mem.keywords = vec![format!("kw{}", i % 50), format!("bench{}", i % 20)];
+        store_plain.store(mem)?;
+    }
+    let store_plain_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // --- Seed with embeddings ---
+    let store_vec = SqliteStore::in_memory()?;
+    let t0 = Instant::now();
+    for i in 0..count {
+        let topic = topics[i % topics.len()].to_string();
+        let content = format!(
+            "Benchmark memory number {i} about {topic} with some extra words for FTS matching"
+        );
+        let importance = match i % 4 {
+            0 => Importance::Critical,
+            1 => Importance::High,
+            2 => Importance::Medium,
+            _ => Importance::Low,
+        };
+        let mut mem = Memory::new(topic, content, importance);
+        mem.keywords = vec![format!("kw{}", i % 50), format!("bench{}", i % 20)];
+        // Vary embedding so vectors aren't identical
+        let mut emb = vec![0.1_f32; DIMS];
+        emb[i % DIMS] += (i as f32) * 0.001;
+        mem.embedding = Some(emb);
+        store_vec.store(mem)?;
+    }
+    let store_vec_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // --- FTS search ---
+    let t0 = Instant::now();
+    for i in 0..SEARCH_ITERS {
+        let q = queries[i % queries.len()];
+        let _ = store_vec.search_fts(q, 10)?;
+    }
+    let fts_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // --- Vector search ---
+    let query_emb = vec![0.1_f32; DIMS];
+    let t0 = Instant::now();
+    for _ in 0..SEARCH_ITERS {
+        let _ = store_vec.search_by_embedding(&query_emb, 10)?;
+    }
+    let vec_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // --- Hybrid search ---
+    let t0 = Instant::now();
+    for i in 0..SEARCH_ITERS {
+        let q = queries[i % queries.len()];
+        let _ = store_vec.search_hybrid(q, &query_emb, 10)?;
+    }
+    let hybrid_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // --- Decay ---
+    let t0 = Instant::now();
+    let _ = store_vec.apply_decay(0.95)?;
+    let decay_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // --- Output ---
+    println!("ICM Benchmark ({count} memories, {DIMS}d embeddings)");
+    println!("{}", "─".repeat(58));
+    print_bench_row("Store (no embeddings)", count, store_plain_ms);
+    print_bench_row("Store (with embeddings)", count, store_vec_ms);
+    print_bench_row("FTS5 search", SEARCH_ITERS, fts_ms);
+    print_bench_row("Vector search (KNN)", SEARCH_ITERS, vec_ms);
+    print_bench_row("Hybrid search", SEARCH_ITERS, hybrid_ms);
+    print_bench_row("Decay (batch)", 1, decay_ms);
+    println!("{}", "─".repeat(58));
+    println!("DB size: in-memory (N/A)");
+    println!(
+        "Platform: {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+
+    Ok(())
+}
+
+fn print_bench_row(label: &str, ops: usize, total_ms: f64) {
+    let per_op = total_ms / ops as f64;
+    let (total_str, per_str) = (format_duration(total_ms), format_duration(per_op));
+    println!(
+        "{:<24} {:>6} ops {:>12} {:>12}/op",
+        label, ops, total_str, per_str
+    );
+}
+
+fn format_duration(ms: f64) -> String {
+    if ms < 0.001 {
+        format!("{:.1} ns", ms * 1_000_000.0)
+    } else if ms < 1.0 {
+        format!("{:.1} µs", ms * 1000.0)
+    } else if ms < 1000.0 {
+        format!("{:.1} ms", ms)
+    } else {
+        format!("{:.2} s", ms / 1000.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent Benchmark
+// ---------------------------------------------------------------------------
+
+struct SessionResult {
+    num_turns: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    duration_ms: u64,
+    response: String,
+}
+
+struct CleanupDir(PathBuf);
+
+impl Drop for CleanupDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn cmd_bench_recall(model: &str) -> Result<()> {
+    // Check claude is in PATH
+    let check = std::process::Command::new("claude")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match check {
+        Ok(s) if s.success() => {}
+        _ => bail!("'claude' not found in PATH. Install Claude Code CLI first."),
+    }
+
+    let questions = bench_knowledge::QUESTIONS;
+    let total_questions = questions.len();
+    let pid = std::process::id();
+    let bench_dir = std::env::temp_dir().join(format!("icm-bench-recall-{pid}"));
+    let _cleanup = CleanupDir(bench_dir.clone());
+    std::fs::create_dir_all(&bench_dir)?;
+
+    // Empty CLAUDE.md — no project files, pure memory test
+    std::fs::write(bench_dir.join("CLAUDE.md"), "Answer questions concisely.")?;
+
+    let no_mcp_path = bench_dir.join("no-mcp.json");
+    std::fs::write(&no_mcp_path, r#"{"mcpServers":{}}"#)?;
+
+    let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
+    let icm_db = bench_dir.join("icm-bench.db");
+    let mcp_config_path = bench_dir.join("icm-mcp.json");
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "icm": {
+                "command": icm_bin.to_string_lossy(),
+                "args": ["--db", icm_db.to_string_lossy(), "serve"]
+            }
+        }
+    });
+    std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
+    // Ensure DB exists
+    {
+        let _ = SqliteStore::new(&icm_db)?;
+    }
+
+    // === WITHOUT ICM ===
+    eprintln!("=== WITHOUT ICM ===");
+
+    // Session 1: read document (so it's fair — both modes read it once)
+    let s1_prompt = format!(
+        "{}{}",
+        bench_knowledge::SESSION1_PROMPT,
+        bench_knowledge::SOURCE_DOCUMENT
+    );
+    eprint!("  Session 1 (read document)...");
+    let s1_result = run_claude_session(&s1_prompt, model, &bench_dir, &no_mcp_path)?;
+    eprintln!(" done ({:.1}s)", s1_result.duration_ms as f64 / 1000.0);
+
+    // Sessions 2+: ask questions WITHOUT the document
+    let mut scores_without: Vec<(usize, usize, f64)> = Vec::new();
+    let mut responses_without: Vec<String> = Vec::new();
+    for (i, q) in questions.iter().enumerate() {
+        let prompt = format!("{}Question: {}", bench_knowledge::RECALL_PREFIX, q.prompt);
+        eprint!("  Q{}/{}...", i + 1, total_questions);
+        let result = run_claude_session(&prompt, model, &bench_dir, &no_mcp_path)?;
+        let score = bench_knowledge::score_answer(&result.response, q);
+        eprintln!(" {}/{} keywords ({:.0}%)", score.0, score.1, score.2);
+        scores_without.push(score);
+        responses_without.push(result.response);
+    }
+
+    // === WITH ICM ===
+    eprintln!("\n=== WITH ICM (MCP + auto-extraction) ===");
+
+    // Session 1: read document + store in ICM
+    eprint!("  Session 1 (read + memorize)...");
+    let s1_icm = run_claude_session(&s1_prompt, model, &bench_dir, &mcp_config_path)?;
+    eprintln!(" done ({:.1}s)", s1_icm.duration_ms as f64 / 1000.0);
+
+    // Also extract from the source document directly (Layer 0)
+    {
+        let store = SqliteStore::new(&icm_db)?;
+        let ext1 =
+            extract::extract_and_store(&store, bench_knowledge::SOURCE_DOCUMENT, "meridian")?;
+        let ext2 = extract::extract_and_store(&store, &s1_icm.response, "meridian")?;
+        eprintln!("    Extracted {} + {} facts", ext1, ext2);
+    }
+
+    // Sessions 2+: ask questions with ICM recall
+    let mut scores_with: Vec<(usize, usize, f64)> = Vec::new();
+    let mut responses_with: Vec<String> = Vec::new();
+    for (i, q) in questions.iter().enumerate() {
+        // Layer 2: inject recalled context
+        let store = SqliteStore::new(&icm_db)?;
+        let ctx = extract::recall_context(&store, q.prompt, 15)?;
+        let prompt = format!(
+            "{}{}\nQuestion: {}",
+            ctx,
+            bench_knowledge::RECALL_PREFIX,
+            q.prompt
+        );
+        eprint!("  Q{}/{}...", i + 1, total_questions);
+        let result = run_claude_session(&prompt, model, &bench_dir, &mcp_config_path)?;
+        let score = bench_knowledge::score_answer(&result.response, q);
+        eprintln!(" {}/{} keywords ({:.0}%)", score.0, score.1, score.2);
+
+        // Extract from response too (accumulate knowledge)
+        {
+            let store = SqliteStore::new(&icm_db)?;
+            let _ = extract::extract_and_store(&store, &result.response, "meridian");
+        }
+
+        scores_with.push(score);
+        responses_with.push(result.response);
+    }
+
+    // === Display Results ===
+    println!();
+    let w = 70;
+    println!("ICM Recall Benchmark ({total_questions} questions, model: {model})");
+    println!("{}", "\u{2550}".repeat(w));
+    println!("{:<40} {:>12} {:>12}", "Question", "No ICM", "With ICM");
+    println!("{}", "\u{2500}".repeat(w));
+
+    let mut total_wo = 0.0;
+    let mut total_wi = 0.0;
+    let mut pass_wo = 0;
+    let mut pass_wi = 0;
+
+    for (i, q) in questions.iter().enumerate() {
+        let wo = &scores_without[i];
+        let wi = &scores_with[i];
+
+        let q_short = if q.prompt.len() > 38 {
+            format!("{}...", &q.prompt[..35])
+        } else {
+            q.prompt.to_string()
+        };
+
+        let wo_str = format!("{}/{} ({:.0}%)", wo.0, wo.1, wo.2);
+        let wi_str = format!("{}/{} ({:.0}%)", wi.0, wi.1, wi.2);
+
+        println!("{:<40} {:>12} {:>12}", q_short, wo_str, wi_str);
+
+        total_wo += wo.2;
+        total_wi += wi.2;
+        if wo.2 >= 100.0 {
+            pass_wo += 1;
+        }
+        if wi.2 >= 100.0 {
+            pass_wi += 1;
+        }
+    }
+
+    let avg_wo = total_wo / total_questions as f64;
+    let avg_wi = total_wi / total_questions as f64;
+
+    println!("{}", "\u{2500}".repeat(w));
+    println!(
+        "{:<40} {:>12} {:>12}",
+        "Average score",
+        format!("{avg_wo:.0}%"),
+        format!("{avg_wi:.0}%"),
+    );
+    println!(
+        "{:<40} {:>12} {:>12}",
+        "Questions passed",
+        format!("{pass_wo}/{total_questions}"),
+        format!("{pass_wi}/{total_questions}"),
+    );
+    println!("{}", "\u{2550}".repeat(w));
+
+    // Show a sample answer comparison
+    if !responses_without.is_empty() {
+        println!();
+        println!("Sample: \"{}\"", questions[0].prompt);
+        println!("{}", "\u{2500}".repeat(w));
+        println!("WITHOUT ICM:");
+        println!("  {}", truncate_words(&responses_without[0], 300));
+        println!();
+        println!("WITH ICM:");
+        println!("  {}", truncate_words(&responses_with[0], 300));
+    }
+
+    Ok(())
+}
+
+fn cmd_bench_agent(sessions: usize, model: &str) -> Result<()> {
+    // Check claude is in PATH
+    let check = std::process::Command::new("claude")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match check {
+        Ok(s) if s.success() => {}
+        _ => bail!("'claude' not found in PATH. Install Claude Code CLI first."),
+    }
+
+    let pid = std::process::id();
+    let bench_dir = std::env::temp_dir().join(format!("icm-bench-agent-{pid}"));
+    let _cleanup = CleanupDir(bench_dir.clone());
+
+    // Create test project (math library: ~550 lines, 12 files)
+    std::fs::create_dir_all(bench_dir.join("src"))?;
+    for (path, content) in bench_data::PROJECT_FILES {
+        let full = bench_dir.join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(full, content)?;
+    }
+    eprintln!(
+        "Test project: {} files in {}",
+        bench_data::PROJECT_FILES.len(),
+        bench_dir.display()
+    );
+
+    let prompts: Vec<&str> = (0..sessions)
+        .map(|i| bench_data::SESSION_PROMPTS[i % bench_data::SESSION_PROMPTS.len()])
+        .collect();
+
+    // --- Without ICM ---
+    eprintln!("Running {sessions} sessions WITHOUT ICM...");
+    let no_mcp_path = bench_dir.join("no-mcp.json");
+    std::fs::write(&no_mcp_path, r#"{"mcpServers":{}}"#)?;
+
+    let mut results_without: Vec<SessionResult> = Vec::new();
+    for (i, prompt) in prompts.iter().enumerate() {
+        eprint!("  Session {}/{}...", i + 1, sessions);
+        let result = run_claude_session(prompt, model, &bench_dir, &no_mcp_path)?;
+        eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
+        results_without.push(result);
+    }
+
+    // --- With ICM (MCP + auto-extraction) ---
+    eprintln!("Running {sessions} sessions WITH ICM (MCP + auto-extraction)...");
+    let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
+    let icm_db = bench_dir.join("icm-bench.db");
+    let mcp_config_path = bench_dir.join("icm-mcp.json");
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "icm": {
+                "command": icm_bin.to_string_lossy(),
+                "args": ["--db", icm_db.to_string_lossy(), "serve"]
+            }
+        }
+    });
+    std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
+
+    // Ensure ICM DB exists for extraction
+    {
+        let _ = SqliteStore::new(&icm_db)?;
+    }
+
+    let mut results_with: Vec<SessionResult> = Vec::new();
+    for (i, prompt) in prompts.iter().enumerate() {
+        // Layer 2: Before sessions 2+, inject recalled context
+        let effective_prompt = if i > 0 {
+            let store = SqliteStore::new(&icm_db)?;
+            let ctx = extract::recall_context(&store, prompt, 15)?;
+            if ctx.is_empty() {
+                prompt.to_string()
+            } else {
+                format!("{ctx}{prompt}")
+            }
+        } else {
+            prompt.to_string()
+        };
+
+        eprint!("  Session {}/{}...", i + 1, sessions);
+        let result = run_claude_session(&effective_prompt, model, &bench_dir, &mcp_config_path)?;
+        eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
+
+        // Layer 0: After each session, extract facts from response
+        {
+            let store = SqliteStore::new(&icm_db)?;
+            let extracted = extract::extract_and_store(&store, &result.response, "mathlib")?;
+            if extracted > 0 {
+                eprintln!("    Extracted {extracted} facts");
+            }
+        }
+
+        results_with.push(result);
+    }
+
+    // --- Display ---
+    display_bench_results(&results_without, &results_with, sessions, model);
+
+    Ok(())
+}
+
+fn run_claude_session(
+    prompt: &str,
+    model: &str,
+    cwd: &std::path::Path,
+    mcp_config: &std::path::Path,
+) -> Result<SessionResult> {
+    let mut cmd = std::process::Command::new("claude");
+    cmd.arg("-p")
+        .arg(prompt)
+        .arg("--output-format")
+        .arg("json")
+        .arg("--model")
+        .arg(model)
+        .arg("--max-turns")
+        .arg("10")
+        .arg("--mcp-config")
+        .arg(mcp_config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(cwd);
+
+    let start = Instant::now();
+    let mut child = cmd.spawn().context("failed to spawn 'claude'")?;
+
+    // Timeout: 120 seconds per session
+    let timeout = std::time::Duration::from_secs(120);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("claude timed out after {}s", timeout.as_secs());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => bail!("error waiting for claude: {e}"),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to get claude output")?;
+    let wall_ms = start.elapsed().as_millis() as u64;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "claude exited with {}: {}",
+            output.status,
+            stderr.chars().take(500).collect::<String>()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).with_context(|| {
+        format!(
+            "failed to parse claude JSON: {}",
+            &stdout[..stdout.len().min(200)]
+        )
+    })?;
+
+    Ok(parse_session_result(&json, wall_ms))
+}
+
+fn parse_session_result(json: &Value, wall_ms: u64) -> SessionResult {
+    let num_turns = json.get("num_turns").and_then(|v| v.as_u64()).unwrap_or(1);
+
+    let usage = json.get("usage");
+
+    // Total input = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+    let input_direct = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_creation = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let input_tokens = input_direct + cache_creation + cache_read;
+
+    let output_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let cost_usd = json
+        .get("total_cost_usd")
+        .and_then(|v| v.as_f64())
+        .or_else(|| json.get("cost_usd").and_then(|v| v.as_f64()))
+        .unwrap_or(0.0);
+
+    let duration_ms = json
+        .get("duration_ms")
+        .and_then(|v| v.as_u64())
+        .or_else(|| json.get("duration_api_ms").and_then(|v| v.as_u64()))
+        .unwrap_or(wall_ms);
+
+    let response = json
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    SessionResult {
+        num_turns,
+        input_tokens,
+        output_tokens,
+        cost_usd,
+        duration_ms,
+        response,
+    }
+}
+
+fn display_bench_results(
+    without: &[SessionResult],
+    with_icm: &[SessionResult],
+    sessions: usize,
+    model: &str,
+) {
+    let w = 66;
+    println!();
+    println!("ICM Agent Benchmark ({sessions} sessions, model: {model})");
+    println!("{}", "\u{2550}".repeat(w));
+    println!(
+        "{:<22} {:>16} {:>16} {:>10}",
+        "", "Without ICM", "With ICM", "Delta"
+    );
+
+    for i in 0..sessions {
+        let wo = &without[i];
+        let wi = &with_icm[i];
+
+        println!("Session {}", i + 1);
+        println!(
+            "  {:<20} {:>16} {:>16} {:>10}",
+            "Turns",
+            wo.num_turns,
+            wi.num_turns,
+            fmt_delta(wo.num_turns as f64, wi.num_turns as f64)
+        );
+        println!(
+            "  {:<20} {:>16} {:>16} {:>10}",
+            "Tokens (in/out)",
+            format!(
+                "{}/{}",
+                fmt_tokens(wo.input_tokens),
+                fmt_tokens(wo.output_tokens)
+            ),
+            format!(
+                "{}/{}",
+                fmt_tokens(wi.input_tokens),
+                fmt_tokens(wi.output_tokens)
+            ),
+            fmt_delta(
+                (wo.input_tokens + wo.output_tokens) as f64,
+                (wi.input_tokens + wi.output_tokens) as f64,
+            )
+        );
+        println!(
+            "  {:<20} {:>16} {:>16} {:>10}",
+            "Context (input)",
+            fmt_tokens(wo.input_tokens),
+            fmt_tokens(wi.input_tokens),
+            fmt_delta(wo.input_tokens as f64, wi.input_tokens as f64)
+        );
+        println!(
+            "  {:<20} {:>16} {:>16} {:>10}",
+            "Cost",
+            fmt_cost(wo.cost_usd),
+            fmt_cost(wi.cost_usd),
+            fmt_delta(wo.cost_usd, wi.cost_usd)
+        );
+        println!();
+    }
+
+    // Totals
+    let total_wo = aggregate_results(without);
+    let total_wi = aggregate_results(with_icm);
+
+    println!("{}", "\u{2500}".repeat(w));
+    println!("Total");
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Turns",
+        total_wo.num_turns,
+        total_wi.num_turns,
+        fmt_delta(total_wo.num_turns as f64, total_wi.num_turns as f64)
+    );
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Context (input)",
+        fmt_tokens(total_wo.input_tokens),
+        fmt_tokens(total_wi.input_tokens),
+        fmt_delta(total_wo.input_tokens as f64, total_wi.input_tokens as f64)
+    );
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Tokens (total)",
+        fmt_tokens(total_wo.input_tokens + total_wo.output_tokens),
+        fmt_tokens(total_wi.input_tokens + total_wi.output_tokens),
+        fmt_delta(
+            (total_wo.input_tokens + total_wo.output_tokens) as f64,
+            (total_wi.input_tokens + total_wi.output_tokens) as f64,
+        )
+    );
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Cost",
+        fmt_cost(total_wo.cost_usd),
+        fmt_cost(total_wi.cost_usd),
+        fmt_delta(total_wo.cost_usd, total_wi.cost_usd)
+    );
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Duration",
+        fmt_duration_s(total_wo.duration_ms),
+        fmt_duration_s(total_wi.duration_ms),
+        fmt_delta(total_wo.duration_ms as f64, total_wi.duration_ms as f64)
+    );
+    println!("{}", "\u{2550}".repeat(w));
+
+    // --- Response comparison ---
+    println!();
+    println!("Response samples (session 2: recall test)");
+    println!("{}", "\u{2500}".repeat(w));
+    if without.len() >= 2 {
+        println!("WITHOUT ICM:");
+        println!("  {}", truncate_words(&without[1].response, 200));
+        println!();
+        println!("WITH ICM:");
+        println!("  {}", truncate_words(&with_icm[1].response, 200));
+    }
+
+    // Response length comparison
+    println!();
+    println!("Response lengths (chars):");
+    let wo_avg = without.iter().map(|s| s.response.len()).sum::<usize>() / sessions.max(1);
+    let wi_avg = with_icm.iter().map(|s| s.response.len()).sum::<usize>() / sessions.max(1);
+    println!(
+        "  avg without ICM: {} chars | avg with ICM: {} chars",
+        wo_avg, wi_avg
+    );
+}
+
+fn aggregate_results(results: &[SessionResult]) -> SessionResult {
+    SessionResult {
+        num_turns: results.iter().map(|s| s.num_turns).sum(),
+        input_tokens: results.iter().map(|s| s.input_tokens).sum(),
+        output_tokens: results.iter().map(|s| s.output_tokens).sum(),
+        cost_usd: results.iter().map(|s| s.cost_usd).sum(),
+        duration_ms: results.iter().map(|s| s.duration_ms).sum(),
+        response: String::new(),
+    }
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{n}")
+    }
+}
+
+fn fmt_delta(without: f64, with_icm: f64) -> String {
+    if without == 0.0 {
+        return "N/A".into();
+    }
+    let pct = ((with_icm - without) / without) * 100.0;
+    if pct >= 0.0 {
+        format!("+{pct:.0}%")
+    } else {
+        format!("{pct:.0}%")
+    }
+}
+
+fn fmt_cost(c: f64) -> String {
+    format!("${c:.4}")
+}
+
+fn fmt_duration_s(ms: u64) -> String {
+    format!("{:.1}s", ms as f64 / 1000.0)
+}
+
+fn truncate_words(s: &str, max_chars: usize) -> String {
+    let s = s.replace('\n', " ");
+    if s.len() <= max_chars {
+        s
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +2071,41 @@ fn cmd_memoir_search(
 
     for c in &results {
         print_concept(c);
+    }
+    Ok(())
+}
+
+fn cmd_memoir_search_all(store: &SqliteStore, query: &str, limit: usize) -> Result<()> {
+    let results = store.search_all_concepts_fts(query, limit)?;
+
+    if results.is_empty() {
+        println!("No concepts found.");
+        return Ok(());
+    }
+
+    // Build memoir_id -> name map
+    let memoirs: std::collections::HashMap<String, String> = store
+        .list_memoirs()?
+        .into_iter()
+        .map(|m| (m.id.clone(), m.name))
+        .collect();
+
+    for c in &results {
+        let memoir_name = memoirs.get(&c.memoir_id).map(|s| s.as_str()).unwrap_or("?");
+        println!("--- {} ({}) ---", c.name, memoir_name);
+        println!("  definition: {}", c.definition);
+        println!("  confidence: {:.2}", c.confidence);
+        println!("  revision:   {}", c.revision);
+        if !c.labels.is_empty() {
+            let labels_str = c
+                .labels
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  labels:     {labels_str}");
+        }
+        println!();
     }
     Ok(())
 }

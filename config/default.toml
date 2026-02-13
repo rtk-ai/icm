@@ -1,6 +1,10 @@
+# ICM Configuration
+# Place at: ~/.config/icm/config.toml
+# Or set ICM_CONFIG=/path/to/config.toml
+
 [store]
-# SQLite database path (default: ~/.icm/memories.db)
-# path = "~/.icm/memories.db"
+# SQLite database path (default: platform data dir)
+# path = "~/Library/Application Support/dev.icm.icm/memories.db"
 
 [memory]
 default_importance = "medium"
@@ -11,9 +15,26 @@ decay_rate = 0.95
 # Weight threshold for automatic pruning
 prune_threshold = 0.1
 
-# Decay multipliers per importance level
-[memory.decay_multipliers]
-critical = 0.0    # No decay
-high = 0.5        # 2x slower decay
-medium = 1.0      # Normal decay
-low = 2.0         # 2x faster decay
+[extraction]
+# Layer 0: rule-based fact extraction (zero LLM cost)
+enabled = true
+
+# Minimum keyword score to keep a fact
+min_score = 3.0
+
+# Maximum facts per extraction pass
+max_facts = 10
+
+[recall]
+# Layer 2: context injection before sessions
+enabled = true
+
+# Maximum memories to inject
+limit = 15
+
+[mcp]
+# MCP server transport: "stdio"
+transport = "stdio"
+
+# Custom instructions appended to MCP server description
+# instructions = "Always recall before starting work"

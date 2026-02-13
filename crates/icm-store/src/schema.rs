@@ -157,6 +157,15 @@ pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
         .map_err(|e| IcmError::Database(e.to_string()))?;
     }
 
+    // Metadata key-value table for internal state (e.g. last_decay_at)
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS icm_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )
+    .map_err(|e| IcmError::Database(e.to_string()))?;
+
     // Migration: add embedding column if missing (existing DBs)
     let has_embedding: bool = conn
         .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='embedding'")

@@ -93,10 +93,10 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
 const ICM_INSTRUCTIONS: &str = "\
 Use ICM (Infinite Context Memory) proactively to maintain long-term memory across sessions.\n\
 \n\
-RECALL (icm_recall): At the start of a task, search for relevant past context — decisions, \
+RECALL (icm_memory_recall): At the start of a task, search for relevant past context — decisions, \
 resolved errors, user preferences. Search only what is relevant, do not dump everything.\n\
 \n\
-STORE (icm_store): Automatically store important information:\n\
+STORE (icm_memory_store): Automatically store important information:\n\
 - Architecture decisions → topic: \"decisions-{project}\"\n\
 - Resolved errors with solutions → topic: \"errors-resolved\"\n\
 - User preferences discovered in session → topic: \"preferences\"\n\

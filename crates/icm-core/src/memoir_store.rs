@@ -32,6 +32,9 @@ pub trait MemoirStore {
         limit: usize,
     ) -> IcmResult<Vec<Concept>>;
 
+    /// Search concepts across all memoirs via FTS.
+    fn search_all_concepts_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>>;
+
     // --- Refinement ---
     fn refine_concept(
         &self,

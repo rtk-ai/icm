@@ -54,30 +54,14 @@ jobs:
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo dpkg --add-architecture arm64
-          # Restrict existing sources to amd64 only
-          sudo sed -i 's/^deb http/deb [arch=amd64] http/' /etc/apt/sources.list
-          sudo sed -i 's/^deb \[arch=amd64\] \[arch=amd64\]/deb [arch=amd64]/' /etc/apt/sources.list
-          # Add arm64 sources via ports.ubuntu.com (covers main, updates, security)
-          CODENAME=$(lsb_release -cs)
-          cat <<EOF | sudo tee /etc/apt/sources.list.d/arm64.list
-          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME} main restricted universe
-          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-updates main restricted universe
-          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-security main restricted universe
-          EOF
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build (cross aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} -p icm-cli
+        run: cargo build --release --target ${{ matrix.target }} -p icm-cli --features vendored-openssl
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_SYSROOT_DIR: /usr/aarch64-linux-gnu
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
-          OPENSSL_DIR: /usr
-          OPENSSL_INCLUDE_DIR: /usr/include/aarch64-linux-gnu
-          OPENSSL_LIB_DIR: /usr/lib/aarch64-linux-gnu
 
       - name: Build
         if: matrix.target != 'aarch64-unknown-linux-gnu'

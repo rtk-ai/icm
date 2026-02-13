@@ -15,6 +15,7 @@ path = "src/main.rs"
 [features]
 default = ["embeddings"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
+vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
 icm-core = { path = "../icm-core" }
@@ -29,3 +30,4 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+openssl = { version = "0.10", optional = true }

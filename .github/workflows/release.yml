@@ -54,13 +54,22 @@ jobs:
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe" | sudo tee /etc/apt/sources.list.d/arm64.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p icm-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_SYSROOT_DIR: /usr/aarch64-linux-gnu
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          OPENSSL_DIR: /usr
+          OPENSSL_INCLUDE_DIR: /usr/include/aarch64-linux-gnu
+          OPENSSL_LIB_DIR: /usr/lib/aarch64-linux-gnu
 
       - name: Package
         run: |

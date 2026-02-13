@@ -158,6 +158,28 @@ With ICM: **5/10 questions passed, 68% average score** (stable across 5 runs) �
 icm bench-recall --model haiku
 ```
 
+### Local LLM benchmark (ollama)
+
+Same knowledge retention test but with local models via ollama — no cloud API, pure context injection (Layer 0+2). Facts are stored in ICM, then injected into the system prompt for each question.
+
+```
+Model               Params   No ICM   With ICM     Delta
+─────────────────────────────────────────────────────────
+qwen2.5:14b           14B       4%       88%       +84%
+mistral:7b             7B       2%       81%       +79%
+qwen2.5:7b             7B       2%       79%       +77%
+llama3.1:8b            8B       4%       67%       +63%
+─────────────────────────────────────────────────────────
+Hardware: RTX 4070 16GB, ollama, temperature 0.1
+```
+
+Even 7B models go from near-zero to 67-81% recall with ICM context injection. No tool use needed — pure system prompt injection.
+
+```bash
+scripts/bench-ollama.sh qwen2.5:14b        # run with specific model
+scripts/bench-ollama.sh mistral:7b verbose  # see answers
+```
+
 ### Test protocol
 
 Both benchmarks use **real Claude API calls** — no mocks, no simulated responses, no cached answers. Every session is a fresh `claude -p` invocation with `--output-format json`.

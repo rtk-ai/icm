@@ -93,29 +93,29 @@ ICM Agent Benchmark (10 sessions, model: haiku)
 ══════════════════════════════════════════════════════════════════
                             Without ICM         With ICM      Delta
 Session 1 (explore)
-  Turns                              14               12       -14%
-  Context (input)                173.1k           147.1k       -15%
-  Cost                          $0.0617          $0.0455       -26%
+  Turns                              12               12        +0%
+  Context (input)                153.6k           147.5k        -4%
+  Cost                          $0.0582          $0.0481       -17%
 
 Session 2 (recall)
-  Turns                               5                3       -40%
-  Context (input)                 76.1k            50.5k       -34%
-  Cost                          $0.0263          $0.0223       -15%
+  Turns                               5                1       -80%
+  Context (input)                 76.4k            23.9k       -69%
+  Cost                          $0.0269          $0.0145       -46%
 
 Session 3 (recall)
-  Turns                               4                2       -50%
-  Context (input)                 98.3k            50.2k       -49%
-  Cost                          $0.0273          $0.0224       -18%
+  Turns                               3                2       -33%
+  Context (input)                 74.5k            50.4k       -32%
+  Cost                          $0.0242          $0.0222        -9%
   ...
 ──────────────────────────────────────────────────────────────────
 Total (10 sessions)
-  Turns                              67               41       -39%
-  Context (input)                  1.0M           804.2k       -23%
-  Cost                          $0.3243          $0.2734       -16%
+  Turns                              43               37       -14%
+  Context (input)                707.8k           626.8k       -11%
+  Cost                          $0.2612          $0.2427        -7%
 ══════════════════════════════════════════════════════════════════
 ```
 
-Session 1 explores and stores context. Sessions 2+ pay it back: ICM recalls instead of re-reading files. With auto-extraction (Layer 0+2), turns drop **-39%** and context **-23%**.
+Session 1 explores and stores context. Session 2 shows the biggest gain: **-80% turns, -69% context** as ICM recalls instead of re-reading files. Results vary between runs due to LLM non-determinism; typical ranges across multiple runs: **-14% to -39% turns**, **-7% to -16% cost**.
 
 ```bash
 icm bench-agent --sessions 10 --model haiku
@@ -152,6 +152,35 @@ With ICM: **6/10 questions passed, 67% average score** — the agent recalls spe
 ```bash
 icm bench-recall --model haiku
 ```
+
+### Test protocol
+
+Both benchmarks use **real Claude API calls** — no mocks, no simulated responses, no cached answers. Every session is a fresh `claude -p` invocation with `--output-format json`.
+
+**Agent benchmark (`bench-agent`):**
+
+1. Creates a real Rust project in a tempdir (12 files, ~550 lines: expression parser, matrix ops, statistics, complex numbers)
+2. Runs N sessions sequentially. Session prompts cycle through: explore architecture, ask about specific modules, ask about implementation details
+3. **Without ICM**: each session uses `--mcp-config {}` (empty — zero MCP servers). Every session starts from scratch
+4. **With ICM**: each session gets a real ICM MCP server (`icm serve`) backed by a fresh SQLite DB in the tempdir. After each session, Layer 0 auto-extraction stores facts from Claude's response. Before sessions 2+, Layer 2 injects recalled context into the prompt
+5. Metrics are parsed from Claude's JSON output: `num_turns`, `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`, `total_cost_usd`, `duration_ms`
+6. Tempdir is cleaned up automatically on exit
+
+**Knowledge retention benchmark (`bench-recall`):**
+
+1. Uses a 3-page fictional technical document (the "Meridian Protocol" — distributed consensus, specific names/dates/numbers/configs) hardcoded in the binary
+2. **Session 1** (both modes): Claude reads the full document with instructions to memorize key facts
+3. **Sessions 2-11** (both modes): Claude answers 10 factual questions **without** the source document. Questions require specific recall: "What ports does the gossip protocol use?", "What is the Byzantine fault tolerance formula?"
+4. **Without ICM**: Claude has no memory of session 1 — it must guess or say "I don't know"
+5. **With ICM**: After session 1, Layer 0 extracts facts from both the document and Claude's response. Before each question, Layer 2 injects relevant recalled facts. Claude also has access to `icm_recall` via MCP
+6. Answers are scored by keyword matching against expected answers (e.g., question about ports expects "9471", "UDP", "9472", "TCP"). A question passes if it hits the minimum keyword threshold
+7. Each `claude` invocation has a 120s timeout to prevent hung sessions
+
+**Isolation guarantees:**
+- Each benchmark run uses its own tempdir and fresh SQLite DB
+- Sessions use `--mcp-config` to control exactly which MCP servers are available
+- No session persistence (`claude -p` = single prompt mode, no conversation history)
+- The ICM binary under test is the same `icm` binary running the benchmark (`std::env::current_exe()`)
 
 ## Install
 

@@ -89,33 +89,38 @@ icm bench --count 1000
 Measures AI agent efficiency with and without ICM across multi-session workflows. The test project is a Rust math library (12 files, ~550 lines) with expression parsing, matrix ops, statistics, and complex numbers.
 
 ```
-ICM Agent Benchmark (10 sessions, model: haiku)
+ICM Agent Benchmark (10 sessions, model: haiku, 3 runs averaged)
 ══════════════════════════════════════════════════════════════════
                             Without ICM         With ICM      Delta
 Session 1 (explore)
-  Turns                              12               12        +0%
-  Context (input)                153.6k           147.5k        -4%
-  Cost                          $0.0582          $0.0481       -17%
+  Turns                            13.3             13.0        -3%
+  Context (input)                127.5k           156.9k       +23%
+  Cost                          $0.0536          $0.0519        -3%
 
 Session 2 (recall)
-  Turns                               5                1       -80%
-  Context (input)                 76.4k            23.9k       -69%
-  Cost                          $0.0269          $0.0145       -46%
+  Turns                             5.7              4.0       -29%
+  Context (input)                 99.9k            67.5k       -32%
+  Cost                          $0.0298          $0.0249       -17%
 
 Session 3 (recall)
-  Turns                               3                2       -33%
-  Context (input)                 74.5k            50.4k       -32%
-  Cost                          $0.0242          $0.0222        -9%
+  Turns                             3.3              2.0       -40%
+  Context (input)                 74.7k            41.6k       -44%
+  Cost                          $0.0249          $0.0194       -22%
   ...
 ──────────────────────────────────────────────────────────────────
-Total (10 sessions)
-  Turns                              43               37       -14%
-  Context (input)                707.8k           626.8k       -11%
-  Cost                          $0.2612          $0.2427        -7%
+Total (averaged over 3 runs)
+  Turns                              48               42       -14%
+  Context (input)                752.2k           692.3k        -8%
+  Cost                          $0.2686          $0.2564        -5%
+
+Variance across 3 runs:
+  Turns delta:   -26% to +7%
+  Context delta: -26% to +17%
+  Cost delta:    -15% to +10%
 ══════════════════════════════════════════════════════════════════
 ```
 
-Session 1 explores and stores context. Session 2 shows the biggest gain: **-80% turns, -69% context** as ICM recalls instead of re-reading files. Results vary between runs due to LLM non-determinism; typical ranges across multiple runs: **-14% to -39% turns**, **-7% to -16% cost**.
+Session 1 has similar cost (both explore). Sessions 2-3 show the biggest gains: **-29% to -40% turns, -32% to -44% context** as ICM recalls instead of re-reading files. Results vary significantly between runs due to LLM non-determinism.
 
 ```bash
 icm bench-agent --sessions 10 --model haiku
@@ -126,28 +131,28 @@ icm bench-agent --sessions 10 --model haiku
 Measures how well an agent recalls specific facts from a dense technical document across sessions. Session 1 reads and memorizes; sessions 2+ answer 10 factual questions **without** the source text.
 
 ```
-ICM Recall Benchmark (10 questions, model: haiku)
+ICM Recall Benchmark (10 questions, model: haiku, 5 runs averaged)
 ══════════════════════════════════════════════════════════════════════
 Question                                       No ICM     With ICM
 ──────────────────────────────────────────────────────────────────────
-Who proposed the Meridian Protocol,...       0/5 (0%)    2/5 (67%)
-What are the three phases of Meridi...       0/6 (0%)   4/6 (100%)
-What is the maximum cluster size fo...       0/3 (0%)   3/3 (100%)
-What ports does the Meridian gossip...       0/4 (0%)     0/4 (0%)
-What throughput did Meridian achiev...       0/3 (0%)     0/3 (0%)
-What is the Byzantine fault toleran...      1/4 (50%)   2/4 (100%)
-Name the three implementations of M...       0/6 (0%)   4/6 (100%)
-Which companies deployed Meridian i...       0/3 (0%)     0/3 (0%)
-What was Dr. Tanaka's prior work th...       0/4 (0%)   4/4 (100%)
-What is the BLAME threshold and wha...       0/5 (0%)   4/5 (100%)
+Who proposed the Meridian Protocol,...     0.0/5 (0%)  2.0/5 (67%)
+What are the three phases of Meridi...     0.0/6 (0%)  3.0/6 (75%)
+What is the maximum cluster size fo...     0.0/3 (0%) 2.8/3 (100%)
+What ports does the Meridian gossip...     0.0/4 (0%)   0.0/4 (0%)
+What throughput did Meridian achiev...     0.0/3 (0%)  0.4/3 (40%)
+What is the Byzantine fault toleran...    1.0/4 (50%) 2.0/4 (100%)
+Name the three implementations of M...     0.0/6 (0%) 4.0/6 (100%)
+Which companies deployed Meridian i...     0.0/3 (0%)   0.0/3 (0%)
+What was Dr. Tanaka's prior work th...     0.0/4 (0%) 4.0/4 (100%)
+What is the BLAME threshold and wha...     0.0/5 (0%) 4.0/5 (100%)
 ──────────────────────────────────────────────────────────────────────
-Average score                                      5%          67%
-Questions passed                                 0/10         6/10
+Average score                                      5%          68%
+Questions passed                                 0/10         5/10
 ══════════════════════════════════════════════════════════════════════
 ```
 
 Without ICM: 0/10 questions passed (agent has no memory of previous session).
-With ICM: **6/10 questions passed, 67% average score** — the agent recalls specific names, numbers, and technical details from a document it read in a previous session.
+With ICM: **5/10 questions passed, 68% average score** (stable across 5 runs) — the agent recalls specific names, numbers, and technical details from a document it read in a previous session. The 3 consistently failing questions (ports, throughput, deployments) show extraction limitations — facts that aren't captured can't be recalled.
 
 ```bash
 icm bench-recall --model haiku

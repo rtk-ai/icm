@@ -190,6 +190,14 @@ enum Commands {
         /// Model to use
         #[arg(short, long, default_value = "sonnet")]
         model: String,
+
+        /// Number of runs to average
+        #[arg(short, long, default_value = "1")]
+        runs: usize,
+
+        /// Show injected context before each question
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Benchmark Claude Code efficiency with and without ICM
@@ -201,6 +209,14 @@ enum Commands {
         /// Model to use
         #[arg(short, long, default_value = "sonnet")]
         model: String,
+
+        /// Number of runs to average
+        #[arg(short, long, default_value = "1")]
+        runs: usize,
+
+        /// Show extracted facts and injected context
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Show current configuration
@@ -549,8 +565,17 @@ fn main() -> Result<()> {
         Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
         Commands::Config => cmd_config(),
         Commands::Bench { count } => cmd_bench(count),
-        Commands::BenchRecall { model } => cmd_bench_recall(&model),
-        Commands::BenchAgent { sessions, model } => cmd_bench_agent(sessions, &model),
+        Commands::BenchRecall {
+            model,
+            runs,
+            verbose,
+        } => cmd_bench_recall(&model, runs, verbose),
+        Commands::BenchAgent {
+            sessions,
+            model,
+            runs,
+            verbose,
+        } => cmd_bench_agent(sessions, &model, runs, verbose),
         Commands::Serve => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -1322,7 +1347,7 @@ impl Drop for CleanupDir {
     }
 }
 
-fn cmd_bench_recall(model: &str) -> Result<()> {
+fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
     // Check claude is in PATH
     let check = std::process::Command::new("claude")
         .arg("--version")
@@ -1336,109 +1361,158 @@ fn cmd_bench_recall(model: &str) -> Result<()> {
 
     let questions = bench_knowledge::QUESTIONS;
     let total_questions = questions.len();
-    let pid = std::process::id();
-    let bench_dir = std::env::temp_dir().join(format!("icm-bench-recall-{pid}"));
-    let _cleanup = CleanupDir(bench_dir.clone());
-    std::fs::create_dir_all(&bench_dir)?;
 
-    // Empty CLAUDE.md — no project files, pure memory test
-    std::fs::write(bench_dir.join("CLAUDE.md"), "Answer questions concisely.")?;
+    // Accumulate scores across runs
+    // Per-question: Vec of (matches_wo, matches_wi) across runs
+    let mut all_scores_wo: Vec<Vec<(usize, usize, f64)>> = Vec::new();
+    let mut all_scores_wi: Vec<Vec<(usize, usize, f64)>> = Vec::new();
+    let mut last_responses_wo: Vec<String> = Vec::new();
+    let mut last_responses_wi: Vec<String> = Vec::new();
 
-    let no_mcp_path = bench_dir.join("no-mcp.json");
-    std::fs::write(&no_mcp_path, r#"{"mcpServers":{}}"#)?;
+    for run in 0..runs {
+        if runs > 1 {
+            eprintln!("\n{}", "=".repeat(60));
+            eprintln!("=== RUN {}/{runs} ===", run + 1);
+        }
 
-    let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
-    let icm_db = bench_dir.join("icm-bench.db");
-    let mcp_config_path = bench_dir.join("icm-mcp.json");
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "icm": {
-                "command": icm_bin.to_string_lossy(),
-                "args": ["--db", icm_db.to_string_lossy(), "serve"]
+        let pid = std::process::id();
+        let bench_dir = std::env::temp_dir().join(format!("icm-bench-recall-{pid}-{run}"));
+        let _cleanup = CleanupDir(bench_dir.clone());
+        std::fs::create_dir_all(&bench_dir)?;
+
+        std::fs::write(bench_dir.join("CLAUDE.md"), "Answer questions concisely.")?;
+
+        let no_mcp_path = bench_dir.join("no-mcp.json");
+        std::fs::write(&no_mcp_path, r#"{"mcpServers":{}}"#)?;
+
+        let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
+        let icm_db = bench_dir.join("icm-bench.db");
+        let mcp_config_path = bench_dir.join("icm-mcp.json");
+        let mcp_config = serde_json::json!({
+            "mcpServers": {
+                "icm": {
+                    "command": icm_bin.to_string_lossy(),
+                    "args": ["--db", icm_db.to_string_lossy(), "serve"]
+                }
+            }
+        });
+        std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
+        {
+            let _ = SqliteStore::new(&icm_db)?;
+        }
+
+        // === WITHOUT ICM ===
+        eprintln!("=== WITHOUT ICM ===");
+        let s1_prompt = format!(
+            "{}{}",
+            bench_knowledge::SESSION1_PROMPT,
+            bench_knowledge::SOURCE_DOCUMENT
+        );
+        eprint!("  Session 1 (read document)...");
+        let s1_result = run_claude_session(&s1_prompt, model, &bench_dir, &no_mcp_path)?;
+        eprintln!(" done ({:.1}s)", s1_result.duration_ms as f64 / 1000.0);
+
+        let mut scores_without: Vec<(usize, usize, f64)> = Vec::new();
+        let mut responses_without: Vec<String> = Vec::new();
+        for (i, q) in questions.iter().enumerate() {
+            let prompt = format!("{}Question: {}", bench_knowledge::RECALL_PREFIX, q.prompt);
+            eprint!("  Q{}/{}...", i + 1, total_questions);
+            match run_claude_session(&prompt, model, &bench_dir, &no_mcp_path) {
+                Ok(result) => {
+                    let score = bench_knowledge::score_answer(&result.response, q);
+                    eprintln!(" {}/{} keywords ({:.0}%)", score.0, score.1, score.2);
+                    if verbose {
+                        eprintln!("    Response: {}", truncate_words(&result.response, 200));
+                    }
+                    scores_without.push(score);
+                    responses_without.push(result.response);
+                }
+                Err(e) => {
+                    eprintln!(" FAILED: {e}");
+                    scores_without.push((0, q.expected.len(), 0.0));
+                    responses_without.push(String::new());
+                }
             }
         }
-    });
-    std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
-    // Ensure DB exists
-    {
-        let _ = SqliteStore::new(&icm_db)?;
-    }
 
-    // === WITHOUT ICM ===
-    eprintln!("=== WITHOUT ICM ===");
+        // === WITH ICM ===
+        eprintln!("\n=== WITH ICM (MCP + auto-extraction) ===");
+        eprint!("  Session 1 (read + memorize)...");
+        let s1_icm = run_claude_session(&s1_prompt, model, &bench_dir, &mcp_config_path)?;
+        eprintln!(" done ({:.1}s)", s1_icm.duration_ms as f64 / 1000.0);
 
-    // Session 1: read document (so it's fair — both modes read it once)
-    let s1_prompt = format!(
-        "{}{}",
-        bench_knowledge::SESSION1_PROMPT,
-        bench_knowledge::SOURCE_DOCUMENT
-    );
-    eprint!("  Session 1 (read document)...");
-    let s1_result = run_claude_session(&s1_prompt, model, &bench_dir, &no_mcp_path)?;
-    eprintln!(" done ({:.1}s)", s1_result.duration_ms as f64 / 1000.0);
-
-    // Sessions 2+: ask questions WITHOUT the document
-    let mut scores_without: Vec<(usize, usize, f64)> = Vec::new();
-    let mut responses_without: Vec<String> = Vec::new();
-    for (i, q) in questions.iter().enumerate() {
-        let prompt = format!("{}Question: {}", bench_knowledge::RECALL_PREFIX, q.prompt);
-        eprint!("  Q{}/{}...", i + 1, total_questions);
-        let result = run_claude_session(&prompt, model, &bench_dir, &no_mcp_path)?;
-        let score = bench_knowledge::score_answer(&result.response, q);
-        eprintln!(" {}/{} keywords ({:.0}%)", score.0, score.1, score.2);
-        scores_without.push(score);
-        responses_without.push(result.response);
-    }
-
-    // === WITH ICM ===
-    eprintln!("\n=== WITH ICM (MCP + auto-extraction) ===");
-
-    // Session 1: read document + store in ICM
-    eprint!("  Session 1 (read + memorize)...");
-    let s1_icm = run_claude_session(&s1_prompt, model, &bench_dir, &mcp_config_path)?;
-    eprintln!(" done ({:.1}s)", s1_icm.duration_ms as f64 / 1000.0);
-
-    // Also extract from the source document directly (Layer 0)
-    {
-        let store = SqliteStore::new(&icm_db)?;
-        let ext1 =
-            extract::extract_and_store(&store, bench_knowledge::SOURCE_DOCUMENT, "meridian")?;
-        let ext2 = extract::extract_and_store(&store, &s1_icm.response, "meridian")?;
-        eprintln!("    Extracted {} + {} facts", ext1, ext2);
-    }
-
-    // Sessions 2+: ask questions with ICM recall
-    let mut scores_with: Vec<(usize, usize, f64)> = Vec::new();
-    let mut responses_with: Vec<String> = Vec::new();
-    for (i, q) in questions.iter().enumerate() {
-        // Layer 2: inject recalled context
-        let store = SqliteStore::new(&icm_db)?;
-        let ctx = extract::recall_context(&store, q.prompt, 15)?;
-        let prompt = format!(
-            "{}{}\nQuestion: {}",
-            ctx,
-            bench_knowledge::RECALL_PREFIX,
-            q.prompt
-        );
-        eprint!("  Q{}/{}...", i + 1, total_questions);
-        let result = run_claude_session(&prompt, model, &bench_dir, &mcp_config_path)?;
-        let score = bench_knowledge::score_answer(&result.response, q);
-        eprintln!(" {}/{} keywords ({:.0}%)", score.0, score.1, score.2);
-
-        // Extract from response too (accumulate knowledge)
         {
             let store = SqliteStore::new(&icm_db)?;
-            let _ = extract::extract_and_store(&store, &result.response, "meridian");
+            let ext1 =
+                extract::extract_and_store(&store, bench_knowledge::SOURCE_DOCUMENT, "meridian")?;
+            let ext2 = extract::extract_and_store(&store, &s1_icm.response, "meridian")?;
+            eprintln!("    Extracted {} + {} facts", ext1, ext2);
+
+            if verbose {
+                let all_mems = store.get_by_topic("context-meridian")?;
+                eprintln!("    Stored facts:");
+                for m in &all_mems {
+                    eprintln!("      - {}", truncate_words(&m.summary, 120));
+                }
+            }
         }
 
-        scores_with.push(score);
-        responses_with.push(result.response);
+        let mut scores_with: Vec<(usize, usize, f64)> = Vec::new();
+        let mut responses_with: Vec<String> = Vec::new();
+        for (i, q) in questions.iter().enumerate() {
+            let store = SqliteStore::new(&icm_db)?;
+            let ctx = extract::recall_context(&store, q.prompt, 15)?;
+            if verbose && !ctx.is_empty() {
+                eprintln!("  [verbose] Context injected for Q{}:", i + 1);
+                for line in ctx.lines().take(10) {
+                    eprintln!("    {line}");
+                }
+            }
+            let prompt = format!(
+                "{}{}\nQuestion: {}",
+                ctx,
+                bench_knowledge::RECALL_PREFIX,
+                q.prompt
+            );
+            eprint!("  Q{}/{}...", i + 1, total_questions);
+            match run_claude_session(&prompt, model, &bench_dir, &mcp_config_path) {
+                Ok(result) => {
+                    let score = bench_knowledge::score_answer(&result.response, q);
+                    eprintln!(" {}/{} keywords ({:.0}%)", score.0, score.1, score.2);
+                    if verbose {
+                        eprintln!("    Response: {}", truncate_words(&result.response, 200));
+                    }
+                    {
+                        let store = SqliteStore::new(&icm_db)?;
+                        let _ = extract::extract_and_store(&store, &result.response, "meridian");
+                    }
+                    scores_with.push(score);
+                    responses_with.push(result.response);
+                }
+                Err(e) => {
+                    eprintln!(" FAILED: {e}");
+                    scores_with.push((0, q.expected.len(), 0.0));
+                    responses_with.push(String::new());
+                }
+            }
+        }
+
+        all_scores_wo.push(scores_without);
+        all_scores_wi.push(scores_with);
+        last_responses_wo = responses_without;
+        last_responses_wi = responses_with;
     }
 
-    // === Display Results ===
+    // === Display Results (averaged across runs) ===
     println!();
     let w = 70;
-    println!("ICM Recall Benchmark ({total_questions} questions, model: {model})");
+    if runs > 1 {
+        println!(
+            "ICM Recall Benchmark ({total_questions} questions, model: {model}, {runs} runs averaged)"
+        );
+    } else {
+        println!("ICM Recall Benchmark ({total_questions} questions, model: {model})");
+    }
     println!("{}", "\u{2550}".repeat(w));
     println!("{:<40} {:>12} {:>12}", "Question", "No ICM", "With ICM");
     println!("{}", "\u{2500}".repeat(w));
@@ -1449,8 +1523,14 @@ fn cmd_bench_recall(model: &str) -> Result<()> {
     let mut pass_wi = 0;
 
     for (i, q) in questions.iter().enumerate() {
-        let wo = &scores_without[i];
-        let wi = &scores_with[i];
+        // Average across runs
+        let avg_matches_wo: f64 =
+            all_scores_wo.iter().map(|r| r[i].0 as f64).sum::<f64>() / runs as f64;
+        let avg_matches_wi: f64 =
+            all_scores_wi.iter().map(|r| r[i].0 as f64).sum::<f64>() / runs as f64;
+        let avg_score_wo: f64 = all_scores_wo.iter().map(|r| r[i].2).sum::<f64>() / runs as f64;
+        let avg_score_wi: f64 = all_scores_wi.iter().map(|r| r[i].2).sum::<f64>() / runs as f64;
+        let total_expected = all_scores_wo[0][i].1;
 
         let q_short = if q.prompt.len() > 38 {
             format!("{}...", &q.prompt[..35])
@@ -1458,17 +1538,23 @@ fn cmd_bench_recall(model: &str) -> Result<()> {
             q.prompt.to_string()
         };
 
-        let wo_str = format!("{}/{} ({:.0}%)", wo.0, wo.1, wo.2);
-        let wi_str = format!("{}/{} ({:.0}%)", wi.0, wi.1, wi.2);
+        let wo_str = format!(
+            "{:.1}/{} ({:.0}%)",
+            avg_matches_wo, total_expected, avg_score_wo
+        );
+        let wi_str = format!(
+            "{:.1}/{} ({:.0}%)",
+            avg_matches_wi, total_expected, avg_score_wi
+        );
 
         println!("{:<40} {:>12} {:>12}", q_short, wo_str, wi_str);
 
-        total_wo += wo.2;
-        total_wi += wi.2;
-        if wo.2 >= 100.0 {
+        total_wo += avg_score_wo;
+        total_wi += avg_score_wi;
+        if avg_score_wo >= 100.0 {
             pass_wo += 1;
         }
-        if wi.2 >= 100.0 {
+        if avg_score_wi >= 100.0 {
             pass_wi += 1;
         }
     }
@@ -1491,22 +1577,22 @@ fn cmd_bench_recall(model: &str) -> Result<()> {
     );
     println!("{}", "\u{2550}".repeat(w));
 
-    // Show a sample answer comparison
-    if !responses_without.is_empty() {
+    // Show a sample answer comparison (from last run)
+    if !last_responses_wo.is_empty() {
         println!();
         println!("Sample: \"{}\"", questions[0].prompt);
         println!("{}", "\u{2500}".repeat(w));
         println!("WITHOUT ICM:");
-        println!("  {}", truncate_words(&responses_without[0], 300));
+        println!("  {}", truncate_words(&last_responses_wo[0], 300));
         println!();
         println!("WITH ICM:");
-        println!("  {}", truncate_words(&responses_with[0], 300));
+        println!("  {}", truncate_words(&last_responses_wi[0], 300));
     }
 
     Ok(())
 }
 
-fn cmd_bench_agent(sessions: usize, model: &str) -> Result<()> {
+fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> Result<()> {
     // Check claude is in PATH
     let check = std::process::Command::new("claude")
         .arg("--version")
@@ -1518,97 +1604,184 @@ fn cmd_bench_agent(sessions: usize, model: &str) -> Result<()> {
         _ => bail!("'claude' not found in PATH. Install Claude Code CLI first."),
     }
 
-    let pid = std::process::id();
-    let bench_dir = std::env::temp_dir().join(format!("icm-bench-agent-{pid}"));
-    let _cleanup = CleanupDir(bench_dir.clone());
+    // Accumulate results across runs
+    let mut all_results_wo: Vec<Vec<SessionResult>> = Vec::new();
+    let mut all_results_wi: Vec<Vec<SessionResult>> = Vec::new();
 
-    // Create test project (math library: ~550 lines, 12 files)
-    std::fs::create_dir_all(bench_dir.join("src"))?;
-    for (path, content) in bench_data::PROJECT_FILES {
-        let full = bench_dir.join(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)?;
+    for run in 0..runs {
+        if runs > 1 {
+            eprintln!("\n{}", "=".repeat(60));
+            eprintln!("=== RUN {}/{runs} ===", run + 1);
         }
-        std::fs::write(full, content)?;
-    }
-    eprintln!(
-        "Test project: {} files in {}",
-        bench_data::PROJECT_FILES.len(),
-        bench_dir.display()
-    );
 
-    let prompts: Vec<&str> = (0..sessions)
-        .map(|i| bench_data::SESSION_PROMPTS[i % bench_data::SESSION_PROMPTS.len()])
-        .collect();
+        let pid = std::process::id();
+        let bench_dir = std::env::temp_dir().join(format!("icm-bench-agent-{pid}-{run}"));
+        let _cleanup = CleanupDir(bench_dir.clone());
 
-    // --- Without ICM ---
-    eprintln!("Running {sessions} sessions WITHOUT ICM...");
-    let no_mcp_path = bench_dir.join("no-mcp.json");
-    std::fs::write(&no_mcp_path, r#"{"mcpServers":{}}"#)?;
+        std::fs::create_dir_all(bench_dir.join("src"))?;
+        for (path, content) in bench_data::PROJECT_FILES {
+            let full = bench_dir.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(full, content)?;
+        }
+        eprintln!(
+            "Test project: {} files in {}",
+            bench_data::PROJECT_FILES.len(),
+            bench_dir.display()
+        );
 
-    let mut results_without: Vec<SessionResult> = Vec::new();
-    for (i, prompt) in prompts.iter().enumerate() {
-        eprint!("  Session {}/{}...", i + 1, sessions);
-        let result = run_claude_session(prompt, model, &bench_dir, &no_mcp_path)?;
-        eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
-        results_without.push(result);
-    }
+        let prompts: Vec<&str> = (0..sessions)
+            .map(|i| bench_data::SESSION_PROMPTS[i % bench_data::SESSION_PROMPTS.len()])
+            .collect();
 
-    // --- With ICM (MCP + auto-extraction) ---
-    eprintln!("Running {sessions} sessions WITH ICM (MCP + auto-extraction)...");
-    let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
-    let icm_db = bench_dir.join("icm-bench.db");
-    let mcp_config_path = bench_dir.join("icm-mcp.json");
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "icm": {
-                "command": icm_bin.to_string_lossy(),
-                "args": ["--db", icm_db.to_string_lossy(), "serve"]
+        // --- Without ICM ---
+        eprintln!("Running {sessions} sessions WITHOUT ICM...");
+        let no_mcp_path = bench_dir.join("no-mcp.json");
+        std::fs::write(&no_mcp_path, r#"{"mcpServers":{}}"#)?;
+
+        let mut results_without: Vec<SessionResult> = Vec::new();
+        for (i, prompt) in prompts.iter().enumerate() {
+            eprint!("  Session {}/{}...", i + 1, sessions);
+            match run_claude_session(prompt, model, &bench_dir, &no_mcp_path) {
+                Ok(result) => {
+                    eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
+                    results_without.push(result);
+                }
+                Err(e) => {
+                    eprintln!(" FAILED: {e}");
+                    results_without.push(SessionResult {
+                        num_turns: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                        duration_ms: 0,
+                        response: String::new(),
+                    });
+                }
             }
         }
-    });
-    std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
 
-    // Ensure ICM DB exists for extraction
-    {
-        let _ = SqliteStore::new(&icm_db)?;
-    }
-
-    let mut results_with: Vec<SessionResult> = Vec::new();
-    for (i, prompt) in prompts.iter().enumerate() {
-        // Layer 2: Before sessions 2+, inject recalled context
-        let effective_prompt = if i > 0 {
-            let store = SqliteStore::new(&icm_db)?;
-            let ctx = extract::recall_context(&store, prompt, 15)?;
-            if ctx.is_empty() {
-                prompt.to_string()
-            } else {
-                format!("{ctx}{prompt}")
+        // --- With ICM (MCP + auto-extraction) ---
+        eprintln!("Running {sessions} sessions WITH ICM (MCP + auto-extraction)...");
+        let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
+        let icm_db = bench_dir.join("icm-bench.db");
+        let mcp_config_path = bench_dir.join("icm-mcp.json");
+        let mcp_config = serde_json::json!({
+            "mcpServers": {
+                "icm": {
+                    "command": icm_bin.to_string_lossy(),
+                    "args": ["--db", icm_db.to_string_lossy(), "serve"]
+                }
             }
-        } else {
-            prompt.to_string()
-        };
-
-        eprint!("  Session {}/{}...", i + 1, sessions);
-        let result = run_claude_session(&effective_prompt, model, &bench_dir, &mcp_config_path)?;
-        eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
-
-        // Layer 0: After each session, extract facts from response
+        });
+        std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let store = SqliteStore::new(&icm_db)?;
-            let extracted = extract::extract_and_store(&store, &result.response, "mathlib")?;
-            if extracted > 0 {
-                eprintln!("    Extracted {extracted} facts");
+            let _ = SqliteStore::new(&icm_db)?;
+        }
+
+        let mut results_with: Vec<SessionResult> = Vec::new();
+        for (i, prompt) in prompts.iter().enumerate() {
+            let effective_prompt = if i > 0 {
+                let store = SqliteStore::new(&icm_db)?;
+                let ctx = extract::recall_context(&store, prompt, 15)?;
+                if verbose && !ctx.is_empty() {
+                    eprintln!("  [verbose] Context injected for session {}:", i + 1);
+                    for line in ctx.lines().take(8) {
+                        eprintln!("    {line}");
+                    }
+                }
+                if ctx.is_empty() {
+                    prompt.to_string()
+                } else {
+                    format!("{ctx}{prompt}")
+                }
+            } else {
+                prompt.to_string()
+            };
+
+            eprint!("  Session {}/{}...", i + 1, sessions);
+            match run_claude_session(&effective_prompt, model, &bench_dir, &mcp_config_path) {
+                Ok(result) => {
+                    eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
+                    {
+                        let store = SqliteStore::new(&icm_db)?;
+                        let extracted =
+                            extract::extract_and_store(&store, &result.response, "mathlib")?;
+                        if extracted > 0 {
+                            eprintln!("    Extracted {extracted} facts");
+                        }
+                        if verbose {
+                            let all_mems = store.get_by_topic("context-mathlib")?;
+                            eprintln!("    Total facts in DB: {}", all_mems.len());
+                        }
+                    }
+                    results_with.push(result);
+                }
+                Err(e) => {
+                    eprintln!(" FAILED: {e}");
+                    results_with.push(SessionResult {
+                        num_turns: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                        duration_ms: 0,
+                        response: String::new(),
+                    });
+                }
             }
         }
 
-        results_with.push(result);
+        // Display per-run results
+        if runs > 1 {
+            eprintln!("  Run {} totals:", run + 1);
+            let wo_turns: u64 = results_without.iter().map(|r| r.num_turns).sum();
+            let wi_turns: u64 = results_with.iter().map(|r| r.num_turns).sum();
+            let wo_ctx: u64 = results_without.iter().map(|r| r.input_tokens).sum();
+            let wi_ctx: u64 = results_with.iter().map(|r| r.input_tokens).sum();
+            let wo_cost: f64 = results_without.iter().map(|r| r.cost_usd).sum();
+            let wi_cost: f64 = results_with.iter().map(|r| r.cost_usd).sum();
+            eprintln!(
+                "    Turns: {} vs {} ({:+.0}%)",
+                wo_turns,
+                wi_turns,
+                pct_delta(wo_turns as f64, wi_turns as f64)
+            );
+            eprintln!(
+                "    Context: {:.1}k vs {:.1}k ({:+.0}%)",
+                wo_ctx as f64 / 1000.0,
+                wi_ctx as f64 / 1000.0,
+                pct_delta(wo_ctx as f64, wi_ctx as f64)
+            );
+            eprintln!(
+                "    Cost: ${:.4} vs ${:.4} ({:+.0}%)",
+                wo_cost,
+                wi_cost,
+                pct_delta(wo_cost, wi_cost)
+            );
+        }
+
+        all_results_wo.push(results_without);
+        all_results_wi.push(results_with);
     }
 
-    // --- Display ---
-    display_bench_results(&results_without, &results_with, sessions, model);
+    // --- Display averaged results ---
+    if runs > 1 {
+        display_bench_results_averaged(&all_results_wo, &all_results_wi, sessions, model, runs);
+    } else {
+        display_bench_results(&all_results_wo[0], &all_results_wi[0], sessions, model);
+    }
 
     Ok(())
+}
+
+fn pct_delta(a: f64, b: f64) -> f64 {
+    if a == 0.0 {
+        0.0
+    } else {
+        ((b - a) / a) * 100.0
+    }
 }
 
 fn run_claude_session(
@@ -1635,8 +1808,8 @@ fn run_claude_session(
     let start = Instant::now();
     let mut child = cmd.spawn().context("failed to spawn 'claude'")?;
 
-    // Timeout: 120 seconds per session
-    let timeout = std::time::Duration::from_secs(120);
+    // Timeout: 180 seconds per session
+    let timeout = std::time::Duration::from_secs(180);
     loop {
         match child.try_wait() {
             Ok(Some(_status)) => break,
@@ -1859,6 +2032,158 @@ fn display_bench_results(
         "  avg without ICM: {} chars | avg with ICM: {} chars",
         wo_avg, wi_avg
     );
+}
+
+fn display_bench_results_averaged(
+    all_wo: &[Vec<SessionResult>],
+    all_wi: &[Vec<SessionResult>],
+    sessions: usize,
+    model: &str,
+    runs: usize,
+) {
+    let w = 66;
+    println!();
+    println!("ICM Agent Benchmark ({sessions} sessions, model: {model}, {runs} runs averaged)");
+    println!("{}", "\u{2550}".repeat(w));
+    println!(
+        "{:<22} {:>16} {:>16} {:>10}",
+        "", "Without ICM", "With ICM", "Delta"
+    );
+
+    // Average totals across runs
+    let mut avg_turns_wo = 0.0f64;
+    let mut avg_turns_wi = 0.0f64;
+    let mut avg_ctx_wo = 0.0f64;
+    let mut avg_ctx_wi = 0.0f64;
+    let mut avg_cost_wo = 0.0f64;
+    let mut avg_cost_wi = 0.0f64;
+    let mut avg_dur_wo = 0.0f64;
+    let mut avg_dur_wi = 0.0f64;
+
+    // Per-run totals for min/max
+    let mut run_delta_turns: Vec<f64> = Vec::new();
+    let mut run_delta_ctx: Vec<f64> = Vec::new();
+    let mut run_delta_cost: Vec<f64> = Vec::new();
+
+    for run in 0..runs {
+        let wo = aggregate_results(&all_wo[run]);
+        let wi = aggregate_results(&all_wi[run]);
+        avg_turns_wo += wo.num_turns as f64;
+        avg_turns_wi += wi.num_turns as f64;
+        avg_ctx_wo += wo.input_tokens as f64;
+        avg_ctx_wi += wi.input_tokens as f64;
+        avg_cost_wo += wo.cost_usd;
+        avg_cost_wi += wi.cost_usd;
+        avg_dur_wo += wo.duration_ms as f64;
+        avg_dur_wi += wi.duration_ms as f64;
+
+        run_delta_turns.push(pct_delta(wo.num_turns as f64, wi.num_turns as f64));
+        run_delta_ctx.push(pct_delta(wo.input_tokens as f64, wi.input_tokens as f64));
+        run_delta_cost.push(pct_delta(wo.cost_usd, wi.cost_usd));
+    }
+
+    let r = runs as f64;
+    avg_turns_wo /= r;
+    avg_turns_wi /= r;
+    avg_ctx_wo /= r;
+    avg_ctx_wi /= r;
+    avg_cost_wo /= r;
+    avg_cost_wi /= r;
+    avg_dur_wo /= r;
+    avg_dur_wi /= r;
+
+    // Per-session averages
+    for s in 0..sessions {
+        let s_turns_wo: f64 = all_wo.iter().map(|r| r[s].num_turns as f64).sum::<f64>() / r;
+        let s_turns_wi: f64 = all_wi.iter().map(|r| r[s].num_turns as f64).sum::<f64>() / r;
+        let s_ctx_wo: f64 = all_wo.iter().map(|r| r[s].input_tokens as f64).sum::<f64>() / r;
+        let s_ctx_wi: f64 = all_wi.iter().map(|r| r[s].input_tokens as f64).sum::<f64>() / r;
+        let s_cost_wo: f64 = all_wo.iter().map(|r| r[s].cost_usd).sum::<f64>() / r;
+        let s_cost_wi: f64 = all_wi.iter().map(|r| r[s].cost_usd).sum::<f64>() / r;
+
+        println!("Session {} (avg)", s + 1);
+        println!(
+            "  {:<20} {:>16} {:>16} {:>10}",
+            "Turns",
+            format!("{:.1}", s_turns_wo),
+            format!("{:.1}", s_turns_wi),
+            fmt_delta(s_turns_wo, s_turns_wi)
+        );
+        println!(
+            "  {:<20} {:>16} {:>16} {:>10}",
+            "Context (input)",
+            fmt_tokens(s_ctx_wo as u64),
+            fmt_tokens(s_ctx_wi as u64),
+            fmt_delta(s_ctx_wo, s_ctx_wi)
+        );
+        println!(
+            "  {:<20} {:>16} {:>16} {:>10}",
+            "Cost",
+            fmt_cost(s_cost_wo),
+            fmt_cost(s_cost_wi),
+            fmt_delta(s_cost_wo, s_cost_wi)
+        );
+        println!();
+    }
+
+    println!("{}", "\u{2500}".repeat(w));
+    println!("Total (averaged over {runs} runs)");
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Turns",
+        format!("{:.0}", avg_turns_wo),
+        format!("{:.0}", avg_turns_wi),
+        fmt_delta(avg_turns_wo, avg_turns_wi)
+    );
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Context (input)",
+        fmt_tokens(avg_ctx_wo as u64),
+        fmt_tokens(avg_ctx_wi as u64),
+        fmt_delta(avg_ctx_wo, avg_ctx_wi)
+    );
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Cost",
+        fmt_cost(avg_cost_wo),
+        fmt_cost(avg_cost_wi),
+        fmt_delta(avg_cost_wo, avg_cost_wi)
+    );
+    println!(
+        "  {:<20} {:>16} {:>16} {:>10}",
+        "Duration",
+        fmt_duration_s(avg_dur_wo as u64),
+        fmt_duration_s(avg_dur_wi as u64),
+        fmt_delta(avg_dur_wo, avg_dur_wi)
+    );
+    println!("{}", "\u{2550}".repeat(w));
+
+    // Variance summary
+    if runs > 1 {
+        let min_t = run_delta_turns
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        let max_t = run_delta_turns
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_c = run_delta_cost.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_c = run_delta_cost
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_x = run_delta_ctx.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_x = run_delta_ctx
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        println!();
+        println!("Variance across {runs} runs:");
+        println!("  Turns delta:   {:.0}% to {:.0}%", min_t, max_t);
+        println!("  Context delta: {:.0}% to {:.0}%", min_x, max_x);
+        println!("  Cost delta:    {:.0}% to {:.0}%", min_c, max_c);
+    }
 }
 
 fn aggregate_results(results: &[SessionResult]) -> SessionResult {

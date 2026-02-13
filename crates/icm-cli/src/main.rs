@@ -67,6 +67,10 @@ enum Commands {
         /// Maximum results
         #[arg(short, long, default_value = "5")]
         limit: usize,
+
+        /// Filter results by keyword
+        #[arg(short = 'k', long)]
+        keyword: Option<String>,
     },
 
     /// List memories
@@ -297,6 +301,10 @@ enum MemoirCommands {
         /// Search query
         query: String,
 
+        /// Filter by label (e.g. "domain:tech")
+        #[arg(short = 'L', long)]
+        label: Option<String>,
+
         /// Maximum results
         #[arg(short, long, default_value = "10")]
         limit: usize,
@@ -386,6 +394,7 @@ enum CliRelation {
     AlternativeTo,
     CausedBy,
     InstanceOf,
+    SupersededBy,
 }
 
 impl From<CliRelation> for Relation {
@@ -399,6 +408,7 @@ impl From<CliRelation> for Relation {
             CliRelation::AlternativeTo => Relation::AlternativeTo,
             CliRelation::CausedBy => Relation::CausedBy,
             CliRelation::InstanceOf => Relation::InstanceOf,
+            CliRelation::SupersededBy => Relation::SupersededBy,
         }
     }
 }
@@ -482,12 +492,20 @@ fn main() -> Result<()> {
             query,
             topic,
             limit,
+            keyword,
         } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
-            cmd_recall(&store, emb_ref, &query, topic.as_deref(), limit)
+            cmd_recall(
+                &store,
+                emb_ref,
+                &query,
+                topic.as_deref(),
+                limit,
+                keyword.as_deref(),
+            )
         }
         Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
         Commands::Forget { id } => cmd_forget(&store, &id),
@@ -536,8 +554,9 @@ fn main() -> Result<()> {
             MemoirCommands::Search {
                 memoir,
                 query,
+                label,
                 limit,
-            } => cmd_memoir_search(&store, &memoir, &query, limit),
+            } => cmd_memoir_search(&store, &memoir, &query, label.as_deref(), limit),
             MemoirCommands::SearchAll { query, limit } => {
                 cmd_memoir_search_all(&store, &query, limit)
             }
@@ -625,6 +644,7 @@ fn cmd_recall(
     query: &str,
     topic: Option<&str>,
     limit: usize,
+    keyword: Option<&str>,
 ) -> Result<()> {
     // Auto-decay if >24h since last decay
     let _ = store.maybe_auto_decay();
@@ -636,6 +656,9 @@ fn cmd_recall(
                 let mut scored = results;
                 if let Some(t) = topic {
                     scored.retain(|(m, _)| m.topic == t);
+                }
+                if let Some(kw) = keyword {
+                    scored.retain(|(m, _)| m.keywords.iter().any(|k| k.contains(kw)));
                 }
 
                 if scored.is_empty() {
@@ -662,6 +685,9 @@ fn cmd_recall(
 
     if let Some(t) = topic {
         results.retain(|m| m.topic == t);
+    }
+    if let Some(kw) = keyword {
+        results.retain(|m| m.keywords.iter().any(|k| k.contains(kw)));
     }
 
     if results.is_empty() {
@@ -2384,10 +2410,24 @@ fn cmd_memoir_search(
     store: &SqliteStore,
     memoir_name: &str,
     query: &str,
+    label: Option<&str>,
     limit: usize,
 ) -> Result<()> {
     let memoir = resolve_memoir(store, memoir_name)?;
-    let results = store.search_concepts_fts(&memoir.id, query, limit)?;
+
+    let results = if let Some(label_str) = label {
+        let parsed: Label = label_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        let mut by_label = store.search_concepts_by_label(&memoir.id, &parsed, limit)?;
+        if !query.is_empty() {
+            let q = query.to_lowercase();
+            by_label.retain(|c| {
+                c.name.to_lowercase().contains(&q) || c.definition.to_lowercase().contains(&q)
+            });
+        }
+        by_label
+    } else {
+        store.search_concepts_fts(&memoir.id, query, limit)?
+    };
 
     if results.is_empty() {
         println!("No concepts found.");

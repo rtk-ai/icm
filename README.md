@@ -337,7 +337,7 @@ icm memory search-all "authentication"
 
 ## Relation types
 
-`part_of` · `depends_on` · `related_to` · `contradicts` · `refines` · `alternative_to` · `caused_by` · `instance_of`
+`part_of` · `depends_on` · `related_to` · `contradicts` · `refines` · `alternative_to` · `caused_by` · `instance_of` · `superseded_by`
 
 ## Auto-extraction
 

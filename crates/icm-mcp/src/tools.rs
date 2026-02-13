@@ -67,6 +67,10 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                         "minimum": 1,
                         "maximum": 20,
                         "description": "Max number of results"
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Filter results by keyword (exact match on memory keywords)"
                     }
                 },
                 "required": ["query"]
@@ -223,6 +227,10 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                         "type": "string",
                         "description": "Search query"
                     },
+                    "label": {
+                        "type": "string",
+                        "description": "Filter by label (e.g. 'domain:tech')"
+                    },
                     "limit": {
                         "type": "integer",
                         "default": 10,
@@ -252,7 +260,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     },
                     "relation": {
                         "type": "string",
-                        "enum": ["part_of", "depends_on", "related_to", "contradicts", "refines", "alternative_to", "caused_by", "instance_of"],
+                        "enum": ["part_of", "depends_on", "related_to", "contradicts", "refines", "alternative_to", "caused_by", "instance_of", "superseded_by"],
                         "description": "Relation type"
                     }
                 },
@@ -431,6 +439,8 @@ fn tool_recall(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Valu
     let limit = get_i64(args, "limit", 5) as usize;
     let topic = get_str(args, "topic");
 
+    let keyword = get_str(args, "keyword");
+
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
         if let Ok(query_emb) = emb.embed(query) {
@@ -438,6 +448,9 @@ fn tool_recall(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Valu
                 let mut scored_results = results;
                 if let Some(t) = topic {
                     scored_results.retain(|(m, _)| m.topic == t);
+                }
+                if let Some(kw) = keyword {
+                    scored_results.retain(|(m, _)| m.keywords.iter().any(|k| k.contains(kw)));
                 }
 
                 // Update access counts
@@ -484,6 +497,9 @@ fn tool_recall(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Valu
 
     if let Some(t) = topic {
         results.retain(|m| m.topic == t);
+    }
+    if let Some(kw) = keyword {
+        results.retain(|m| m.keywords.iter().any(|k| k.contains(kw)));
     }
 
     // Update access counts
@@ -831,15 +847,34 @@ fn tool_memoir_search(store: &SqliteStore, args: &Value) -> ToolResult {
         None => return ToolResult::error("missing required field: query".into()),
     };
     let limit = get_i64(args, "limit", 10) as usize;
+    let label_str = get_str(args, "label");
 
     let memoir = match resolve_memoir(store, memoir_name) {
         Ok(m) => m,
         Err(e) => return e,
     };
 
-    let results = match store.search_concepts_fts(&memoir.id, query, limit) {
-        Ok(r) => r,
-        Err(e) => return ToolResult::error(format!("search error: {e}")),
+    let results = if let Some(lbl) = label_str {
+        let parsed: Label = match lbl.parse() {
+            Ok(l) => l,
+            Err(e) => return ToolResult::error(format!("invalid label: {e}")),
+        };
+        let mut by_label = match store.search_concepts_by_label(&memoir.id, &parsed, limit) {
+            Ok(r) => r,
+            Err(e) => return ToolResult::error(format!("search error: {e}")),
+        };
+        if !query.is_empty() {
+            let q = query.to_lowercase();
+            by_label.retain(|c| {
+                c.name.to_lowercase().contains(&q) || c.definition.to_lowercase().contains(&q)
+            });
+        }
+        by_label
+    } else {
+        match store.search_concepts_fts(&memoir.id, query, limit) {
+            Ok(r) => r,
+            Err(e) => return ToolResult::error(format!("search error: {e}")),
+        }
     };
 
     if results.is_empty() {

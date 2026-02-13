@@ -124,6 +124,7 @@ pub enum Relation {
     AlternativeTo,
     CausedBy,
     InstanceOf,
+    SupersededBy,
 }
 
 impl fmt::Display for Relation {
@@ -137,6 +138,7 @@ impl fmt::Display for Relation {
             Self::AlternativeTo => write!(f, "alternative_to"),
             Self::CausedBy => write!(f, "caused_by"),
             Self::InstanceOf => write!(f, "instance_of"),
+            Self::SupersededBy => write!(f, "superseded_by"),
         }
     }
 }
@@ -154,6 +156,7 @@ impl std::str::FromStr for Relation {
             "alternative_to" | "alternativeto" => Ok(Self::AlternativeTo),
             "caused_by" | "causedby" => Ok(Self::CausedBy),
             "instance_of" | "instanceof" => Ok(Self::InstanceOf),
+            "superseded_by" | "supersededby" => Ok(Self::SupersededBy),
             _ => Err(format!("invalid relation: {s}")),
         }
     }

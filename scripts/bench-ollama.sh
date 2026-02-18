@@ -47,17 +47,17 @@ declare -a KEYWORDS=(
 # Pre-populate ICM DB with extracted facts from the document
 echo "=== Populating ICM with extracted facts ==="
 $ICM_BIN --db "$ICM_DB" store -t "init" -c "init" -i low 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'The Meridian Protocol was proposed by Dr. Elena Vasquez and Dr. Kenji Tanaka at SIGCOMM 2019 in Beijing.' -i high 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Their paper "Meridian: Sub-millisecond Consensus at the Edge" won Best Paper and introduced a three-phase commit protocol.' -i high 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Meridian uses three phases: Propose (150ms timeout), Validate (300ms timeout), Commit (50ms timeout). Total worst-case: 500ms.' -i high 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Maximum cluster size: 127 nodes (limited by 7-bit node ID in header). Minimum: 5 nodes.' -i medium 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Gossip protocol port: 9471 (UDP) for peer discovery, 9472 (TCP) for state sync.' -i medium 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Benchmark: 64 nodes cluster achieved 47,000 TPS with 47ms median latency.' -i high 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Meridian tolerates up to f Byzantine faults in a cluster of n = 3f + 1 nodes. For crash-only: n = 2f + 1.' -i high 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Three implementations: libmeridian (C++, 47k lines, Stanford), meridian-rs (Rust, 12k lines, Constellation Labs), PyMeridian (Python, 3.2k lines, MIT).' -i high 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Deployments: Cloudflare Workers KV (2020), Akamai EdgeDB (2021), Fastly Compute@Edge (2022).' -i medium 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c "Tanaka prior work: the Firefly gossip protocol, published at SOSP 2017, provided foundation for Meridian peer discovery layer." -i high 2>/dev/null
-$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'BLAME threshold: f + 1 messages. When reached, the leader is blacklisted for 10 epochs and leader rotation is triggered.' -i high 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'The Meridian Protocol was proposed by Dr. Elena Vasquez and Dr. Kenji Tanaka at SIGCOMM 2019 in Beijing.' -i high -k "proposed,authors,conference,SIGCOMM,Vasquez,Tanaka,origin" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Their paper "Meridian: Sub-millisecond Consensus at the Edge" won Best Paper and introduced a three-phase commit protocol.' -i high -k "paper,best-paper,consensus,edge" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Meridian uses three phases: Propose (150ms timeout), Validate (300ms timeout), Commit (50ms timeout). Total worst-case: 500ms.' -i high -k "phases,timeout,propose,validate,commit" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Maximum cluster size: 127 nodes (limited by 7-bit node ID in header). Minimum: 5 nodes.' -i medium -k "cluster,size,maximum,nodes,limit" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Gossip protocol port: 9471 (UDP) for peer discovery, 9472 (TCP) for state sync.' -i medium -k "gossip,port,UDP,TCP,network" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Benchmark: 64 nodes cluster achieved 47,000 TPS with 47ms median latency.' -i high -k "benchmark,throughput,TPS,latency,performance" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Meridian tolerates up to f Byzantine faults in a cluster of n = 3f + 1 nodes. For crash-only: n = 2f + 1.' -i high -k "byzantine,fault,tolerance,crash,formula" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Three implementations: libmeridian (C++, 47k lines, Stanford), meridian-rs (Rust, 12k lines, Constellation Labs), PyMeridian (Python, 3.2k lines, MIT).' -i high -k "implementations,languages,C++,Rust,Python" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'Deployments: Cloudflare Workers KV (2020), Akamai EdgeDB (2021), Fastly Compute@Edge (2022).' -i medium -k "deployments,production,companies,Cloudflare,Akamai,Fastly" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c "Tanaka prior work: the Firefly gossip protocol, published at SOSP 2017, provided foundation for Meridian peer discovery layer." -i high -k "Tanaka,Firefly,prior-work,SOSP,gossip" 2>/dev/null
+$ICM_BIN --db "$ICM_DB" store -t "context-meridian" -c 'BLAME threshold: f + 1 messages. When reached, the leader is blacklisted for 10 epochs and leader rotation is triggered.' -i high -k "BLAME,threshold,blacklist,leader,rotation" 2>/dev/null
 echo "  Stored 11 facts in ICM"
 
 # Function: query ollama via SSH — builds JSON with python to avoid escaping hell
@@ -132,7 +132,7 @@ for i in "${!QUESTIONS[@]}"; do
   Q="${QUESTIONS[$i]}"
 
   # Get raw facts from ICM recall (extract summary lines)
-  FACTS=$($ICM_BIN --db "$ICM_DB" recall "$Q" --limit 10 2>/dev/null | grep '  summary:' | sed 's/^  summary:  *//' || echo "")
+  FACTS=$($ICM_BIN --db "$ICM_DB" recall "$Q" --limit 15 2>/dev/null | grep '  summary:' | sed 's/^  summary:  *//' || echo "")
 
   SYSTEM="You are a helpful assistant. Answer the question using ONLY the reference information below. Be concise and accurate.
 

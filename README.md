@@ -293,10 +293,14 @@ Same test with local models — pure context injection, no tool use needed.
 ```
 Model               Params   No ICM   With ICM     Delta
 ─────────────────────────────────────────────────────────
-qwen2.5:14b           14B       4%       88%       +84%
-mistral:7b             7B       2%       81%       +79%
-qwen2.5:7b             7B       2%       79%       +77%
-llama3.1:8b            8B       4%       67%       +63%
+qwen2.5:14b           14B       4%       97%       +93%
+mistral:7b             7B       4%       93%       +89%
+llama3.1:8b            8B       4%       93%       +89%
+qwen2.5:7b             7B       4%       90%       +86%
+phi4:14b              14B       6%       79%       +73%
+llama3.2:3b            3B       0%       76%       +76%
+gemma2:9b              9B       4%       76%       +72%
+qwen2.5:3b             3B       2%       58%       +56%
 ─────────────────────────────────────────────────────────
 ```
 

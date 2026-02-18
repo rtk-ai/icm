@@ -817,25 +817,64 @@ fn cmd_init(mode: InitMode) -> Result<()> {
             "env": {}
         });
 
-        // Tool configs: (name, config_path)
-        let tools: Vec<(&str, PathBuf)> = vec![
-            ("Claude Code", PathBuf::from(&home).join(".claude.json")),
+        // Tool configs: (display_name, config_path, json_key_for_mcp_servers)
+        let tools: Vec<(&str, PathBuf, &str)> = vec![
+            (
+                "Claude Code",
+                PathBuf::from(&home).join(".claude.json"),
+                "mcpServers",
+            ),
             (
                 "Claude Desktop",
                 PathBuf::from(&home)
                     .join("Library/Application Support/Claude/claude_desktop_config.json"),
+                "mcpServers",
             ),
-            ("Cursor", PathBuf::from(&home).join(".cursor/mcp.json")),
+            (
+                "Cursor",
+                PathBuf::from(&home).join(".cursor/mcp.json"),
+                "mcpServers",
+            ),
             (
                 "Windsurf",
                 PathBuf::from(&home).join(".codeium/windsurf/mcp_config.json"),
+                "mcpServers",
+            ),
+            (
+                "VS Code",
+                if cfg!(target_os = "macos") {
+                    PathBuf::from(&home)
+                        .join("Library/Application Support/Code/User/mcp.json")
+                } else {
+                    PathBuf::from(&home).join(".config/Code/User/mcp.json")
+                },
+                "servers",
+            ),
+            (
+                "Gemini",
+                PathBuf::from(&home).join(".gemini/settings.json"),
+                "mcpServers",
+            ),
+            (
+                "Zed",
+                if cfg!(target_os = "macos") {
+                    PathBuf::from(&home).join(".zed/settings.json")
+                } else {
+                    PathBuf::from(&home).join(".config/zed/settings.json")
+                },
+                "context_servers",
             ),
         ];
 
-        for (name, config_path) in &tools {
-            let status = inject_mcp_server(config_path, "icm", &icm_server_entry)?;
+        for (name, config_path, key) in &tools {
+            let status = inject_mcp_server(config_path, "icm", &icm_server_entry, key)?;
             println!("[mcp] {name:<16} {status}");
         }
+
+        // Codex CLI uses TOML format
+        let codex_path = PathBuf::from(&home).join(".codex/config.toml");
+        let codex_status = inject_codex_mcp_server(&codex_path, "icm", &icm_bin_str)?;
+        println!("[mcp] {:<16} {codex_status}", "Codex CLI");
     }
 
     // --- CLI mode: inject CLAUDE.md instructions ---
@@ -922,13 +961,19 @@ icm recall \"topic keywords\"\n\
     println!("  binary: {icm_bin_str}");
     println!("  db:     {}", default_db_path().display());
     println!();
-    println!("Restart Claude Code / Claude Desktop to activate.");
+    println!("Restart your AI tool to activate.");
 
     Ok(())
 }
 
-/// Inject ICM MCP server into a Claude config file. Returns a status string.
-fn inject_mcp_server(config_path: &PathBuf, name: &str, entry: &Value) -> Result<String> {
+/// Inject ICM MCP server into a JSON config file. Returns a status string.
+/// `servers_key` is the JSON key for the servers object (e.g. "mcpServers", "servers", "context_servers").
+fn inject_mcp_server(
+    config_path: &PathBuf,
+    name: &str,
+    entry: &Value,
+    servers_key: &str,
+) -> Result<String> {
     // Read existing config or create empty object
     let mut config: Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
@@ -946,7 +991,7 @@ fn inject_mcp_server(config_path: &PathBuf, name: &str, entry: &Value) -> Result
     let mcp_servers = config
         .as_object_mut()
         .context("config is not a JSON object")?
-        .entry("mcpServers")
+        .entry(servers_key)
         .or_insert_with(|| serde_json::json!({}));
 
     // Check if already configured with same binary
@@ -964,6 +1009,62 @@ fn inject_mcp_server(config_path: &PathBuf, name: &str, entry: &Value) -> Result
         .insert(name.to_string(), entry.clone());
 
     let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_path, output)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+
+    Ok("configured".into())
+}
+
+/// Inject ICM MCP server into Codex CLI TOML config. Returns a status string.
+fn inject_codex_mcp_server(
+    config_path: &PathBuf,
+    name: &str,
+    icm_bin: &str,
+) -> Result<String> {
+    let mut config: toml::Value = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        content
+            .parse::<toml::Value>()
+            .with_context(|| format!("invalid TOML in {}", config_path.display()))?
+    } else {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    let root = config
+        .as_table_mut()
+        .context("config is not a TOML table")?;
+
+    let mcp_servers = root
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+
+    // Check if already configured with same binary
+    if let Some(existing) = mcp_servers.get(name) {
+        if existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
+            return Ok("already configured".into());
+        }
+    }
+
+    let mut server = toml::map::Map::new();
+    server.insert(
+        "command".into(),
+        toml::Value::String(icm_bin.to_string()),
+    );
+    server.insert(
+        "args".into(),
+        toml::Value::Array(vec![toml::Value::String("serve".into())]),
+    );
+
+    mcp_servers
+        .as_table_mut()
+        .unwrap()
+        .insert(name.to_string(), toml::Value::Table(server));
+
+    let output = toml::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
         .with_context(|| format!("cannot write {}", config_path.display()))?;
 

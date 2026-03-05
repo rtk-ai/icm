@@ -1,10 +1,14 @@
 {
   "packages": {
-    ".": {
+    "crates/icm-cli": {
       "release-type": "rust",
       "package-name": "icm",
+      "component": "icm",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true
+      "bump-patch-for-minor-pre-major": true,
+      "extra-files": [
+        "../../CHANGELOG.md"
+      ]
     }
   }
 }

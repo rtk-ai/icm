@@ -13,6 +13,9 @@ const SERVER_NAME: &str = "icm";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Number of non-store tool calls before we nudge the agent to store.
+const STORE_NUDGE_THRESHOLD: u32 = 10;
+
 /// Run the MCP server on stdio. Blocks until stdin is closed.
 pub fn run_server(
     store: &SqliteStore,
@@ -21,6 +24,7 @@ pub fn run_server(
 ) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut calls_since_store: u32 = 0;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -60,7 +64,14 @@ pub fn run_server(
             "initialize" => handle_initialize(id),
             "ping" => JsonRpcResponse::ok(id, json!({})),
             "tools/list" => handle_tools_list(id, embedder.is_some()),
-            "tools/call" => handle_tools_call(id, &msg.params, store, embedder, compact),
+            "tools/call" => handle_tools_call(
+                id,
+                &msg.params,
+                store,
+                embedder,
+                compact,
+                &mut calls_since_store,
+            ),
             other => JsonRpcResponse::method_not_found(id, other),
         };
 
@@ -106,6 +117,14 @@ STORE (icm_memory_store): Automatically store important information:\n\
 - User preferences discovered in session → topic: \"preferences\"\n\
 - Project context after significant work → topic: \"context-{project}\"\n\
 \n\
+IMPORTANT — Store frequently. Your context window will be compacted without warning, and \
+any unstored information will be lost forever. Store after:\n\
+- Resolving a bug or error\n\
+- Making an architecture or design decision\n\
+- Discovering a user preference\n\
+- Completing a significant piece of work\n\
+If ICM reminds you to store, do it immediately.\n\
+\n\
 Do NOT store: trivial details, information already in CLAUDE.md, ephemeral state.\n\
 \n\
 Importance levels: critical (never forgotten), high (slow decay), medium (normal), low (fast decay).";
@@ -120,6 +139,7 @@ fn handle_tools_call(
     store: &SqliteStore,
     embedder: Option<&dyn Embedder>,
     compact: bool,
+    calls_since_store: &mut u32,
 ) -> JsonRpcResponse {
     let params = match params {
         Some(p) => p,
@@ -137,6 +157,23 @@ fn handle_tools_call(
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    let result = tools::call_tool(store, embedder, tool_name, &args, compact);
+    // Track store calls to nudge the agent
+    if tool_name == "icm_memory_store" {
+        *calls_since_store = 0;
+    } else {
+        *calls_since_store += 1;
+    }
+
+    let mut result = tools::call_tool(store, embedder, tool_name, &args, compact);
+
+    // Nudge: append a store reminder if too many calls without storing
+    if *calls_since_store >= STORE_NUDGE_THRESHOLD && tool_name != "icm_memory_store" {
+        result.append_hint(&format!(
+            "\n[ICM: {} tool calls since last store. \
+             Consider saving important context with icm_memory_store before it is lost.]",
+            calls_since_store
+        ));
+    }
+
     JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap_or(json!(null)))
 }

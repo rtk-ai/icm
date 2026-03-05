@@ -432,6 +432,8 @@ enum InitMode {
     Cli,
     /// Claude Code slash commands /recall and /remember
     Skill,
+    /// Claude Code PostToolUse hook (auto-extract context)
+    Hook,
     /// All integration modes
     All,
 }
@@ -820,6 +822,7 @@ fn cmd_init(mode: InitMode) -> Result<()> {
     let do_mcp = matches!(mode, InitMode::Mcp | InitMode::All);
     let do_cli = matches!(mode, InitMode::Cli | InitMode::All);
     let do_skill = matches!(mode, InitMode::Skill | InitMode::All);
+    let do_hook = matches!(mode, InitMode::Hook | InitMode::All);
 
     // --- MCP mode: configure MCP servers for all detected tools ---
     if do_mcp {
@@ -1034,6 +1037,32 @@ After completing significant work, store a summary:
         )?;
     }
 
+    // --- Hook mode: install Claude Code PostToolUse hook ---
+    if do_hook {
+        let claude_settings_path = PathBuf::from(&home).join(".claude/settings.json");
+        let hook_dir = PathBuf::from(&home).join(".claude/hooks");
+        std::fs::create_dir_all(&hook_dir).ok();
+
+        // Write the hook script
+        let hook_script_path = hook_dir.join("icm-post-tool.sh");
+        let hook_script = include_str!("../../../scripts/hooks/icm-post-tool.sh");
+        if hook_script_path.exists() {
+            println!("[hook] icm-post-tool.sh already exists, updating.");
+        }
+        std::fs::write(&hook_script_path, hook_script).context("cannot write hook script")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_script_path, std::fs::Permissions::from_mode(0o755))
+                .ok();
+        }
+
+        // Inject into settings.json
+        let hook_cmd = hook_script_path.to_string_lossy().to_string();
+        let status = inject_claude_hook(&claude_settings_path, &hook_cmd)?;
+        println!("[hook] Claude Code PostToolUse: {status}");
+    }
+
     println!();
     println!("  binary: {icm_bin_str}");
     println!("  db:     {}", default_db_path().display());
@@ -1041,6 +1070,68 @@ After completing significant work, store a summary:
     println!("Restart your AI tool to activate.");
 
     Ok(())
+}
+
+/// Inject ICM PostToolUse hook into Claude Code settings.json
+fn inject_claude_hook(settings_path: &PathBuf, hook_command: &str) -> Result<String> {
+    let mut config: Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(settings_path)
+            .with_context(|| format!("cannot read {}", settings_path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("cannot parse {}", settings_path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+
+    let hooks = config
+        .as_object_mut()
+        .context("settings is not a JSON object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let post_tool = hooks
+        .as_object_mut()
+        .context("hooks is not a JSON object")?
+        .entry("PostToolUse")
+        .or_insert_with(|| serde_json::json!([]));
+
+    let post_tool_arr = post_tool
+        .as_array_mut()
+        .context("PostToolUse is not an array")?;
+
+    // Check if ICM hook already exists
+    let already = post_tool_arr.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("icm-post-tool"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if already {
+        return Ok("already configured".into());
+    }
+
+    // Add ICM hook entry (matches all tools except ICM's own)
+    post_tool_arr.push(serde_json::json!({
+        "hooks": [{
+            "type": "command",
+            "command": hook_command
+        }]
+    }));
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(settings_path, output)
+        .with_context(|| format!("cannot write {}", settings_path.display()))?;
+
+    Ok("configured".into())
 }
 
 /// Install a skill/rule file if it doesn't exist yet.

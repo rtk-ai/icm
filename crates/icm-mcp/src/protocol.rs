@@ -93,4 +93,11 @@ impl ToolResult {
             is_error: true,
         }
     }
+
+    /// Append a hint to the last text content block.
+    pub fn append_hint(&mut self, hint: &str) {
+        if let Some(last) = self.content.last_mut() {
+            last.text.push_str(hint);
+        }
+    }
 }

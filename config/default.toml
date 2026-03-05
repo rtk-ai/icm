@@ -15,6 +15,17 @@ decay_rate = 0.95
 # Weight threshold for automatic pruning
 prune_threshold = 0.1
 
+[embeddings]
+# Embedding model (fastembed model_code). Default: multilingual-e5-small (384d, 100+ languages)
+# Other options:
+#   "BAAI/bge-small-en-v1.5"              — 384d, English-only (fastest)
+#   "Xenova/bge-small-en-v1.5"            — 384d, quantized English-only
+#   "intfloat/multilingual-e5-base"       — 768d, multilingual (more accurate, slower)
+#   "intfloat/multilingual-e5-large"      — 1024d, multilingual (best accuracy, largest)
+#   "Xenova/all-MiniLM-L12-v2"            — 384d, English
+#   "jinaai/jina-embeddings-v2-base-code" — 768d, code-optimized
+model = "intfloat/multilingual-e5-base"
+
 [extraction]
 # Layer 0: rule-based fact extraction (zero LLM cost)
 enabled = true

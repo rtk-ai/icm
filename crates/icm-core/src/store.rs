@@ -1,5 +1,5 @@
 use crate::error::IcmResult;
-use crate::memory::{Memory, StoreStats};
+use crate::memory::{Memory, StoreStats, TopicHealth};
 
 pub trait MemoryStore {
     // CRUD
@@ -32,5 +32,7 @@ pub trait MemoryStore {
 
     // Stats
     fn count(&self) -> IcmResult<usize>;
+    fn count_by_topic(&self, topic: &str) -> IcmResult<usize>;
     fn stats(&self) -> IcmResult<StoreStats>;
+    fn topic_health(&self, topic: &str) -> IcmResult<TopicHealth>;
 }

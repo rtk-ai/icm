@@ -8,13 +8,78 @@ use crate::error::{IcmError, IcmResult};
 pub struct FastEmbedder {
     model: OnceLock<TextEmbedding>,
     init_lock: Mutex<()>,
+    model_name: String,
+    dims: usize,
+}
+
+/// Default model: multilingual-e5-small (384d, supports 100+ languages)
+const DEFAULT_MODEL: &str = "intfloat/multilingual-e5-base";
+
+/// Resolve a model string to (EmbeddingModel, dimensions).
+fn resolve_model(name: &str) -> IcmResult<(EmbeddingModel, usize)> {
+    let model: EmbeddingModel = name
+        .parse()
+        .map_err(|e: String| IcmError::Embedding(e))?;
+    let dims = model_dimensions(&model);
+    Ok((model, dims))
+}
+
+/// Known dimensions for fastembed models.
+fn model_dimensions(model: &EmbeddingModel) -> usize {
+    match model {
+        EmbeddingModel::AllMiniLML6V2
+        | EmbeddingModel::AllMiniLML6V2Q
+        | EmbeddingModel::AllMiniLML12V2
+        | EmbeddingModel::AllMiniLML12V2Q
+        | EmbeddingModel::BGESmallENV15
+        | EmbeddingModel::BGESmallENV15Q
+        | EmbeddingModel::MultilingualE5Small
+        | EmbeddingModel::ParaphraseMLMiniLML12V2
+        | EmbeddingModel::ParaphraseMLMiniLML12V2Q => 384,
+
+        EmbeddingModel::BGEBaseENV15
+        | EmbeddingModel::BGEBaseENV15Q
+        | EmbeddingModel::MultilingualE5Base
+        | EmbeddingModel::ParaphraseMLMpnetBaseV2
+        | EmbeddingModel::BGESmallZHV15
+        | EmbeddingModel::GTEBaseENV15
+        | EmbeddingModel::GTEBaseENV15Q
+        | EmbeddingModel::JinaEmbeddingsV2BaseCode => 768,
+
+        EmbeddingModel::BGELargeENV15
+        | EmbeddingModel::BGELargeENV15Q
+        | EmbeddingModel::MultilingualE5Large
+        | EmbeddingModel::MxbaiEmbedLargeV1
+        | EmbeddingModel::MxbaiEmbedLargeV1Q
+        | EmbeddingModel::BGELargeZHV15
+        | EmbeddingModel::GTELargeENV15
+        | EmbeddingModel::GTELargeENV15Q
+        | EmbeddingModel::ModernBertEmbedLarge => 1024,
+
+        EmbeddingModel::NomicEmbedTextV1
+        | EmbeddingModel::NomicEmbedTextV15
+        | EmbeddingModel::NomicEmbedTextV15Q => 768,
+
+        EmbeddingModel::ClipVitB32 => 512,
+    }
 }
 
 impl FastEmbedder {
+    /// Create with default model (multilingual-e5-small).
     pub fn new() -> Self {
+        Self::with_model(DEFAULT_MODEL)
+    }
+
+    /// Create with a specific model by name (e.g. "intfloat/multilingual-e5-small").
+    pub fn with_model(model_name: &str) -> Self {
+        let dims = resolve_model(model_name)
+            .map(|(_, d)| d)
+            .unwrap_or(384);
         Self {
             model: OnceLock::new(),
             init_lock: Mutex::new(()),
+            model_name: model_name.to_string(),
+            dims,
         }
     }
 
@@ -26,8 +91,9 @@ impl FastEmbedder {
         if let Some(m) = self.model.get() {
             return Ok(m);
         }
+        let (emb_model, _) = resolve_model(&self.model_name)?;
         let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGESmallENV15Q).with_show_download_progress(true),
+            InitOptions::new(emb_model).with_show_download_progress(true),
         )
         .map_err(|e| IcmError::Embedding(format!("failed to init model: {e}")))?;
         let _ = self.model.set(model);
@@ -64,6 +130,6 @@ impl Embedder for FastEmbedder {
     }
 
     fn dimensions(&self) -> usize {
-        384
+        self.dims
     }
 }

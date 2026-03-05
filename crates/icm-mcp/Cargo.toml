@@ -1,6 +1,6 @@
 [package]
 name = "icm-mcp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [features]
@@ -10,6 +10,7 @@ embeddings = ["icm-core/embeddings"]
 [dependencies]
 icm-core = { path = "../icm-core" }
 icm-store = { path = "../icm-store" }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

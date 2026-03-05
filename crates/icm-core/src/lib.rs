@@ -13,5 +13,5 @@ pub use error::{IcmError, IcmResult};
 pub use fastembed_embedder::FastEmbedder;
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
 pub use memoir_store::MemoirStore;
-pub use memory::{Importance, Memory, MemorySource, StoreStats};
+pub use memory::{Importance, Memory, MemorySource, StoreStats, TopicHealth};
 pub use store::MemoryStore;

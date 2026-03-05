@@ -6,6 +6,7 @@ use std::fmt;
 pub struct Memory {
     pub id: String,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub last_accessed: DateTime<Utc>,
     pub access_count: u32,
     pub weight: f32,
@@ -30,6 +31,7 @@ impl Memory {
         Self {
             id: ulid::Ulid::new().to_string(),
             created_at: now,
+            updated_at: now,
             last_accessed: now,
             access_count: 0,
             weight: 1.0,
@@ -109,4 +111,17 @@ pub struct StoreStats {
     pub avg_weight: f32,
     pub oldest_memory: Option<DateTime<Utc>>,
     pub newest_memory: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TopicHealth {
+    pub topic: String,
+    pub entry_count: usize,
+    pub avg_weight: f32,
+    pub avg_access_count: f32,
+    pub oldest: Option<DateTime<Utc>>,
+    pub newest: Option<DateTime<Utc>>,
+    pub last_accessed: Option<DateTime<Utc>>,
+    pub needs_consolidation: bool,
+    pub stale_count: usize,
 }

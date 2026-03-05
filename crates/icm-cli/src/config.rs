@@ -16,6 +16,7 @@ use serde::Deserialize;
 pub struct Config {
     pub store: StoreConfig,
     pub memory: MemoryConfig,
+    pub embeddings: EmbeddingsConfig,
     pub extraction: ExtractionConfig,
     pub recall: RecallConfig,
     pub mcp: McpConfig,
@@ -36,6 +37,22 @@ pub struct MemoryConfig {
     pub default_importance: String,
     pub decay_rate: f32,
     pub prune_threshold: f32,
+}
+
+/// Embedding model settings.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingsConfig {
+    /// Model identifier (fastembed model_code, e.g. "intfloat/multilingual-e5-small").
+    pub model: String,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            model: "intfloat/multilingual-e5-base".into(),
+        }
+    }
 }
 
 /// Auto-extraction settings (Layer 0).

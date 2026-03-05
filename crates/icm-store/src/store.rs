@@ -8,10 +8,10 @@ use zerocopy::IntoBytes;
 
 use icm_core::{
     Concept, ConceptLink, IcmError, IcmResult, Importance, Label, Memoir, MemoirStats, MemoirStore,
-    Memory, MemorySource, MemoryStore, Relation, StoreStats,
+    Memory, MemorySource, MemoryStore, Relation, StoreStats, TopicHealth,
 };
 
-use crate::schema::init_db;
+use crate::schema::{init_db, init_db_with_dims};
 
 static SQLITE_VEC_INIT: Once = Once::new();
 
@@ -30,6 +30,11 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn new(path: &Path) -> IcmResult<Self> {
+        Self::with_dims(path, 384)
+    }
+
+    /// Open or create a store with a specific embedding dimension.
+    pub fn with_dims(path: &Path, embedding_dims: usize) -> IcmResult<Self> {
         ensure_sqlite_vec();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -39,7 +44,7 @@ impl SqliteStore {
             .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .map_err(|e| IcmError::Database(e.to_string()))?;
-        init_db(&conn)?;
+        init_db_with_dims(&conn, embedding_dims)?;
         Ok(Self { conn })
     }
 
@@ -132,39 +137,53 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
 }
 
 fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
-    let keywords_json: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+    // Column order: id(0), created_at(1), updated_at(2), last_accessed(3),
+    //   access_count(4), weight(5), topic(6), summary(7), raw_excerpt(8),
+    //   keywords(9), importance(10), source_type(11), source_data(12),
+    //   related_ids(13), embedding(14)
+    let keywords_json: String = row.get::<_, Option<String>>(9)?.unwrap_or_default();
     let keywords: Vec<String> = serde_json::from_str(&keywords_json).unwrap_or_default();
 
-    let importance_str: String = row.get(9)?;
+    let importance_str: String = row.get(10)?;
     let importance = importance_str.parse().unwrap_or(Importance::Medium);
 
-    let source_type_str: String = row.get(10)?;
-    let source_data_str: Option<String> = row.get(11)?;
+    let source_type_str: String = row.get(11)?;
+    let source_data_str: Option<String> = row.get(12)?;
     let source = parse_source(&source_type_str, source_data_str);
 
-    let related_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
+    let related_json: String = row.get::<_, Option<String>>(13)?.unwrap_or_default();
     let related_ids: Vec<String> = serde_json::from_str(&related_json).unwrap_or_default();
 
     let embedding: Option<Vec<f32>> = row
-        .get::<_, Option<Vec<u8>>>(13)?
+        .get::<_, Option<Vec<u8>>>(14)?
         .map(|b| blob_to_embedding(&b));
 
     let created_at_str: String = row.get(1)?;
-    let last_accessed_str: String = row.get(2)?;
+    let updated_at_str: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+    let last_accessed_str: String = row.get(3)?;
+
+    let parse_dt = |s: &str| -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now())
+    };
+
+    let created_at = parse_dt(&created_at_str);
 
     Ok(Memory {
         id: row.get(0)?,
-        created_at: DateTime::parse_from_rfc3339(&created_at_str)
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-        last_accessed: DateTime::parse_from_rfc3339(&last_accessed_str)
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-        access_count: row.get::<_, u32>(3)?,
-        weight: row.get(4)?,
-        topic: row.get(5)?,
-        summary: row.get(6)?,
-        raw_excerpt: row.get(7)?,
+        created_at,
+        updated_at: if updated_at_str.is_empty() {
+            created_at
+        } else {
+            parse_dt(&updated_at_str)
+        },
+        last_accessed: parse_dt(&last_accessed_str),
+        access_count: row.get::<_, u32>(4)?,
+        weight: row.get(5)?,
+        topic: row.get(6)?,
+        summary: row.get(7)?,
+        raw_excerpt: row.get(8)?,
         keywords,
         importance,
         source,
@@ -173,7 +192,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     })
 }
 
-const SELECT_COLS: &str = "id, created_at, last_accessed, access_count, weight, \
+const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_count, weight, \
                            topic, summary, raw_excerpt, keywords, \
                            importance, source_type, source_data, related_ids, embedding";
 
@@ -223,13 +242,14 @@ impl MemoryStore for SqliteStore {
 
         self.conn
             .execute(
-                "INSERT INTO memories (id, created_at, last_accessed, access_count, weight,
+                "INSERT INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
                  topic, summary, raw_excerpt, keywords,
                  importance, source_type, source_data, related_ids, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     memory.id,
                     memory.created_at.to_rfc3339(),
+                    memory.updated_at.to_rfc3339(),
                     memory.last_accessed.to_rfc3339(),
                     memory.access_count,
                     memory.weight,
@@ -285,13 +305,14 @@ impl MemoryStore for SqliteStore {
             .conn
             .execute(
                 "UPDATE memories SET
-                 last_accessed = ?2, access_count = ?3, weight = ?4,
-                 topic = ?5, summary = ?6, raw_excerpt = ?7, keywords = ?8,
-                 importance = ?9, source_type = ?10, source_data = ?11, related_ids = ?12,
-                 embedding = ?13
+                 updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
+                 topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
+                 importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
+                 embedding = ?14
                  WHERE id = ?1",
                 params![
                     memory.id,
+                    memory.updated_at.to_rfc3339(),
                     memory.last_accessed.to_rfc3339(),
                     memory.access_count,
                     memory.weight,
@@ -492,7 +513,7 @@ impl MemoryStore for SqliteStore {
             if let Ok(mut stmt) = self.conn.prepare(fts_sql) {
                 if let Ok(rows) = stmt.query_map(params![sanitized, pool_size as i64], |row| {
                     let memory = row_to_memory(row)?;
-                    let rank: f32 = row.get(14)?;
+                    let rank: f32 = row.get(15)?;
                     Ok((memory, rank))
                 }) {
                     for row in rows.flatten() {
@@ -553,10 +574,25 @@ impl MemoryStore for SqliteStore {
     }
 
     fn apply_decay(&self, decay_factor: f32) -> IcmResult<usize> {
+        // Access-aware decay: frequently accessed memories decay slower.
+        // decay = base_rate * importance_multiplier / (1 + access_count * 0.1)
+        // critical: never decays
+        // high: 0.5x decay (half speed)
+        // medium: 1.0x decay (normal)
+        // low: 2.0x decay (double speed)
         let changed = self
             .conn
             .execute(
-                "UPDATE memories SET weight = weight * ?1 WHERE importance != 'critical'",
+                "UPDATE memories SET weight = weight * (
+                    1.0 - (1.0 - ?1) *
+                    CASE importance
+                        WHEN 'high' THEN 0.5
+                        WHEN 'low' THEN 2.0
+                        ELSE 1.0
+                    END
+                    / (1.0 + access_count * 0.1)
+                )
+                WHERE importance != 'critical'",
                 params![decay_factor],
             )
             .map_err(|e| IcmError::Database(e.to_string()))?;
@@ -565,10 +601,10 @@ impl MemoryStore for SqliteStore {
     }
 
     fn prune(&self, weight_threshold: f32) -> IcmResult<usize> {
-        // Clean vec_memories for entries about to be pruned
+        // Never prune critical or high importance memories
         let _ = self.conn.execute(
             "DELETE FROM vec_memories WHERE memory_id IN (
-                SELECT id FROM memories WHERE weight < ?1 AND importance != 'critical'
+                SELECT id FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')
             )",
             params![weight_threshold],
         );
@@ -576,7 +612,7 @@ impl MemoryStore for SqliteStore {
         let changed = self
             .conn
             .execute(
-                "DELETE FROM memories WHERE weight < ?1 AND importance != 'critical'",
+                "DELETE FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')",
                 params![weight_threshold],
             )
             .map_err(|e| IcmError::Database(e.to_string()))?;
@@ -645,6 +681,89 @@ impl MemoryStore for SqliteStore {
                 row.get::<_, usize>(0)
             })
             .map_err(|e| IcmError::Database(e.to_string()))
+    }
+
+    fn count_by_topic(&self, topic: &str) -> IcmResult<usize> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE topic = ?1",
+                params![topic],
+                |row| row.get::<_, usize>(0),
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))
+    }
+
+    fn topic_health(&self, topic: &str) -> IcmResult<TopicHealth> {
+        let entry_count = self.count_by_topic(topic)?;
+        if entry_count == 0 {
+            return Err(IcmError::NotFound(format!("topic: {topic}")));
+        }
+
+        let (avg_weight, avg_access): (f32, f32) = self
+            .conn
+            .query_row(
+                "SELECT AVG(weight), AVG(CAST(access_count AS REAL)) FROM memories WHERE topic = ?1",
+                params![topic],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let oldest: Option<DateTime<Utc>> = self
+            .conn
+            .query_row(
+                "SELECT MIN(created_at) FROM memories WHERE topic = ?1",
+                params![topic],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&Utc));
+
+        let newest: Option<DateTime<Utc>> = self
+            .conn
+            .query_row(
+                "SELECT MAX(created_at) FROM memories WHERE topic = ?1",
+                params![topic],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&Utc));
+
+        let last_accessed: Option<DateTime<Utc>> = self
+            .conn
+            .query_row(
+                "SELECT MAX(last_accessed) FROM memories WHERE topic = ?1",
+                params![topic],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&Utc));
+
+        // Stale = not accessed in 14 days and weight < 0.5
+        let stale_count: usize = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE topic = ?1
+                 AND weight < 0.5
+                 AND julianday('now') - julianday(last_accessed) > 14",
+                params![topic],
+                |row| row.get(0),
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        Ok(TopicHealth {
+            topic: topic.to_string(),
+            entry_count,
+            avg_weight,
+            avg_access_count: avg_access,
+            oldest,
+            newest,
+            last_accessed,
+            needs_consolidation: entry_count > 5,
+            stale_count,
+        })
     }
 
     fn stats(&self) -> IcmResult<StoreStats> {

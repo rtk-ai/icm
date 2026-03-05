@@ -14,7 +14,11 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Run the MCP server on stdio. Blocks until stdin is closed.
-pub fn run_server(store: &SqliteStore, embedder: Option<&dyn Embedder>) -> anyhow::Result<()> {
+pub fn run_server(
+    store: &SqliteStore,
+    embedder: Option<&dyn Embedder>,
+    compact: bool,
+) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -56,7 +60,7 @@ pub fn run_server(store: &SqliteStore, embedder: Option<&dyn Embedder>) -> anyho
             "initialize" => handle_initialize(id),
             "ping" => JsonRpcResponse::ok(id, json!({})),
             "tools/list" => handle_tools_list(id, embedder.is_some()),
-            "tools/call" => handle_tools_call(id, &msg.params, store, embedder),
+            "tools/call" => handle_tools_call(id, &msg.params, store, embedder, compact),
             other => JsonRpcResponse::method_not_found(id, other),
         };
 
@@ -115,6 +119,7 @@ fn handle_tools_call(
     params: &Option<Value>,
     store: &SqliteStore,
     embedder: Option<&dyn Embedder>,
+    compact: bool,
 ) -> JsonRpcResponse {
     let params = match params {
         Some(p) => p,
@@ -132,6 +137,6 @@ fn handle_tools_call(
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    let result = tools::call_tool(store, embedder, tool_name, &args);
+    let result = tools::call_tool(store, embedder, tool_name, &args, compact);
     JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap_or(json!(null)))
 }

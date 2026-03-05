@@ -2,12 +2,19 @@ use rusqlite::Connection;
 
 use icm_core::IcmError;
 
+/// Initialize the database schema. `embedding_dims` controls the sqlite-vec vector size.
+/// Pass `None` to skip vector table creation (no embeddings feature).
 pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
+    init_db_with_dims(conn, 384)
+}
+
+pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(), IcmError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS memories (
             id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT '',
             last_accessed TEXT NOT NULL,
             access_count INTEGER DEFAULT 0,
             weight REAL DEFAULT 1.0,
@@ -166,6 +173,20 @@ pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
     )
     .map_err(|e| IcmError::Database(e.to_string()))?;
 
+    // Migration: add updated_at column if missing (existing DBs pre-0.3.1)
+    let has_updated_at: bool = conn
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='updated_at'")
+        .and_then(|mut s| s.query_row([], |row| row.get(0)))
+        .map_err(|e| IcmError::Database(e.to_string()))?;
+
+    if !has_updated_at {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN updated_at TEXT;
+             UPDATE memories SET updated_at = created_at WHERE updated_at IS NULL;",
+        )
+        .map_err(|e| IcmError::Database(e.to_string()))?;
+    }
+
     // Migration: add embedding column if missing (existing DBs)
     let has_embedding: bool = conn
         .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='embedding'")
@@ -177,7 +198,7 @@ pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
             .map_err(|e| IcmError::Database(e.to_string()))?;
     }
 
-    // sqlite-vec virtual table for vector search
+    // sqlite-vec virtual table for vector search (dimension-aware)
     let vec_exists: bool = conn
         .query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_memories'",
@@ -186,12 +207,48 @@ pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
         )
         .map_err(|e| IcmError::Database(e.to_string()))?;
 
-    if !vec_exists {
-        conn.execute_batch(
+    if vec_exists {
+        // Check if stored dims differ from requested dims — if so, recreate
+        let stored_dims: Option<String> = conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        let stored: usize = stored_dims
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(384);
+        if stored != embedding_dims {
+            // Model changed — drop vec table and clear embeddings
+            conn.execute_batch("DROP TABLE IF EXISTS vec_memories")
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+            conn.execute("UPDATE memories SET embedding = NULL", [])
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE vec_memories USING vec0(
+                    memory_id TEXT PRIMARY KEY,
+                    embedding float[{embedding_dims}] distance_metric=cosine
+                )"
+            ))
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO icm_metadata (key, value) VALUES ('embedding_dims', ?1)",
+                [&embedding_dims.to_string()],
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+        }
+    } else {
+        conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE vec_memories USING vec0(
                 memory_id TEXT PRIMARY KEY,
-                embedding float[384] distance_metric=cosine
-            )",
+                embedding float[{embedding_dims}] distance_metric=cosine
+            )"
+        ))
+        .map_err(|e| IcmError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO icm_metadata (key, value) VALUES ('embedding_dims', ?1)",
+            [&embedding_dims.to_string()],
         )
         .map_err(|e| IcmError::Database(e.to_string()))?;
     }

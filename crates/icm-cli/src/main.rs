@@ -227,7 +227,11 @@ enum Commands {
     Config,
 
     /// Launch MCP server (stdio transport for Claude Code)
-    Serve,
+    Serve {
+        /// Compact output mode (shorter responses to save tokens)
+        #[arg(long)]
+        compact: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -438,18 +442,18 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("memories.db"))
 }
 
-fn open_store(db: Option<PathBuf>) -> Result<SqliteStore> {
+fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<SqliteStore> {
     let path = db.unwrap_or_else(default_db_path);
-    SqliteStore::new(&path).context("failed to open database")
+    SqliteStore::with_dims(&path, embedding_dims).context("failed to open database")
 }
 
 #[cfg(feature = "embeddings")]
-fn init_embedder() -> Option<icm_core::FastEmbedder> {
-    Some(icm_core::FastEmbedder::new())
+fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
+    Some(icm_core::FastEmbedder::with_model(model))
 }
 
 #[cfg(not(feature = "embeddings"))]
-fn init_embedder() -> Option<()> {
+fn init_embedder(_model: &str) -> Option<()> {
     None
 }
 
@@ -462,9 +466,14 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let store = open_store(cli.db)?;
+    let cfg = config::load_config()?;
     #[allow(unused_variables)]
-    let embedder = init_embedder();
+    let embedder = init_embedder(&cfg.embeddings.model);
+    let embedding_dims = embedder.as_ref().map(|e| {
+        use icm_core::Embedder;
+        e.dimensions()
+    }).unwrap_or(384);
+    let store = open_store(cli.db, embedding_dims)?;
 
     match cli.command {
         Commands::Store {
@@ -595,12 +604,12 @@ fn main() -> Result<()> {
             runs,
             verbose,
         } => cmd_bench_agent(sessions, &model, runs, verbose),
-        Commands::Serve => {
+        Commands::Serve { compact } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
-            icm_mcp::run_server(&store, emb_ref)
+            icm_mcp::run_server(&store, emb_ref, compact)
         }
     }
 }
@@ -817,53 +826,33 @@ fn cmd_init(mode: InitMode) -> Result<()> {
             "env": {}
         });
 
-        // Tool configs: (display_name, config_path, json_key_for_mcp_servers)
+        let vscode_data = if cfg!(target_os = "macos") {
+            PathBuf::from(&home).join("Library/Application Support/Code/User")
+        } else {
+            PathBuf::from(&home).join(".config/Code/User")
+        };
+
+        // Standard JSON tools: (name, path, json_key)
         let tools: Vec<(&str, PathBuf, &str)> = vec![
-            (
-                "Claude Code",
-                PathBuf::from(&home).join(".claude.json"),
-                "mcpServers",
-            ),
-            (
-                "Claude Desktop",
-                PathBuf::from(&home)
-                    .join("Library/Application Support/Claude/claude_desktop_config.json"),
-                "mcpServers",
-            ),
-            (
-                "Cursor",
-                PathBuf::from(&home).join(".cursor/mcp.json"),
-                "mcpServers",
-            ),
-            (
-                "Windsurf",
-                PathBuf::from(&home).join(".codeium/windsurf/mcp_config.json"),
-                "mcpServers",
-            ),
-            (
-                "VS Code",
-                if cfg!(target_os = "macos") {
-                    PathBuf::from(&home)
-                        .join("Library/Application Support/Code/User/mcp.json")
-                } else {
-                    PathBuf::from(&home).join(".config/Code/User/mcp.json")
-                },
-                "servers",
-            ),
-            (
-                "Gemini",
-                PathBuf::from(&home).join(".gemini/settings.json"),
-                "mcpServers",
-            ),
-            (
-                "Zed",
-                if cfg!(target_os = "macos") {
-                    PathBuf::from(&home).join(".zed/settings.json")
-                } else {
-                    PathBuf::from(&home).join(".config/zed/settings.json")
-                },
-                "context_servers",
-            ),
+            // --- Editors & IDEs ---
+            ("Claude Code", PathBuf::from(&home).join(".claude.json"), "mcpServers"),
+            ("Claude Desktop", PathBuf::from(&home).join("Library/Application Support/Claude/claude_desktop_config.json"), "mcpServers"),
+            ("Cursor", PathBuf::from(&home).join(".cursor/mcp.json"), "mcpServers"),
+            ("Windsurf", PathBuf::from(&home).join(".codeium/windsurf/mcp_config.json"), "mcpServers"),
+            ("VS Code", vscode_data.join("mcp.json"), "servers"),
+            ("Gemini", PathBuf::from(&home).join(".gemini/settings.json"), "mcpServers"),
+            ("Zed", if cfg!(target_os = "macos") {
+                PathBuf::from(&home).join(".zed/settings.json")
+            } else {
+                PathBuf::from(&home).join(".config/zed/settings.json")
+            }, "context_servers"),
+            // --- Terminal tools ---
+            ("Amp", PathBuf::from(&home).join(".config/amp/settings.json"), "amp.mcpServers"),
+            ("Amazon Q", PathBuf::from(&home).join(".aws/amazonq/mcp.json"), "mcpServers"),
+            // --- VS Code extensions ---
+            ("Cline", vscode_data.join("globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"), "mcpServers"),
+            ("Roo Code", vscode_data.join("globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json"), "mcpServers"),
+            ("Kilo Code", vscode_data.join("globalStorage/kilocode.kilo-code/settings/mcp_settings.json"), "mcpServers"),
         ];
 
         for (name, config_path, key) in &tools {
@@ -875,6 +864,11 @@ fn cmd_init(mode: InitMode) -> Result<()> {
         let codex_path = PathBuf::from(&home).join(".codex/config.toml");
         let codex_status = inject_codex_mcp_server(&codex_path, "icm", &icm_bin_str)?;
         println!("[mcp] {:<16} {codex_status}", "Codex CLI");
+
+        // OpenCode uses different JSON structure (command is array, key is "mcp")
+        let opencode_path = PathBuf::from(&home).join(".config/opencode/opencode.json");
+        let opencode_status = inject_opencode_mcp_server(&opencode_path, "icm", &icm_bin_str)?;
+        println!("[mcp] {:<16} {opencode_status}", "OpenCode");
     }
 
     // --- CLI mode: inject CLAUDE.md instructions ---
@@ -917,44 +911,57 @@ icm recall \"topic keywords\"\n\
         }
     }
 
-    // --- Skill mode: create /recall and /remember slash commands ---
+    // --- Skill mode: create slash commands / rules for all tools ---
     if do_skill {
-        let skills_dir = PathBuf::from(&home).join(".claude/commands");
-        std::fs::create_dir_all(&skills_dir).ok();
+        let icm_recall_prompt = "\
+Search ICM memory for: $ARGUMENTS
 
-        let recall_path = skills_dir.join("recall.md");
-        if recall_path.exists() {
-            println!("[skill] /recall already configured.");
-        } else {
-            std::fs::write(
-                &recall_path,
-                "Search ICM memory for: $ARGUMENTS\n\
-                 \n\
-                 Use the icm_memory_recall MCP tool if available, otherwise run:\n\
-                 ```bash\n\
-                 icm recall \"$ARGUMENTS\"\n\
-                 ```\n",
-            )
-            .context("cannot write recall skill")?;
-            println!("[skill] /recall command created.");
-        }
+Use the icm_memory_recall MCP tool if available, otherwise run:
+```bash
+icm recall \"$ARGUMENTS\"
+```
+";
+        let icm_remember_prompt = "\
+Store the following in ICM memory: $ARGUMENTS
 
-        let remember_path = skills_dir.join("remember.md");
-        if remember_path.exists() {
-            println!("[skill] /remember already configured.");
-        } else {
-            std::fs::write(
-                &remember_path,
-                "Store the following in ICM memory: $ARGUMENTS\n\
-                 \n\
-                 Use the icm_memory_store MCP tool if available, otherwise run:\n\
-                 ```bash\n\
-                 icm store -t \"note\" -c \"$ARGUMENTS\"\n\
-                 ```\n",
-            )
-            .context("cannot write remember skill")?;
-            println!("[skill] /remember command created.");
-        }
+Use the icm_memory_store MCP tool if available, otherwise run:
+```bash
+icm store -t \"note\" -c \"$ARGUMENTS\"
+```
+";
+
+        // Claude Code: ~/.claude/commands/
+        let claude_skills_dir = PathBuf::from(&home).join(".claude/commands");
+        install_skill(&claude_skills_dir, "recall.md", icm_recall_prompt, "Claude Code /recall")?;
+        install_skill(&claude_skills_dir, "remember.md", icm_remember_prompt, "Claude Code /remember")?;
+
+        // Cursor: ~/.cursor/rules/ (project or global)
+        let cursor_rules_dir = PathBuf::from(&home).join(".cursor/rules");
+        let cursor_icm_rule = "\
+---
+description: ICM persistent memory for AI agents
+globs:
+alwaysApply: true
+---
+
+This project uses ICM (Infinite Context Memory) for persistent memory.
+
+At the start of each task, recall relevant context:
+- Use `icm_memory_recall` MCP tool or run `icm recall \"topic\"`
+
+After completing significant work, store a summary:
+- Use `icm_memory_store` MCP tool or run `icm store -t \"topic\" -c \"summary\"`
+";
+        install_skill(&cursor_rules_dir, "icm.mdc", cursor_icm_rule, "Cursor rule")?;
+
+        // Roo Code: ~/.roo/rules/ (global)
+        let roo_rules_dir = PathBuf::from(&home).join(".roo/rules");
+        install_skill(&roo_rules_dir, "icm.md", cursor_icm_rule, "Roo Code rule")?;
+
+        // Amp: ~/.config/amp/skills/
+        let amp_skills_dir = PathBuf::from(&home).join(".config/amp/skills");
+        install_skill(&amp_skills_dir, "icm-recall.md", icm_recall_prompt, "Amp /icm-recall")?;
+        install_skill(&amp_skills_dir, "icm-remember.md", icm_remember_prompt, "Amp /icm-remember")?;
     }
 
     println!();
@@ -963,6 +970,19 @@ icm recall \"topic keywords\"\n\
     println!();
     println!("Restart your AI tool to activate.");
 
+    Ok(())
+}
+
+/// Install a skill/rule file if it doesn't exist yet.
+fn install_skill(dir: &PathBuf, filename: &str, content: &str, label: &str) -> Result<()> {
+    std::fs::create_dir_all(dir).ok();
+    let path = dir.join(filename);
+    if path.exists() {
+        println!("[skill] {label} already configured.");
+    } else {
+        std::fs::write(&path, content).with_context(|| format!("cannot write {label}"))?;
+        println!("[skill] {label} created.");
+    }
     Ok(())
 }
 
@@ -988,11 +1008,25 @@ fn inject_mcp_server(
         serde_json::json!({})
     };
 
-    let mcp_servers = config
-        .as_object_mut()
-        .context("config is not a JSON object")?
-        .entry(servers_key)
-        .or_insert_with(|| serde_json::json!({}));
+    // Support nested keys like "amp.mcpServers"
+    let mcp_servers = if servers_key.contains('.') {
+        let parts: Vec<&str> = servers_key.split('.').collect();
+        let obj = config.as_object_mut().context("config is not a JSON object")?;
+        let parent = obj
+            .entry(parts[0])
+            .or_insert_with(|| serde_json::json!({}));
+        parent
+            .as_object_mut()
+            .context("nested key is not an object")?
+            .entry(parts[1])
+            .or_insert_with(|| serde_json::json!({}))
+    } else {
+        config
+            .as_object_mut()
+            .context("config is not a JSON object")?
+            .entry(servers_key)
+            .or_insert_with(|| serde_json::json!({}))
+    };
 
     // Check if already configured with same binary
     if let Some(existing) = mcp_servers.get(name) {
@@ -1071,6 +1105,53 @@ fn inject_codex_mcp_server(
     Ok("configured".into())
 }
 
+/// Inject ICM MCP server into OpenCode config (uses "mcp" key, command is array).
+fn inject_opencode_mcp_server(
+    config_path: &PathBuf,
+    name: &str,
+    icm_bin: &str,
+) -> Result<String> {
+    let mut config: Value = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("invalid JSON in {}", config_path.display()))?
+    } else {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        serde_json::json!({})
+    };
+
+    let mcp = config
+        .as_object_mut()
+        .context("config is not a JSON object")?
+        .entry("mcp")
+        .or_insert_with(|| serde_json::json!({}));
+
+    if let Some(existing) = mcp.get(name) {
+        if let Some(cmd) = existing.get("command").and_then(|v| v.as_array()) {
+            if cmd.first().and_then(|v| v.as_str()) == Some(icm_bin) {
+                return Ok("already configured".into());
+            }
+        }
+    }
+
+    mcp.as_object_mut()
+        .unwrap()
+        .insert(name.to_string(), serde_json::json!({
+            "type": "local",
+            "command": [icm_bin, "serve"],
+            "enabled": true
+        }));
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_path, output)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+
+    Ok("configured".into())
+}
+
 fn cmd_config() -> Result<()> {
     let cfg = config::load_config()?;
     println!("Config: {}", config::show_config_path());
@@ -1088,6 +1169,9 @@ fn cmd_config() -> Result<()> {
     println!("  default_importance = {}", cfg.memory.default_importance);
     println!("  decay_rate = {}", cfg.memory.decay_rate);
     println!("  prune_threshold = {}", cfg.memory.prune_threshold);
+    println!();
+    println!("[embeddings]");
+    println!("  model = {}", cfg.embeddings.model);
     println!();
     println!("[extraction]");
     println!("  enabled = {}", cfg.extraction.enabled);

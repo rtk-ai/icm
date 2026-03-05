@@ -1,3 +1,4 @@
+use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
@@ -122,6 +123,47 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {}
+            }
+        }),
+        json!({
+            "name": "icm_memory_update",
+            "description": "Update an existing memory in-place. Use to correct, refresh, or extend a memory without creating a duplicate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Memory ID to update"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "New content (replaces existing summary)"
+                    },
+                    "importance": {
+                        "type": "string",
+                        "enum": ["critical", "high", "medium", "low"],
+                        "description": "New importance level (optional, keeps existing if not set)"
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "New keywords (optional, keeps existing if not set)"
+                    }
+                },
+                "required": ["id", "content"]
+            }
+        }),
+        json!({
+            "name": "icm_memory_health",
+            "description": "Get health stats for all topics: entry count, staleness, consolidation needs. Use to audit memory hygiene.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Check a specific topic (optional — checks all if omitted)"
+                    }
+                }
             }
         }),
         // --- Memoir tools ---
@@ -339,15 +381,18 @@ pub fn call_tool(
     embedder: Option<&dyn Embedder>,
     name: &str,
     args: &Value,
+    compact: bool,
 ) -> ToolResult {
     match name {
         // Memory tools
-        "icm_memory_store" => tool_store(store, embedder, args),
-        "icm_memory_recall" => tool_recall(store, embedder, args),
+        "icm_memory_store" => tool_store(store, embedder, args, compact),
+        "icm_memory_recall" => tool_recall(store, embedder, args, compact),
         "icm_memory_forget" => tool_forget(store, args),
+        "icm_memory_update" => tool_update(store, embedder, args),
         "icm_memory_consolidate" => tool_consolidate(store, args),
         "icm_memory_list_topics" => tool_list_topics(store),
         "icm_memory_stats" => tool_stats(store),
+        "icm_memory_health" => tool_health(store, args),
         "icm_memory_embed_all" => tool_embed_all(store, embedder, args),
         // Memoir tools
         "icm_memoir_create" => tool_memoir_create(store, args),
@@ -386,7 +431,7 @@ fn resolve_memoir(store: &SqliteStore, name: &str) -> Result<Memoir, ToolResult>
 // Memory tool handlers
 // ---------------------------------------------------------------------------
 
-fn tool_store(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
+fn tool_store(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value, compact: bool) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -422,13 +467,72 @@ fn tool_store(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value
         }
     }
 
+    // Dedup check: if a very similar memory exists in the same topic, update it instead
+    if let Some(emb) = embedder {
+        let text = format!("{topic} {content}");
+        if let Ok(query_emb) = emb.embed(&text) {
+            if let Ok(similar) = store.search_hybrid(&text, &query_emb, 1) {
+                if let Some((existing, score)) = similar.first() {
+                    if score > &0.85 && existing.topic == topic {
+                        // Very similar content in same topic — update instead of duplicate
+                        let mut updated = existing.clone();
+                        updated.summary = content.to_string();
+                        updated.updated_at = Utc::now();
+                        updated.weight = 1.0; // Reset weight on update
+                        if let Some(raw) = get_str(args, "raw_excerpt") {
+                            updated.raw_excerpt = Some(raw.into());
+                        }
+                        if let Some(keywords_arr) = args.get("keywords").and_then(|v| v.as_array())
+                        {
+                            updated.keywords = keywords_arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                        }
+                        updated.importance = importance;
+                        updated.embedding = Some(query_emb);
+                        if let Err(e) = store.update(&updated) {
+                            return ToolResult::error(format!("failed to update: {e}"));
+                        }
+                        return if compact {
+                            ToolResult::text(format!("ok:{}", updated.id))
+                        } else {
+                            ToolResult::text(format!(
+                                "Updated existing memory (similarity {score:.2}): {}",
+                                updated.id
+                            ))
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     match store.store(memory) {
-        Ok(id) => ToolResult::text(format!("Stored memory: {id}")),
+        Ok(id) => {
+            if compact {
+                ToolResult::text(format!("ok:{id}"))
+            } else {
+                // Check if topic needs consolidation
+                let hint = if let Ok(count) = store.count_by_topic(topic) {
+                    if count > 7 {
+                        format!(
+                            "\n⚠ Topic '{topic}' has {count} entries — consider consolidating with icm_memory_consolidate."
+                        )
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                ToolResult::text(format!("Stored memory: {id}{hint}"))
+            }
+        }
         Err(e) => ToolResult::error(format!("failed to store: {e}")),
     }
 }
 
-fn tool_recall(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
+fn tool_recall(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value, compact: bool) -> ToolResult {
     // Auto-decay if >24h since last decay
     let _ = store.maybe_auto_decay();
 
@@ -463,18 +567,24 @@ fn tool_recall(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Valu
                 }
 
                 let mut output = String::new();
-                for (mem, score) in &scored_results {
-                    output.push_str(&format!(
-                        "--- {} [score: {:.3}] ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
-                        mem.id, score, mem.topic, mem.importance, mem.weight, mem.summary
-                    ));
-                    if !mem.keywords.is_empty() {
-                        output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
+                if compact {
+                    for (mem, _) in &scored_results {
+                        output.push_str(&format!("[{}] {}\n", mem.topic, mem.summary));
                     }
-                    if let Some(ref raw) = mem.raw_excerpt {
-                        output.push_str(&format!("  raw: {raw}\n"));
+                } else {
+                    for (mem, score) in &scored_results {
+                        output.push_str(&format!(
+                            "--- {} [score: {:.3}] ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
+                            mem.id, score, mem.topic, mem.importance, mem.weight, mem.summary
+                        ));
+                        if !mem.keywords.is_empty() {
+                            output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
+                        }
+                        if let Some(ref raw) = mem.raw_excerpt {
+                            output.push_str(&format!("  raw: {raw}\n"));
+                        }
+                        output.push('\n');
                     }
-                    output.push('\n');
                 }
                 return ToolResult::text(output);
             }
@@ -512,18 +622,24 @@ fn tool_recall(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Valu
     }
 
     let mut output = String::new();
-    for mem in &results {
-        output.push_str(&format!(
-            "--- {} ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
-            mem.id, mem.topic, mem.importance, mem.weight, mem.summary
-        ));
-        if !mem.keywords.is_empty() {
-            output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
+    if compact {
+        for mem in &results {
+            output.push_str(&format!("[{}] {}\n", mem.topic, mem.summary));
         }
-        if let Some(ref raw) = mem.raw_excerpt {
-            output.push_str(&format!("  raw: {raw}\n"));
+    } else {
+        for mem in &results {
+            output.push_str(&format!(
+                "--- {} ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
+                mem.id, mem.topic, mem.importance, mem.weight, mem.summary
+            ));
+            if !mem.keywords.is_empty() {
+                output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
+            }
+            if let Some(ref raw) = mem.raw_excerpt {
+                output.push_str(&format!("  raw: {raw}\n"));
+            }
+            output.push('\n');
         }
-        output.push('\n');
     }
 
     ToolResult::text(output)
@@ -592,6 +708,112 @@ fn tool_stats(store: &SqliteStore) -> ToolResult {
         }
         Err(e) => ToolResult::error(format!("failed to get stats: {e}")),
     }
+}
+
+fn tool_update(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
+    let id = match get_str(args, "id") {
+        Some(id) => id,
+        None => return ToolResult::error("missing required field: id".into()),
+    };
+    let content = match get_str(args, "content") {
+        Some(c) => c,
+        None => return ToolResult::error("missing required field: content".into()),
+    };
+
+    let mut memory = match store.get(id) {
+        Ok(Some(m)) => m,
+        Ok(None) => return ToolResult::error(format!("memory not found: {id}")),
+        Err(e) => return ToolResult::error(format!("db error: {e}")),
+    };
+
+    memory.summary = content.to_string();
+    memory.updated_at = Utc::now();
+    memory.weight = 1.0; // Reset weight on update (refreshed content)
+
+    if let Some(imp_str) = get_str(args, "importance") {
+        if let Ok(imp) = imp_str.parse() {
+            memory.importance = imp;
+        }
+    }
+
+    if let Some(keywords_arr) = args.get("keywords").and_then(|v| v.as_array()) {
+        memory.keywords = keywords_arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+    }
+
+    // Re-embed if embedder available
+    if let Some(emb) = embedder {
+        let text = format!("{} {}", memory.topic, content);
+        if let Ok(vec) = emb.embed(&text) {
+            memory.embedding = Some(vec);
+        }
+    }
+
+    match store.update(&memory) {
+        Ok(()) => ToolResult::text(format!("Updated memory: {id}")),
+        Err(e) => ToolResult::error(format!("failed to update: {e}")),
+    }
+}
+
+fn tool_health(store: &SqliteStore, args: &Value) -> ToolResult {
+    let specific_topic = get_str(args, "topic");
+
+    let topics = if let Some(t) = specific_topic {
+        vec![(t.to_string(), 0usize)]
+    } else {
+        match store.list_topics() {
+            Ok(t) => t,
+            Err(e) => return ToolResult::error(format!("failed to list topics: {e}")),
+        }
+    };
+
+    if topics.is_empty() {
+        return ToolResult::text("No topics yet.".into());
+    }
+
+    let mut output = String::from("Memory Health Report:\n\n");
+    let mut total_stale = 0usize;
+    let mut topics_needing_consolidation = 0usize;
+
+    for (topic, _) in &topics {
+        match store.topic_health(topic) {
+            Ok(health) => {
+                let status = if health.needs_consolidation && health.stale_count > 0 {
+                    "⚠ NEEDS ATTENTION"
+                } else if health.needs_consolidation {
+                    "⚠ consolidate"
+                } else if health.stale_count > 0 {
+                    "○ has stale entries"
+                } else {
+                    "✓ healthy"
+                };
+
+                output.push_str(&format!(
+                    "  {topic}: {status}\n    entries: {}  avg_weight: {:.2}  stale: {}  avg_access: {:.1}\n",
+                    health.entry_count, health.avg_weight, health.stale_count, health.avg_access_count
+                ));
+
+                if health.needs_consolidation {
+                    topics_needing_consolidation += 1;
+                }
+                total_stale += health.stale_count;
+            }
+            Err(_) => {
+                output.push_str(&format!("  {topic}: (error reading)\n"));
+            }
+        }
+    }
+
+    output.push_str(&format!(
+        "\nSummary: {} topics, {} need consolidation, {} stale entries total\n",
+        topics.len(),
+        topics_needing_consolidation,
+        total_stale
+    ));
+
+    ToolResult::text(output)
 }
 
 fn tool_embed_all(

@@ -80,6 +80,8 @@ pub struct RecallConfig {
 #[serde(default)]
 pub struct McpConfig {
     pub transport: String,
+    /// Compact mode: shorter MCP responses to save tokens (default: true).
+    pub compact: bool,
     /// Custom system instructions appended to MCP server info.
     pub instructions: Option<String>,
 }
@@ -119,6 +121,7 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             transport: "stdio".into(),
+            compact: true,
             instructions: None,
         }
     }
@@ -180,6 +183,7 @@ mod tests {
         assert!(config.extraction.enabled);
         assert_eq!(config.memory.decay_rate, 0.95);
         assert_eq!(config.recall.limit, 15);
+        assert!(config.mcp.compact);
     }
 
     #[test]

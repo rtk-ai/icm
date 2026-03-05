@@ -614,7 +614,9 @@ fn main() -> Result<()> {
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
-            icm_mcp::run_server(&store, emb_ref, compact)
+            // --compact flag overrides, otherwise use config (default: true)
+            let use_compact = compact || cfg.mcp.compact;
+            icm_mcp::run_server(&store, emb_ref, use_compact)
         }
     }
 }
@@ -1380,6 +1382,7 @@ fn cmd_config() -> Result<()> {
     println!();
     println!("[mcp]");
     println!("  transport = {}", cfg.mcp.transport);
+    println!("  compact = {}", cfg.mcp.compact);
     if let Some(ref instr) = cfg.mcp.instructions {
         println!("  instructions = {instr}");
     }

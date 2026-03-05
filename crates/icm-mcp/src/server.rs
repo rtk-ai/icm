@@ -117,14 +117,6 @@ STORE (icm_memory_store): Automatically store important information:\n\
 - User preferences discovered in session → topic: \"preferences\"\n\
 - Project context after significant work → topic: \"context-{project}\"\n\
 \n\
-IMPORTANT — Store frequently. Your context window will be compacted without warning, and \
-any unstored information will be lost forever. Store after:\n\
-- Resolving a bug or error\n\
-- Making an architecture or design decision\n\
-- Discovering a user preference\n\
-- Completing a significant piece of work\n\
-If ICM reminds you to store, do it immediately.\n\
-\n\
 Do NOT store: trivial details, information already in CLAUDE.md, ephemeral state.\n\
 \n\
 Importance levels: critical (never forgotten), high (slow decay), medium (normal), low (fast decay).";

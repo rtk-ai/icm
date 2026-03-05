@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/rtk-ai/icm/actions/workflows/ci.yml"><img src="https://github.com/rtk-ai/icm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/rtk-ai/icm/releases/latest"><img src="https://img.shields.io/github/v/release/rtk-ai/icm?color=purple" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Source--Available-orange.svg" alt="Source-Available"></a>
 </p>
 
 ---
@@ -367,4 +367,4 @@ All benchmarks use **real API calls** — no mocks, no simulated responses, no c
 
 ## License
 
-[MIT](LICENSE)
+[Source-Available](LICENSE) — Free for individuals and teams ≤ 20 people. Enterprise license required for larger organizations. Contact: license@rtk.ai

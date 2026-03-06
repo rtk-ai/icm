@@ -2196,10 +2196,7 @@ mod tests {
     fn test_sql_injection_in_keywords() {
         let store = test_store();
         let mut mem = make_memory("test", "keyword injection");
-        mem.keywords = vec![
-            "normal".into(),
-            "'; DROP TABLE memories; --".into(),
-        ];
+        mem.keywords = vec!["normal".into(), "'; DROP TABLE memories; --".into()];
         store.store(mem).unwrap();
         assert_eq!(store.count().unwrap(), 1);
 
@@ -2266,11 +2263,17 @@ mod tests {
         let store = test_store();
         for i in 0..50 {
             store
-                .store(make_memory("lang", &format!("programming language number {i}")))
+                .store(make_memory(
+                    "lang",
+                    &format!("programming language number {i}"),
+                ))
                 .unwrap();
         }
         store
-            .store(make_memory("unique", "Rust is a memory-safe systems language"))
+            .store(make_memory(
+                "unique",
+                "Rust is a memory-safe systems language",
+            ))
             .unwrap();
 
         let results = store.search_fts("memory-safe systems", 10).unwrap();
@@ -2407,5 +2410,150 @@ mod tests {
         let results = store.search_by_embedding(&vec![0.3; 384], 5).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.id, id);
+    }
+
+    #[test]
+    fn perf_store_1000() {
+        let store = test_store();
+        let start = std::time::Instant::now();
+        for i in 0..1000 {
+            store
+                .store(make_memory("perf", &format!("memory number {i}")))
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 2000,
+            "1000 stores took {}ms (max 2000ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_store_with_embeddings_1000() {
+        let store = test_store();
+        let start = std::time::Instant::now();
+        for i in 0..1000 {
+            let mut mem = make_memory("perf", &format!("embedded memory {i}"));
+            mem.embedding = Some(vec![0.1; 384]);
+            store.store(mem).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 3000,
+            "1000 stores+embedding took {}ms (max 3000ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_fts_search_100() {
+        let store = test_store();
+        for i in 0..500 {
+            store
+                .store(make_memory(
+                    "lang",
+                    &format!("programming language {i} with features"),
+                ))
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            store
+                .search_fts("programming language features", 10)
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 1000,
+            "100 FTS searches took {}ms (max 1000ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_vector_search_100() {
+        let store = test_store();
+        for i in 0..500 {
+            let mut mem = make_memory("vec", &format!("vector memory {i}"));
+            let mut emb = vec![0.0; 384];
+            emb[i % 384] = 1.0;
+            mem.embedding = Some(emb);
+            store.store(mem).unwrap();
+        }
+        let query = vec![0.5; 384];
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            store.search_by_embedding(&query, 10).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 5000,
+            "100 vector searches took {}ms (max 5000ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_hybrid_search_100() {
+        let store = test_store();
+        for i in 0..500 {
+            let mut mem = make_memory("hybrid", &format!("hybrid searchable memory {i}"));
+            mem.embedding = Some(vec![0.1; 384]);
+            store.store(mem).unwrap();
+        }
+        let query_emb = vec![0.1; 384];
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            store
+                .search_hybrid("hybrid searchable", &query_emb, 10)
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 10000,
+            "100 hybrid searches took {}ms (max 10000ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_decay_1000() {
+        let store = test_store();
+        for i in 0..1000 {
+            store
+                .store(make_memory("decay", &format!("decayable {i}")))
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        store.apply_decay(0.95).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 500,
+            "decay on 1000 memories took {}ms (max 500ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_get_by_id_1000() {
+        let store = test_store();
+        let mut ids = Vec::new();
+        for i in 0..1000 {
+            let mem = make_memory("get", &format!("lookup {i}"));
+            let id = mem.id.clone();
+            store.store(mem).unwrap();
+            ids.push(id);
+        }
+        let start = std::time::Instant::now();
+        for id in &ids {
+            store.get(id).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 1000,
+            "1000 gets took {}ms (max 1000ms)",
+            elapsed.as_millis()
+        );
     }
 }

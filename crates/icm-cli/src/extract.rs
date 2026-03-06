@@ -222,6 +222,95 @@ fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)>
             score += 1.0;
         }
 
+        // --- Dev tool signals (Claude Code hook context) ---
+
+        // Bug fixes and error resolution
+        for kw in &[
+            "fixed",
+            "resolved",
+            "bug",
+            "workaround",
+            "root cause",
+            "regression",
+            "patch",
+        ] {
+            if lower.contains(kw) {
+                score += 2.5;
+                importance = Importance::High;
+            }
+        }
+
+        // Configuration and setup
+        for kw in &[
+            "configured",
+            "installed",
+            "migrated",
+            "upgraded",
+            "downgraded",
+            "enabled",
+            "disabled",
+            "deprecated",
+        ] {
+            if lower.contains(kw) {
+                score += 2.0;
+            }
+        }
+
+        // Error patterns from tool outputs
+        for kw in &[
+            "error:",
+            "failed:",
+            "warning:",
+            "panic",
+            "traceback",
+            "exception",
+            "denied",
+            "unauthorized",
+            "not found",
+            "timed out",
+        ] {
+            if lower.contains(kw) {
+                score += 2.0;
+            }
+        }
+
+        // Version and release info
+        for kw in &[
+            "version",
+            "release",
+            "v0.",
+            "v1.",
+            "v2.",
+            "changelog",
+            "breaking change",
+        ] {
+            if lower.contains(kw) {
+                score += 1.5;
+            }
+        }
+
+        // Provider / infrastructure context
+        for kw in &[
+            "provider",
+            "database",
+            "credential",
+            "endpoint",
+            "webhook",
+            "api key",
+            "token",
+            "connection",
+            "cluster",
+        ] {
+            if lower.contains(kw) {
+                score += 1.5;
+            }
+        }
+
+        // File paths and code locations
+        if s.contains('/') && (lower.contains(".rs") || lower.contains(".ts") || lower.contains(".py") || lower.contains(".toml") || lower.contains(".json")) {
+            score += 1.5;
+        }
+
         if score >= 3.0 {
             scored.push((score, s.to_string(), importance));
         }
@@ -310,6 +399,27 @@ mod tests {
             "Matrix operations use cofactor expansion",
             "Complex numbers use conjugate division"
         ));
+    }
+
+    #[test]
+    fn test_extract_dev_signals_bugfix() {
+        let text = "Fixed NOT_ANY condition: was using check_all instead of check_some in evaluator.rs";
+        let facts = extract_facts(text, "test");
+        assert!(!facts.is_empty(), "should extract bug fix facts");
+    }
+
+    #[test]
+    fn test_extract_dev_signals_error() {
+        let text = "Error: Provider configuration error: Missing Proxmox VE API Endpoint";
+        let facts = extract_facts(text, "test");
+        assert!(!facts.is_empty(), "should extract error facts");
+    }
+
+    #[test]
+    fn test_extract_dev_signals_config() {
+        let text = "Configured release-please for Cargo workspace with simple release-type instead of rust";
+        let facts = extract_facts(text, "test");
+        assert!(!facts.is_empty(), "should extract config facts");
     }
 
     #[test]

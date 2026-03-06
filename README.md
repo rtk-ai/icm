@@ -365,6 +365,14 @@ All benchmarks use **real API calls** — no mocks, no simulated responses, no c
 - **Knowledge retention**: Uses a fictional technical document (the "Meridian Protocol"). Scores answers by keyword matching against expected facts. 120s timeout per invocation.
 - **Isolation**: Each run uses its own tempdir and fresh SQLite DB. No session persistence.
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Technical Architecture](docs/architecture.md) | Crate structure, search pipeline, decay model, sqlite-vec integration, testing |
+| [User Guide](docs/guide.md) | Installation, topic organization, consolidation, extraction, troubleshooting |
+| [Product Overview](docs/product.md) | Use cases, benchmarks, comparison with alternatives |
+
 ## License
 
 [Source-Available](LICENSE) — Free for individuals and teams ≤ 20 people. Enterprise license required for larger organizations. Contact: license@rtk.ai

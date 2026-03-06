@@ -101,3 +101,107 @@ impl ToolResult {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_tool_result_text() {
+        let result = ToolResult::text("hello".into());
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].text, "hello");
+        assert_eq!(result.content[0].content_type, "text");
+    }
+
+    #[test]
+    fn test_tool_result_error() {
+        let result = ToolResult::error("boom".into());
+        assert!(result.is_error);
+        assert_eq!(result.content[0].text, "boom");
+    }
+
+    #[test]
+    fn test_append_hint() {
+        let mut result = ToolResult::text("original".into());
+        result.append_hint("\n[nudge]");
+        assert_eq!(result.content[0].text, "original\n[nudge]");
+    }
+
+    #[test]
+    fn test_append_hint_empty_content() {
+        let mut result = ToolResult {
+            content: vec![],
+            is_error: false,
+        };
+        result.append_hint("[hint]");
+        assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn test_jsonrpc_ok() {
+        let resp = JsonRpcResponse::ok(json!(1), json!({"status": "ok"}));
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert_eq!(resp.id, json!(1));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_err() {
+        let resp = JsonRpcResponse::err(json!(2), -32600, "bad request".into());
+        assert!(resp.result.is_none());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32600);
+        assert_eq!(err.message, "bad request");
+    }
+
+    #[test]
+    fn test_jsonrpc_method_not_found() {
+        let resp = JsonRpcResponse::method_not_found(json!(3), "tools/execute");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32601);
+        assert!(err.message.contains("tools/execute"));
+    }
+
+    #[test]
+    fn test_jsonrpc_parse_valid() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":null}"#;
+        let msg: JsonRpcMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.method.as_deref(), Some("ping"));
+        assert_eq!(msg.id, Some(json!(1)));
+    }
+
+    #[test]
+    fn test_jsonrpc_parse_missing_method() {
+        let raw = r#"{"jsonrpc":"2.0","id":1}"#;
+        let msg: JsonRpcMessage = serde_json::from_str(raw).unwrap();
+        assert!(msg.method.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_parse_invalid_json() {
+        let raw = r#"not json at all"#;
+        let result: Result<JsonRpcMessage, _> = serde_json::from_str(raw);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tool_result_serializes_correctly() {
+        let result = ToolResult::text("hello".into());
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "hello");
+        // isError should be absent when false (skip_serializing_if)
+        assert!(json.get("isError").is_none());
+    }
+
+    #[test]
+    fn test_error_result_serializes_is_error() {
+        let result = ToolResult::error("fail".into());
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["isError"], true);
+    }
+}

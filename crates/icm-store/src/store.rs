@@ -2157,6 +2157,236 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_injection_in_topic() {
+        let store = test_store();
+        let mem = make_memory("'; DROP TABLE memories; --", "should be safe");
+        store.store(mem.clone()).unwrap();
+
+        let retrieved = store.get(&mem.id).unwrap().unwrap();
+        assert_eq!(retrieved.topic, "'; DROP TABLE memories; --");
+        assert_eq!(store.count().unwrap(), 1);
+        let topics = store.list_topics().unwrap();
+        assert_eq!(topics.len(), 1);
+    }
+
+    #[test]
+    fn test_sql_injection_in_summary() {
+        let store = test_store();
+        let mem = make_memory("test", "value'); DELETE FROM memories WHERE ('1'='1");
+        store.store(mem).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_sql_injection_in_fts_query() {
+        let store = test_store();
+        store
+            .store(make_memory("test", "normal content here"))
+            .unwrap();
+
+        // FTS5 injection attempts
+        let results = store.search_fts("') OR 1=1 --", 10).unwrap();
+        assert!(results.is_empty() || results.len() <= 1);
+
+        let results = store.search_fts("NEAR(a b)", 10).unwrap();
+        let _ = results;
+    }
+
+    #[test]
+    fn test_sql_injection_in_keywords() {
+        let store = test_store();
+        let mut mem = make_memory("test", "keyword injection");
+        mem.keywords = vec![
+            "normal".into(),
+            "'; DROP TABLE memories; --".into(),
+        ];
+        store.store(mem).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+
+        let results = store
+            .search_by_keywords(&["'; DROP TABLE memories; --"], 10)
+            .unwrap();
+        let _ = results;
+    }
+
+    #[test]
+    fn test_null_bytes_in_content() {
+        let store = test_store();
+        let mem = make_memory("test", "before\0after");
+        store.store(mem.clone()).unwrap();
+        let retrieved = store.get(&mem.id).unwrap().unwrap();
+        assert!(retrieved.summary.contains("before"));
+    }
+
+    #[test]
+    fn test_unicode_boundary_content() {
+        let store = test_store();
+        let unicode_topic = "\u{1F600}\u{1F4A9}\u{0000}";
+        let mem = make_memory(unicode_topic, "emoji topic");
+        store.store(mem.clone()).unwrap();
+        let retrieved = store.get(&mem.id).unwrap().unwrap();
+        assert!(retrieved.topic.starts_with('\u{1F600}'));
+    }
+
+    #[test]
+    fn test_very_long_summary() {
+        let store = test_store();
+        let long_summary = "a".repeat(100_000);
+        let mem = make_memory("test", &long_summary);
+        store.store(mem.clone()).unwrap();
+        let retrieved = store.get(&mem.id).unwrap().unwrap();
+        assert_eq!(retrieved.summary.len(), 100_000);
+    }
+
+    #[test]
+    fn test_empty_strings() {
+        let store = test_store();
+        let mem = make_memory("", "");
+        store.store(mem.clone()).unwrap();
+        let retrieved = store.get(&mem.id).unwrap().unwrap();
+        assert_eq!(retrieved.topic, "");
+        assert_eq!(retrieved.summary, "");
+    }
+
+    #[test]
+    fn test_bulk_insert_100() {
+        let store = test_store();
+        for i in 0..100 {
+            store
+                .store(make_memory("bulk", &format!("memory number {i}")))
+                .unwrap();
+        }
+        assert_eq!(store.count().unwrap(), 100);
+        let by_topic = store.get_by_topic("bulk").unwrap();
+        assert_eq!(by_topic.len(), 100);
+    }
+
+    #[test]
+    fn test_fts_search_many_entries() {
+        let store = test_store();
+        for i in 0..50 {
+            store
+                .store(make_memory("lang", &format!("programming language number {i}")))
+                .unwrap();
+        }
+        store
+            .store(make_memory("unique", "Rust is a memory-safe systems language"))
+            .unwrap();
+
+        let results = store.search_fts("memory-safe systems", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].topic, "unique");
+    }
+
+    #[test]
+    fn test_decay_bulk() {
+        let store = test_store();
+        for i in 0..50 {
+            let mut mem = make_memory("decay", &format!("entry {i}"));
+            if i % 5 == 0 {
+                mem.importance = Importance::Critical;
+            }
+            store.store(mem).unwrap();
+        }
+        // 10 critical, 40 non-critical
+        let affected = store.apply_decay(0.9).unwrap();
+        assert_eq!(affected, 40);
+    }
+
+    #[test]
+    fn test_prune_leaves_important() {
+        let store = test_store();
+        for i in 0..20 {
+            let mut mem = make_memory("prune", &format!("entry {i}"));
+            mem.weight = if i < 10 { 0.01 } else { 0.5 };
+            store.store(mem).unwrap();
+        }
+        let pruned = store.prune(0.1).unwrap();
+        assert_eq!(pruned, 10);
+        assert_eq!(store.count().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_many_topics_listing() {
+        let store = test_store();
+        for i in 0..30 {
+            store
+                .store(make_memory(&format!("topic-{i}"), &format!("content {i}")))
+                .unwrap();
+        }
+        let topics = store.list_topics().unwrap();
+        assert_eq!(topics.len(), 30);
+    }
+
+    #[test]
+    fn test_consolidate_large_topic() {
+        let store = test_store();
+        for i in 0..25 {
+            store
+                .store(make_memory("big-topic", &format!("detail {i}")))
+                .unwrap();
+        }
+        let consolidated = make_memory("big-topic", "consolidated summary of 25 entries");
+        store.consolidate_topic("big-topic", consolidated).unwrap();
+        let remaining = store.get_by_topic("big-topic").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].summary.contains("consolidated"));
+    }
+
+    #[test]
+    fn test_get_by_topic_returns_sorted_by_weight() {
+        let store = test_store();
+        let mut low = make_memory("ux", "low weight");
+        low.weight = 0.3;
+        store.store(low).unwrap();
+
+        let mut high = make_memory("ux", "high weight");
+        high.weight = 0.9;
+        store.store(high).unwrap();
+
+        let results = store.get_by_topic("ux").unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].weight >= results[1].weight);
+    }
+
+    #[test]
+    fn test_update_access_increments_correctly() {
+        let store = test_store();
+        let mem = make_memory("ux", "access counter");
+        let id = mem.id.clone();
+        store.store(mem).unwrap();
+
+        for _ in 0..5 {
+            store.update_access(&id).unwrap();
+        }
+        let retrieved = store.get(&id).unwrap().unwrap();
+        assert_eq!(retrieved.access_count, 5);
+    }
+
+    #[test]
+    fn test_stats_on_empty_store() {
+        let store = test_store();
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.total_memories, 0);
+        assert_eq!(stats.total_topics, 0);
+        assert_eq!(stats.avg_weight, 0.0);
+        assert!(stats.oldest_memory.is_none());
+        assert!(stats.newest_memory.is_none());
+    }
+
+    #[test]
+    fn test_double_delete_returns_not_found() {
+        let store = test_store();
+        let mem = make_memory("ux", "delete twice");
+        let id = mem.id.clone();
+        store.store(mem).unwrap();
+
+        store.delete(&id).unwrap();
+        let result = store.delete(&id);
+        assert!(matches!(result, Err(IcmError::NotFound(_))));
+    }
+
+    #[test]
     fn test_update_syncs_embedding() {
         let store = test_store();
         let mut mem = make_memory("test", "before update");

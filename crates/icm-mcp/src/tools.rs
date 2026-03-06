@@ -1228,6 +1228,359 @@ fn tool_memoir_link(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_store() -> SqliteStore {
+        SqliteStore::in_memory().unwrap()
+    }
+
+    #[test]
+    fn test_unknown_tool_returns_error() {
+        let store = test_store();
+        let result = call_tool(&store, None, "nonexistent_tool", &json!({}), false);
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("unknown tool"));
+    }
+
+    #[test]
+    fn test_store_missing_topic() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"content": "hello"}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("topic"));
+    }
+
+    #[test]
+    fn test_store_missing_content() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "test"}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("content"));
+    }
+
+    #[test]
+    fn test_recall_missing_query() {
+        let store = test_store();
+        let result = call_tool(&store, None, "icm_memory_recall", &json!({}), false);
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("query"));
+    }
+
+    #[test]
+    fn test_recall_empty_store() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "anything"}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("No memories"));
+    }
+
+    #[test]
+    fn test_forget_missing_id() {
+        let store = test_store();
+        let result = call_tool(&store, None, "icm_memory_forget", &json!({}), false);
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("id"));
+    }
+
+    #[test]
+    fn test_forget_nonexistent_id() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_forget",
+            &json!({"id": "does-not-exist"}),
+            false,
+        );
+        assert!(result.is_error);
+    }
+
+    #[test]
+    fn test_store_and_recall_roundtrip() {
+        let store = test_store();
+        let store_result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "test-project", "content": "Uses Rust and SQLite"}),
+            false,
+        );
+        assert!(!store_result.is_error);
+        assert!(store_result.content[0].text.contains("Stored memory"));
+
+        let recall_result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "Rust SQLite"}),
+            false,
+        );
+        assert!(!recall_result.is_error);
+        assert!(recall_result.content[0].text.contains("Rust"));
+    }
+
+    #[test]
+    fn test_compact_store_output() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "t", "content": "c"}),
+            true,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.starts_with("ok:"));
+    }
+
+    #[test]
+    fn test_compact_recall_output() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "proj", "content": "Rust memory system"}),
+            false,
+        );
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "Rust memory"}),
+            true,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("[proj]"));
+    }
+
+    #[test]
+    fn test_stats_empty() {
+        let store = test_store();
+        let result = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("Memories: 0"));
+    }
+
+    #[test]
+    fn test_list_topics_empty() {
+        let store = test_store();
+        let result = call_tool(&store, None, "icm_memory_list_topics", &json!({}), false);
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("No topics"));
+    }
+
+    #[test]
+    fn test_health_empty() {
+        let store = test_store();
+        let result = call_tool(&store, None, "icm_memory_health", &json!({}), false);
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("No topics"));
+    }
+
+    #[test]
+    fn test_update_missing_fields() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_update",
+            &json!({"id": "x"}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("content"));
+    }
+
+    #[test]
+    fn test_update_nonexistent() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_update",
+            &json!({"id": "fake", "content": "new"}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("not found"));
+    }
+
+    #[test]
+    fn test_store_sql_injection_topic() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "'; DROP TABLE memories;--", "content": "pwned"}),
+            false,
+        );
+        assert!(!result.is_error);
+        let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
+        assert!(stats.content[0].text.contains("Memories: 1"));
+    }
+
+    #[test]
+    fn test_recall_injection_query() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "safe", "content": "normal data"}),
+            false,
+        );
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "') OR 1=1 --"}),
+            false,
+        );
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn test_store_xss_in_content() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "xss",
+                "content": "<script>alert('xss')</script>"
+            }),
+            false,
+        );
+        assert!(!result.is_error);
+        let recall = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "script alert"}),
+            false,
+        );
+        assert!(recall.content[0].text.contains("<script>"));
+    }
+
+    #[test]
+    fn test_store_very_large_content() {
+        let store = test_store();
+        let huge = "x".repeat(500_000);
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "big", "content": huge}),
+            false,
+        );
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn test_memoir_create_injection() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memoir_create",
+            &json!({"name": "'; DROP TABLE memoirs;--", "description": "test"}),
+            false,
+        );
+        assert!(!result.is_error);
+        let list = call_tool(&store, None, "icm_memoir_list", &json!({}), false);
+        assert!(!list.is_error);
+        assert!(list.content[0].text.contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn test_store_many_via_mcp() {
+        let store = test_store();
+        for i in 0..50 {
+            let result = call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({"topic": "perf", "content": format!("item {i}")}),
+                true,
+            );
+            assert!(!result.is_error);
+        }
+        let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
+        assert!(stats.content[0].text.contains("Memories: 50"));
+    }
+
+    #[test]
+    fn test_recall_with_topic_filter() {
+        let store = test_store();
+        for topic in &["alpha", "beta", "gamma"] {
+            call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({"topic": topic, "content": format!("data for {topic}")}),
+                false,
+            );
+        }
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "data", "topic": "beta"}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("beta"));
+        assert!(!result.content[0].text.contains("alpha"));
+    }
+
+    #[test]
+    fn test_consolidate_via_mcp() {
+        let store = test_store();
+        for i in 0..10 {
+            call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({"topic": "consolidate-me", "content": format!("detail {i}")}),
+                false,
+            );
+        }
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_consolidate",
+            &json!({"topic": "consolidate-me", "summary": "All 10 details merged"}),
+            false,
+        );
+        assert!(!result.is_error);
+        let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
+        assert!(stats.content[0].text.contains("Memories: 1"));
+    }
+}
+
 fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
     let memoir_name = match get_str(args, "memoir") {
         Some(n) => n,

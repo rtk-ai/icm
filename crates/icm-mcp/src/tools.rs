@@ -1579,6 +1579,210 @@ mod tests {
         let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
         assert!(stats.content[0].text.contains("Memories: 1"));
     }
+
+    // === Security tests ===
+
+    #[test]
+    fn test_path_traversal_in_topic() {
+        let store = test_store();
+        let malicious_topics = [
+            "../../../etc/passwd",
+            "..\\..\\windows\\system32",
+            "/etc/shadow",
+            "topic/../../secret",
+            "....//....//etc/passwd",
+        ];
+        for topic in &malicious_topics {
+            let result = call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({"topic": topic, "content": "path traversal attempt"}),
+                false,
+            );
+            // Should either store safely (topic is just a string label) or reject
+            // but must NOT crash or access filesystem
+            assert!(!result.content.is_empty());
+        }
+        let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
+        assert!(!stats.is_error);
+    }
+
+    #[test]
+    fn test_extremely_long_content_over_1mb() {
+        let store = test_store();
+        let huge_content = "A".repeat(1_100_000); // ~1.1MB
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "huge", "content": huge_content}),
+            false,
+        );
+        // Should either store or reject gracefully, never panic
+        assert!(!result.content.is_empty());
+    }
+
+    #[test]
+    fn test_null_bytes_in_topic() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "before\0after", "content": "null byte topic"}),
+            false,
+        );
+        assert!(!result.content.is_empty());
+    }
+
+    #[test]
+    fn test_null_bytes_in_content() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "test", "content": "start\0middle\0end"}),
+            false,
+        );
+        assert!(!result.content.is_empty());
+    }
+
+    #[test]
+    fn test_null_bytes_in_query() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "safe", "content": "normal data"}),
+            false,
+        );
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "normal\0injected"}),
+            false,
+        );
+        assert!(!result.content.is_empty());
+    }
+
+    #[test]
+    fn test_unicode_rtl_and_zero_width_chars() {
+        let store = test_store();
+        // Right-to-left override, zero-width joiners, bidi markers
+        let tricky_strings = [
+            "\u{202E}reversed\u{202C}",                  // RTL override
+            "normal\u{200B}zero\u{200B}width",           // zero-width space
+            "\u{FEFF}bom_prefix",                         // BOM
+            "a\u{0300}\u{0301}\u{0302}\u{0303}combining", // stacked combining marks
+            "\u{200D}\u{200D}\u{200D}",                   // zero-width joiners only
+        ];
+        for s in &tricky_strings {
+            let result = call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({"topic": s, "content": format!("content with {s}")}),
+                false,
+            );
+            assert!(!result.is_error, "Failed on unicode string: {:?}", s);
+        }
+        let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
+        assert!(!stats.is_error);
+    }
+
+    #[test]
+    fn test_json_injection_in_params() {
+        let store = test_store();
+        // Attempt to inject extra JSON fields
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "test",
+                "content": "legit",
+                "__proto__": {"admin": true},
+                "constructor": {"prototype": {"isAdmin": true}},
+                "extra_unknown_field": "should be ignored"
+            }),
+            false,
+        );
+        // Should store normally, ignoring unknown fields
+        assert!(!result.is_error);
+        let recall = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "legit"}),
+            false,
+        );
+        assert!(!recall.is_error);
+        assert!(recall.content[0].text.contains("legit"));
+    }
+
+    #[test]
+    fn test_empty_topic_field() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "", "content": "empty topic"}),
+            false,
+        );
+        // Should either reject or store; must not panic
+        assert!(!result.content.is_empty());
+    }
+
+    #[test]
+    fn test_whitespace_only_fields() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "   \t\n  ", "content": "   \n\t  "}),
+            false,
+        );
+        // Should either reject or store; must not panic
+        assert!(!result.content.is_empty());
+    }
+
+    #[test]
+    fn test_whitespace_only_recall_query() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "   \t\n  "}),
+            false,
+        );
+        // Should return empty or error, not crash
+        assert!(!result.content.is_empty());
+    }
+
+    #[test]
+    fn test_memoir_create_path_traversal_name() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memoir_create",
+            &json!({"name": "../../../etc/passwd", "description": "traversal"}),
+            false,
+        );
+        // Should store as a label, not access filesystem
+        assert!(!result.content.is_empty());
+        if !result.is_error {
+            let list = call_tool(&store, None, "icm_memoir_list", &json!({}), false);
+            assert!(!list.is_error);
+        }
+    }
 }
 
 fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {

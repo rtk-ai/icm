@@ -2556,4 +2556,272 @@ mod tests {
             elapsed.as_millis()
         );
     }
+
+    // === Additional performance tests ===
+
+    #[test]
+    fn perf_search_fts_latency_with_1000_entries() {
+        let store = test_store();
+        for i in 0..1000 {
+            store
+                .store(make_memory(
+                    &format!("topic-{}", i % 50),
+                    &format!("detailed description about system component {i} with features and architecture"),
+                ))
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            let results = store.search_fts("system component architecture", 10).unwrap();
+            assert!(!results.is_empty());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 2000,
+            "50 FTS searches over 1000 entries took {}ms (max 2000ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_sequential_store_operations_rapid() {
+        let store = test_store();
+        let start = std::time::Instant::now();
+        // Simulate concurrent-like rapid sequential operations mixing stores, gets, searches
+        for i in 0..500 {
+            let mem = make_memory("rapid", &format!("rapid entry {i}"));
+            let id = mem.id.clone();
+            store.store(mem).unwrap();
+            // Interleave reads
+            if i % 5 == 0 {
+                store.get(&id).unwrap();
+            }
+            // Interleave searches
+            if i % 20 == 0 {
+                store.search_fts("rapid entry", 5).unwrap();
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 3000,
+            "500 mixed store/get/search ops took {}ms (max 3000ms)",
+            elapsed.as_millis()
+        );
+        assert_eq!(store.count().unwrap(), 500);
+    }
+
+    #[test]
+    fn perf_memoir_creation_and_concept_linking() {
+        let store = test_store();
+        let start = std::time::Instant::now();
+
+        // Create 10 memoirs, each with 10 concepts and links between them
+        for m in 0..10 {
+            let m_id = store
+                .create_memoir(make_memoir(&format!("perf-memoir-{m}")))
+                .unwrap();
+            let mut concept_ids = Vec::new();
+            for c in 0..10 {
+                let c_id = store
+                    .add_concept(make_concept(
+                        &m_id,
+                        &format!("concept-{m}-{c}"),
+                        &format!("Definition for concept {c} in memoir {m}"),
+                    ))
+                    .unwrap();
+                concept_ids.push(c_id);
+            }
+            // Link each concept to the next one (chain)
+            for w in concept_ids.windows(2) {
+                store
+                    .add_link(ConceptLink::new(
+                        w[0].clone(),
+                        w[1].clone(),
+                        Relation::DependsOn,
+                    ))
+                    .unwrap();
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 3000,
+            "10 memoirs x 10 concepts + links took {}ms (max 3000ms)",
+            elapsed.as_millis()
+        );
+
+        // Verify structure
+        let memoirs = store.list_memoirs().unwrap();
+        assert_eq!(memoirs.len(), 10);
+    }
+
+    #[test]
+    fn perf_neighborhood_bfs_large_graph() {
+        let store = test_store();
+        let m_id = store.create_memoir(make_memoir("large-graph")).unwrap();
+
+        // Create a large graph: 50 concepts in a chain
+        let mut concept_ids = Vec::new();
+        for i in 0..50 {
+            let c_id = store
+                .add_concept(make_concept(
+                    &m_id,
+                    &format!("node-{i}"),
+                    &format!("Graph node number {i}"),
+                ))
+                .unwrap();
+            concept_ids.push(c_id);
+        }
+        // Chain: 0->1->2->...->49
+        for w in concept_ids.windows(2) {
+            store
+                .add_link(ConceptLink::new(
+                    w[0].clone(),
+                    w[1].clone(),
+                    Relation::DependsOn,
+                ))
+                .unwrap();
+        }
+        // Add some cross-links for complexity
+        for i in (0..50).step_by(5) {
+            if i + 10 < 50 {
+                store
+                    .add_link(ConceptLink::new(
+                        concept_ids[i].clone(),
+                        concept_ids[i + 10].clone(),
+                        Relation::RelatedTo,
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let start = std::time::Instant::now();
+        // BFS traversal at various depths
+        for depth in 1..=5 {
+            let (concepts, links) = store.get_neighborhood(&concept_ids[0], depth).unwrap();
+            assert!(!concepts.is_empty());
+            assert!(!links.is_empty());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 2000,
+            "BFS traversals (depth 1-5) on 50-node graph took {}ms (max 2000ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_embedding_storage_batch() {
+        let store = test_store();
+        let start = std::time::Instant::now();
+        for i in 0..500 {
+            let mut mem = make_memory("embed-perf", &format!("embedding batch entry {i}"));
+            let mut emb = vec![0.0f32; 384];
+            // Vary embeddings so they're not all identical
+            emb[i % 384] = 1.0;
+            emb[(i * 7) % 384] = 0.5;
+            mem.embedding = Some(emb);
+            store.store(mem).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 3000,
+            "500 stores with embeddings took {}ms (max 3000ms)",
+            elapsed.as_millis()
+        );
+
+        // Now search
+        let query = vec![0.5f32; 384];
+        let search_start = std::time::Instant::now();
+        for _ in 0..50 {
+            let results = store.search_by_embedding(&query, 10).unwrap();
+            assert!(!results.is_empty());
+        }
+        let search_elapsed = search_start.elapsed();
+        assert!(
+            search_elapsed.as_millis() < 3000,
+            "50 vector searches over 500 entries took {}ms (max 3000ms)",
+            search_elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_keyword_search_with_many_entries() {
+        let store = test_store();
+        for i in 0..1000 {
+            let mut mem = make_memory(
+                &format!("kw-topic-{}", i % 20),
+                &format!("keyword searchable entry number {i}"),
+            );
+            mem.keywords = vec![
+                format!("keyword-{}", i % 10),
+                format!("category-{}", i % 5),
+                "common".into(),
+            ];
+            store.store(mem).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        for i in 0..50 {
+            let results = store
+                .search_by_keywords(&[&format!("keyword-{}", i % 10)], 10)
+                .unwrap();
+            assert!(!results.is_empty());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 2000,
+            "50 keyword searches over 1000 entries took {}ms (max 2000ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn perf_consolidate_large_topic_timing() {
+        let store = test_store();
+        for i in 0..100 {
+            store
+                .store(make_memory(
+                    "consolidate-perf",
+                    &format!("detail entry {i} with various information"),
+                ))
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        let consolidated = make_memory("consolidate-perf", "All 100 entries consolidated");
+        store
+            .consolidate_topic("consolidate-perf", consolidated)
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 1000,
+            "Consolidating 100 entries took {}ms (max 1000ms)",
+            elapsed.as_millis()
+        );
+        assert_eq!(store.get_by_topic("consolidate-perf").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn perf_list_topics_many() {
+        let store = test_store();
+        // Create 200 distinct topics
+        for i in 0..200 {
+            store
+                .store(make_memory(
+                    &format!("distinct-topic-{i}"),
+                    &format!("content for topic {i}"),
+                ))
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            let topics = store.list_topics().unwrap();
+            assert_eq!(topics.len(), 200);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 1000,
+            "50 list_topics calls over 200 topics took {}ms (max 1000ms)",
+            elapsed.as_millis()
+        );
+    }
 }

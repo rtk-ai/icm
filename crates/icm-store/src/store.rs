@@ -2572,7 +2572,9 @@ mod tests {
         }
         let start = std::time::Instant::now();
         for _ in 0..50 {
-            let results = store.search_fts("system component architecture", 10).unwrap();
+            let results = store
+                .search_fts("system component architecture", 10)
+                .unwrap();
             assert!(!results.is_empty());
         }
         let elapsed = start.elapsed();

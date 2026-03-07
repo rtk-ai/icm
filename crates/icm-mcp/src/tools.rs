@@ -1674,8 +1674,8 @@ mod tests {
         let store = test_store();
         // Right-to-left override, zero-width joiners, bidi markers
         let tricky_strings = [
-            "\u{202E}reversed\u{202C}",                  // RTL override
-            "normal\u{200B}zero\u{200B}width",           // zero-width space
+            "\u{202E}reversed\u{202C}",                   // RTL override
+            "normal\u{200B}zero\u{200B}width",            // zero-width space
             "\u{FEFF}bom_prefix",                         // BOM
             "a\u{0300}\u{0301}\u{0302}\u{0303}combining", // stacked combining marks
             "\u{200D}\u{200D}\u{200D}",                   // zero-width joiners only

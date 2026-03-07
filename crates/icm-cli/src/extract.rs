@@ -307,7 +307,13 @@ fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)>
         }
 
         // File paths and code locations
-        if s.contains('/') && (lower.contains(".rs") || lower.contains(".ts") || lower.contains(".py") || lower.contains(".toml") || lower.contains(".json")) {
+        if s.contains('/')
+            && (lower.contains(".rs")
+                || lower.contains(".ts")
+                || lower.contains(".py")
+                || lower.contains(".toml")
+                || lower.contains(".json"))
+        {
             score += 1.5;
         }
 
@@ -403,7 +409,8 @@ mod tests {
 
     #[test]
     fn test_extract_dev_signals_bugfix() {
-        let text = "Fixed NOT_ANY condition: was using check_all instead of check_some in evaluator.rs";
+        let text =
+            "Fixed NOT_ANY condition: was using check_all instead of check_some in evaluator.rs";
         let facts = extract_facts(text, "test");
         assert!(!facts.is_empty(), "should extract bug fix facts");
     }

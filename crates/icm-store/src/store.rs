@@ -189,6 +189,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         source,
         related_ids,
         embedding,
+        scope: icm_core::Scope::User, // default for existing local memories
     })
 }
 

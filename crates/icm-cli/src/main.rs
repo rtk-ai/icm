@@ -1,5 +1,6 @@
 mod bench_data;
 mod bench_knowledge;
+pub mod cloud;
 mod config;
 mod extract;
 
@@ -226,11 +227,49 @@ enum Commands {
     /// Show current configuration
     Config,
 
+    /// RTK Cloud commands (login, sync, status)
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommands,
+    },
+
     /// Launch MCP server (stdio transport for Claude Code)
     Serve {
         /// Compact output mode (shorter responses to save tokens)
         #[arg(long)]
         compact: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudCommands {
+    /// Login to RTK Cloud via browser OAuth
+    Login {
+        /// RTK Cloud endpoint
+        #[arg(short, long, default_value = "https://cloud.rtk-ai.app")]
+        endpoint: String,
+    },
+    /// Logout from RTK Cloud
+    Logout,
+    /// Show cloud connection status
+    Status,
+    /// Push local memories to cloud (project/org scope)
+    Push {
+        /// Scope to push (project or org)
+        #[arg(short, long, default_value = "project")]
+        scope: String,
+        /// Only push memories from this topic
+        #[arg(short, long)]
+        topic: Option<String>,
+    },
+    /// Pull shared memories from cloud
+    Pull {
+        /// Scope to pull (project or org)
+        #[arg(short, long, default_value = "project")]
+        scope: String,
+        /// Only pull memories updated since this ISO timestamp
+        #[arg(long)]
+        since: Option<String>,
     },
 }
 
@@ -609,6 +648,7 @@ fn main() -> Result<()> {
             runs,
             verbose,
         } => cmd_bench_agent(sessions, &model, runs, verbose),
+        Commands::Cloud { command } => cmd_cloud(command, &store),
         Commands::Serve { compact } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -2997,5 +3037,81 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..max.saturating_sub(3)])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cloud commands
+// ---------------------------------------------------------------------------
+
+fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
+    use icm_core::Scope;
+
+    match command {
+        CloudCommands::Login { endpoint } => {
+            cloud::login_browser(&endpoint)?;
+            Ok(())
+        }
+        CloudCommands::Logout => cloud::logout(),
+        CloudCommands::Status => cloud::status(),
+        CloudCommands::Push { scope, topic } => {
+            let scope: Scope = scope.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+            let creds = cloud::require_credentials_for_scope(scope)
+                .context("Cloud login required for push. Run: icm cloud login")?;
+
+            let memories: Vec<Memory> = if let Some(ref t) = topic {
+                use icm_core::MemoryStore;
+                store.get_by_topic(t)?
+            } else {
+                use icm_core::MemoryStore;
+                // Get all memories — list topics then fetch each
+                let topics = store.list_topics()?;
+                let mut all = Vec::new();
+                for (t, _) in &topics {
+                    all.extend(store.get_by_topic(t)?);
+                }
+                all
+            };
+
+            let mut synced = 0;
+            for mut mem in memories {
+                mem.scope = scope;
+                if let Err(e) = cloud::sync_memory(&creds, &mem) {
+                    eprintln!("Failed to sync {}: {}", mem.id, e);
+                } else {
+                    synced += 1;
+                }
+            }
+
+            eprintln!("Pushed {} memories to cloud (scope: {})", synced, scope);
+            Ok(())
+        }
+        CloudCommands::Pull { scope, since } => {
+            let scope: Scope = scope.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+            let creds = cloud::require_credentials_for_scope(scope)
+                .context("Cloud login required for pull. Run: icm cloud login")?;
+
+            let memories = cloud::pull_memories(&creds, scope, since.as_deref())?;
+
+            let mut imported = 0;
+            for mem in memories {
+                use icm_core::MemoryStore;
+                // Upsert: if memory exists locally, update it; otherwise store it
+                match store.get(&mem.id)? {
+                    Some(_) => {
+                        store.update(&mem)?;
+                    }
+                    None => {
+                        store.store(mem)?;
+                    }
+                }
+                imported += 1;
+            }
+
+            eprintln!("Pulled {} memories from cloud (scope: {})", imported, scope);
+            Ok(())
+        }
     }
 }

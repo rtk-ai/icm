@@ -20,6 +20,7 @@ pub struct Config {
     pub extraction: ExtractionConfig,
     pub recall: RecallConfig,
     pub mcp: McpConfig,
+    pub cloud: CloudConfig,
 }
 
 /// Database storage settings.
@@ -84,6 +85,28 @@ pub struct McpConfig {
     pub compact: bool,
     /// Custom system instructions appended to MCP server info.
     pub instructions: Option<String>,
+}
+
+/// RTK Cloud sync settings.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct CloudConfig {
+    /// Enable cloud sync (requires login).
+    pub enabled: bool,
+    /// RTK Cloud endpoint.
+    pub endpoint: String,
+    /// Default scope for new memories (user, project, org).
+    pub default_scope: String,
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "https://cloud.rtk-ai.app".into(),
+            default_scope: "user".into(),
+        }
+    }
 }
 
 // --- Defaults ---

@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1181,14 +1181,14 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
 name = "icm-core"
-version = "0.10.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
- "directories",
  "fastembed",
  "serde",
  "serde_json",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "icm-mcp"
-version = "0.10.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "icm-store"
-version = "0.10.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "icm-core",

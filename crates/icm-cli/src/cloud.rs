@@ -34,9 +34,36 @@ fn credentials_path() -> Result<PathBuf> {
 }
 
 pub fn load_credentials() -> Option<Credentials> {
-    let path = credentials_path().ok()?;
+    // 1. Try ICM's own credentials
+    if let Some(creds) = load_credentials_from_path(credentials_path().ok()?) {
+        return Some(creds);
+    }
+
+    // 2. Fallback: reuse rtk-pro credentials (same format, avoids re-login)
+    //    rtk-pro uses dirs::config_dir() which is:
+    //    - macOS: ~/Library/Application Support/rtk/
+    //    - Linux: ~/.config/rtk/
+    let rtk_paths = [
+        // macOS: ~/Library/Application Support/rtk/credentials.json
+        std::env::var("HOME").ok().map(|h| PathBuf::from(&h).join("Library/Application Support/rtk/credentials.json")),
+        // Linux: ~/.config/rtk/credentials.json
+        std::env::var("HOME").ok().map(|h| PathBuf::from(&h).join(".config/rtk/credentials.json")),
+    ];
+    for path in rtk_paths.into_iter().flatten() {
+        if let Some(creds) = load_credentials_from_path(path) {
+            return Some(creds);
+        }
+    }
+
+    None
+}
+
+fn load_credentials_from_path(path: PathBuf) -> Option<Credentials> {
     let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    let creds: Credentials = serde_json::from_str(&content).ok()?;
+    // Validate token is non-empty
+    if creds.token.is_empty() { return None; }
+    Some(creds)
 }
 
 pub fn save_credentials(creds: &Credentials) -> Result<()> {
@@ -188,6 +215,58 @@ pub fn login_browser(endpoint: &str) -> Result<Credentials> {
     }
 }
 
+/// Email/password login for orgs without OAuth (generic email, self-hosted, etc.)
+/// POST {endpoint}/api/auth/login
+pub fn login_password(endpoint: &str, email: &str, password: &str) -> Result<Credentials> {
+    let url = format!("{}/api/auth/login", endpoint.trim_end_matches('/'));
+
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(10))
+        .send_string(&serde_json::json!({
+            "email": email,
+            "password": password,
+        }).to_string())
+        .context("Failed to connect to RTK Cloud")?;
+
+    let status = resp.status();
+    let body = resp.into_string().context("Failed to read response")?;
+
+    if status != 200 {
+        anyhow::bail!("Login failed ({}): {}", status, body);
+    }
+
+    #[derive(Deserialize)]
+    struct LoginResponse {
+        token: String,
+        #[serde(rename = "orgId")]
+        org_id: Option<String>,
+        user: LoginUser,
+    }
+
+    #[derive(Deserialize)]
+    struct LoginUser {
+        #[allow(dead_code)]
+        id: String,
+        email: String,
+        #[allow(dead_code)]
+        name: String,
+    }
+
+    let data: LoginResponse = serde_json::from_str(&body).context("Invalid server response")?;
+
+    let creds = Credentials {
+        endpoint: endpoint.to_string(),
+        token: data.token,
+        org_id: data.org_id.unwrap_or_default(),
+        org_slug: String::new(),
+    };
+
+    save_credentials(&creds)?;
+    eprintln!("Logged in as {}", data.user.email);
+    Ok(creds)
+}
+
 pub fn logout() -> Result<()> {
     clear_credentials()?;
     eprintln!("Logged out from ICM Cloud");
@@ -229,16 +308,24 @@ pub fn sync_memory(creds: &Credentials, memory: &Memory) -> Result<()> {
         "updatedAt": memory.updated_at.to_rfc3339(),
     });
 
-    let resp = ureq::post(&url)
+    let resp = match ureq::post(&url)
         .set("Authorization", &format!("Bearer {}", creds.token))
         .set("Content-Type", "application/json")
+        .set("X-Org-Id", &creds.org_id)
         .timeout(std::time::Duration::from_secs(5))
         .send_string(&payload.to_string())
-        .context("Failed to sync memory to cloud")?;
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            anyhow::bail!("Cloud sync failed ({}): {}", code, body);
+        }
+        Err(e) => anyhow::bail!("Cloud sync connection error: {}", e),
+    };
 
     let status = resp.status();
-    let body = resp.into_string().unwrap_or_default();
     if status != 200 && status != 201 {
+        let body = resp.into_string().unwrap_or_default();
         anyhow::bail!("Cloud sync failed ({}): {}", status, body);
     }
 
@@ -264,6 +351,7 @@ pub fn pull_memories(
 
     let resp = ureq::get(&url)
         .set("Authorization", &format!("Bearer {}", creds.token))
+        .set("X-Org-Id", &creds.org_id)
         .timeout(std::time::Duration::from_secs(10))
         .call()
         .context("Failed to pull memories from cloud")?;
@@ -275,14 +363,79 @@ pub fn pull_memories(
         anyhow::bail!("Cloud pull failed ({}): {}", status, body);
     }
 
+    /// Intermediate type for deserializing cloud responses.
+    /// The cloud API may return different field shapes than local Memory.
+    #[derive(Deserialize)]
+    struct CloudMemory {
+        id: String,
+        topic: String,
+        summary: String,
+        #[serde(default)]
+        raw_excerpt: Option<String>,
+        #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default = "default_importance_str")]
+        importance: String,
+        #[serde(default = "default_scope_str")]
+        scope: String,
+        #[serde(default)]
+        weight: f32,
+        #[serde(default)]
+        access_count: u32,
+        #[serde(default)]
+        related_ids: Vec<String>,
+        #[serde(default)]
+        source: Option<serde_json::Value>,
+        created_at: Option<String>,
+        updated_at: Option<String>,
+        last_accessed: Option<String>,
+    }
+
+    fn default_importance_str() -> String { "medium".to_string() }
+    fn default_scope_str() -> String { "user".to_string() }
+
     #[derive(Deserialize)]
     struct PullResponse {
-        memories: Vec<Memory>,
+        memories: Vec<CloudMemory>,
     }
 
     let data: PullResponse = serde_json::from_str(&body).context("Invalid cloud response")?;
 
-    Ok(data.memories)
+    let memories = data.memories.into_iter().map(|cm| {
+        let importance = cm.importance.parse::<icm_core::Importance>()
+            .unwrap_or(icm_core::Importance::Medium);
+        let scope = cm.scope.parse::<Scope>().unwrap_or(Scope::User);
+        let source = cm.source
+            .and_then(|v| serde_json::from_value::<icm_core::MemorySource>(v).ok())
+            .unwrap_or(icm_core::MemorySource::Manual);
+        let now = chrono::Utc::now();
+
+        Memory {
+            id: cm.id,
+            topic: cm.topic,
+            summary: cm.summary,
+            raw_excerpt: cm.raw_excerpt,
+            keywords: cm.keywords,
+            importance,
+            scope,
+            source,
+            weight: cm.weight,
+            access_count: cm.access_count,
+            related_ids: cm.related_ids,
+            embedding: None,
+            created_at: cm.created_at
+                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                .unwrap_or(now),
+            updated_at: cm.updated_at
+                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                .unwrap_or(now),
+            last_accessed: cm.last_accessed
+                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                .unwrap_or(now),
+        }
+    }).collect();
+
+    Ok(memories)
 }
 
 /// Delete a memory from RTK Cloud.
@@ -296,6 +449,7 @@ pub fn delete_cloud_memory(creds: &Credentials, memory_id: &str) -> Result<()> {
 
     let resp = ureq::delete(&url)
         .set("Authorization", &format!("Bearer {}", creds.token))
+        .set("X-Org-Id", &creds.org_id)
         .timeout(std::time::Duration::from_secs(5))
         .call()
         .context("Failed to delete cloud memory")?;

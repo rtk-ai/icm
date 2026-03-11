@@ -243,11 +243,14 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum CloudCommands {
-    /// Login to RTK Cloud via browser OAuth
+    /// Login to RTK Cloud (OAuth browser or email/password)
     Login {
         /// RTK Cloud endpoint
         #[arg(short, long, default_value = "https://cloud.rtk-ai.app")]
         endpoint: String,
+        /// Use email/password instead of browser OAuth
+        #[arg(long)]
+        password: bool,
     },
     /// Logout from RTK Cloud
     Logout,
@@ -3048,8 +3051,27 @@ fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
     use icm_core::Scope;
 
     match command {
-        CloudCommands::Login { endpoint } => {
-            cloud::login_browser(&endpoint)?;
+        CloudCommands::Login { endpoint, password } => {
+            if password {
+                // Email/password login (for generic emails, self-hosted, no OAuth)
+                eprint!("Email: ");
+                let mut email = String::new();
+                std::io::stdin().read_line(&mut email)?;
+                let email = email.trim().to_string();
+
+                // Read password without echo using stty
+                eprint!("Password: ");
+                let _ = std::process::Command::new("stty").arg("-echo").status();
+                let mut pwd = String::new();
+                std::io::stdin().read_line(&mut pwd)?;
+                let _ = std::process::Command::new("stty").arg("echo").status();
+                eprintln!(); // newline after hidden input
+                let pwd = pwd.trim().to_string();
+
+                cloud::login_password(&endpoint, &email, &pwd)?;
+            } else {
+                cloud::login_browser(&endpoint)?;
+            }
             Ok(())
         }
         CloudCommands::Logout => cloud::logout(),

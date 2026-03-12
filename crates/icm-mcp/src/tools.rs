@@ -15,9 +15,7 @@ const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
 /// Returns a human-readable message if consolidation happened, or empty string.
 fn try_auto_consolidate(store: &SqliteStore, topic: &str, threshold: usize) -> String {
     match store.auto_consolidate(topic, threshold) {
-        Ok(true) => format!(
-            "Auto-consolidated topic '{topic}' (exceeded {threshold} entries)."
-        ),
+        Ok(true) => format!("Auto-consolidated topic '{topic}' (exceeded {threshold} entries)."),
         Ok(false) => String::new(),
         Err(e) => {
             tracing::warn!("auto-consolidation failed for topic '{topic}': {e}");
@@ -618,9 +616,8 @@ fn tool_recall(
                 let mut scored_results = results;
                 if let Some(t) = topic {
                     // Prefix matching: "wshm" matches "wshm", "wshm:owner/repo", etc.
-                    scored_results.retain(|(m, _)| {
-                        m.topic == t || m.topic.starts_with(&format!("{t}:"))
-                    });
+                    scored_results
+                        .retain(|(m, _)| m.topic == t || m.topic.starts_with(&format!("{t}:")));
                 }
                 if let Some(kw) = keyword {
                     scored_results.retain(|(m, _)| m.keywords.iter().any(|k| k.contains(kw)));

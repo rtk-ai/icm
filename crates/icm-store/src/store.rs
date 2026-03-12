@@ -1467,10 +1467,18 @@ impl SqliteStore {
         }
 
         // Sort by weight DESC (get_by_topic already does this, but be explicit)
-        memories.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        memories.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Take the top 3 summaries for the consolidated summary
-        let top_summaries: Vec<&str> = memories.iter().take(3).map(|m| m.summary.as_str()).collect();
+        let top_summaries: Vec<&str> = memories
+            .iter()
+            .take(3)
+            .map(|m| m.summary.as_str())
+            .collect();
         let consolidated_summary = top_summaries.join(" | ");
 
         // Merge all unique keywords
@@ -1490,7 +1498,8 @@ impl SqliteStore {
         // Build the consolidated memory
         let mut consolidated = Memory::new(topic.into(), consolidated_summary, Importance::High);
         consolidated.keywords = all_keywords;
-        consolidated.raw_excerpt = Some(format!("auto-consolidated from {original_count} memories"));
+        consolidated.raw_excerpt =
+            Some(format!("auto-consolidated from {original_count} memories"));
         consolidated.weight = 1.0;
 
         // Replace all memories in the topic with the consolidated one
@@ -1680,7 +1689,13 @@ impl SqliteStore {
         let concept_name = if cluster.keywords.is_empty() {
             format!("pattern-{}", &cluster.memory_ids[0][..8])
         } else {
-            cluster.keywords.iter().take(3).cloned().collect::<Vec<_>>().join("-")
+            cluster
+                .keywords
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("-")
         };
 
         // Build definition from cluster representative + count

@@ -45,9 +45,13 @@ pub fn load_credentials() -> Option<Credentials> {
     //    - Linux: ~/.config/rtk/
     let rtk_paths = [
         // macOS: ~/Library/Application Support/rtk/credentials.json
-        std::env::var("HOME").ok().map(|h| PathBuf::from(&h).join("Library/Application Support/rtk/credentials.json")),
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(&h).join("Library/Application Support/rtk/credentials.json")),
         // Linux: ~/.config/rtk/credentials.json
-        std::env::var("HOME").ok().map(|h| PathBuf::from(&h).join(".config/rtk/credentials.json")),
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(&h).join(".config/rtk/credentials.json")),
     ];
     for path in rtk_paths.into_iter().flatten() {
         if let Some(creds) = load_credentials_from_path(path) {
@@ -62,7 +66,9 @@ fn load_credentials_from_path(path: PathBuf) -> Option<Credentials> {
     let content = std::fs::read_to_string(&path).ok()?;
     let creds: Credentials = serde_json::from_str(&content).ok()?;
     // Validate token is non-empty
-    if creds.token.is_empty() { return None; }
+    if creds.token.is_empty() {
+        return None;
+    }
     Some(creds)
 }
 
@@ -223,10 +229,13 @@ pub fn login_password(endpoint: &str, email: &str, password: &str) -> Result<Cre
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(10))
-        .send_string(&serde_json::json!({
-            "email": email,
-            "password": password,
-        }).to_string())
+        .send_string(
+            &serde_json::json!({
+                "email": email,
+                "password": password,
+            })
+            .to_string(),
+        )
         .context("Failed to connect to RTK Cloud")?;
 
     let status = resp.status();
@@ -391,8 +400,12 @@ pub fn pull_memories(
         last_accessed: Option<String>,
     }
 
-    fn default_importance_str() -> String { "medium".to_string() }
-    fn default_scope_str() -> String { "user".to_string() }
+    fn default_importance_str() -> String {
+        "medium".to_string()
+    }
+    fn default_scope_str() -> String {
+        "user".to_string()
+    }
 
     #[derive(Deserialize)]
     struct PullResponse {
@@ -401,39 +414,49 @@ pub fn pull_memories(
 
     let data: PullResponse = serde_json::from_str(&body).context("Invalid cloud response")?;
 
-    let memories = data.memories.into_iter().map(|cm| {
-        let importance = cm.importance.parse::<icm_core::Importance>()
-            .unwrap_or(icm_core::Importance::Medium);
-        let scope = cm.scope.parse::<Scope>().unwrap_or(Scope::User);
-        let source = cm.source
-            .and_then(|v| serde_json::from_value::<icm_core::MemorySource>(v).ok())
-            .unwrap_or(icm_core::MemorySource::Manual);
-        let now = chrono::Utc::now();
+    let memories = data
+        .memories
+        .into_iter()
+        .map(|cm| {
+            let importance = cm
+                .importance
+                .parse::<icm_core::Importance>()
+                .unwrap_or(icm_core::Importance::Medium);
+            let scope = cm.scope.parse::<Scope>().unwrap_or(Scope::User);
+            let source = cm
+                .source
+                .and_then(|v| serde_json::from_value::<icm_core::MemorySource>(v).ok())
+                .unwrap_or(icm_core::MemorySource::Manual);
+            let now = chrono::Utc::now();
 
-        Memory {
-            id: cm.id,
-            topic: cm.topic,
-            summary: cm.summary,
-            raw_excerpt: cm.raw_excerpt,
-            keywords: cm.keywords,
-            importance,
-            scope,
-            source,
-            weight: cm.weight,
-            access_count: cm.access_count,
-            related_ids: cm.related_ids,
-            embedding: None,
-            created_at: cm.created_at
-                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
-                .unwrap_or(now),
-            updated_at: cm.updated_at
-                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
-                .unwrap_or(now),
-            last_accessed: cm.last_accessed
-                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
-                .unwrap_or(now),
-        }
-    }).collect();
+            Memory {
+                id: cm.id,
+                topic: cm.topic,
+                summary: cm.summary,
+                raw_excerpt: cm.raw_excerpt,
+                keywords: cm.keywords,
+                importance,
+                scope,
+                source,
+                weight: cm.weight,
+                access_count: cm.access_count,
+                related_ids: cm.related_ids,
+                embedding: None,
+                created_at: cm
+                    .created_at
+                    .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                    .unwrap_or(now),
+                updated_at: cm
+                    .updated_at
+                    .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                    .unwrap_or(now),
+                last_accessed: cm
+                    .last_accessed
+                    .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                    .unwrap_or(now),
+            }
+        })
+        .collect();
 
     Ok(memories)
 }

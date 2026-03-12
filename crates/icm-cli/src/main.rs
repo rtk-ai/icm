@@ -985,7 +985,10 @@ fn cmd_extract_patterns(
         return Ok(());
     }
 
-    println!("Detected {} pattern(s) in topic '{topic}':\n", patterns.len());
+    println!(
+        "Detected {} pattern(s) in topic '{topic}':\n",
+        patterns.len()
+    );
 
     for (i, cluster) in patterns.iter().enumerate() {
         println!(
@@ -994,7 +997,10 @@ fn cmd_extract_patterns(
             cluster.count,
             cluster.keywords.join(", ")
         );
-        println!("    Summary: {}", &cluster.representative_summary[..cluster.representative_summary.len().min(120)]);
+        println!(
+            "    Summary: {}",
+            &cluster.representative_summary[..cluster.representative_summary.len().min(120)]
+        );
     }
 
     if let Some(memoir_name) = memoir {

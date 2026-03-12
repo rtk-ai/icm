@@ -23,6 +23,10 @@ pub struct Memory {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+
+    /// Cloud scope: user (local default), project, or org.
+    #[serde(default)]
+    pub scope: Scope,
 }
 
 impl Memory {
@@ -43,6 +47,48 @@ impl Memory {
             source: MemorySource::Manual,
             related_ids: Vec::new(),
             embedding: None,
+            scope: Scope::User,
+        }
+    }
+}
+
+/// Memory scope for cloud sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// Personal memories (local only, default).
+    User,
+    /// Shared within a project (synced to cloud).
+    Project,
+    /// Shared across the entire organization (synced to cloud).
+    Org,
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self::User
+    }
+}
+
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User => write!(f, "user"),
+            Self::Project => write!(f, "project"),
+            Self::Org => write!(f, "org"),
+        }
+    }
+}
+
+impl std::str::FromStr for Scope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "user" => Ok(Self::User),
+            "project" => Ok(Self::Project),
+            "org" => Ok(Self::Org),
+            _ => Err(format!("invalid scope: {s} (expected: user, project, org)")),
         }
     }
 }
@@ -111,6 +157,19 @@ pub struct StoreStats {
     pub avg_weight: f32,
     pub oldest_memory: Option<DateTime<Utc>>,
     pub newest_memory: Option<DateTime<Utc>>,
+}
+
+/// A cluster of related memories detected by keyword similarity analysis.
+#[derive(Debug, Clone)]
+pub struct PatternCluster {
+    /// A representative summary for the cluster (from the highest-weight memory).
+    pub representative_summary: String,
+    /// IDs of memories in this cluster.
+    pub memory_ids: Vec<String>,
+    /// Common keywords shared across the cluster.
+    pub keywords: Vec<String>,
+    /// Number of memories in the cluster.
+    pub count: usize,
 }
 
 #[derive(Debug, Clone)]

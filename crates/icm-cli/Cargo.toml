@@ -1,6 +1,6 @@
 [package]
 name = "icm-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Permanent memory for AI agents"
 license = "LicenseRef-Proprietary"
@@ -31,3 +31,4 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 openssl = { version = "0.10", optional = true }
+ureq = { workspace = true }

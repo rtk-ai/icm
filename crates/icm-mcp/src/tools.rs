@@ -8,6 +8,22 @@ use icm_store::SqliteStore;
 
 use crate::protocol::ToolResult;
 
+/// Default threshold for auto-consolidation (can be overridden by config).
+const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
+
+/// Try to auto-consolidate a topic if it exceeds the threshold.
+/// Returns a human-readable message if consolidation happened, or empty string.
+fn try_auto_consolidate(store: &SqliteStore, topic: &str, threshold: usize) -> String {
+    match store.auto_consolidate(topic, threshold) {
+        Ok(true) => format!("Auto-consolidated topic '{topic}' (exceeded {threshold} entries)."),
+        Ok(false) => String::new(),
+        Err(e) => {
+            tracing::warn!("auto-consolidation failed for topic '{topic}': {e}");
+            String::new()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool schemas for tools/list
 // ---------------------------------------------------------------------------
@@ -333,6 +349,30 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
+            "name": "icm_memory_extract_patterns",
+            "description": "Detect recurring patterns in a topic by keyword similarity. Optionally create concepts in a memoir from detected patterns.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic to analyze for patterns"
+                    },
+                    "memoir": {
+                        "type": "string",
+                        "description": "Memoir name — if provided, creates concepts from detected patterns"
+                    },
+                    "min_cluster_size": {
+                        "type": "integer",
+                        "default": 3,
+                        "minimum": 2,
+                        "description": "Minimum number of similar memories to form a pattern (default: 3)"
+                    }
+                },
+                "required": ["topic"]
+            }
+        }),
+        json!({
             "name": "icm_memoir_search_all",
             "description": "Full-text search concepts across all memoirs.",
             "inputSchema": {
@@ -393,6 +433,7 @@ pub fn call_tool(
         "icm_memory_list_topics" => tool_list_topics(store),
         "icm_memory_stats" => tool_stats(store),
         "icm_memory_health" => tool_health(store, args),
+        "icm_memory_extract_patterns" => tool_extract_patterns(store, args),
         "icm_memory_embed_all" => tool_embed_all(store, embedder, args),
         // Memoir tools
         "icm_memoir_create" => tool_memoir_create(store, args),
@@ -516,21 +557,34 @@ fn tool_store(
     match store.store(memory) {
         Ok(id) => {
             if compact {
-                ToolResult::text(format!("ok:{id}"))
+                // Try auto-consolidation even in compact mode
+                let consolidation_msg =
+                    try_auto_consolidate(store, topic, AUTO_CONSOLIDATE_THRESHOLD);
+                if consolidation_msg.is_empty() {
+                    ToolResult::text(format!("ok:{id}"))
+                } else {
+                    ToolResult::text(format!("ok:{id}\n{consolidation_msg}"))
+                }
             } else {
-                // Check if topic needs consolidation
-                let hint = if let Ok(count) = store.count_by_topic(topic) {
-                    if count > 7 {
-                        format!(
-                            "\n⚠ Topic '{topic}' has {count} entries — consider consolidating with icm_memory_consolidate."
-                        )
+                let consolidation_msg =
+                    try_auto_consolidate(store, topic, AUTO_CONSOLIDATE_THRESHOLD);
+                if consolidation_msg.is_empty() {
+                    // Still show a nudge if approaching threshold
+                    let hint = if let Ok(count) = store.count_by_topic(topic) {
+                        if count > 7 {
+                            format!(
+                                "\n⚠ Topic '{topic}' has {count} entries — consider consolidating with icm_memory_consolidate."
+                            )
+                        } else {
+                            String::new()
+                        }
                     } else {
                         String::new()
-                    }
+                    };
+                    ToolResult::text(format!("Stored memory: {id}{hint}"))
                 } else {
-                    String::new()
-                };
-                ToolResult::text(format!("Stored memory: {id}{hint}"))
+                    ToolResult::text(format!("Stored memory: {id}\n{consolidation_msg}"))
+                }
             }
         }
         Err(e) => ToolResult::error(format!("failed to store: {e}")),
@@ -561,7 +615,9 @@ fn tool_recall(
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored_results = results;
                 if let Some(t) = topic {
-                    scored_results.retain(|(m, _)| m.topic == t);
+                    // Prefix matching: "wshm" matches "wshm", "wshm:owner/repo", etc.
+                    scored_results
+                        .retain(|(m, _)| m.topic == t || m.topic.starts_with(&format!("{t}:")));
                 }
                 if let Some(kw) = keyword {
                     scored_results.retain(|(m, _)| m.keywords.iter().any(|k| k.contains(kw)));
@@ -616,7 +672,8 @@ fn tool_recall(
     }
 
     if let Some(t) = topic {
-        results.retain(|m| m.topic == t);
+        // Prefix matching: "wshm" matches "wshm", "wshm:owner/repo", etc.
+        results.retain(|m| m.topic == t || m.topic.starts_with(&format!("{t}:")));
     }
     if let Some(kw) = keyword {
         results.retain(|m| m.keywords.iter().any(|k| k.contains(kw)));
@@ -691,10 +748,39 @@ fn tool_list_topics(store: &SqliteStore) -> ToolResult {
             if topics.is_empty() {
                 return ToolResult::text("No topics yet.".into());
             }
-            let mut output = String::from("Topics:\n");
+
+            // Group topics by scope prefix (before ':')
+            let mut scoped: std::collections::BTreeMap<String, Vec<(String, usize)>> =
+                std::collections::BTreeMap::new();
+            let mut unscoped: Vec<(String, usize)> = Vec::new();
+
             for (topic, count) in &topics {
+                if let Some((prefix, _rest)) = topic.split_once(':') {
+                    scoped
+                        .entry(prefix.to_string())
+                        .or_default()
+                        .push((topic.clone(), *count));
+                } else {
+                    unscoped.push((topic.clone(), *count));
+                }
+            }
+
+            let mut output = String::from("Topics:\n");
+
+            // Show unscoped topics first
+            for (topic, count) in &unscoped {
                 output.push_str(&format!("  {topic}: {count} memories\n"));
             }
+
+            // Show scoped topics grouped by prefix
+            for (prefix, sub_topics) in &scoped {
+                let total: usize = sub_topics.iter().map(|(_, c)| c).sum();
+                output.push_str(&format!("  [{prefix}] ({total} total):\n"));
+                for (topic, count) in sub_topics {
+                    output.push_str(&format!("    {topic}: {count} memories\n"));
+                }
+            }
+
             ToolResult::text(output)
         }
         Err(e) => ToolResult::error(format!("failed to list topics: {e}")),
@@ -822,6 +908,74 @@ fn tool_health(store: &SqliteStore, args: &Value) -> ToolResult {
         topics_needing_consolidation,
         total_stale
     ));
+
+    ToolResult::text(output)
+}
+
+fn tool_extract_patterns(store: &SqliteStore, args: &Value) -> ToolResult {
+    let topic = match get_str(args, "topic") {
+        Some(t) => t,
+        None => return ToolResult::error("missing required field: topic".into()),
+    };
+    let min_cluster_size = get_i64(args, "min_cluster_size", 3) as usize;
+    let memoir_name = get_str(args, "memoir");
+
+    let patterns = match store.detect_patterns(topic, min_cluster_size) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::error(format!("pattern detection failed: {e}")),
+    };
+
+    if patterns.is_empty() {
+        return ToolResult::text(format!(
+            "No patterns detected in topic '{topic}' (min cluster size: {min_cluster_size})."
+        ));
+    }
+
+    let mut output = format!(
+        "Detected {} pattern(s) in topic '{topic}':\n\n",
+        patterns.len()
+    );
+
+    // If memoir is provided, resolve it and create concepts
+    let memoir_id = if let Some(mname) = memoir_name {
+        match resolve_memoir(store, mname) {
+            Ok(m) => Some(m.id),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+
+    for (i, cluster) in patterns.iter().enumerate() {
+        output.push_str(&format!(
+            "Pattern {}: {} memories\n  Keywords: {}\n  Representative: {}\n",
+            i + 1,
+            cluster.count,
+            cluster.keywords.join(", "),
+            cluster.representative_summary,
+        ));
+
+        if let Some(ref mid) = memoir_id {
+            match store.extract_pattern_as_concept(cluster, mid) {
+                Ok(concept_id) => {
+                    output.push_str(&format!("  -> Created concept: {concept_id}\n"));
+                }
+                Err(e) => {
+                    output.push_str(&format!("  -> Failed to create concept: {e}\n"));
+                }
+            }
+        }
+
+        output.push('\n');
+    }
+
+    if memoir_id.is_some() {
+        output.push_str(&format!(
+            "Created {} concept(s) in memoir '{}'.\n",
+            patterns.len(),
+            memoir_name.unwrap_or("?")
+        ));
+    }
 
     ToolResult::text(output)
 }
@@ -1518,12 +1672,14 @@ mod tests {
     #[test]
     fn test_store_many_via_mcp() {
         let store = test_store();
+        // Use different topics to avoid auto-consolidation (threshold=10)
         for i in 0..50 {
+            let topic = format!("perf-{}", i / 9); // max 9 per topic, under threshold
             let result = call_tool(
                 &store,
                 None,
                 "icm_memory_store",
-                &json!({"topic": "perf", "content": format!("item {i}")}),
+                &json!({"topic": topic, "content": format!("item {i}")}),
                 true,
             );
             assert!(!result.is_error);

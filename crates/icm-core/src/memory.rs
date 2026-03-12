@@ -159,6 +159,19 @@ pub struct StoreStats {
     pub newest_memory: Option<DateTime<Utc>>,
 }
 
+/// A cluster of related memories detected by keyword similarity analysis.
+#[derive(Debug, Clone)]
+pub struct PatternCluster {
+    /// A representative summary for the cluster (from the highest-weight memory).
+    pub representative_summary: String,
+    /// IDs of memories in this cluster.
+    pub memory_ids: Vec<String>,
+    /// Common keywords shared across the cluster.
+    pub keywords: Vec<String>,
+    /// Number of memories in the cluster.
+    pub count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TopicHealth {
     pub topic: String,

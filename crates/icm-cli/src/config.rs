@@ -38,6 +38,10 @@ pub struct MemoryConfig {
     pub default_importance: String,
     pub decay_rate: f32,
     pub prune_threshold: f32,
+    /// Enable automatic consolidation when a topic exceeds the threshold.
+    pub auto_consolidate_enabled: bool,
+    /// Number of entries in a topic before auto-consolidation triggers.
+    pub auto_consolidate_threshold: usize,
 }
 
 /// Embedding model settings.
@@ -117,6 +121,8 @@ impl Default for MemoryConfig {
             default_importance: "medium".into(),
             decay_rate: 0.95,
             prune_threshold: 0.1,
+            auto_consolidate_enabled: false,
+            auto_consolidate_threshold: 10,
         }
     }
 }

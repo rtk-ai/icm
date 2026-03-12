@@ -11,7 +11,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    Concept, ConceptLink, Importance, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation,
+    Concept, ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir, MemoirStore, Memory,
+    MemoryStore, Relation,
 };
 use icm_store::SqliteStore;
 
@@ -92,6 +93,37 @@ enum Commands {
     Forget {
         /// Memory ID
         id: String,
+    },
+
+    /// Update an existing memory in-place
+    Update {
+        /// Memory ID to update
+        id: String,
+
+        /// New content (replaces existing summary)
+        #[arg(short, long)]
+        content: String,
+
+        /// New importance level (optional, keeps existing if not set)
+        #[arg(short, long)]
+        importance: Option<CliImportance>,
+
+        /// New keywords (comma-separated, optional)
+        #[arg(short, long)]
+        keywords: Option<String>,
+    },
+
+    /// Show memory health report (staleness, consolidation needs)
+    Health {
+        /// Check a specific topic (checks all if omitted)
+        #[arg(short, long)]
+        topic: Option<String>,
+    },
+
+    /// Feedback subcommands — record and search prediction corrections
+    Feedback {
+        #[command(subcommand)]
+        command: FeedbackCommands,
     },
 
     /// List all topics
@@ -369,6 +401,53 @@ enum MemoirCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum FeedbackCommands {
+    /// Record a prediction correction (what AI predicted vs what was correct)
+    Record {
+        /// Topic/category for the feedback
+        #[arg(short, long)]
+        topic: String,
+
+        /// Context in which the prediction was made
+        #[arg(short, long)]
+        context: String,
+
+        /// What the AI predicted
+        #[arg(short, long)]
+        predicted: String,
+
+        /// What the correct answer was
+        #[arg(long)]
+        corrected: String,
+
+        /// Why the prediction was wrong (optional)
+        #[arg(short, long)]
+        reason: Option<String>,
+
+        /// Source of the feedback (e.g. "user", "ci", "review")
+        #[arg(short, long, default_value = "cli")]
+        source: String,
+    },
+
+    /// Search feedback entries
+    Search {
+        /// Search query
+        query: String,
+
+        /// Filter by topic
+        #[arg(short, long)]
+        topic: Option<String>,
+
+        /// Maximum results
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+    },
+
+    /// Show feedback statistics
+    Stats,
+}
+
 #[derive(Clone, ValueEnum)]
 enum CliImportance {
     Critical,
@@ -523,6 +602,35 @@ fn main() -> Result<()> {
         }
         Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
         Commands::Forget { id } => cmd_forget(&store, &id),
+        Commands::Update {
+            id,
+            content,
+            importance,
+            keywords,
+        } => {
+            #[cfg(feature = "embeddings")]
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            #[cfg(not(feature = "embeddings"))]
+            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            cmd_update(&store, emb_ref, &id, content, importance, keywords)
+        }
+        Commands::Health { topic } => cmd_health(&store, topic.as_deref()),
+        Commands::Feedback { command } => match command {
+            FeedbackCommands::Record {
+                topic,
+                context,
+                predicted,
+                corrected,
+                reason,
+                source,
+            } => cmd_feedback_record(&store, topic, context, predicted, corrected, reason, source),
+            FeedbackCommands::Search {
+                query,
+                topic,
+                limit,
+            } => cmd_feedback_search(&store, &query, topic.as_deref(), limit),
+            FeedbackCommands::Stats => cmd_feedback_stats(&store),
+        },
         Commands::Topics => cmd_topics(&store),
         Commands::Stats => cmd_stats(&store),
         Commands::Decay { factor } => cmd_decay(&store, factor),
@@ -755,6 +863,179 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
 fn cmd_forget(store: &SqliteStore, id: &str) -> Result<()> {
     store.delete(id)?;
     println!("Deleted: {id}");
+    Ok(())
+}
+
+fn cmd_update(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    id: &str,
+    content: String,
+    importance: Option<CliImportance>,
+    keywords: Option<String>,
+) -> Result<()> {
+    let mut memory = store
+        .get(id)?
+        .with_context(|| format!("memory not found: {id}"))?;
+
+    memory.summary = content.clone();
+    memory.updated_at = chrono::Utc::now();
+    memory.weight = 1.0; // Reset weight on update (refreshed content)
+
+    if let Some(imp) = importance {
+        memory.importance = imp.into();
+    }
+
+    if let Some(kw) = keywords {
+        memory.keywords = kw.split(',').map(|s| s.trim().to_string()).collect();
+    }
+
+    // Re-embed if embedder available
+    if let Some(emb) = embedder {
+        let text = format!("{} {}", memory.topic, content);
+        match emb.embed(&text) {
+            Ok(vec) => memory.embedding = Some(vec),
+            Err(e) => eprintln!("warning: re-embedding failed: {e}"),
+        }
+    }
+
+    store.update(&memory)?;
+    println!("Updated: {id}");
+    Ok(())
+}
+
+fn cmd_health(store: &SqliteStore, topic_filter: Option<&str>) -> Result<()> {
+    let topics = if let Some(t) = topic_filter {
+        vec![(t.to_string(), 0usize)]
+    } else {
+        store.list_topics()?
+    };
+
+    if topics.is_empty() {
+        println!("No topics yet.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<30} {:<20} {:>7} {:>8} {:>6}",
+        "Topic", "Status", "Entries", "AvgWgt", "Stale"
+    );
+    println!("{}", "-".repeat(75));
+
+    let mut total_stale = 0usize;
+    let mut needs_consolidation = 0usize;
+
+    for (topic, _) in &topics {
+        match store.topic_health(topic) {
+            Ok(health) => {
+                let status = if health.needs_consolidation && health.stale_count > 0 {
+                    "⚠ NEEDS ATTENTION"
+                } else if health.needs_consolidation {
+                    "⚠ consolidate"
+                } else if health.stale_count > 0 {
+                    "○ stale entries"
+                } else {
+                    "✓ healthy"
+                };
+
+                println!(
+                    "{:<30} {:<20} {:>7} {:>8.2} {:>6}",
+                    topic, status, health.entry_count, health.avg_weight, health.stale_count
+                );
+
+                if health.needs_consolidation {
+                    needs_consolidation += 1;
+                }
+                total_stale += health.stale_count;
+            }
+            Err(_) => {
+                println!("{:<30} (error reading)", topic);
+            }
+        }
+    }
+
+    println!("{}", "-".repeat(75));
+    println!(
+        "{} topics, {} need consolidation, {} stale entries",
+        topics.len(),
+        needs_consolidation,
+        total_stale
+    );
+    Ok(())
+}
+
+fn cmd_feedback_record(
+    store: &SqliteStore,
+    topic: String,
+    context: String,
+    predicted: String,
+    corrected: String,
+    reason: Option<String>,
+    source: String,
+) -> Result<()> {
+    let feedback = Feedback::new(
+        topic.clone(),
+        context,
+        predicted.clone(),
+        corrected.clone(),
+        reason,
+        source,
+    );
+    let id = store.store_feedback(feedback)?;
+    println!("Feedback recorded: {id}");
+    println!("  topic: {topic}");
+    println!("  predicted: {predicted}");
+    println!("  corrected: {corrected}");
+    Ok(())
+}
+
+fn cmd_feedback_search(
+    store: &SqliteStore,
+    query: &str,
+    topic: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let results = store.search_feedback(query, topic, limit)?;
+    if results.is_empty() {
+        println!("No feedback found.");
+        return Ok(());
+    }
+
+    for fb in &results {
+        println!("--- {} [{}] ---", fb.id, fb.topic);
+        println!("  context:   {}", fb.context);
+        println!("  predicted: {}", fb.predicted);
+        println!("  corrected: {}", fb.corrected);
+        if let Some(ref reason) = fb.reason {
+            println!("  reason:    {reason}");
+        }
+        if !fb.source.is_empty() {
+            println!("  source:    {}", fb.source);
+        }
+        if fb.applied_count > 0 {
+            println!("  applied:   {} times", fb.applied_count);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_feedback_stats(store: &SqliteStore) -> Result<()> {
+    let stats = store.feedback_stats()?;
+    println!("Feedback total: {}", stats.total);
+
+    if !stats.by_topic.is_empty() {
+        println!("\nBy topic:");
+        for (topic, count) in &stats.by_topic {
+            println!("  {topic}: {count}");
+        }
+    }
+
+    if !stats.most_applied.is_empty() {
+        println!("\nMost applied:");
+        for (id, count) in &stats.most_applied {
+            println!("  {id}: {count} times");
+        }
+    }
     Ok(())
 }
 

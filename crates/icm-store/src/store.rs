@@ -1463,7 +1463,8 @@ fn row_to_feedback(row: &rusqlite::Row) -> rusqlite::Result<Feedback> {
     })
 }
 
-const FEEDBACK_COLS: &str = "id, topic, context, predicted, corrected, reason, source, created_at, applied_count";
+const FEEDBACK_COLS: &str =
+    "id, topic, context, predicted, corrected, reason, source, created_at, applied_count";
 
 // ---------------------------------------------------------------------------
 // FeedbackStore impl
@@ -3124,9 +3125,7 @@ mod tests {
             .store_feedback(make_feedback("pr-review", "memory usage", "ok", "bad"))
             .unwrap();
 
-        let results = store
-            .search_feedback("memory", Some("triage"), 10)
-            .unwrap();
+        let results = store.search_feedback("memory", Some("triage"), 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].topic, "triage");
     }

@@ -1926,13 +1926,7 @@ mod tests {
     #[test]
     fn test_feedback_search_missing_query() {
         let store = test_store();
-        let result = call_tool(
-            &store,
-            None,
-            "icm_feedback_search",
-            &json!({}),
-            false,
-        );
+        let result = call_tool(&store, None, "icm_feedback_search", &json!({}), false);
         assert!(result.is_error);
         assert!(result.content[0].text.contains("query"));
     }
@@ -1954,13 +1948,7 @@ mod tests {
     #[test]
     fn test_feedback_stats_empty() {
         let store = test_store();
-        let result = call_tool(
-            &store,
-            None,
-            "icm_feedback_stats",
-            &json!({}),
-            false,
-        );
+        let result = call_tool(&store, None, "icm_feedback_stats", &json!({}), false);
         assert!(!result.is_error);
         assert!(result.content[0].text.contains("Feedback total: 0"));
     }
@@ -1993,13 +1981,7 @@ mod tests {
             false,
         );
 
-        let result = call_tool(
-            &store,
-            None,
-            "icm_feedback_stats",
-            &json!({}),
-            false,
-        );
+        let result = call_tool(&store, None, "icm_feedback_stats", &json!({}), false);
         assert!(!result.is_error);
         assert!(result.content[0].text.contains("Feedback total: 2"));
         assert!(result.content[0].text.contains("triage"));

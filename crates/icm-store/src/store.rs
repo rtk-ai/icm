@@ -7,8 +7,9 @@ use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
 use zerocopy::IntoBytes;
 
 use icm_core::{
-    Concept, ConceptLink, IcmError, IcmResult, Importance, Label, Memoir, MemoirStats, MemoirStore,
-    Memory, MemorySource, MemoryStore, Relation, StoreStats, TopicHealth,
+    Concept, ConceptLink, Feedback, FeedbackStats, FeedbackStore, IcmError, IcmResult, Importance,
+    Label, Memoir, MemoirStats, MemoirStore, Memory, MemorySource, MemoryStore, Relation,
+    StoreStats, TopicHealth,
 };
 
 use crate::schema::{init_db, init_db_with_dims};
@@ -1445,6 +1446,221 @@ impl MemoirStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// Feedback helpers
+// ---------------------------------------------------------------------------
+
+fn row_to_feedback(row: &rusqlite::Row) -> rusqlite::Result<Feedback> {
+    Ok(Feedback {
+        id: row.get(0)?,
+        topic: row.get(1)?,
+        context: row.get(2)?,
+        predicted: row.get(3)?,
+        corrected: row.get(4)?,
+        reason: row.get(5)?,
+        source: row.get(6)?,
+        created_at: parse_dt(&row.get::<_, String>(7)?),
+        applied_count: row.get(8)?,
+    })
+}
+
+const FEEDBACK_COLS: &str = "id, topic, context, predicted, corrected, reason, source, created_at, applied_count";
+
+// ---------------------------------------------------------------------------
+// FeedbackStore impl
+// ---------------------------------------------------------------------------
+
+impl FeedbackStore for SqliteStore {
+    fn store_feedback(&self, feedback: Feedback) -> IcmResult<String> {
+        self.conn
+            .execute(
+                "INSERT INTO feedback (id, topic, context, predicted, corrected, reason, source, created_at, applied_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    feedback.id,
+                    feedback.topic,
+                    feedback.context,
+                    feedback.predicted,
+                    feedback.corrected,
+                    feedback.reason,
+                    feedback.source,
+                    feedback.created_at.to_rfc3339(),
+                    feedback.applied_count,
+                ],
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+        Ok(feedback.id)
+    }
+
+    fn search_feedback(
+        &self,
+        query: &str,
+        topic: Option<&str>,
+        limit: usize,
+    ) -> IcmResult<Vec<Feedback>> {
+        // Sanitize FTS query: remove special characters
+        let sanitized: String = query
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .trim()
+            .to_string();
+
+        if sanitized.is_empty() {
+            return self.list_feedback(topic, limit);
+        }
+
+        let results = if let Some(t) = topic {
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "SELECT {FEEDBACK_COLS} FROM feedback
+                     WHERE id IN (SELECT id FROM feedback_fts WHERE feedback_fts MATCH ?1)
+                     AND topic = ?2
+                     ORDER BY created_at DESC
+                     LIMIT ?3"
+                ))
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(params![sanitized, t, limit as i64], row_to_feedback)
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+            }
+            results
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "SELECT {FEEDBACK_COLS} FROM feedback
+                     WHERE id IN (SELECT id FROM feedback_fts WHERE feedback_fts MATCH ?1)
+                     ORDER BY created_at DESC
+                     LIMIT ?2"
+                ))
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(params![sanitized, limit as i64], row_to_feedback)
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+            }
+            results
+        };
+
+        Ok(results)
+    }
+
+    fn list_feedback(&self, topic: Option<&str>, limit: usize) -> IcmResult<Vec<Feedback>> {
+        let results = if let Some(t) = topic {
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "SELECT {FEEDBACK_COLS} FROM feedback WHERE topic = ?1 ORDER BY created_at DESC LIMIT ?2"
+                ))
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(params![t, limit as i64], row_to_feedback)
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+            }
+            results
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "SELECT {FEEDBACK_COLS} FROM feedback ORDER BY created_at DESC LIMIT ?1"
+                ))
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(params![limit as i64], row_to_feedback)
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+            }
+            results
+        };
+
+        Ok(results)
+    }
+
+    fn increment_applied(&self, id: &str) -> IcmResult<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE feedback SET applied_count = applied_count + 1 WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    fn delete_feedback(&self, id: &str) -> IcmResult<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM feedback WHERE id = ?1", params![id])
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    fn feedback_stats(&self) -> IcmResult<FeedbackStats> {
+        let total: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM feedback", [], |row| row.get(0))
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT topic, COUNT(*) as cnt FROM feedback GROUP BY topic ORDER BY cnt DESC")
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let by_topic: Vec<(String, usize)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| IcmError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, applied_count FROM feedback WHERE applied_count > 0 ORDER BY applied_count DESC LIMIT 10",
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let most_applied: Vec<(String, u32)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| IcmError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(FeedbackStats {
+            total,
+            by_topic,
+            most_applied,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers (visible to other modules in crate for test use)
 // ---------------------------------------------------------------------------
 
@@ -2825,5 +3041,160 @@ mod tests {
             "50 list_topics calls over 200 topics took {}ms (max 1000ms)",
             elapsed.as_millis()
         );
+    }
+
+    // === FeedbackStore tests ===
+
+    fn make_feedback(topic: &str, context: &str, predicted: &str, corrected: &str) -> Feedback {
+        Feedback::new(
+            topic.into(),
+            context.into(),
+            predicted.into(),
+            corrected.into(),
+            None,
+            "test".into(),
+        )
+    }
+
+    #[test]
+    fn test_feedback_store_and_list() {
+        let store = test_store();
+        let fb = make_feedback("triage", "issue about crashes", "low", "high");
+        let id = fb.id.clone();
+        store.store_feedback(fb).unwrap();
+
+        let results = store.list_feedback(None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+        assert_eq!(results[0].topic, "triage");
+        assert_eq!(results[0].predicted, "low");
+        assert_eq!(results[0].corrected, "high");
+    }
+
+    #[test]
+    fn test_feedback_list_by_topic() {
+        let store = test_store();
+        store
+            .store_feedback(make_feedback("triage", "ctx1", "a", "b"))
+            .unwrap();
+        store
+            .store_feedback(make_feedback("pr-review", "ctx2", "c", "d"))
+            .unwrap();
+
+        let triage = store.list_feedback(Some("triage"), 10).unwrap();
+        assert_eq!(triage.len(), 1);
+        assert_eq!(triage[0].topic, "triage");
+
+        let all = store.list_feedback(None, 10).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_feedback_search() {
+        let store = test_store();
+        store
+            .store_feedback(make_feedback(
+                "triage",
+                "user reports memory leak",
+                "low priority",
+                "high priority",
+            ))
+            .unwrap();
+        store
+            .store_feedback(make_feedback(
+                "triage",
+                "build failure on CI",
+                "feature",
+                "bug",
+            ))
+            .unwrap();
+
+        let results = store.search_feedback("memory leak", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].context.contains("memory leak"));
+    }
+
+    #[test]
+    fn test_feedback_search_with_topic_filter() {
+        let store = test_store();
+        store
+            .store_feedback(make_feedback("triage", "memory issue", "low", "high"))
+            .unwrap();
+        store
+            .store_feedback(make_feedback("pr-review", "memory usage", "ok", "bad"))
+            .unwrap();
+
+        let results = store
+            .search_feedback("memory", Some("triage"), 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].topic, "triage");
+    }
+
+    #[test]
+    fn test_feedback_increment_applied() {
+        let store = test_store();
+        let fb = make_feedback("triage", "ctx", "a", "b");
+        let id = fb.id.clone();
+        store.store_feedback(fb).unwrap();
+
+        store.increment_applied(&id).unwrap();
+        store.increment_applied(&id).unwrap();
+
+        let results = store.list_feedback(None, 10).unwrap();
+        assert_eq!(results[0].applied_count, 2);
+    }
+
+    #[test]
+    fn test_feedback_increment_applied_not_found() {
+        let store = test_store();
+        let result = store.increment_applied("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_feedback_delete() {
+        let store = test_store();
+        let fb = make_feedback("triage", "ctx", "a", "b");
+        let id = fb.id.clone();
+        store.store_feedback(fb).unwrap();
+
+        store.delete_feedback(&id).unwrap();
+        let results = store.list_feedback(None, 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_feedback_delete_not_found() {
+        let store = test_store();
+        let result = store.delete_feedback("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_feedback_stats() {
+        let store = test_store();
+        store
+            .store_feedback(make_feedback("triage", "ctx1", "a", "b"))
+            .unwrap();
+        store
+            .store_feedback(make_feedback("triage", "ctx2", "c", "d"))
+            .unwrap();
+        store
+            .store_feedback(make_feedback("pr-review", "ctx3", "e", "f"))
+            .unwrap();
+
+        let fb = make_feedback("triage", "ctx4", "g", "h");
+        let id = fb.id.clone();
+        store.store_feedback(fb).unwrap();
+        store.increment_applied(&id).unwrap();
+
+        let stats = store.feedback_stats().unwrap();
+        assert_eq!(stats.total, 4);
+        assert_eq!(stats.by_topic.len(), 2);
+        assert_eq!(stats.by_topic[0].0, "triage");
+        assert_eq!(stats.by_topic[0].1, 3);
+        assert_eq!(stats.most_applied.len(), 1);
+        assert_eq!(stats.most_applied[0].1, 1);
     }
 }

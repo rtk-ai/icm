@@ -43,6 +43,7 @@ ICM gives your AI agent a real memory — not a note-taking tool, not a context 
 
 - **Memories** — store/recall with temporal decay by importance. Critical memories never fade, low-importance ones decay naturally. Filter by topic or keyword.
 - **Memoirs** — permanent knowledge graphs. Concepts linked by typed relations (`depends_on`, `contradicts`, `superseded_by`, ...). Filter by label.
+- **Feedback** — record corrections when AI predictions are wrong. Search past mistakes before making new predictions. Closed-loop learning.
 
 ## Install
 
@@ -147,7 +148,7 @@ icm memoir search -m "system-architecture" "service" --label "domain:auth"
 icm memoir inspect -m "system-architecture" "auth-service" -D 2
 ```
 
-## MCP Tools (18)
+## MCP Tools (21)
 
 ### Memory tools
 
@@ -176,6 +177,14 @@ icm memoir inspect -m "system-architecture" "auth-service" -D 2
 | `icm_memoir_search_all` | Search across all memoirs |
 | `icm_memoir_link` | Create typed relation between concepts |
 | `icm_memoir_inspect` | Inspect concept and graph neighborhood (BFS) |
+
+### Feedback tools (learning from mistakes)
+
+| Tool | Description |
+|------|-------------|
+| `icm_feedback_record` | Record a correction when an AI prediction was wrong |
+| `icm_feedback_search` | Search past corrections to inform future predictions |
+| `icm_feedback_stats` | Feedback statistics: total count, breakdown by topic, most applied |
 
 ### Relation types
 

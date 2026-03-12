@@ -575,6 +575,41 @@ Topics suggérés:
 - "contexte-{projet}" : Infos spécifiques au projet
 ```
 
+### Feedback (apprentissage par correction)
+
+```rust
+pub struct Feedback {
+    pub id: String,
+    pub topic: String,
+    pub context: String,       // Situation qui a mené à la prédiction
+    pub predicted: String,     // Ce que l'AI a prédit
+    pub corrected: String,     // La bonne réponse
+    pub reason: Option<String>,
+    pub source: String,        // Pipeline source
+    pub created_at: DateTime<Utc>,
+    pub applied_count: u32,    // Nombre de fois où cette correction a été consultée
+}
+```
+
+### MCP Tools Feedback (3)
+
+- `icm_feedback_record` — Enregistrer une correction quand une prédiction AI est fausse
+- `icm_feedback_search` — Rechercher des corrections passées avant de faire une prédiction (FTS5)
+- `icm_feedback_stats` — Statistiques globales des corrections
+
+### FeedbackStore trait
+
+```rust
+pub trait FeedbackStore {
+    fn store_feedback(&self, feedback: Feedback) -> IcmResult<String>;
+    fn search_feedback(&self, query: &str, topic: Option<&str>, limit: usize) -> IcmResult<Vec<Feedback>>;
+    fn list_feedback(&self, topic: Option<&str>, limit: usize) -> IcmResult<Vec<Feedback>>;
+    fn increment_applied(&self, id: &str) -> IcmResult<()>;
+    fn delete_feedback(&self, id: &str) -> IcmResult<()>;
+    fn feedback_stats(&self) -> IcmResult<FeedbackStats>;
+}
+```
+
 ## Implémentation prioritaire
 
 ### Phase 1: Core + Storage (MVP)

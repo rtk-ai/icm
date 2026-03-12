@@ -9,9 +9,10 @@
   - [Administration et maintenance](#administration-et-maintenance)
   - [Configuration et setup](#configuration-et-setup)
   - [Benchmarks](#benchmarks)
-- [Outils MCP (18)](#outils-mcp-18)
+- [Outils MCP (21)](#outils-mcp-21)
   - [Outils Memory (9)](#outils-memory-9)
   - [Outils Memoir (9)](#outils-memoir-9)
+  - [Outils Feedback (3)](#outils-feedback-3)
 - [Memory vs Memoir : quand utiliser quoi](#memory-vs-memoir--quand-utiliser-quoi)
 - [Workflow multi-session](#workflow-multi-session)
 - [Organisation des topics](#organisation-des-topics)
@@ -758,7 +759,7 @@ icm bench-agent --sessions 10 --model haiku --runs 3
 
 ---
 
-## Outils MCP (18)
+## Outils MCP (21)
 
 Le serveur MCP expose 18 outils via le protocole JSON-RPC 2.0 sur stdio. Tous les outils sont appeles par l'agent IA (Claude, Cursor, etc.) de maniere transparente.
 
@@ -1102,6 +1103,64 @@ Incremente la revision et augmente la confiance.
 ```
 
 Retourne le concept et tous les concepts atteignables en N sauts, avec les liens entre eux.
+
+---
+
+### Outils Feedback (3)
+
+Les outils de feedback permettent l'apprentissage en boucle fermee : quand une prediction AI est fausse, on enregistre la correction pour ameliorer les predictions futures.
+
+#### `icm_feedback_record` -- Enregistrer une correction
+
+**Parametres :**
+
+| Parametre | Type | Obligatoire | Description |
+|-----------|------|-------------|-------------|
+| `topic` | string | oui | Categorie/namespace (ex: `triage-owner/repo`, `pr-analysis`) |
+| `context` | string | oui | Situation / input qui a mene a la prediction |
+| `predicted` | string | oui | Ce que l'AI a predit ou fait |
+| `corrected` | string | oui | La bonne reponse/action |
+| `reason` | string | non | Pourquoi la correction a ete faite |
+| `source` | string | non | Quel outil/pipeline a genere la prediction |
+
+**Exemple :**
+```json
+{
+  "topic": "triage-myorg/myrepo",
+  "context": "Issue: 'App crashes when clicking save button'",
+  "predicted": "feature",
+  "corrected": "bug",
+  "reason": "The issue describes a crash, which is a bug not a feature request"
+}
+```
+
+En mode compact, retourne uniquement l'ID. En mode normal, retourne l'objet complet.
+
+#### `icm_feedback_search` -- Rechercher des corrections passees
+
+**Parametres :**
+
+| Parametre | Type | Obligatoire | Description |
+|-----------|------|-------------|-------------|
+| `query` | string | oui | Requete de recherche |
+| `topic` | string | non | Filtrer par topic |
+| `limit` | integer | non | Nombre max de resultats (defaut: 5, max: 20) |
+
+**Exemple :**
+```json
+{ "query": "crash bug classification", "topic": "triage-myorg/myrepo", "limit": 5 }
+```
+
+Utilise la recherche full-text (FTS5) sur les champs context, predicted, corrected et reason.
+
+#### `icm_feedback_stats` -- Statistiques de feedback
+
+**Parametres :** aucun
+
+Retourne :
+- `total` : nombre total de corrections enregistrees
+- `by_topic` : ventilation par topic
+- `most_applied` : les corrections les plus souvent referencees
 
 ---
 

@@ -2,7 +2,8 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
-    Concept, ConceptLink, Embedder, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation,
+    Concept, ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
+    MemoryStore, Relation,
 };
 use icm_store::SqliteStore;
 
@@ -351,6 +352,74 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["query"]
             }
         }),
+        // --- Feedback tools ---
+        json!({
+            "name": "icm_feedback_record",
+            "description": "Record a correction/feedback when an AI prediction was wrong. Helps improve future predictions by learning from mistakes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Category/namespace for this feedback (e.g. 'triage-owner/repo', 'pr-analysis')"
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "What was the situation / input that led to the prediction"
+                    },
+                    "predicted": {
+                        "type": "string",
+                        "description": "What the AI predicted or did"
+                    },
+                    "corrected": {
+                        "type": "string",
+                        "description": "What the correct answer/action should have been"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the correction was made (optional)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Which tool/pipeline generated the prediction (optional)"
+                    }
+                },
+                "required": ["topic", "context", "predicted", "corrected"]
+            }
+        }),
+        json!({
+            "name": "icm_feedback_search",
+            "description": "Search past feedback/corrections to inform current predictions. Use before making predictions to learn from past mistakes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query to find relevant past corrections"
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Filter by topic (optional)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Max number of results"
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "icm_feedback_stats",
+            "description": "Get feedback statistics: total count, breakdown by topic, most applied corrections.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
     ];
 
     if has_embedder {
@@ -404,6 +473,10 @@ pub fn call_tool(
         "icm_memoir_search_all" => tool_memoir_search_all(store, args),
         "icm_memoir_link" => tool_memoir_link(store, args),
         "icm_memoir_inspect" => tool_memoir_inspect(store, args),
+        // Feedback tools
+        "icm_feedback_record" => tool_feedback_record(store, args, compact),
+        "icm_feedback_search" => tool_feedback_search(store, args),
+        "icm_feedback_stats" => tool_feedback_stats(store),
         _ => ToolResult::error(format!("unknown tool: {name}")),
     }
 }
@@ -1783,6 +1856,155 @@ mod tests {
             assert!(!list.is_error);
         }
     }
+
+    // === Feedback tool tests ===
+
+    #[test]
+    fn test_feedback_record_missing_fields() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_feedback_record",
+            &json!({"topic": "test"}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("context"));
+    }
+
+    #[test]
+    fn test_feedback_record_and_search_roundtrip() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_feedback_record",
+            &json!({
+                "topic": "triage",
+                "context": "issue about memory leak in connection pool",
+                "predicted": "low priority",
+                "corrected": "high priority",
+                "reason": "memory leaks are always high priority"
+            }),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("Feedback recorded"));
+
+        let search = call_tool(
+            &store,
+            None,
+            "icm_feedback_search",
+            &json!({"query": "memory leak"}),
+            false,
+        );
+        assert!(!search.is_error);
+        assert!(search.content[0].text.contains("memory leak"));
+        assert!(search.content[0].text.contains("high priority"));
+    }
+
+    #[test]
+    fn test_feedback_record_compact_mode() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_feedback_record",
+            &json!({
+                "topic": "test",
+                "context": "ctx",
+                "predicted": "a",
+                "corrected": "b"
+            }),
+            true,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.starts_with("ok "));
+    }
+
+    #[test]
+    fn test_feedback_search_missing_query() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_feedback_search",
+            &json!({}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("query"));
+    }
+
+    #[test]
+    fn test_feedback_search_empty_results() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_feedback_search",
+            &json!({"query": "nonexistent"}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("No feedback found"));
+    }
+
+    #[test]
+    fn test_feedback_stats_empty() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_feedback_stats",
+            &json!({}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("Feedback total: 0"));
+    }
+
+    #[test]
+    fn test_feedback_stats_with_data() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_feedback_record",
+            &json!({
+                "topic": "triage",
+                "context": "ctx1",
+                "predicted": "a",
+                "corrected": "b"
+            }),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_feedback_record",
+            &json!({
+                "topic": "pr-review",
+                "context": "ctx2",
+                "predicted": "c",
+                "corrected": "d"
+            }),
+            false,
+        );
+
+        let result = call_tool(
+            &store,
+            None,
+            "icm_feedback_stats",
+            &json!({}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("Feedback total: 2"));
+        assert!(result.content[0].text.contains("triage"));
+        assert!(result.content[0].text.contains("pr-review"));
+    }
 }
 
 fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
@@ -1847,4 +2069,107 @@ fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 
     ToolResult::text(output)
+}
+
+// ---------------------------------------------------------------------------
+// Feedback tool handlers
+// ---------------------------------------------------------------------------
+
+fn tool_feedback_record(store: &SqliteStore, args: &Value, compact: bool) -> ToolResult {
+    let topic = match get_str(args, "topic") {
+        Some(t) => t,
+        None => return ToolResult::error("missing required field: topic".into()),
+    };
+    let context = match get_str(args, "context") {
+        Some(c) => c,
+        None => return ToolResult::error("missing required field: context".into()),
+    };
+    let predicted = match get_str(args, "predicted") {
+        Some(p) => p,
+        None => return ToolResult::error("missing required field: predicted".into()),
+    };
+    let corrected = match get_str(args, "corrected") {
+        Some(c) => c,
+        None => return ToolResult::error("missing required field: corrected".into()),
+    };
+    let reason = get_str(args, "reason").map(|s| s.to_string());
+    let source = get_str(args, "source").unwrap_or("").to_string();
+
+    let feedback = Feedback::new(
+        topic.into(),
+        context.into(),
+        predicted.into(),
+        corrected.into(),
+        reason,
+        source,
+    );
+
+    let id = feedback.id.clone();
+    match store.store_feedback(feedback) {
+        Ok(_) => {
+            if compact {
+                ToolResult::text(format!("ok {id}"))
+            } else {
+                ToolResult::text(format!("Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"))
+            }
+        }
+        Err(e) => ToolResult::error(format!("failed to store feedback: {e}")),
+    }
+}
+
+fn tool_feedback_search(store: &SqliteStore, args: &Value) -> ToolResult {
+    let query = match get_str(args, "query") {
+        Some(q) => q,
+        None => return ToolResult::error("missing required field: query".into()),
+    };
+    let topic = get_str(args, "topic");
+    let limit = get_i64(args, "limit", 5) as usize;
+
+    match store.search_feedback(query, topic, limit) {
+        Ok(results) => {
+            if results.is_empty() {
+                return ToolResult::text("No feedback found.".into());
+            }
+            let mut output = String::new();
+            for fb in &results {
+                output.push_str(&format!(
+                    "--- {} [{}] ---\n  context: {}\n  predicted: {}\n  corrected: {}\n",
+                    fb.id, fb.topic, fb.context, fb.predicted, fb.corrected
+                ));
+                if let Some(ref reason) = fb.reason {
+                    output.push_str(&format!("  reason: {reason}\n"));
+                }
+                if !fb.source.is_empty() {
+                    output.push_str(&format!("  source: {}\n", fb.source));
+                }
+                if fb.applied_count > 0 {
+                    output.push_str(&format!("  applied: {} times\n", fb.applied_count));
+                }
+            }
+            ToolResult::text(output)
+        }
+        Err(e) => ToolResult::error(format!("failed to search feedback: {e}")),
+    }
+}
+
+fn tool_feedback_stats(store: &SqliteStore) -> ToolResult {
+    match store.feedback_stats() {
+        Ok(stats) => {
+            let mut output = format!("Feedback total: {}\n", stats.total);
+            if !stats.by_topic.is_empty() {
+                output.push_str("\nBy topic:\n");
+                for (topic, count) in &stats.by_topic {
+                    output.push_str(&format!("  {topic}: {count}\n"));
+                }
+            }
+            if !stats.most_applied.is_empty() {
+                output.push_str("\nMost applied:\n");
+                for (id, count) in &stats.most_applied {
+                    output.push_str(&format!("  {id}: {count} times\n"));
+                }
+            }
+            ToolResult::text(output)
+        }
+        Err(e) => ToolResult::error(format!("failed to get feedback stats: {e}")),
+    }
 }

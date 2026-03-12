@@ -173,6 +173,63 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
     )
     .map_err(|e| IcmError::Database(e.to_string()))?;
 
+    // Feedback table
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS feedback (
+            id TEXT PRIMARY KEY,
+            topic TEXT NOT NULL,
+            context TEXT NOT NULL,
+            predicted TEXT NOT NULL,
+            corrected TEXT NOT NULL,
+            reason TEXT,
+            source TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            applied_count INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_feedback_topic ON feedback(topic);
+        ",
+    )
+    .map_err(|e| IcmError::Database(e.to_string()))?;
+
+    // Feedback FTS table
+    let feedback_fts_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='feedback_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| IcmError::Database(e.to_string()))?;
+
+    if !feedback_fts_exists {
+        conn.execute_batch(
+            "
+            CREATE VIRTUAL TABLE feedback_fts USING fts5(
+                id, topic, context, predicted, corrected, reason,
+                content='feedback', content_rowid='rowid'
+            );
+
+            CREATE TRIGGER feedback_ai AFTER INSERT ON feedback BEGIN
+                INSERT INTO feedback_fts(rowid, id, topic, context, predicted, corrected, reason)
+                VALUES (new.rowid, new.id, new.topic, new.context, new.predicted, new.corrected, new.reason);
+            END;
+
+            CREATE TRIGGER feedback_ad AFTER DELETE ON feedback BEGIN
+                INSERT INTO feedback_fts(feedback_fts, rowid, id, topic, context, predicted, corrected, reason)
+                VALUES('delete', old.rowid, old.id, old.topic, old.context, old.predicted, old.corrected, old.reason);
+            END;
+
+            CREATE TRIGGER feedback_au AFTER UPDATE ON feedback BEGIN
+                INSERT INTO feedback_fts(feedback_fts, rowid, id, topic, context, predicted, corrected, reason)
+                VALUES('delete', old.rowid, old.id, old.topic, old.context, old.predicted, old.corrected, old.reason);
+                INSERT INTO feedback_fts(rowid, id, topic, context, predicted, corrected, reason)
+                VALUES (new.rowid, new.id, new.topic, new.context, new.predicted, new.corrected, new.reason);
+            END;
+            ",
+        )
+        .map_err(|e| IcmError::Database(e.to_string()))?;
+    }
+
     // Migration: add updated_at column if missing (existing DBs pre-0.3.1)
     let has_updated_at: bool = conn
         .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='updated_at'")

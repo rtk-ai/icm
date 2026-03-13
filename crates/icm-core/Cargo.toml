@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-embeddings = ["fastembed"]
+embeddings = ["fastembed", "directories"]
 
 [dependencies]
 chrono = { workspace = true }
@@ -14,3 +14,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
 fastembed = { workspace = true, optional = true }
+directories = { workspace = true, optional = true }

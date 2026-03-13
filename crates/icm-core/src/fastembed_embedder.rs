@@ -1,9 +1,29 @@
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use directories::ProjectDirs;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use crate::embedder::Embedder;
 use crate::error::{IcmError, IcmResult};
+
+/// Répertoire cache pour les modèles d'embedding (multi-OS via `directories`).
+/// macOS: ~/Library/Caches/dev.icm.icm/models/
+/// Linux: ~/.cache/icm/models/
+/// Windows: C:\Users\<user>\AppData\Local\icm\icm\cache\models\
+fn cache_dir() -> PathBuf {
+    ProjectDirs::from("dev", "icm", "icm")
+        .map(|dirs| dirs.cache_dir().join("models"))
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home)
+                .join(".cache")
+                .join("icm")
+                .join("models")
+        })
+}
 
 pub struct FastEmbedder {
     model: OnceLock<TextEmbedding>,
@@ -88,9 +108,13 @@ impl FastEmbedder {
             return Ok(m);
         }
         let (emb_model, _) = resolve_model(&self.model_name)?;
-        let model =
-            TextEmbedding::try_new(InitOptions::new(emb_model).with_show_download_progress(true))
-                .map_err(|e| IcmError::Embedding(format!("failed to init model: {e}")))?;
+        let cache = cache_dir();
+        let model = TextEmbedding::try_new(
+            InitOptions::new(emb_model)
+                .with_show_download_progress(true)
+                .with_cache_dir(cache),
+        )
+        .map_err(|e| IcmError::Embedding(format!("failed to init model: {e}")))?;
         let _ = self.model.set(model);
         Ok(self.model.get().unwrap())
     }

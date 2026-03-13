@@ -1301,6 +1301,169 @@ fn tool_memoir_link(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
+fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
+    let memoir_name = match get_str(args, "memoir") {
+        Some(n) => n,
+        None => return ToolResult::error("missing required field: memoir".into()),
+    };
+    let name = match get_str(args, "name") {
+        Some(n) => n,
+        None => return ToolResult::error("missing required field: name".into()),
+    };
+    let depth = get_i64(args, "depth", 1) as usize;
+
+    let memoir = match resolve_memoir(store, memoir_name) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+
+    let concept = match store.get_concept_by_name(&memoir.id, name) {
+        Ok(Some(c)) => c,
+        Ok(None) => return ToolResult::error(format!("concept not found: {name}")),
+        Err(e) => return ToolResult::error(format!("db error: {e}")),
+    };
+
+    let labels_str = concept
+        .labels
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut output = format!(
+        "Concept: {}\n  id: {}\n  definition: {}\n  confidence: {:.2}\n  revision: {}\n",
+        concept.name, concept.id, concept.definition, concept.confidence, concept.revision
+    );
+    if !labels_str.is_empty() {
+        output.push_str(&format!("  labels: {labels_str}\n"));
+    }
+
+    let (neighbors, links) = match store.get_neighborhood(&concept.id, depth) {
+        Ok(r) => r,
+        Err(e) => return ToolResult::error(format!("graph error: {e}")),
+    };
+
+    if links.is_empty() {
+        output.push_str("\n(no links)\n");
+    } else {
+        output.push_str(&format!("\nGraph (depth={depth}):\n"));
+        for link in &links {
+            let src = neighbors
+                .iter()
+                .find(|c| c.id == link.source_id)
+                .map(|c| c.name.as_str())
+                .unwrap_or("?");
+            let tgt = neighbors
+                .iter()
+                .find(|c| c.id == link.target_id)
+                .map(|c| c.name.as_str())
+                .unwrap_or("?");
+            output.push_str(&format!("  {src} --{}--> {tgt}\n", link.relation));
+        }
+    }
+
+    ToolResult::text(output)
+}
+
+fn tool_feedback_record(store: &SqliteStore, args: &Value, compact: bool) -> ToolResult {
+    let topic = match get_str(args, "topic") {
+        Some(t) => t,
+        None => return ToolResult::error("missing required field: topic".into()),
+    };
+    let context = match get_str(args, "context") {
+        Some(c) => c,
+        None => return ToolResult::error("missing required field: context".into()),
+    };
+    let predicted = match get_str(args, "predicted") {
+        Some(p) => p,
+        None => return ToolResult::error("missing required field: predicted".into()),
+    };
+    let corrected = match get_str(args, "corrected") {
+        Some(c) => c,
+        None => return ToolResult::error("missing required field: corrected".into()),
+    };
+    let reason = get_str(args, "reason").map(|s| s.to_string());
+    let source = get_str(args, "source").unwrap_or("").to_string();
+
+    let feedback = Feedback::new(
+        topic.into(),
+        context.into(),
+        predicted.into(),
+        corrected.into(),
+        reason,
+        source,
+    );
+
+    let id = feedback.id.clone();
+    match store.store_feedback(feedback) {
+        Ok(_) => {
+            if compact {
+                ToolResult::text(format!("ok {id}"))
+            } else {
+                ToolResult::text(format!("Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"))
+            }
+        }
+        Err(e) => ToolResult::error(format!("failed to store feedback: {e}")),
+    }
+}
+
+fn tool_feedback_search(store: &SqliteStore, args: &Value) -> ToolResult {
+    let query = match get_str(args, "query") {
+        Some(q) => q,
+        None => return ToolResult::error("missing required field: query".into()),
+    };
+    let topic = get_str(args, "topic");
+    let limit = get_i64(args, "limit", 5) as usize;
+
+    match store.search_feedback(query, topic, limit) {
+        Ok(results) => {
+            if results.is_empty() {
+                return ToolResult::text("No feedback found.".into());
+            }
+            let mut output = String::new();
+            for fb in &results {
+                output.push_str(&format!(
+                    "--- {} [{}] ---\n  context: {}\n  predicted: {}\n  corrected: {}\n",
+                    fb.id, fb.topic, fb.context, fb.predicted, fb.corrected
+                ));
+                if let Some(ref reason) = fb.reason {
+                    output.push_str(&format!("  reason: {reason}\n"));
+                }
+                if !fb.source.is_empty() {
+                    output.push_str(&format!("  source: {}\n", fb.source));
+                }
+                if fb.applied_count > 0 {
+                    output.push_str(&format!("  applied: {} times\n", fb.applied_count));
+                }
+            }
+            ToolResult::text(output)
+        }
+        Err(e) => ToolResult::error(format!("failed to search feedback: {e}")),
+    }
+}
+
+fn tool_feedback_stats(store: &SqliteStore) -> ToolResult {
+    match store.feedback_stats() {
+        Ok(stats) => {
+            let mut output = format!("Feedback total: {}\n", stats.total);
+            if !stats.by_topic.is_empty() {
+                output.push_str("\nBy topic:\n");
+                for (topic, count) in &stats.by_topic {
+                    output.push_str(&format!("  {topic}: {count}\n"));
+                }
+            }
+            if !stats.most_applied.is_empty() {
+                output.push_str("\nMost applied:\n");
+                for (id, count) in &stats.most_applied {
+                    output.push_str(&format!("  {id}: {count} times\n"));
+                }
+            }
+            ToolResult::text(output)
+        }
+        Err(e) => ToolResult::error(format!("failed to get feedback stats: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1986,172 +2149,5 @@ mod tests {
         assert!(result.content[0].text.contains("Feedback total: 2"));
         assert!(result.content[0].text.contains("triage"));
         assert!(result.content[0].text.contains("pr-review"));
-    }
-}
-
-fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
-    let memoir_name = match get_str(args, "memoir") {
-        Some(n) => n,
-        None => return ToolResult::error("missing required field: memoir".into()),
-    };
-    let name = match get_str(args, "name") {
-        Some(n) => n,
-        None => return ToolResult::error("missing required field: name".into()),
-    };
-    let depth = get_i64(args, "depth", 1) as usize;
-
-    let memoir = match resolve_memoir(store, memoir_name) {
-        Ok(m) => m,
-        Err(e) => return e,
-    };
-
-    let concept = match store.get_concept_by_name(&memoir.id, name) {
-        Ok(Some(c)) => c,
-        Ok(None) => return ToolResult::error(format!("concept not found: {name}")),
-        Err(e) => return ToolResult::error(format!("db error: {e}")),
-    };
-
-    let labels_str = concept
-        .labels
-        .iter()
-        .map(|l| l.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut output = format!(
-        "Concept: {}\n  id: {}\n  definition: {}\n  confidence: {:.2}\n  revision: {}\n",
-        concept.name, concept.id, concept.definition, concept.confidence, concept.revision
-    );
-    if !labels_str.is_empty() {
-        output.push_str(&format!("  labels: {labels_str}\n"));
-    }
-
-    let (neighbors, links) = match store.get_neighborhood(&concept.id, depth) {
-        Ok(r) => r,
-        Err(e) => return ToolResult::error(format!("graph error: {e}")),
-    };
-
-    if links.is_empty() {
-        output.push_str("\n(no links)\n");
-    } else {
-        output.push_str(&format!("\nGraph (depth={depth}):\n"));
-        for link in &links {
-            let src = neighbors
-                .iter()
-                .find(|c| c.id == link.source_id)
-                .map(|c| c.name.as_str())
-                .unwrap_or("?");
-            let tgt = neighbors
-                .iter()
-                .find(|c| c.id == link.target_id)
-                .map(|c| c.name.as_str())
-                .unwrap_or("?");
-            output.push_str(&format!("  {src} --{}--> {tgt}\n", link.relation));
-        }
-    }
-
-    ToolResult::text(output)
-}
-
-// ---------------------------------------------------------------------------
-// Feedback tool handlers
-// ---------------------------------------------------------------------------
-
-fn tool_feedback_record(store: &SqliteStore, args: &Value, compact: bool) -> ToolResult {
-    let topic = match get_str(args, "topic") {
-        Some(t) => t,
-        None => return ToolResult::error("missing required field: topic".into()),
-    };
-    let context = match get_str(args, "context") {
-        Some(c) => c,
-        None => return ToolResult::error("missing required field: context".into()),
-    };
-    let predicted = match get_str(args, "predicted") {
-        Some(p) => p,
-        None => return ToolResult::error("missing required field: predicted".into()),
-    };
-    let corrected = match get_str(args, "corrected") {
-        Some(c) => c,
-        None => return ToolResult::error("missing required field: corrected".into()),
-    };
-    let reason = get_str(args, "reason").map(|s| s.to_string());
-    let source = get_str(args, "source").unwrap_or("").to_string();
-
-    let feedback = Feedback::new(
-        topic.into(),
-        context.into(),
-        predicted.into(),
-        corrected.into(),
-        reason,
-        source,
-    );
-
-    let id = feedback.id.clone();
-    match store.store_feedback(feedback) {
-        Ok(_) => {
-            if compact {
-                ToolResult::text(format!("ok {id}"))
-            } else {
-                ToolResult::text(format!("Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"))
-            }
-        }
-        Err(e) => ToolResult::error(format!("failed to store feedback: {e}")),
-    }
-}
-
-fn tool_feedback_search(store: &SqliteStore, args: &Value) -> ToolResult {
-    let query = match get_str(args, "query") {
-        Some(q) => q,
-        None => return ToolResult::error("missing required field: query".into()),
-    };
-    let topic = get_str(args, "topic");
-    let limit = get_i64(args, "limit", 5) as usize;
-
-    match store.search_feedback(query, topic, limit) {
-        Ok(results) => {
-            if results.is_empty() {
-                return ToolResult::text("No feedback found.".into());
-            }
-            let mut output = String::new();
-            for fb in &results {
-                output.push_str(&format!(
-                    "--- {} [{}] ---\n  context: {}\n  predicted: {}\n  corrected: {}\n",
-                    fb.id, fb.topic, fb.context, fb.predicted, fb.corrected
-                ));
-                if let Some(ref reason) = fb.reason {
-                    output.push_str(&format!("  reason: {reason}\n"));
-                }
-                if !fb.source.is_empty() {
-                    output.push_str(&format!("  source: {}\n", fb.source));
-                }
-                if fb.applied_count > 0 {
-                    output.push_str(&format!("  applied: {} times\n", fb.applied_count));
-                }
-            }
-            ToolResult::text(output)
-        }
-        Err(e) => ToolResult::error(format!("failed to search feedback: {e}")),
-    }
-}
-
-fn tool_feedback_stats(store: &SqliteStore) -> ToolResult {
-    match store.feedback_stats() {
-        Ok(stats) => {
-            let mut output = format!("Feedback total: {}\n", stats.total);
-            if !stats.by_topic.is_empty() {
-                output.push_str("\nBy topic:\n");
-                for (topic, count) in &stats.by_topic {
-                    output.push_str(&format!("  {topic}: {count}\n"));
-                }
-            }
-            if !stats.most_applied.is_empty() {
-                output.push_str("\nMost applied:\n");
-                for (id, count) in &stats.most_applied {
-                    output.push_str(&format!("  {id}: {count} times\n"));
-                }
-            }
-            ToolResult::text(output)
-        }
-        Err(e) => ToolResult::error(format!("failed to get feedback stats: {e}")),
     }
 }

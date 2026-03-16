@@ -464,6 +464,17 @@ enum MemoirCommands {
         depth: usize,
     },
 
+    /// Export memoir graph as JSON or DOT (Graphviz)
+    Export {
+        /// Memoir name
+        #[arg(short, long)]
+        memoir: String,
+
+        /// Output format: json or dot
+        #[arg(short, long, default_value = "json")]
+        format: String,
+    },
+
     /// Distill memories from a topic into concepts in a memoir
     Distill {
         /// Source memory topic
@@ -773,6 +784,9 @@ fn main() -> Result<()> {
                 name,
                 depth,
             } => cmd_memoir_inspect(&store, &memoir, &name, depth),
+            MemoirCommands::Export { memoir, format } => {
+                cmd_memoir_export(&store, &memoir, &format)
+            }
             MemoirCommands::Distill { from_topic, into } => {
                 cmd_memoir_distill(&store, &from_topic, &into)
             }
@@ -3554,6 +3568,92 @@ fn cmd_memoir_inspect(
             .map(|c| c.name.as_str())
             .unwrap_or("?");
         println!("    {src_name} --{}--> {tgt_name}", link.relation);
+    }
+
+    Ok(())
+}
+
+fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Result<()> {
+    let memoir = resolve_memoir(store, memoir_name)?;
+    let concepts = store.list_concepts(&memoir.id)?;
+
+    // Collect all outgoing links
+    let mut links = Vec::new();
+    for c in &concepts {
+        links.extend(store.get_links_from(&c.id)?);
+    }
+
+    // Name lookup for links
+    let id_to_name: std::collections::HashMap<&str, &str> = concepts
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
+
+    match format {
+        "json" => {
+            let json_concepts: Vec<serde_json::Value> = concepts
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "name": c.name,
+                        "definition": c.definition,
+                        "labels": c.labels.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+                        "confidence": c.confidence,
+                        "revision": c.revision,
+                    })
+                })
+                .collect();
+
+            let json_links: Vec<serde_json::Value> = links
+                .iter()
+                .filter_map(|l| {
+                    let src = id_to_name.get(l.source_id.as_str())?;
+                    let tgt = id_to_name.get(l.target_id.as_str())?;
+                    Some(serde_json::json!({
+                        "id": l.id,
+                        "source": src,
+                        "target": tgt,
+                        "relation": l.relation.to_string(),
+                        "weight": l.weight,
+                    }))
+                })
+                .collect();
+
+            let output = serde_json::json!({
+                "memoir": {
+                    "name": memoir.name,
+                    "description": memoir.description,
+                    "created_at": memoir.created_at.to_rfc3339(),
+                    "updated_at": memoir.updated_at.to_rfc3339(),
+                },
+                "concepts": json_concepts,
+                "links": json_links,
+            });
+
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        "dot" => {
+            println!("digraph \"{}\" {{", memoir.name);
+            println!("  rankdir=LR;");
+            println!("  node [shape=box, style=rounded];");
+            println!();
+            for c in &concepts {
+                let escaped_def = c.definition.replace('"', "\\\"");
+                println!("  \"{}\" [tooltip=\"{}\"];", c.name, escaped_def);
+            }
+            println!();
+            for l in &links {
+                if let (Some(src), Some(tgt)) = (
+                    id_to_name.get(l.source_id.as_str()),
+                    id_to_name.get(l.target_id.as_str()),
+                ) {
+                    println!("  \"{}\" -> \"{}\" [label=\"{}\"];", src, tgt, l.relation);
+                }
+            }
+            println!("}}");
+        }
+        _ => bail!("unsupported format: {format} (use 'json' or 'dot')"),
     }
 
     Ok(())

@@ -350,6 +350,26 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
+            "name": "icm_memoir_export",
+            "description": "Export a memoir's full concept graph as JSON or DOT (Graphviz).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Memoir name"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["json", "dot"],
+                        "default": "json",
+                        "description": "Output format: json (structured) or dot (Graphviz)"
+                    }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
             "name": "icm_memory_extract_patterns",
             "description": "Detect recurring patterns in a topic by keyword similarity. Optionally create concepts in a memoir from detected patterns.",
             "inputSchema": {
@@ -514,6 +534,7 @@ pub fn call_tool(
         "icm_memoir_search_all" => tool_memoir_search_all(store, args),
         "icm_memoir_link" => tool_memoir_link(store, args),
         "icm_memoir_inspect" => tool_memoir_inspect(store, args),
+        "icm_memoir_export" => tool_memoir_export(store, args),
         // Feedback tools
         "icm_feedback_record" => tool_feedback_record(store, args, compact),
         "icm_feedback_search" => tool_feedback_search(store, args),
@@ -1517,6 +1538,108 @@ fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 
     ToolResult::text(output)
+}
+
+fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
+    let memoir_name = match get_str(args, "name") {
+        Some(n) => n,
+        None => return ToolResult::error("missing required field: name".into()),
+    };
+    let format = get_str(args, "format").unwrap_or("json");
+
+    let memoir = match resolve_memoir(store, memoir_name) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+
+    let concepts = match store.list_concepts(&memoir.id) {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(format!("db error: {e}")),
+    };
+
+    // Collect all outgoing links
+    let mut links = Vec::new();
+    for c in &concepts {
+        match store.get_links_from(&c.id) {
+            Ok(l) => links.extend(l),
+            Err(e) => return ToolResult::error(format!("db error: {e}")),
+        }
+    }
+
+    let id_to_name: std::collections::HashMap<&str, &str> = concepts
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
+
+    match format {
+        "json" => {
+            let json_concepts: Vec<serde_json::Value> = concepts
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "name": c.name,
+                        "definition": c.definition,
+                        "labels": c.labels.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+                        "confidence": c.confidence,
+                        "revision": c.revision,
+                    })
+                })
+                .collect();
+
+            let json_links: Vec<serde_json::Value> = links
+                .iter()
+                .filter_map(|l| {
+                    let src = id_to_name.get(l.source_id.as_str())?;
+                    let tgt = id_to_name.get(l.target_id.as_str())?;
+                    Some(serde_json::json!({
+                        "source": src,
+                        "target": tgt,
+                        "relation": l.relation.to_string(),
+                        "weight": l.weight,
+                    }))
+                })
+                .collect();
+
+            let output = serde_json::json!({
+                "memoir": { "name": memoir.name, "description": memoir.description },
+                "concepts": json_concepts,
+                "links": json_links,
+            });
+
+            ToolResult::text(
+                serde_json::to_string_pretty(&output)
+                    .unwrap_or_else(|e| format!("json error: {e}")),
+            )
+        }
+        "dot" => {
+            let mut out = format!(
+                "digraph \"{}\" {{\n  rankdir=LR;\n  node [shape=box, style=rounded];\n\n",
+                memoir.name
+            );
+            for c in &concepts {
+                let escaped = c.definition.replace('"', "\\\"");
+                out.push_str(&format!("  \"{}\" [tooltip=\"{}\"];\n", c.name, escaped));
+            }
+            out.push('\n');
+            for l in &links {
+                if let (Some(src), Some(tgt)) = (
+                    id_to_name.get(l.source_id.as_str()),
+                    id_to_name.get(l.target_id.as_str()),
+                ) {
+                    out.push_str(&format!(
+                        "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
+                        src, tgt, l.relation
+                    ));
+                }
+            }
+            out.push_str("}\n");
+            ToolResult::text(out)
+        }
+        _ => ToolResult::error(format!(
+            "unsupported format: {format} (use 'json' or 'dot')"
+        )),
+    }
 }
 
 fn tool_feedback_record(store: &SqliteStore, args: &Value, compact: bool) -> ToolResult {

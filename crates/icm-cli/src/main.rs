@@ -308,6 +308,10 @@ enum HookCommands {
         #[arg(long, default_value = "15")]
         every: usize,
     },
+    /// PreCompact hook: extract memories from transcript before context compression
+    Compact,
+    /// UserPromptSubmit hook: inject recalled context at the start of each prompt
+    Prompt,
 }
 
 #[derive(Subcommand)]
@@ -841,6 +845,8 @@ fn main() -> Result<()> {
         Commands::Hook { command } => match command {
             HookCommands::Pre => cmd_hook_pre(),
             HookCommands::Post { every } => cmd_hook_post(&store, every),
+            HookCommands::Compact => cmd_hook_compact(&store),
+            HookCommands::Prompt => cmd_hook_prompt(&store),
         },
     }
 }
@@ -1292,6 +1298,129 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize) -> Result<()> {
     Ok(())
 }
 
+/// PreCompact hook (Layer 1): extract memories from transcript before context compression.
+/// Reads JSON from stdin with `transcript_path`, reads the JSONL transcript,
+/// and extracts facts from assistant messages.
+fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+
+    let json: Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let transcript_path = match json.get("transcript_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return Ok(()), // No transcript path — nothing to do
+    };
+
+    let transcript = match std::fs::read_to_string(transcript_path) {
+        Ok(t) => t,
+        Err(_) => return Ok(()), // Can't read transcript — fail silently
+    };
+
+    // Extract assistant text from the last 100 JSONL lines
+    let mut assistant_text = String::new();
+    for line in transcript.lines().rev().take(100) {
+        if let Ok(entry) = serde_json::from_str::<Value>(line) {
+            if entry.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                if let Some(content) = entry.pointer("/message/content") {
+                    if let Some(arr) = content.as_array() {
+                        for block in arr {
+                            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    assistant_text.push_str(text);
+                                    assistant_text.push('\n');
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if assistant_text.is_empty() {
+        return Ok(());
+    }
+
+    // Truncate to last 4000 chars to keep extraction reasonable
+    let text = if assistant_text.len() > 4000 {
+        &assistant_text[assistant_text.len() - 4000..]
+    } else {
+        &assistant_text
+    };
+
+    let project = json
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
+
+    match extract::extract_and_store(store, text, &project) {
+        Ok(n) if n > 0 => eprintln!("[icm] pre-compact: extracted {n} facts from transcript"),
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
+/// Reads JSON from stdin with `user_message`, recalls relevant memories,
+/// and prints context to stdout (Claude Code appends it as system-reminder).
+fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+
+    let json: Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    // Extract query from user message
+    let message = json
+        .get("user_message")
+        .or_else(|| json.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if message.is_empty() {
+        return Ok(());
+    }
+
+    // Build query: combine project name + user message
+    let project = json
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let query = if project.is_empty() {
+        message.to_string()
+    } else {
+        format!("{project} {message}")
+    };
+
+    // Truncate query to first 200 chars for search
+    let query = if query.len() > 200 {
+        &query[..200]
+    } else {
+        &query
+    };
+
+    let ctx = extract::recall_context(store, query, 5)?;
+    if !ctx.is_empty() {
+        print!("{ctx}");
+    }
+
+    Ok(())
+}
+
 fn cmd_topics(store: &SqliteStore) -> Result<()> {
     let topics = store.list_topics()?;
     if topics.is_empty() {
@@ -1645,8 +1774,19 @@ icm store -t \"topic\" -c \"summary\"
 
         // PostToolUse hook: `icm hook post` (auto-extract context)
         let post_cmd = format!("{} hook post", icm_bin_str);
-        let post_status = inject_claude_hook(&claude_settings_path, &post_cmd)?;
+        let post_status = inject_claude_hook(&claude_settings_path, "PostToolUse", &post_cmd)?;
         println!("[hook] Claude Code PostToolUse (auto-extract): {post_status}");
+
+        // PreCompact hook: `icm hook compact` (extract from transcript before compression)
+        let compact_cmd = format!("{} hook compact", icm_bin_str);
+        let compact_status = inject_claude_hook(&claude_settings_path, "PreCompact", &compact_cmd)?;
+        println!("[hook] Claude Code PreCompact (transcript extract): {compact_status}");
+
+        // UserPromptSubmit hook: `icm hook prompt` (recall context on each prompt)
+        let prompt_cmd = format!("{} hook prompt", icm_bin_str);
+        let prompt_status =
+            inject_claude_hook(&claude_settings_path, "UserPromptSubmit", &prompt_cmd)?;
+        println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
     }
 
     println!();
@@ -1681,8 +1821,12 @@ fn inject_icm_block(path: &PathBuf, block: &str) -> Result<String> {
     }
 }
 
-/// Inject ICM PostToolUse hook into Claude Code settings.json
-fn inject_claude_hook(settings_path: &PathBuf, hook_command: &str) -> Result<String> {
+/// Inject ICM hook into Claude Code settings.json for a given event name.
+fn inject_claude_hook(
+    settings_path: &PathBuf,
+    event_name: &str,
+    hook_command: &str,
+) -> Result<String> {
     let mut config: Value = if settings_path.exists() {
         let content = std::fs::read_to_string(settings_path)
             .with_context(|| format!("cannot read {}", settings_path.display()))?;
@@ -1698,18 +1842,18 @@ fn inject_claude_hook(settings_path: &PathBuf, hook_command: &str) -> Result<Str
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
 
-    let post_tool = hooks
+    let event_hooks = hooks
         .as_object_mut()
         .context("hooks is not a JSON object")?
-        .entry("PostToolUse")
+        .entry(event_name)
         .or_insert_with(|| serde_json::json!([]));
 
-    let post_tool_arr = post_tool
+    let event_arr = event_hooks
         .as_array_mut()
-        .context("PostToolUse is not an array")?;
+        .with_context(|| format!("{event_name} is not an array"))?;
 
     // Check if ICM hook already exists
-    let already = post_tool_arr.iter().any(|entry| {
+    let already = event_arr.iter().any(|entry| {
         entry
             .get("hooks")
             .and_then(|h| h.as_array())
@@ -1717,7 +1861,7 @@ fn inject_claude_hook(settings_path: &PathBuf, hook_command: &str) -> Result<Str
                 hooks.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|c| c.contains("icm-post-tool") || c.contains("icm hook post"))
+                        .map(|c| c.contains("icm hook") || c.contains("icm-post-tool"))
                         .unwrap_or(false)
                 })
             })
@@ -1728,8 +1872,8 @@ fn inject_claude_hook(settings_path: &PathBuf, hook_command: &str) -> Result<Str
         return Ok("already configured".into());
     }
 
-    // Add ICM PostToolUse hook entry
-    post_tool_arr.push(serde_json::json!({
+    // Add ICM hook entry
+    event_arr.push(serde_json::json!({
         "hooks": [{
             "type": "command",
             "command": hook_command

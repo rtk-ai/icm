@@ -450,4 +450,4 @@ qwen2.5:3b             3B       2%       58%       +56%
 
 ## 许可证
 
-[Source-Available](LICENSE) — 个人及 20 人以下团队免费使用。20 人以上的组织需要企业许可证。联系方式：license@rtk.ai
+[Source-Available](LICENSE) — 个人及 20 人以下团队免费使用。20 人以上的组织需要企业许可证。联系方式：contact@rtk-ai.app

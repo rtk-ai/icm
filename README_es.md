@@ -451,4 +451,4 @@ Todos los benchmarks usan **llamadas API reales** — sin mocks, sin respuestas 
 
 ## Licencia
 
-[Source-Available](LICENSE) — Gratuito para individuos y equipos de ≤ 20 personas. Se requiere licencia empresarial para organizaciones más grandes. Contacto: license@rtk.ai
+[Source-Available](LICENSE) — Gratuito para individuos y equipos de ≤ 20 personas. Se requiere licencia empresarial para organizaciones más grandes. Contacto: contact@rtk-ai.app

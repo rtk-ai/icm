@@ -186,7 +186,7 @@ No cloud. No API key for storage. No Docker. No configuration beyond `icm init`.
 
 **Free** for individuals and teams up to 20 people.
 
-Enterprise license required for organizations >20. Contact: license@rtk.ai
+Enterprise license required for organizations >20. Contact: contact@rtk-ai.app
 
 ## Getting Started
 

@@ -451,4 +451,4 @@ Wszystkie benchmarki używają **prawdziwych wywołań API** — bez atrap, bez 
 
 ## Licencja
 
-[Source-Available](LICENSE) — Bezpłatna dla osób prywatnych i zespołów liczących ≤ 20 osób. Licencja korporacyjna wymagana dla większych organizacji. Kontakt: license@rtk.ai
+[Source-Available](LICENSE) — Bezpłatna dla osób prywatnych i zespołów liczących ≤ 20 osób. Licencja korporacyjna wymagana dla większych organizacji. Kontakt: contact@rtk-ai.app

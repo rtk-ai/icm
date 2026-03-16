@@ -452,4 +452,4 @@ Alle benchmarks gebruiken **echte API-aanroepen** — geen mocks, geen gesimulee
 
 ## Licentie
 
-[Source-Available](LICENSE) — Gratis voor particulieren en teams van maximaal 20 personen. Ondernemingslicentie vereist voor grotere organisaties. Contact: license@rtk.ai
+[Source-Available](LICENSE) — Gratis voor particulieren en teams van maximaal 20 personen. Ondernemingslicentie vereist voor grotere organisaties. Contact: contact@rtk-ai.app

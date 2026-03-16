@@ -8,8 +8,8 @@ use zerocopy::IntoBytes;
 
 use icm_core::{
     Concept, ConceptLink, Feedback, FeedbackStats, FeedbackStore, IcmError, IcmResult, Importance,
-    Label, Memoir, MemoirStats, MemoirStore, Memory, MemorySource, MemoryStore, Relation,
-    StoreStats, TopicHealth,
+    Label, Memoir, MemoirStats, MemoirStore, Memory, MemorySource, MemoryStore, PatternCluster,
+    Relation, StoreStats, TopicHealth,
 };
 
 use crate::schema::{init_db, init_db_with_dims};
@@ -190,6 +190,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         source,
         related_ids,
         embedding,
+        scope: icm_core::Scope::User, // default for existing local memories
     })
 }
 
@@ -1658,6 +1659,279 @@ impl FeedbackStore for SqliteStore {
             by_topic,
             most_applied,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-consolidation, prefix queries, and pattern detection
+// ---------------------------------------------------------------------------
+
+impl SqliteStore {
+    /// Automatically consolidate a topic if it exceeds the threshold.
+    ///
+    /// Keeps the top 3 summaries (by weight), merges all unique keywords,
+    /// and replaces all memories with a single consolidated memory.
+    /// Returns `true` if consolidation was performed.
+    pub fn auto_consolidate(&self, topic: &str, threshold: usize) -> IcmResult<bool> {
+        let count = self.count_by_topic(topic)?;
+        if count < threshold {
+            return Ok(false);
+        }
+
+        let mut memories = self.get_by_topic(topic)?;
+        if memories.is_empty() {
+            return Ok(false);
+        }
+
+        // Sort by weight DESC (get_by_topic already does this, but be explicit)
+        memories.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Take the top 3 summaries for the consolidated summary
+        let top_summaries: Vec<&str> = memories
+            .iter()
+            .take(3)
+            .map(|m| m.summary.as_str())
+            .collect();
+        let consolidated_summary = top_summaries.join(" | ");
+
+        // Merge all unique keywords
+        let mut all_keywords: Vec<String> = Vec::new();
+        let mut seen_keywords: HashSet<String> = HashSet::new();
+        for mem in &memories {
+            for kw in &mem.keywords {
+                let lower = kw.to_lowercase();
+                if seen_keywords.insert(lower) {
+                    all_keywords.push(kw.clone());
+                }
+            }
+        }
+
+        let original_count = memories.len();
+
+        // Build the consolidated memory
+        let mut consolidated = Memory::new(topic.into(), consolidated_summary, Importance::High);
+        consolidated.keywords = all_keywords;
+        consolidated.raw_excerpt =
+            Some(format!("auto-consolidated from {original_count} memories"));
+        consolidated.weight = 1.0;
+
+        // Replace all memories in the topic with the consolidated one
+        self.consolidate_topic(topic, consolidated)?;
+
+        Ok(true)
+    }
+
+    /// Get memories by topic prefix (e.g., "wshm" matches "wshm:owner/repo").
+    ///
+    /// If `topic` ends with `*`, uses LIKE matching. Otherwise exact match.
+    pub fn get_by_topic_prefix(&self, topic: &str) -> IcmResult<Vec<Memory>> {
+        if let Some(prefix) = topic.strip_suffix('*') {
+            let pattern = format!("{prefix}%");
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "SELECT {SELECT_COLS} FROM memories WHERE topic LIKE ?1 ORDER BY weight DESC"
+                ))
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(params![pattern], row_to_memory)
+                .map_err(|e| IcmError::Database(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+            }
+            Ok(results)
+        } else {
+            self.get_by_topic(topic)
+        }
+    }
+
+    /// List topics, optionally filtered by a prefix.
+    pub fn list_topics_with_prefix(&self, prefix: Option<&str>) -> IcmResult<Vec<(String, usize)>> {
+        match prefix {
+            Some(p) => {
+                let pattern = format!("{p}%");
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT topic, COUNT(*) FROM memories WHERE topic LIKE ?1 GROUP BY topic ORDER BY topic",
+                    )
+                    .map_err(|e| IcmError::Database(e.to_string()))?;
+
+                let rows = stmt
+                    .query_map(params![pattern], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+                    })
+                    .map_err(|e| IcmError::Database(e.to_string()))?;
+
+                let mut results = Vec::new();
+                for row in rows {
+                    results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+                }
+                Ok(results)
+            }
+            None => self.list_topics(),
+        }
+    }
+
+    /// Detect recurring patterns in a topic by computing Jaccard similarity on keywords.
+    ///
+    /// Groups memories with keyword similarity > 0.5 into clusters,
+    /// and returns clusters of size >= `min_cluster_size`.
+    pub fn detect_patterns(
+        &self,
+        topic: &str,
+        min_cluster_size: usize,
+    ) -> IcmResult<Vec<PatternCluster>> {
+        let memories = self.get_by_topic(topic)?;
+        if memories.len() < min_cluster_size {
+            return Ok(Vec::new());
+        }
+
+        // Build keyword sets for each memory
+        let keyword_sets: Vec<HashSet<String>> = memories
+            .iter()
+            .map(|m| m.keywords.iter().map(|k| k.to_lowercase()).collect())
+            .collect();
+
+        // Union-Find-style clustering via adjacency
+        let n = memories.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], i: usize) -> usize {
+            let mut i = i;
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+
+        // Compute Jaccard similarity for each pair, union if > 0.5
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if keyword_sets[i].is_empty() && keyword_sets[j].is_empty() {
+                    continue;
+                }
+                let intersection = keyword_sets[i].intersection(&keyword_sets[j]).count();
+                let union_size = keyword_sets[i].union(&keyword_sets[j]).count();
+                if union_size > 0 {
+                    let jaccard = intersection as f32 / union_size as f32;
+                    if jaccard > 0.5 {
+                        union(&mut parent, i, j);
+                    }
+                }
+            }
+        }
+
+        // Group by cluster root
+        let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters.entry(root).or_default().push(i);
+        }
+
+        // Build PatternCluster for each group meeting the minimum size
+        let mut result: Vec<PatternCluster> = Vec::new();
+        for indices in clusters.values() {
+            if indices.len() < min_cluster_size {
+                continue;
+            }
+
+            // Representative = the highest-weight memory in the cluster
+            let best_idx = *indices
+                .iter()
+                .max_by(|&&a, &&b| {
+                    memories[a]
+                        .weight
+                        .partial_cmp(&memories[b].weight)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+
+            // Collect all unique keywords from the cluster
+            let mut all_kw: Vec<String> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for &idx in indices {
+                for kw in &memories[idx].keywords {
+                    let lower = kw.to_lowercase();
+                    if seen.insert(lower) {
+                        all_kw.push(kw.clone());
+                    }
+                }
+            }
+
+            result.push(PatternCluster {
+                representative_summary: memories[best_idx].summary.clone(),
+                memory_ids: indices.iter().map(|&i| memories[i].id.clone()).collect(),
+                keywords: all_kw,
+                count: indices.len(),
+            });
+        }
+
+        // Sort by cluster size descending
+        result.sort_by(|a, b| b.count.cmp(&a.count));
+
+        Ok(result)
+    }
+
+    /// Extract a pattern cluster as a concept in a memoir.
+    ///
+    /// Creates a Concept with:
+    /// - name derived from common keywords
+    /// - definition = combined summary of the cluster
+    /// - source_memory_ids = memory IDs in the cluster
+    /// - confidence = 0.5 + (count * 0.05) capped at 0.9
+    /// - labels = common keywords as labels
+    pub fn extract_pattern_as_concept(
+        &self,
+        cluster: &PatternCluster,
+        memoir_id: &str,
+    ) -> IcmResult<String> {
+        // Derive concept name from top keywords
+        let concept_name = if cluster.keywords.is_empty() {
+            format!("pattern-{}", &cluster.memory_ids[0][..8])
+        } else {
+            cluster
+                .keywords
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("-")
+        };
+
+        // Build definition from cluster representative + count
+        let definition = format!(
+            "{} (pattern detected across {} memories)",
+            cluster.representative_summary, cluster.count
+        );
+
+        let mut concept = Concept::new(memoir_id.into(), concept_name, definition);
+        concept.source_memory_ids = cluster.memory_ids.clone();
+        concept.confidence = (0.5 + cluster.count as f32 * 0.05).min(0.9);
+        concept.labels = cluster
+            .keywords
+            .iter()
+            .take(5)
+            .map(|kw| Label::new("pattern", kw.as_str()))
+            .collect();
+
+        self.add_concept(concept)
     }
 }
 

@@ -1176,11 +1176,13 @@ dependencies = [
  "icm-mcp",
  "icm-store",
  "openssl",
+ "rpassword",
  "serde",
  "serde_json",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
@@ -2319,6 +2321,16 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rpassword"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffc936cf8a7ea60c58f030fd36a612a48f440610214dc54bc36431f9ea0c3efb"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

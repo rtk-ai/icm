@@ -20,6 +20,7 @@ pub struct Config {
     pub extraction: ExtractionConfig,
     pub recall: RecallConfig,
     pub mcp: McpConfig,
+    pub cloud: CloudConfig,
 }
 
 /// Database storage settings.
@@ -37,6 +38,10 @@ pub struct MemoryConfig {
     pub default_importance: String,
     pub decay_rate: f32,
     pub prune_threshold: f32,
+    /// Enable automatic consolidation when a topic exceeds the threshold.
+    pub auto_consolidate_enabled: bool,
+    /// Number of entries in a topic before auto-consolidation triggers.
+    pub auto_consolidate_threshold: usize,
 }
 
 /// Embedding model settings.
@@ -86,6 +91,28 @@ pub struct McpConfig {
     pub instructions: Option<String>,
 }
 
+/// RTK Cloud sync settings.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct CloudConfig {
+    /// Enable cloud sync (requires login).
+    pub enabled: bool,
+    /// RTK Cloud endpoint.
+    pub endpoint: String,
+    /// Default scope for new memories (user, project, org).
+    pub default_scope: String,
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "https://cloud.rtk-ai.app".into(),
+            default_scope: "user".into(),
+        }
+    }
+}
+
 // --- Defaults ---
 
 impl Default for MemoryConfig {
@@ -94,6 +121,8 @@ impl Default for MemoryConfig {
             default_importance: "medium".into(),
             decay_rate: 0.95,
             prune_threshold: 0.1,
+            auto_consolidate_enabled: false,
+            auto_consolidate_threshold: 10,
         }
     }
 }

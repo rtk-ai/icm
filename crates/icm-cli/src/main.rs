@@ -1,5 +1,6 @@
 mod bench_data;
 mod bench_knowledge;
+pub mod cloud;
 mod config;
 mod extract;
 
@@ -124,6 +125,21 @@ enum Commands {
     Feedback {
         #[command(subcommand)]
         command: FeedbackCommands,
+    },
+
+    /// Detect recurring patterns in a topic and optionally create memoir concepts
+    ExtractPatterns {
+        /// Topic to analyze
+        #[arg(short, long)]
+        topic: String,
+
+        /// Memoir name — if provided, creates concepts from detected patterns
+        #[arg(short, long)]
+        memoir: Option<String>,
+
+        /// Minimum cluster size to form a pattern (default: 3)
+        #[arg(long, default_value = "3")]
+        min_cluster_size: usize,
     },
 
     /// List all topics
@@ -258,6 +274,12 @@ enum Commands {
     /// Show current configuration
     Config,
 
+    /// RTK Cloud commands (login, sync, status)
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommands,
+    },
+
     /// Launch MCP server (stdio transport for Claude Code)
     Serve {
         /// Compact output mode (shorter responses to save tokens)
@@ -281,6 +303,41 @@ enum HookCommands {
         /// Extract every N tool calls
         #[arg(long, default_value = "15")]
         every: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudCommands {
+    /// Login to RTK Cloud (OAuth browser or email/password)
+    Login {
+        /// RTK Cloud endpoint
+        #[arg(short, long, default_value = "https://cloud.rtk-ai.app")]
+        endpoint: String,
+        /// Use email/password instead of browser OAuth
+        #[arg(long)]
+        password: bool,
+    },
+    /// Logout from RTK Cloud
+    Logout,
+    /// Show cloud connection status
+    Status,
+    /// Push local memories to cloud (project/org scope)
+    Push {
+        /// Scope to push (project or org)
+        #[arg(short, long, default_value = "project")]
+        scope: String,
+        /// Only push memories from this topic
+        #[arg(short, long)]
+        topic: Option<String>,
+    },
+    /// Pull shared memories from cloud
+    Pull {
+        /// Scope to pull (project or org)
+        #[arg(short, long, default_value = "project")]
+        scope: String,
+        /// Only pull memories updated since this ISO timestamp
+        #[arg(long)]
+        since: Option<String>,
     },
 }
 
@@ -649,6 +706,11 @@ fn main() -> Result<()> {
             } => cmd_feedback_search(&store, &query, topic.as_deref(), limit),
             FeedbackCommands::Stats => cmd_feedback_stats(&store),
         },
+        Commands::ExtractPatterns {
+            topic,
+            memoir,
+            min_cluster_size,
+        } => cmd_extract_patterns(&store, &topic, memoir.as_deref(), min_cluster_size),
         Commands::Topics => cmd_topics(&store),
         Commands::Stats => cmd_stats(&store),
         Commands::Decay { factor } => cmd_decay(&store, factor),
@@ -735,6 +797,7 @@ fn main() -> Result<()> {
             runs,
             verbose,
         } => cmd_bench_agent(sessions, &model, runs, verbose),
+        Commands::Cloud { command } => cmd_cloud(command, &store),
         Commands::Serve { compact } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -1253,6 +1316,58 @@ fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
         let pruned = store.prune(threshold)?;
         println!("Pruned {pruned} memories (threshold={threshold}).");
     }
+    Ok(())
+}
+
+fn cmd_extract_patterns(
+    store: &SqliteStore,
+    topic: &str,
+    memoir: Option<&str>,
+    min_cluster_size: usize,
+) -> Result<()> {
+    let patterns = store.detect_patterns(topic, min_cluster_size)?;
+
+    if patterns.is_empty() {
+        println!("No patterns detected in topic '{topic}' (min cluster size: {min_cluster_size}).");
+        return Ok(());
+    }
+
+    println!(
+        "Detected {} pattern(s) in topic '{topic}':\n",
+        patterns.len()
+    );
+
+    for (i, cluster) in patterns.iter().enumerate() {
+        println!(
+            "  Pattern #{}: {} memories, keywords: [{}]",
+            i + 1,
+            cluster.count,
+            cluster.keywords.join(", ")
+        );
+        println!(
+            "    Summary: {}",
+            &cluster.representative_summary[..cluster.representative_summary.len().min(120)]
+        );
+    }
+
+    if let Some(memoir_name) = memoir {
+        // Resolve memoir
+        let memoirs = store.list_memoirs()?;
+        let memoir_obj = memoirs
+            .iter()
+            .find(|m| m.name == memoir_name)
+            .ok_or_else(|| anyhow::anyhow!("Memoir '{memoir_name}' not found. Create it first with `icm memoir create -n {memoir_name}`"))?;
+
+        println!("\nCreating concepts in memoir '{memoir_name}'...");
+        for cluster in &patterns {
+            let concept_id = store.extract_pattern_as_concept(cluster, &memoir_obj.id)?;
+            println!("  Created concept: {concept_id}");
+        }
+        println!("Done. {} concept(s) created.", patterns.len());
+    } else {
+        println!("\nTo create concepts from these patterns, add --memoir <name>.");
+    }
+
     Ok(())
 }
 
@@ -3522,5 +3637,94 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..max.saturating_sub(3)])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cloud commands
+// ---------------------------------------------------------------------------
+
+fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
+    use icm_core::Scope;
+
+    match command {
+        CloudCommands::Login { endpoint, password } => {
+            if password {
+                // Email/password login (for generic emails, self-hosted, no OAuth)
+                eprint!("Email: ");
+                let mut email = String::new();
+                std::io::stdin().read_line(&mut email)?;
+                let email = email.trim().to_string();
+
+                eprint!("Password: ");
+                let pwd = rpassword::read_password().context("failed to read password")?;
+
+                cloud::login_password(&endpoint, &email, &pwd)?;
+            } else {
+                cloud::login_browser(&endpoint)?;
+            }
+            Ok(())
+        }
+        CloudCommands::Logout => cloud::logout(),
+        CloudCommands::Status => cloud::status(),
+        CloudCommands::Push { scope, topic } => {
+            let scope: Scope = scope.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+            let creds = cloud::require_credentials_for_scope(scope)
+                .context("Cloud login required for push. Run: icm cloud login")?;
+
+            let memories: Vec<Memory> = if let Some(ref t) = topic {
+                use icm_core::MemoryStore;
+                store.get_by_topic(t)?
+            } else {
+                use icm_core::MemoryStore;
+                // Get all memories — list topics then fetch each
+                let topics = store.list_topics()?;
+                let mut all = Vec::new();
+                for (t, _) in &topics {
+                    all.extend(store.get_by_topic(t)?);
+                }
+                all
+            };
+
+            let mut synced = 0;
+            for mut mem in memories {
+                mem.scope = scope;
+                if let Err(e) = cloud::sync_memory(&creds, &mem) {
+                    eprintln!("Failed to sync {}: {}", mem.id, e);
+                } else {
+                    synced += 1;
+                }
+            }
+
+            eprintln!("Pushed {} memories to cloud (scope: {})", synced, scope);
+            Ok(())
+        }
+        CloudCommands::Pull { scope, since } => {
+            let scope: Scope = scope.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+            let creds = cloud::require_credentials_for_scope(scope)
+                .context("Cloud login required for pull. Run: icm cloud login")?;
+
+            let memories = cloud::pull_memories(&creds, scope, since.as_deref())?;
+
+            let mut imported = 0;
+            for mem in memories {
+                use icm_core::MemoryStore;
+                // Upsert: if memory exists locally, update it; otherwise store it
+                match store.get(&mem.id)? {
+                    Some(_) => {
+                        store.update(&mem)?;
+                    }
+                    None => {
+                        store.store(mem)?;
+                    }
+                }
+                imported += 1;
+            }
+
+            eprintln!("Pulled {} memories from cloud (scope: {})", imported, scope);
+            Ok(())
+        }
     }
 }

@@ -193,7 +193,7 @@ impl ConceptLink {
 // MemoirStats
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MemoirStats {
     pub total_concepts: usize,
     pub total_links: usize,

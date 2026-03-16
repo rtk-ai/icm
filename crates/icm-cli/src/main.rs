@@ -3,6 +3,8 @@ mod bench_knowledge;
 pub mod cloud;
 mod config;
 mod extract;
+#[cfg(feature = "tui")]
+mod tui;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -300,6 +302,15 @@ enum Commands {
         #[command(subcommand)]
         command: HookCommands,
     },
+
+    /// Launch interactive TUI dashboard
+    #[cfg(feature = "tui")]
+    Dashboard,
+
+    /// Launch interactive TUI dashboard (alias for dashboard)
+    #[cfg(feature = "tui")]
+    #[command(hide = true)]
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -668,6 +679,7 @@ fn main() -> Result<()> {
             e.dimensions()
         })
         .unwrap_or(384);
+    let db_path = cli.db.clone().unwrap_or_else(default_db_path);
     let store = open_store(cli.db, embedding_dims)?;
 
     match cli.command {
@@ -853,6 +865,16 @@ fn main() -> Result<()> {
             HookCommands::Compact => cmd_hook_compact(&store),
             HookCommands::Prompt => cmd_hook_prompt(&store),
         },
+        #[cfg(feature = "tui")]
+        Commands::Dashboard => {
+            let db_path_str = db_path.to_string_lossy().to_string();
+            tui::run_dashboard(&store, Some(&db_path_str))
+        }
+        #[cfg(feature = "tui")]
+        Commands::Tui => {
+            let db_path_str = db_path.to_string_lossy().to_string();
+            tui::run_dashboard(&store, Some(&db_path_str))
+        }
     }
 }
 
@@ -1056,13 +1078,13 @@ fn cmd_health(store: &SqliteStore, topic_filter: Option<&str>) -> Result<()> {
         match store.topic_health(topic) {
             Ok(health) => {
                 let status = if health.needs_consolidation && health.stale_count > 0 {
-                    "⚠ NEEDS ATTENTION"
+                    "!! NEEDS ATTENTION"
                 } else if health.needs_consolidation {
-                    "⚠ consolidate"
+                    "!  consolidate"
                 } else if health.stale_count > 0 {
-                    "○ stale entries"
+                    "-  stale entries"
                 } else {
-                    "✓ healthy"
+                    "ok healthy"
                 };
 
                 println!(
@@ -3772,7 +3794,7 @@ fn confidence_color(confidence: f32) -> &'static str {
 fn confidence_bar(confidence: f32) -> String {
     let filled = (confidence * 5.0).round() as usize;
     let empty = 5 - filled.min(5);
-    format!("{}{}", "●".repeat(filled), "○".repeat(empty))
+    format!("{}{}", "#".repeat(filled), ".".repeat(empty))
 }
 
 fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Result<()> {

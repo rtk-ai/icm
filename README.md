@@ -144,6 +144,16 @@ ICM can be used via CLI (`icm` commands) or MCP server (`icm serve`). Both acces
 | **Auto-extraction** | Yes (hooks trigger `icm extract`) | Yes (MCP tools call store) |
 | **Best for** | Power users, token savings | Universal compatibility |
 
+## Dashboard
+
+```bash
+icm dashboard    # or: icm tui
+```
+
+Interactive TUI with 5 tabs: Overview, Topics, Memories, Health, Memoirs. Keyboard navigation (vim-style: j/k, g/G, Tab, 1-5), live search (/), auto-refresh.
+
+Requires the `tui` feature (enabled by default). Build without: `cargo install --path crates/icm-cli --no-default-features --features embeddings`.
+
 ## CLI
 
 ### Memories (episodic, with decay)

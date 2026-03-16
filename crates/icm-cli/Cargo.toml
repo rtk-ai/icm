@@ -13,8 +13,9 @@ name = "icm"
 path = "src/main.rs"
 
 [features]
-default = ["embeddings"]
+default = ["embeddings", "tui"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
+tui = ["dep:ratatui", "dep:crossterm"]
 vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
@@ -33,6 +34,8 @@ tracing-subscriber = { workspace = true }
 openssl = { version = "0.10", optional = true }
 ureq = { workspace = true }
 rpassword = { workspace = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

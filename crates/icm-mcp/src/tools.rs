@@ -667,7 +667,7 @@ fn tool_store(
                     let hint = if let Ok(count) = store.count_by_topic(topic) {
                         if count > 7 {
                             format!(
-                                "\n⚠ Topic '{topic}' has {count} entries — consider consolidating with icm_memory_consolidate."
+                                "\nNote: Topic '{topic}' has {count} entries — consider consolidating with icm_memory_consolidate."
                             )
                         } else {
                             String::new()
@@ -971,13 +971,13 @@ fn tool_health(store: &SqliteStore, args: &Value) -> ToolResult {
         match store.topic_health(topic) {
             Ok(health) => {
                 let status = if health.needs_consolidation && health.stale_count > 0 {
-                    "⚠ NEEDS ATTENTION"
+                    "!! NEEDS ATTENTION"
                 } else if health.needs_consolidation {
-                    "⚠ consolidate"
+                    "!  consolidate"
                 } else if health.stale_count > 0 {
-                    "○ has stale entries"
+                    "-  has stale entries"
                 } else {
-                    "✓ healthy"
+                    "ok healthy"
                 };
 
                 output.push_str(&format!(
@@ -1555,7 +1555,7 @@ fn confidence_color(confidence: f32) -> &'static str {
 fn confidence_bar(confidence: f32) -> String {
     let filled = (confidence * 5.0).round() as usize;
     let empty = 5 - filled.min(5);
-    format!("{}{}", "●".repeat(filled), "○".repeat(empty))
+    format!("{}{}", "#".repeat(filled), ".".repeat(empty))
 }
 
 fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {

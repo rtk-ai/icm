@@ -229,6 +229,10 @@ enum Commands {
         /// Don't store, just print extracted facts
         #[arg(long)]
         dry_run: bool,
+
+        /// Store raw text as low-importance memory when no facts are extracted
+        #[arg(long)]
+        store_raw: bool,
     },
 
     /// Output recalled context formatted for prompt injection
@@ -817,7 +821,8 @@ fn main() -> Result<()> {
             project,
             text,
             dry_run,
-        } => cmd_extract(&store, &project, text, dry_run),
+            store_raw,
+        } => cmd_extract(&store, &project, text, dry_run, store_raw),
         Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
         Commands::Config => cmd_config(),
         Commands::Bench { count } => cmd_bench(count),
@@ -2258,6 +2263,7 @@ fn cmd_extract(
     project: &str,
     text: Option<String>,
     dry_run: bool,
+    store_raw: bool,
 ) -> Result<()> {
     let input = match text {
         Some(t) => t,
@@ -2272,7 +2278,6 @@ fn cmd_extract(
     };
 
     if dry_run {
-        // Just show what would be extracted
         let facts = extract::extract_facts_public(&input, project);
         if facts.is_empty() {
             println!("No facts extracted.");
@@ -2283,7 +2288,7 @@ fn cmd_extract(
             }
         }
     } else {
-        let stored = extract::extract_and_store(store, &input, project)?;
+        let stored = extract::extract_and_store_with_opts(store, &input, project, store_raw)?;
         println!("Extracted and stored {stored} facts.");
     }
     Ok(())

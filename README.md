@@ -296,20 +296,20 @@ See [config/default.toml](config/default.toml) for all options.
 ICM extracts memories automatically via three layers:
 
 ```
-  Layer 0: Pattern hooks              Layer 1: PreCompact           Layer 2: SessionStart
-  (zero LLM cost)                     (cheap LLM, ~500 tok)         (zero LLM cost)
+  Layer 0: Pattern hooks              Layer 1: PreCompact           Layer 2: UserPromptSubmit
+  (zero LLM cost)                     (zero LLM cost)               (zero LLM cost)
   ┌──────────────────┐                ┌──────────────────┐          ┌──────────────────┐
-  │ PostToolUse hook  │                │ PreCompact hook   │          │ SessionStart hook │
+  │ PostToolUse hook  │                │ PreCompact hook   │          │ UserPromptSubmit  │
   │                   │                │                   │          │                   │
-  │ • Bash exit != 0  │                │ Context about to  │          │ Read cwd project  │
-  │   → store error   │                │ be compressed →   │          │ → icm recall      │
-  │ • git commit      │                │ extract memories  │          │ → inject as       │
-  │   → store commit  │                │ before they're    │          │   additionalContext│
-  │ • Edit CLAUDE.md  │                │ lost forever      │          │                   │
-  │   → store context │                │                   │          │ Agent starts with  │
-  │                   │                │ This is the #1    │          │ relevant memories  │
-  │ Pure pattern      │                │ extraction point   │          │ already loaded     │
-  │ matching, no LLM  │                │ nobody else does  │          │                   │
+  │ • Bash errors     │                │ Context about to  │          │ User sends prompt │
+  │ • git commits     │                │ be compressed →   │          │ → icm recall      │
+  │ • config changes  │                │ extract memories  │          │ → inject context  │
+  │ • decisions       │                │ from transcript   │          │                   │
+  │ • preferences     │                │ before they're    │          │ Agent starts with  │
+  │ • learnings       │                │ lost forever      │          │ relevant memories  │
+  │ • constraints     │                │                   │          │ already loaded     │
+  │                   │                │ Same patterns +   │          │                   │
+  │ Rule-based, no LLM│                │ --store-raw fallbk│          │                   │
   └──────────────────┘                └──────────────────┘          └──────────────────┘
 ```
 

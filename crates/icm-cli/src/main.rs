@@ -3580,6 +3580,24 @@ fn cmd_memoir_inspect(
     Ok(())
 }
 
+fn confidence_color(confidence: f32) -> &'static str {
+    if confidence >= 0.8 {
+        "#4CAF50" // green
+    } else if confidence >= 0.5 {
+        "#FFC107" // amber
+    } else if confidence >= 0.3 {
+        "#FF9800" // orange
+    } else {
+        "#F44336" // red
+    }
+}
+
+fn confidence_bar(confidence: f32) -> String {
+    let filled = (confidence * 5.0).round() as usize;
+    let empty = 5 - filled.min(5);
+    format!("{}{}", "●".repeat(filled), "○".repeat(empty))
+}
+
 fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Result<()> {
     let memoir = resolve_memoir(store, memoir_name)?;
     let concepts = store.list_concepts(&memoir.id)?;
@@ -3643,11 +3661,19 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
         "dot" => {
             println!("digraph \"{}\" {{", memoir.name);
             println!("  rankdir=LR;");
-            println!("  node [shape=box, style=rounded];");
+            println!("  node [shape=box, style=\"rounded,filled\", fillcolor=white];");
             println!();
             for c in &concepts {
                 let escaped_def = c.definition.replace('"', "\\\"");
-                println!("  \"{}\" [tooltip=\"{}\"];", c.name, escaped_def);
+                let color = confidence_color(c.confidence);
+                println!(
+                    "  \"{}\" [tooltip=\"{}\" fillcolor=\"{}\" label=\"{}\\n({:.0}%)\"];",
+                    c.name,
+                    escaped_def,
+                    color,
+                    c.name,
+                    c.confidence * 100.0
+                );
             }
             println!();
             for l in &links {
@@ -3655,7 +3681,11 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
                     id_to_name.get(l.source_id.as_str()),
                     id_to_name.get(l.target_id.as_str()),
                 ) {
-                    println!("  \"{}\" -> \"{}\" [label=\"{}\"];", src, tgt, l.relation);
+                    let pw = 0.5 + l.weight * 2.0;
+                    println!(
+                        "  \"{}\" -> \"{}\" [label=\"{}\" penwidth={:.1}];",
+                        src, tgt, l.relation, pw
+                    );
                 }
             }
             println!("}}");
@@ -3700,7 +3730,12 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
                             .join(", ")
                     )
                 };
-                println!("┌─ {}{}", c.name, labels_str);
+                println!(
+                    "┌─ {}{} {}",
+                    c.name,
+                    labels_str,
+                    confidence_bar(c.confidence)
+                );
                 println!("│  {}", c.definition);
 
                 if let Some(outs) = outgoing.get(c.name.as_str()) {
@@ -3734,7 +3769,13 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
                             .join(", ")
                     )
                 };
-                println!("- **{}**{}: {}", c.name, labels_str, c.definition);
+                println!(
+                    "- **{}**{} (confidence: {:.0}%): {}",
+                    c.name,
+                    labels_str,
+                    c.confidence * 100.0,
+                    c.definition
+                );
             }
             if !links.is_empty() {
                 println!();
@@ -3744,7 +3785,7 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
                         id_to_name.get(l.source_id.as_str()),
                         id_to_name.get(l.target_id.as_str()),
                     ) {
-                        println!("- {} ──{}──> {}", src, l.relation, tgt);
+                        println!("- {} ──{}──> {} (w:{:.1})", src, l.relation, tgt, l.weight);
                     }
                 }
             }

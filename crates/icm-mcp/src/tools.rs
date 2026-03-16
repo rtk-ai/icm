@@ -1540,6 +1540,24 @@ fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
     ToolResult::text(output)
 }
 
+fn confidence_color(confidence: f32) -> &'static str {
+    if confidence >= 0.8 {
+        "#4CAF50"
+    } else if confidence >= 0.5 {
+        "#FFC107"
+    } else if confidence >= 0.3 {
+        "#FF9800"
+    } else {
+        "#F44336"
+    }
+}
+
+fn confidence_bar(confidence: f32) -> String {
+    let filled = (confidence * 5.0).round() as usize;
+    let empty = 5 - filled.min(5);
+    format!("{}{}", "●".repeat(filled), "○".repeat(empty))
+}
+
 fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
     let memoir_name = match get_str(args, "name") {
         Some(n) => n,
@@ -1614,12 +1632,20 @@ fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
         }
         "dot" => {
             let mut out = format!(
-                "digraph \"{}\" {{\n  rankdir=LR;\n  node [shape=box, style=rounded];\n\n",
+                "digraph \"{}\" {{\n  rankdir=LR;\n  node [shape=box, style=\"rounded,filled\", fillcolor=white];\n\n",
                 memoir.name
             );
             for c in &concepts {
                 let escaped = c.definition.replace('"', "\\\"");
-                out.push_str(&format!("  \"{}\" [tooltip=\"{}\"];\n", c.name, escaped));
+                let color = confidence_color(c.confidence);
+                out.push_str(&format!(
+                    "  \"{}\" [tooltip=\"{}\" fillcolor=\"{}\" label=\"{}\\n({:.0}%)\"];\n",
+                    c.name,
+                    escaped,
+                    color,
+                    c.name,
+                    c.confidence * 100.0
+                ));
             }
             out.push('\n');
             for l in &links {
@@ -1627,9 +1653,10 @@ fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
                     id_to_name.get(l.source_id.as_str()),
                     id_to_name.get(l.target_id.as_str()),
                 ) {
+                    let pw = 0.5 + l.weight * 2.0;
                     out.push_str(&format!(
-                        "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
-                        src, tgt, l.relation
+                        "  \"{}\" -> \"{}\" [label=\"{}\" penwidth={:.1}];\n",
+                        src, tgt, l.relation, pw
                     ));
                 }
             }
@@ -1681,7 +1708,12 @@ fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
                             .join(", ")
                     )
                 };
-                out.push_str(&format!("┌─ {}{}\n", c.name, labels_str));
+                out.push_str(&format!(
+                    "┌─ {}{} {}\n",
+                    c.name,
+                    labels_str,
+                    confidence_bar(c.confidence)
+                ));
                 out.push_str(&format!("│  {}\n", c.definition));
                 if let Some(outs) = outgoing.get(c.name.as_str()) {
                     for (rel, tgt) in outs {
@@ -1714,8 +1746,11 @@ fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
                     )
                 };
                 out.push_str(&format!(
-                    "- **{}**{}: {}\n",
-                    c.name, labels_str, c.definition
+                    "- **{}**{} (confidence: {:.0}%): {}\n",
+                    c.name,
+                    labels_str,
+                    c.confidence * 100.0,
+                    c.definition
                 ));
             }
             if !links.is_empty() {
@@ -1725,7 +1760,10 @@ fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
                         id_to_name.get(l.source_id.as_str()),
                         id_to_name.get(l.target_id.as_str()),
                     ) {
-                        out.push_str(&format!("- {} ──{}──> {}\n", src, l.relation, tgt));
+                        out.push_str(&format!(
+                            "- {} ──{}──> {} (w:{:.1})\n",
+                            src, l.relation, tgt, l.weight
+                        ));
                     }
                 }
             }

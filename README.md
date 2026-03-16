@@ -146,9 +146,18 @@ icm memoir search -m "system-architecture" "service" --label "domain:auth"
 
 # Inspect neighborhood
 icm memoir inspect -m "system-architecture" "auth-service" -D 2
+
+# Export graph (formats: json, dot, ascii, ai)
+icm memoir export -m "system-architecture" -f ascii   # Box-drawing with confidence bars
+icm memoir export -m "system-architecture" -f dot      # Graphviz DOT (color = confidence level)
+icm memoir export -m "system-architecture" -f ai       # Markdown optimized for LLM context
+icm memoir export -m "system-architecture" -f json     # Structured JSON with all metadata
+
+# Generate SVG visualization
+icm memoir export -m "system-architecture" -f dot | dot -Tsvg > graph.svg
 ```
 
-## MCP Tools (21)
+## MCP Tools (22)
 
 ### Memory tools
 
@@ -177,6 +186,7 @@ icm memoir inspect -m "system-architecture" "auth-service" -D 2
 | `icm_memoir_search_all` | Search across all memoirs |
 | `icm_memoir_link` | Create typed relation between concepts |
 | `icm_memoir_inspect` | Inspect concept and graph neighborhood (BFS) |
+| `icm_memoir_export` | Export graph (json, dot, ascii, ai) with confidence levels |
 
 ### Feedback tools (learning from mistakes)
 

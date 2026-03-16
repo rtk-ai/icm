@@ -6,12 +6,7 @@
       "component": "icm",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
-      "extra-files": [
-        "../../CHANGELOG.md",
-        "../icm-core/Cargo.toml",
-        "../icm-store/Cargo.toml",
-        "../icm-mcp/Cargo.toml"
-      ]
+      "changelog-path": "../../CHANGELOG.md"
     }
   }
 }

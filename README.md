@@ -233,6 +233,7 @@ Default model: `intfloat/multilingual-e5-base` (768d, 100+ languages). Configura
 
 ```toml
 [embeddings]
+# enabled = false                          # Disable entirely (no model download)
 model = "intfloat/multilingual-e5-base"    # 768d, multilingual (default)
 # model = "intfloat/multilingual-e5-small" # 384d, multilingual (lighter)
 # model = "intfloat/multilingual-e5-large" # 1024d, multilingual (best accuracy)
@@ -240,9 +241,14 @@ model = "intfloat/multilingual-e5-base"    # 768d, multilingual (default)
 # model = "jinaai/jina-embeddings-v2-base-code"  # 768d, code-optimized
 ```
 
-Changing the model automatically re-creates the vector index (existing embeddings are cleared and can be regenerated with `icm_memory_embed_all`).
+To skip the embedding model download entirely, use any of these:
+```bash
+icm --no-embeddings serve          # CLI flag
+ICM_NO_EMBEDDINGS=1 icm serve     # Environment variable
+```
+Or set `enabled = false` in your config file. ICM will fall back to FTS5 keyword search (still works, just no semantic matching).
 
-Without embeddings, falls back to FTS5 then keyword LIKE search.
+Changing the model automatically re-creates the vector index (existing embeddings are cleared and can be regenerated with `icm_memory_embed_all`).
 
 ### Storage
 

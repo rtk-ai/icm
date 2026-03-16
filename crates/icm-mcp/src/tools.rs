@@ -351,7 +351,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
         }),
         json!({
             "name": "icm_memoir_export",
-            "description": "Export a memoir's full concept graph as JSON or DOT (Graphviz).",
+            "description": "Export a memoir's full concept graph. Formats: json (structured), dot (Graphviz), ascii (visual), ai (compact markdown for LLM context).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -361,9 +361,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["json", "dot"],
+                        "enum": ["json", "dot", "ascii", "ai"],
                         "default": "json",
-                        "description": "Output format: json (structured) or dot (Graphviz)"
+                        "description": "Output format: json (structured), dot (Graphviz), ascii (visual graph), ai (compact markdown for LLM)"
                     }
                 },
                 "required": ["name"]
@@ -1636,8 +1636,103 @@ fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
             out.push_str("}\n");
             ToolResult::text(out)
         }
+        "ascii" => {
+            let mut out = format!("╔══ {} ══╗\n", memoir.name);
+            if !memoir.description.is_empty() {
+                out.push_str(&format!("║ {}\n", memoir.description));
+            }
+            out.push_str(&format!(
+                "║ {} concepts, {} links\n",
+                concepts.len(),
+                links.len()
+            ));
+            out.push_str(&format!("╚{}╝\n\n", "═".repeat(memoir.name.len() + 6)));
+
+            let mut outgoing: std::collections::HashMap<&str, Vec<(String, &str)>> =
+                std::collections::HashMap::new();
+            let mut incoming: std::collections::HashMap<&str, Vec<(String, &str)>> =
+                std::collections::HashMap::new();
+            for l in &links {
+                if let (Some(&src), Some(&tgt)) = (
+                    id_to_name.get(l.source_id.as_str()),
+                    id_to_name.get(l.target_id.as_str()),
+                ) {
+                    outgoing
+                        .entry(src)
+                        .or_default()
+                        .push((l.relation.to_string(), tgt));
+                    incoming
+                        .entry(tgt)
+                        .or_default()
+                        .push((l.relation.to_string(), src));
+                }
+            }
+
+            for c in &concepts {
+                let labels_str = if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        c.labels
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                out.push_str(&format!("┌─ {}{}\n", c.name, labels_str));
+                out.push_str(&format!("│  {}\n", c.definition));
+                if let Some(outs) = outgoing.get(c.name.as_str()) {
+                    for (rel, tgt) in outs {
+                        out.push_str(&format!("│  ──{}──> {}\n", rel, tgt));
+                    }
+                }
+                if let Some(ins) = incoming.get(c.name.as_str()) {
+                    for (rel, src) in ins {
+                        out.push_str(&format!("│  <──{}── {}\n", rel, src));
+                    }
+                }
+                out.push_str("└─\n");
+            }
+            ToolResult::text(out)
+        }
+        "ai" => {
+            let mut out = format!("# Memoir: {} — {}\n\n", memoir.name, memoir.description);
+            out.push_str(&format!("## Concepts ({})\n", concepts.len()));
+            for c in &concepts {
+                let labels_str = if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        c.labels
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                out.push_str(&format!(
+                    "- **{}**{}: {}\n",
+                    c.name, labels_str, c.definition
+                ));
+            }
+            if !links.is_empty() {
+                out.push_str(&format!("\n## Relations ({})\n", links.len()));
+                for l in &links {
+                    if let (Some(src), Some(tgt)) = (
+                        id_to_name.get(l.source_id.as_str()),
+                        id_to_name.get(l.target_id.as_str()),
+                    ) {
+                        out.push_str(&format!("- {} ──{}──> {}\n", src, l.relation, tgt));
+                    }
+                }
+            }
+            ToolResult::text(out)
+        }
         _ => ToolResult::error(format!(
-            "unsupported format: {format} (use 'json' or 'dot')"
+            "unsupported format: {format} (use 'json', 'dot', 'ascii', or 'ai')"
         )),
     }
 }

@@ -3653,7 +3653,96 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
             }
             println!("}}");
         }
-        _ => bail!("unsupported format: {format} (use 'json' or 'dot')"),
+        "ascii" => {
+            println!("╔══ {} ══╗", memoir.name);
+            if !memoir.description.is_empty() {
+                println!("║ {}", memoir.description);
+            }
+            println!("║ {} concepts, {} links", concepts.len(), links.len());
+            println!("╚{}╝", "═".repeat(memoir.name.len() + 6));
+            println!();
+
+            // Build incoming links map for display
+            let mut incoming: std::collections::HashMap<&str, Vec<(&str, &str)>> =
+                std::collections::HashMap::new();
+            let mut outgoing: std::collections::HashMap<&str, Vec<(&str, &str)>> =
+                std::collections::HashMap::new();
+            for l in &links {
+                if let (Some(&src), Some(&tgt)) = (
+                    id_to_name.get(l.source_id.as_str()),
+                    id_to_name.get(l.target_id.as_str()),
+                ) {
+                    let rel = l.relation.to_string();
+                    // Leak is fine here — small, short-lived CLI output
+                    let rel: &str = Box::leak(rel.into_boxed_str());
+                    outgoing.entry(src).or_default().push((rel, tgt));
+                    incoming.entry(tgt).or_default().push((rel, src));
+                }
+            }
+
+            for c in &concepts {
+                let labels_str = if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        c.labels
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                println!("┌─ {}{}", c.name, labels_str);
+                println!("│  {}", c.definition);
+
+                if let Some(outs) = outgoing.get(c.name.as_str()) {
+                    for (rel, tgt) in outs {
+                        println!("│  ──{}──> {}", rel, tgt);
+                    }
+                }
+                if let Some(ins) = incoming.get(c.name.as_str()) {
+                    for (rel, src) in ins {
+                        println!("│  <──{}── {}", rel, src);
+                    }
+                }
+                println!("└─");
+            }
+        }
+        "ai" => {
+            // Compact format for LLM context injection
+            println!("# Memoir: {} — {}", memoir.name, memoir.description);
+            println!();
+            println!("## Concepts ({})", concepts.len());
+            for c in &concepts {
+                let labels_str = if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        c.labels
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                println!("- **{}**{}: {}", c.name, labels_str, c.definition);
+            }
+            if !links.is_empty() {
+                println!();
+                println!("## Relations ({})", links.len());
+                for l in &links {
+                    if let (Some(src), Some(tgt)) = (
+                        id_to_name.get(l.source_id.as_str()),
+                        id_to_name.get(l.target_id.as_str()),
+                    ) {
+                        println!("- {} ──{}──> {}", src, l.relation, tgt);
+                    }
+                }
+            }
+        }
+        _ => bail!("unsupported format: {format} (use 'json', 'dot', 'ascii', or 'ai')"),
     }
 
     Ok(())

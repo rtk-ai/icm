@@ -350,6 +350,26 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
+            "name": "icm_memoir_export",
+            "description": "Export a memoir's full concept graph. Formats: json (structured), dot (Graphviz), ascii (visual), ai (compact markdown for LLM context).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Memoir name"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["json", "dot", "ascii", "ai"],
+                        "default": "json",
+                        "description": "Output format: json (structured), dot (Graphviz), ascii (visual graph), ai (compact markdown for LLM)"
+                    }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
             "name": "icm_memory_extract_patterns",
             "description": "Detect recurring patterns in a topic by keyword similarity. Optionally create concepts in a memoir from detected patterns.",
             "inputSchema": {
@@ -514,6 +534,7 @@ pub fn call_tool(
         "icm_memoir_search_all" => tool_memoir_search_all(store, args),
         "icm_memoir_link" => tool_memoir_link(store, args),
         "icm_memoir_inspect" => tool_memoir_inspect(store, args),
+        "icm_memoir_export" => tool_memoir_export(store, args),
         // Feedback tools
         "icm_feedback_record" => tool_feedback_record(store, args, compact),
         "icm_feedback_search" => tool_feedback_search(store, args),
@@ -1517,6 +1538,241 @@ fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 
     ToolResult::text(output)
+}
+
+fn confidence_color(confidence: f32) -> &'static str {
+    if confidence >= 0.8 {
+        "#4CAF50"
+    } else if confidence >= 0.5 {
+        "#FFC107"
+    } else if confidence >= 0.3 {
+        "#FF9800"
+    } else {
+        "#F44336"
+    }
+}
+
+fn confidence_bar(confidence: f32) -> String {
+    let filled = (confidence * 5.0).round() as usize;
+    let empty = 5 - filled.min(5);
+    format!("{}{}", "●".repeat(filled), "○".repeat(empty))
+}
+
+fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
+    let memoir_name = match get_str(args, "name") {
+        Some(n) => n,
+        None => return ToolResult::error("missing required field: name".into()),
+    };
+    let format = get_str(args, "format").unwrap_or("json");
+
+    let memoir = match resolve_memoir(store, memoir_name) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+
+    let concepts = match store.list_concepts(&memoir.id) {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(format!("db error: {e}")),
+    };
+
+    // Collect all outgoing links
+    let mut links = Vec::new();
+    for c in &concepts {
+        match store.get_links_from(&c.id) {
+            Ok(l) => links.extend(l),
+            Err(e) => return ToolResult::error(format!("db error: {e}")),
+        }
+    }
+
+    let id_to_name: std::collections::HashMap<&str, &str> = concepts
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
+
+    match format {
+        "json" => {
+            let json_concepts: Vec<serde_json::Value> = concepts
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "name": c.name,
+                        "definition": c.definition,
+                        "labels": c.labels.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+                        "confidence": c.confidence,
+                        "revision": c.revision,
+                    })
+                })
+                .collect();
+
+            let json_links: Vec<serde_json::Value> = links
+                .iter()
+                .filter_map(|l| {
+                    let src = id_to_name.get(l.source_id.as_str())?;
+                    let tgt = id_to_name.get(l.target_id.as_str())?;
+                    Some(serde_json::json!({
+                        "source": src,
+                        "target": tgt,
+                        "relation": l.relation.to_string(),
+                        "weight": l.weight,
+                    }))
+                })
+                .collect();
+
+            let output = serde_json::json!({
+                "memoir": { "name": memoir.name, "description": memoir.description },
+                "concepts": json_concepts,
+                "links": json_links,
+            });
+
+            ToolResult::text(
+                serde_json::to_string_pretty(&output)
+                    .unwrap_or_else(|e| format!("json error: {e}")),
+            )
+        }
+        "dot" => {
+            let mut out = format!(
+                "digraph \"{}\" {{\n  rankdir=LR;\n  node [shape=box, style=\"rounded,filled\", fillcolor=white];\n\n",
+                memoir.name
+            );
+            for c in &concepts {
+                let escaped = c.definition.replace('"', "\\\"");
+                let color = confidence_color(c.confidence);
+                out.push_str(&format!(
+                    "  \"{}\" [tooltip=\"{}\" fillcolor=\"{}\" label=\"{}\\n({:.0}%)\"];\n",
+                    c.name,
+                    escaped,
+                    color,
+                    c.name,
+                    c.confidence * 100.0
+                ));
+            }
+            out.push('\n');
+            for l in &links {
+                if let (Some(src), Some(tgt)) = (
+                    id_to_name.get(l.source_id.as_str()),
+                    id_to_name.get(l.target_id.as_str()),
+                ) {
+                    let pw = 0.5 + l.weight * 2.0;
+                    out.push_str(&format!(
+                        "  \"{}\" -> \"{}\" [label=\"{}\" penwidth={:.1}];\n",
+                        src, tgt, l.relation, pw
+                    ));
+                }
+            }
+            out.push_str("}\n");
+            ToolResult::text(out)
+        }
+        "ascii" => {
+            let mut out = format!("╔══ {} ══╗\n", memoir.name);
+            if !memoir.description.is_empty() {
+                out.push_str(&format!("║ {}\n", memoir.description));
+            }
+            out.push_str(&format!(
+                "║ {} concepts, {} links\n",
+                concepts.len(),
+                links.len()
+            ));
+            out.push_str(&format!("╚{}╝\n\n", "═".repeat(memoir.name.len() + 6)));
+
+            let mut outgoing: std::collections::HashMap<&str, Vec<(String, &str)>> =
+                std::collections::HashMap::new();
+            let mut incoming: std::collections::HashMap<&str, Vec<(String, &str)>> =
+                std::collections::HashMap::new();
+            for l in &links {
+                if let (Some(&src), Some(&tgt)) = (
+                    id_to_name.get(l.source_id.as_str()),
+                    id_to_name.get(l.target_id.as_str()),
+                ) {
+                    outgoing
+                        .entry(src)
+                        .or_default()
+                        .push((l.relation.to_string(), tgt));
+                    incoming
+                        .entry(tgt)
+                        .or_default()
+                        .push((l.relation.to_string(), src));
+                }
+            }
+
+            for c in &concepts {
+                let labels_str = if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        c.labels
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                out.push_str(&format!(
+                    "┌─ {}{} {}\n",
+                    c.name,
+                    labels_str,
+                    confidence_bar(c.confidence)
+                ));
+                out.push_str(&format!("│  {}\n", c.definition));
+                if let Some(outs) = outgoing.get(c.name.as_str()) {
+                    for (rel, tgt) in outs {
+                        out.push_str(&format!("│  ──{}──> {}\n", rel, tgt));
+                    }
+                }
+                if let Some(ins) = incoming.get(c.name.as_str()) {
+                    for (rel, src) in ins {
+                        out.push_str(&format!("│  <──{}── {}\n", rel, src));
+                    }
+                }
+                out.push_str("└─\n");
+            }
+            ToolResult::text(out)
+        }
+        "ai" => {
+            let mut out = format!("# Memoir: {} — {}\n\n", memoir.name, memoir.description);
+            out.push_str(&format!("## Concepts ({})\n", concepts.len()));
+            for c in &concepts {
+                let labels_str = if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        c.labels
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                out.push_str(&format!(
+                    "- **{}**{} (confidence: {:.0}%): {}\n",
+                    c.name,
+                    labels_str,
+                    c.confidence * 100.0,
+                    c.definition
+                ));
+            }
+            if !links.is_empty() {
+                out.push_str(&format!("\n## Relations ({})\n", links.len()));
+                for l in &links {
+                    if let (Some(src), Some(tgt)) = (
+                        id_to_name.get(l.source_id.as_str()),
+                        id_to_name.get(l.target_id.as_str()),
+                    ) {
+                        out.push_str(&format!(
+                            "- {} ──{}──> {} (w:{:.1})\n",
+                            src, l.relation, tgt, l.weight
+                        ));
+                    }
+                }
+            }
+            ToolResult::text(out)
+        }
+        _ => ToolResult::error(format!(
+            "unsupported format: {format} (use 'json', 'dot', 'ascii', or 'ai')"
+        )),
+    }
 }
 
 fn tool_feedback_record(store: &SqliteStore, args: &Value, compact: bool) -> ToolResult {

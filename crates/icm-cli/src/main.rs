@@ -464,6 +464,17 @@ enum MemoirCommands {
         depth: usize,
     },
 
+    /// Export memoir graph as JSON or DOT (Graphviz)
+    Export {
+        /// Memoir name
+        #[arg(short, long)]
+        memoir: String,
+
+        /// Output format: json or dot
+        #[arg(short, long, default_value = "json")]
+        format: String,
+    },
+
     /// Distill memories from a topic into concepts in a memoir
     Distill {
         /// Source memory topic
@@ -614,6 +625,13 @@ fn init_embedder(_model: &str) -> Option<()> {
 }
 
 fn main() -> Result<()> {
+    // Reset SIGPIPE to default so piped commands (e.g. `icm export | head`)
+    // don't panic on broken pipe.
+    #[cfg(unix)]
+    {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -773,6 +791,9 @@ fn main() -> Result<()> {
                 name,
                 depth,
             } => cmd_memoir_inspect(&store, &memoir, &name, depth),
+            MemoirCommands::Export { memoir, format } => {
+                cmd_memoir_export(&store, &memoir, &format)
+            }
             MemoirCommands::Distill { from_topic, into } => {
                 cmd_memoir_distill(&store, &from_topic, &into)
             }
@@ -3554,6 +3575,222 @@ fn cmd_memoir_inspect(
             .map(|c| c.name.as_str())
             .unwrap_or("?");
         println!("    {src_name} --{}--> {tgt_name}", link.relation);
+    }
+
+    Ok(())
+}
+
+fn confidence_color(confidence: f32) -> &'static str {
+    if confidence >= 0.8 {
+        "#4CAF50" // green
+    } else if confidence >= 0.5 {
+        "#FFC107" // amber
+    } else if confidence >= 0.3 {
+        "#FF9800" // orange
+    } else {
+        "#F44336" // red
+    }
+}
+
+fn confidence_bar(confidence: f32) -> String {
+    let filled = (confidence * 5.0).round() as usize;
+    let empty = 5 - filled.min(5);
+    format!("{}{}", "●".repeat(filled), "○".repeat(empty))
+}
+
+fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Result<()> {
+    let memoir = resolve_memoir(store, memoir_name)?;
+    let concepts = store.list_concepts(&memoir.id)?;
+
+    // Collect all outgoing links
+    let mut links = Vec::new();
+    for c in &concepts {
+        links.extend(store.get_links_from(&c.id)?);
+    }
+
+    // Name lookup for links
+    let id_to_name: std::collections::HashMap<&str, &str> = concepts
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
+
+    match format {
+        "json" => {
+            let json_concepts: Vec<serde_json::Value> = concepts
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "name": c.name,
+                        "definition": c.definition,
+                        "labels": c.labels.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+                        "confidence": c.confidence,
+                        "revision": c.revision,
+                    })
+                })
+                .collect();
+
+            let json_links: Vec<serde_json::Value> = links
+                .iter()
+                .filter_map(|l| {
+                    let src = id_to_name.get(l.source_id.as_str())?;
+                    let tgt = id_to_name.get(l.target_id.as_str())?;
+                    Some(serde_json::json!({
+                        "id": l.id,
+                        "source": src,
+                        "target": tgt,
+                        "relation": l.relation.to_string(),
+                        "weight": l.weight,
+                    }))
+                })
+                .collect();
+
+            let output = serde_json::json!({
+                "memoir": {
+                    "name": memoir.name,
+                    "description": memoir.description,
+                    "created_at": memoir.created_at.to_rfc3339(),
+                    "updated_at": memoir.updated_at.to_rfc3339(),
+                },
+                "concepts": json_concepts,
+                "links": json_links,
+            });
+
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        "dot" => {
+            println!("digraph \"{}\" {{", memoir.name);
+            println!("  rankdir=LR;");
+            println!("  node [shape=box, style=\"rounded,filled\", fillcolor=white];");
+            println!();
+            for c in &concepts {
+                let escaped_def = c.definition.replace('"', "\\\"");
+                let color = confidence_color(c.confidence);
+                println!(
+                    "  \"{}\" [tooltip=\"{}\" fillcolor=\"{}\" label=\"{}\\n({:.0}%)\"];",
+                    c.name,
+                    escaped_def,
+                    color,
+                    c.name,
+                    c.confidence * 100.0
+                );
+            }
+            println!();
+            for l in &links {
+                if let (Some(src), Some(tgt)) = (
+                    id_to_name.get(l.source_id.as_str()),
+                    id_to_name.get(l.target_id.as_str()),
+                ) {
+                    let pw = 0.5 + l.weight * 2.0;
+                    println!(
+                        "  \"{}\" -> \"{}\" [label=\"{}\" penwidth={:.1}];",
+                        src, tgt, l.relation, pw
+                    );
+                }
+            }
+            println!("}}");
+        }
+        "ascii" => {
+            println!("╔══ {} ══╗", memoir.name);
+            if !memoir.description.is_empty() {
+                println!("║ {}", memoir.description);
+            }
+            println!("║ {} concepts, {} links", concepts.len(), links.len());
+            println!("╚{}╝", "═".repeat(memoir.name.len() + 6));
+            println!();
+
+            // Build incoming links map for display
+            let mut incoming: std::collections::HashMap<&str, Vec<(&str, &str)>> =
+                std::collections::HashMap::new();
+            let mut outgoing: std::collections::HashMap<&str, Vec<(&str, &str)>> =
+                std::collections::HashMap::new();
+            for l in &links {
+                if let (Some(&src), Some(&tgt)) = (
+                    id_to_name.get(l.source_id.as_str()),
+                    id_to_name.get(l.target_id.as_str()),
+                ) {
+                    let rel = l.relation.to_string();
+                    // Leak is fine here — small, short-lived CLI output
+                    let rel: &str = Box::leak(rel.into_boxed_str());
+                    outgoing.entry(src).or_default().push((rel, tgt));
+                    incoming.entry(tgt).or_default().push((rel, src));
+                }
+            }
+
+            for c in &concepts {
+                let labels_str = if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        c.labels
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                println!(
+                    "┌─ {}{} {}",
+                    c.name,
+                    labels_str,
+                    confidence_bar(c.confidence)
+                );
+                println!("│  {}", c.definition);
+
+                if let Some(outs) = outgoing.get(c.name.as_str()) {
+                    for (rel, tgt) in outs {
+                        println!("│  ──{}──> {}", rel, tgt);
+                    }
+                }
+                if let Some(ins) = incoming.get(c.name.as_str()) {
+                    for (rel, src) in ins {
+                        println!("│  <──{}── {}", rel, src);
+                    }
+                }
+                println!("└─");
+            }
+        }
+        "ai" => {
+            // Compact format for LLM context injection
+            println!("# Memoir: {} — {}", memoir.name, memoir.description);
+            println!();
+            println!("## Concepts ({})", concepts.len());
+            for c in &concepts {
+                let labels_str = if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        c.labels
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                println!(
+                    "- **{}**{} (confidence: {:.0}%): {}",
+                    c.name,
+                    labels_str,
+                    c.confidence * 100.0,
+                    c.definition
+                );
+            }
+            if !links.is_empty() {
+                println!();
+                println!("## Relations ({})", links.len());
+                for l in &links {
+                    if let (Some(src), Some(tgt)) = (
+                        id_to_name.get(l.source_id.as_str()),
+                        id_to_name.get(l.target_id.as_str()),
+                    ) {
+                        println!("- {} ──{}──> {} (w:{:.1})", src, l.relation, tgt, l.weight);
+                    }
+                }
+            }
+        }
+        _ => bail!("unsupported format: {format} (use 'json', 'dot', 'ascii', or 'ai')"),
     }
 
     Ok(())

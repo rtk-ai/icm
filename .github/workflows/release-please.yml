@@ -23,9 +23,6 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
-        with:
-          release-type: rust
-          package-name: icm
 
   build-release:
     name: Build and upload release assets

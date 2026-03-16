@@ -450,4 +450,4 @@ qwen2.5:3b             3B       2%       58%       +56%
 
 ## 라이선스
 
-[Source-Available](LICENSE) — 개인 및 20명 이하 팀에게 무료. 대규모 조직은 엔터프라이즈 라이선스 필요. 문의: license@rtk.ai
+[Source-Available](LICENSE) — 개인 및 20명 이하 팀에게 무료. 대규모 조직은 엔터프라이즈 라이선스 필요. 문의: contact@rtk-ai.app

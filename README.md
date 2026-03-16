@@ -460,4 +460,4 @@ All benchmarks use **real API calls** — no mocks, no simulated responses, no c
 
 ## License
 
-[Source-Available](LICENSE) — Free for individuals and teams ≤ 20 people. Enterprise license required for larger organizations. Contact: license@rtk.ai
+[Source-Available](LICENSE) — Free for individuals and teams ≤ 20 people. Enterprise license required for larger organizations. Contact: contact@rtk-ai.app

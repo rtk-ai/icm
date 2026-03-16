@@ -9,6 +9,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/release*.yml'
+      - 'release-please-config.json'
+      - '.release-please-manifest.json'
+  workflow_dispatch:
 
 permissions:
   contents: write

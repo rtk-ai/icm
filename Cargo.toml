@@ -45,3 +45,6 @@ directories = "6"
 # HTTP (cloud sync)
 ureq = "2"
 rpassword = "5"
+
+# Platform
+libc = "0.2"

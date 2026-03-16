@@ -625,6 +625,13 @@ fn init_embedder(_model: &str) -> Option<()> {
 }
 
 fn main() -> Result<()> {
+    // Reset SIGPIPE to default so piped commands (e.g. `icm export | head`)
+    // don't panic on broken pipe.
+    #[cfg(unix)]
+    {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()

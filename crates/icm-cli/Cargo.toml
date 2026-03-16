@@ -33,3 +33,6 @@ tracing-subscriber = { workspace = true }
 openssl = { version = "0.10", optional = true }
 ureq = { workspace = true }
 rpassword = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

@@ -28,6 +28,10 @@ struct Cli {
     #[arg(long, global = true)]
     db: Option<PathBuf>,
 
+    /// Disable embeddings (skip model download, use keyword search only)
+    #[arg(long, global = true)]
+    no_embeddings: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -641,8 +645,14 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load_config()?;
+    let embeddings_enabled =
+        cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
     #[allow(unused_variables)]
-    let embedder = init_embedder(&cfg.embeddings.model);
+    let embedder = if embeddings_enabled {
+        init_embedder(&cfg.embeddings.model)
+    } else {
+        None
+    };
     let embedding_dims = embedder
         .as_ref()
         .map(|e| {

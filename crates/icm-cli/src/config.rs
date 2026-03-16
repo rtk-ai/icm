@@ -48,6 +48,8 @@ pub struct MemoryConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct EmbeddingsConfig {
+    /// Enable embeddings (set to false to skip model download entirely).
+    pub enabled: bool,
     /// Model identifier (fastembed model_code, e.g. "intfloat/multilingual-e5-small").
     pub model: String,
 }
@@ -55,6 +57,7 @@ pub struct EmbeddingsConfig {
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             model: "intfloat/multilingual-e5-base".into(),
         }
     }

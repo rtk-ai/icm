@@ -21,6 +21,9 @@ decay_rate = 0.95
 prune_threshold = 0.1
 
 [embeddings]
+# Set to false to disable embeddings entirely (no model download, keyword search only)
+# enabled = false
+
 # Embedding model (fastembed model_code). Default: multilingual-e5-small (384d, 100+ languages)
 # Other options:
 #   "BAAI/bge-small-en-v1.5"              — 384d, English-only (fastest)

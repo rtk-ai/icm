@@ -219,7 +219,7 @@ With embeddings enabled, ICM uses hybrid search:
 - **FTS5 BM25** (30%) — full-text keyword matching
 - **Cosine similarity** (70%) — semantic vector search via sqlite-vec
 
-Default model: `intfloat/multilingual-e5-base` (768d, 100+ languages). Configurable in `~/.config/icm/config.toml`:
+Default model: `intfloat/multilingual-e5-base` (768d, 100+ languages). Configurable in your [config file](#configuration):
 
 ```toml
 [embeddings]
@@ -239,15 +239,23 @@ Without embeddings, falls back to FTS5 then keyword LIKE search.
 Single SQLite file. No external services, no network dependency.
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db   # macOS
-~/.local/share/dev.icm.icm/memories.db                  # Linux
+~/Library/Application Support/dev.icm.icm/memories.db                    # macOS
+~/.local/share/dev.icm.icm/memories.db                                   # Linux
+C:\Users\<user>\AppData\Local\icm\icm\data\memories.db                   # Windows
 ```
 
 ### Configuration
 
 ```bash
 icm config                    # Show active config
-# Edit: ~/.config/icm/config.toml (or $ICM_CONFIG)
+```
+
+Config file location (platform-specific, or `$ICM_CONFIG`):
+
+```
+~/Library/Application Support/dev.icm.icm/config.toml                    # macOS
+~/.config/icm/config.toml                                                # Linux
+C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Windows
 ```
 
 See [config/default.toml](config/default.toml) for all options.

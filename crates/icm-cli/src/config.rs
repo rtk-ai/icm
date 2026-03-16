@@ -173,24 +173,19 @@ pub fn load_config() -> Result<Config> {
     Ok(Config::default())
 }
 
-/// Resolve the config file path.
+/// Resolve the config file path (cross-platform via `directories`).
 fn config_path() -> Option<PathBuf> {
     // 1. Environment variable
     if let Ok(p) = std::env::var("ICM_CONFIG") {
         return Some(PathBuf::from(p));
     }
 
-    // 2. ~/.config/icm/config.toml
-    if let Some(home) = dirs_home() {
-        let p = home.join(".config").join("icm").join("config.toml");
-        return Some(p);
-    }
-
-    None
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    // 2. Platform-specific config dir:
+    //    macOS:   ~/Library/Application Support/dev.icm.icm/config.toml
+    //    Linux:   ~/.config/icm/config.toml  (XDG_CONFIG_HOME)
+    //    Windows: C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml
+    directories::ProjectDirs::from("dev", "icm", "icm")
+        .map(|dirs| dirs.config_dir().join("config.toml"))
 }
 
 /// Show the active config path (for `icm config show`).

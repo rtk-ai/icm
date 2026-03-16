@@ -1,10 +1,15 @@
 # ICM Configuration
-# Place at: ~/.config/icm/config.toml
-# Or set ICM_CONFIG=/path/to/config.toml
+#
+# Location (platform-specific):
+#   macOS:   ~/Library/Application Support/dev.icm.icm/config.toml
+#   Linux:   ~/.config/icm/config.toml
+#   Windows: C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml
+# Or override with: ICM_CONFIG=/path/to/config.toml
 
 [store]
-# SQLite database path (default: platform data dir)
-# path = "~/Library/Application Support/dev.icm.icm/memories.db"
+# SQLite database path (default: platform data dir).
+# Uncomment to use a custom location:
+# path = "/custom/path/to/memories.db"
 
 [memory]
 default_importance = "medium"

@@ -26,6 +26,8 @@ use icm_core::{
 };
 use icm_store::SqliteStore;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Tab indices
 const TAB_OVERVIEW: usize = 0;
 const TAB_TOPICS: usize = 1;
@@ -33,48 +35,51 @@ const TAB_MEMORIES: usize = 2;
 const TAB_HEALTH: usize = 3;
 const TAB_MEMOIRS: usize = 4;
 
+/// Confirmation dialog state
+#[derive(Clone)]
+enum Confirm {
+    None,
+    DeleteMemory { id: String, summary: String },
+    ConsolidateTopic { topic: String },
+    PruneStale,
+    DecayAll,
+}
+
+/// Status message with auto-clear
+struct StatusMsg {
+    text: String,
+    style: Style,
+    expires: Instant,
+}
+
 /// Application state
 struct App {
-    /// Active tab
     tab: usize,
-    /// Should quit
     quit: bool,
-    /// Global stats (cached)
     stats: StoreStats,
-    /// Topics with counts
     topics: Vec<(String, usize)>,
-    /// Topic list selection state
     topic_state: ListState,
-    /// Selected topic's memories
     memories: Vec<Memory>,
-    /// Memory list selection state
     memory_state: ListState,
-    /// Memory scroll offset for detail view
     memory_scroll: u16,
-    /// Health reports
     health: Vec<TopicHealth>,
-    /// Health table selection state
     health_state: TableState,
-    /// Memoir names
-    memoirs: Vec<(String, String, usize, usize)>, // (name, desc, concepts, links)
-    /// Memoir table state
+    memoirs: Vec<(String, String, usize, usize)>,
     memoir_state: TableState,
-    /// DB file size in bytes
     db_size: u64,
-    /// DB path for display
     db_path_display: String,
-    /// Total feedback count
     feedback_count: usize,
-    /// Search mode active
     search_mode: bool,
-    /// Search input buffer
     search_input: String,
-    /// Search results
     search_results: Vec<Memory>,
-    /// Search result list state
     search_state: ListState,
-    /// Last refresh time
     last_refresh: Instant,
+    /// Help overlay visible
+    show_help: bool,
+    /// Confirmation dialog
+    confirm: Confirm,
+    /// Status bar message
+    status: Option<StatusMsg>,
 }
 
 impl App {
@@ -115,11 +120,12 @@ impl App {
             search_results: Vec::new(),
             search_state: ListState::default(),
             last_refresh: Instant::now(),
+            show_help: false,
+            confirm: Confirm::None,
+            status: None,
         };
 
-        // Load memories for the first topic
         app.load_topic_memories(store);
-
         Ok(app)
     }
 
@@ -213,11 +219,22 @@ impl App {
     fn select_prev(selected: Option<usize>) -> Option<usize> {
         Some(selected.map(|i| i.saturating_sub(1)).unwrap_or(0))
     }
+
+    fn set_status(&mut self, text: impl Into<String>, color: Color) {
+        self.status = Some(StatusMsg {
+            text: text.into(),
+            style: Style::default().fg(color),
+            expires: Instant::now() + Duration::from_secs(5),
+        });
+    }
+
+    fn status_text(&self) -> Option<&StatusMsg> {
+        self.status.as_ref().filter(|s| Instant::now() < s.expires)
+    }
 }
 
 /// Entry point for the TUI dashboard.
 pub fn run_dashboard(store: &SqliteStore, db_path: Option<&str>) -> Result<()> {
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -225,14 +242,11 @@ pub fn run_dashboard(store: &SqliteStore, db_path: Option<&str>) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(store, db_path)?;
-
     let result = run_loop(&mut terminal, &mut app, store, db_path);
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     result
 }
 
@@ -245,10 +259,29 @@ fn run_loop(
     loop {
         terminal.draw(|f| draw(f, app))?;
 
-        // Poll events with 250ms timeout for auto-refresh
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
-                // Search mode input handling
+                // Confirmation dialog
+                if !matches!(app.confirm, Confirm::None) {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            execute_confirm(app, store, db_path);
+                        }
+                        _ => {
+                            app.confirm = Confirm::None;
+                            app.set_status("Cancelled", Color::DarkGray);
+                        }
+                    }
+                    continue;
+                }
+
+                // Help overlay
+                if app.show_help {
+                    app.show_help = false;
+                    continue;
+                }
+
+                // Search mode
                 if app.search_mode {
                     match key.code {
                         KeyCode::Esc => {
@@ -281,6 +314,18 @@ fn run_loop(
                             let sel = App::select_prev(app.search_state.selected());
                             app.search_state.select(sel);
                         }
+                        KeyCode::Delete => {
+                            // Delete selected search result
+                            if let Some(idx) = app.search_state.selected() {
+                                if let Some(mem) = app.search_results.get(idx) {
+                                    let summary = truncate(&mem.summary, 57);
+                                    app.confirm = Confirm::DeleteMemory {
+                                        id: mem.id.clone(),
+                                        summary,
+                                    };
+                                }
+                            }
+                        }
                         KeyCode::Char(c) => {
                             app.search_input.push(c);
                         }
@@ -289,11 +334,14 @@ fn run_loop(
                     continue;
                 }
 
+                // Normal mode
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.quit = true
                     }
+                    // Help
+                    KeyCode::Char('?') => app.show_help = true,
                     // Tab navigation
                     KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => app.next_tab(),
                     KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.prev_tab(),
@@ -349,7 +397,7 @@ fn run_loop(
                         }
                         _ => {}
                     },
-                    // Page up/down for memory detail scroll
+                    // Scroll
                     KeyCode::PageDown => app.memory_scroll = app.memory_scroll.saturating_add(5),
                     KeyCode::PageUp => app.memory_scroll = app.memory_scroll.saturating_sub(5),
                     // Jump to top/bottom
@@ -379,7 +427,7 @@ fn run_loop(
                         }
                         _ => {}
                     },
-                    // Enter on topics tab → switch to memories for that topic
+                    // Enter on topics tab -> switch to memories
                     KeyCode::Enter => {
                         if app.tab == TAB_TOPICS {
                             app.load_topic_memories(store);
@@ -393,7 +441,46 @@ fn run_loop(
                         app.search_results.clear();
                     }
                     // Refresh
-                    KeyCode::Char('r') => app.refresh(store, db_path),
+                    KeyCode::Char('r') => {
+                        app.refresh(store, db_path);
+                        app.set_status("Refreshed", Color::Green);
+                    }
+                    // === Actions ===
+                    // d: delete selected memory (Memories tab)
+                    KeyCode::Char('d') if app.tab == TAB_MEMORIES => {
+                        if let Some(idx) = app.memory_state.selected() {
+                            if let Some(mem) = app.memories.get(idx) {
+                                let summary = truncate(&mem.summary, 57);
+                                app.confirm = Confirm::DeleteMemory {
+                                    id: mem.id.clone(),
+                                    summary,
+                                };
+                            }
+                        }
+                    }
+                    // c: consolidate selected topic (Health tab or Topics tab)
+                    KeyCode::Char('c') if app.tab == TAB_HEALTH || app.tab == TAB_TOPICS => {
+                        let topic = match app.tab {
+                            TAB_HEALTH => app
+                                .health_state
+                                .selected()
+                                .and_then(|i| app.health.get(i))
+                                .map(|h| h.topic.clone()),
+                            TAB_TOPICS => app.selected_topic_name().map(|s| s.to_string()),
+                            _ => None,
+                        };
+                        if let Some(t) = topic {
+                            app.confirm = Confirm::ConsolidateTopic { topic: t };
+                        }
+                    }
+                    // p: prune stale entries (Health tab or Overview)
+                    KeyCode::Char('p') if app.tab == TAB_HEALTH || app.tab == TAB_OVERVIEW => {
+                        app.confirm = Confirm::PruneStale;
+                    }
+                    // D: apply decay (Overview tab)
+                    KeyCode::Char('D') if app.tab == TAB_OVERVIEW => {
+                        app.confirm = Confirm::DecayAll;
+                    }
                     _ => {}
                 }
             }
@@ -410,6 +497,82 @@ fn run_loop(
     }
     Ok(())
 }
+
+/// Execute a confirmed action
+fn execute_confirm(app: &mut App, store: &SqliteStore, db_path: Option<&str>) {
+    let confirm = app.confirm.clone();
+    app.confirm = Confirm::None;
+
+    match confirm {
+        Confirm::DeleteMemory { id, .. } => match store.delete(&id) {
+            Ok(()) => {
+                let id_short: String = id.chars().take(8).collect();
+                app.set_status(format!("Deleted memory {id_short}"), Color::Green);
+                app.load_topic_memories(store);
+                // Adjust selection after deletion
+                if let Some(sel) = app.memory_state.selected() {
+                    if sel >= app.memories.len() && !app.memories.is_empty() {
+                        app.memory_state.select(Some(app.memories.len() - 1));
+                    } else if app.memories.is_empty() {
+                        app.memory_state.select(None);
+                    }
+                }
+                app.refresh(store, db_path);
+            }
+            Err(e) => app.set_status(format!("Error: {e}"), Color::Red),
+        },
+        Confirm::ConsolidateTopic { topic } => {
+            if let Ok(mems) = store.get_by_topic(&topic) {
+                if mems.len() < 2 {
+                    app.set_status("Need at least 2 memories to consolidate", Color::Yellow);
+                    return;
+                }
+                let summaries: Vec<&str> = mems.iter().map(|m| m.summary.as_str()).collect();
+                let combined = summaries.join(" | ");
+                let combined = truncate(&combined, 500);
+                let consolidated = icm_core::Memory::new(
+                    topic.clone(),
+                    format!("[consolidated] {combined}"),
+                    icm_core::Importance::Medium,
+                );
+                match store.consolidate_topic(&topic, consolidated) {
+                    Ok(()) => {
+                        app.set_status(
+                            format!("Consolidated {} ({} entries)", topic, mems.len()),
+                            Color::Green,
+                        );
+                        app.refresh(store, db_path);
+                        app.load_topic_memories(store);
+                    }
+                    Err(e) => app.set_status(format!("Error: {e}"), Color::Red),
+                }
+            }
+        }
+        Confirm::PruneStale => match store.prune(0.1) {
+            Ok(pruned) => {
+                app.set_status(format!("Pruned {pruned} stale memories"), Color::Green);
+                app.refresh(store, db_path);
+                app.load_topic_memories(store);
+            }
+            Err(e) => app.set_status(format!("Error: {e}"), Color::Red),
+        },
+        Confirm::DecayAll => match store.apply_decay(0.95) {
+            Ok(affected) => {
+                app.set_status(
+                    format!("Decay applied to {affected} memories"),
+                    Color::Green,
+                );
+                app.refresh(store, db_path);
+            }
+            Err(e) => app.set_status(format!("Error: {e}"), Color::Red),
+        },
+        Confirm::None => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
 
 fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -434,9 +597,15 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     draw_status_bar(f, app, chunks[2]);
 
-    // Search overlay
+    // Overlays
     if app.search_mode {
         draw_search_overlay(f, app);
+    }
+    if app.show_help {
+        draw_help_overlay(f);
+    }
+    if !matches!(app.confirm, Confirm::None) {
+        draw_confirm_overlay(f, app);
     }
 }
 
@@ -446,7 +615,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" ICM Dashboard "),
+                .title(format!(" ICM Dashboard v{VERSION} ")),
         )
         .select(app.tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -456,10 +625,25 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    // Show status message if active, otherwise show context-specific help
+    if let Some(msg) = app.status_text() {
+        let bar = Paragraph::new(format!(" {}", msg.text)).style(msg.style);
+        f.render_widget(bar, area);
+        return;
+    }
+
     let help = if app.search_mode {
-        " ESC: cancel | ENTER: search | Type query..."
+        " ESC: cancel | ENTER: search | Type query...".to_string()
     } else {
-        " q: quit | Tab/1-5: switch tab | j/k: navigate | /: search | r: refresh | Enter: select"
+        let actions = match app.tab {
+            TAB_OVERVIEW => " | p: prune | D: decay",
+            TAB_TOPICS => " | c: consolidate | Enter: browse",
+            TAB_MEMORIES => " | d: delete",
+            TAB_HEALTH => " | c: consolidate | p: prune",
+            TAB_MEMOIRS => "",
+            _ => "",
+        };
+        format!(" q: quit | Tab/1-5: tabs | j/k: nav | /: search | r: refresh | ?: help{actions}")
     };
     let bar = Paragraph::new(help).style(Style::default().fg(Color::DarkGray).bg(Color::Black));
     f.render_widget(bar, area);
@@ -471,7 +655,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(10), // Stats box
             Constraint::Length(10), // Top topics
-            Constraint::Min(0),     // Recent activity
+            Constraint::Min(0),     // Health summary
         ])
         .split(area);
 
@@ -572,7 +756,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     );
     f.render_widget(topic_table, chunks[1]);
 
-    // Importance distribution
+    // Health summary
     let health_summary = importance_distribution(&app.health);
     let dist_block = Paragraph::new(health_summary).block(
         Block::default()
@@ -589,7 +773,6 @@ fn draw_topics(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    // Topics list
     let items: Vec<ListItem> = app
         .topics
         .iter()
@@ -616,7 +799,6 @@ fn draw_topics(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[0], &mut app.topic_state);
 
-    // Topic detail (right panel)
     let detail = if let Some(idx) = app.topic_state.selected() {
         if let Some(health) = app.health.get(idx) {
             topic_detail_text(health)
@@ -644,22 +826,17 @@ fn draw_memories(f: &mut Frame, app: &mut App, area: Rect) {
 
     let topic_label = app.selected_topic_name().unwrap_or("all").to_string();
 
-    // Memory list
     let items: Vec<ListItem> = app
         .memories
         .iter()
         .map(|m| {
             let imp_color = importance_color(&m.importance);
-            let summary = if m.summary.len() > 50 {
-                format!("{}...", &m.summary[..47])
-            } else {
-                m.summary.clone()
-            };
+            let summary = truncate(&m.summary, 47);
             let bar = weight_bar(m.weight, 5);
             ListItem::new(Line::from(vec![
                 Span::styled(bar, Style::default().fg(weight_color(m.weight))),
                 Span::raw(" "),
-                Span::styled("● ", Style::default().fg(imp_color)),
+                Span::styled("# ", Style::default().fg(imp_color)),
                 Span::raw(summary),
             ]))
         })
@@ -670,7 +847,7 @@ fn draw_memories(f: &mut Frame, app: &mut App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " Memories — {} ({}) ",
+                    " Memories -- {} ({}) ",
                     topic_label,
                     app.memories.len()
                 ))
@@ -684,7 +861,6 @@ fn draw_memories(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[0], &mut app.memory_state);
 
-    // Memory detail
     let detail = if let Some(idx) = app.memory_state.selected() {
         if let Some(mem) = app.memories.get(idx) {
             memory_detail_text(mem)
@@ -804,11 +980,7 @@ fn draw_memoirs(f: &mut Frame, app: &mut App, area: Rect) {
         .memoirs
         .iter()
         .map(|(name, desc, concepts, links)| {
-            let desc_short = if desc.len() > 40 {
-                format!("{}...", &desc[..37])
-            } else {
-                desc.clone()
-            };
+            let desc_short = truncate(desc, 37);
             Row::new(vec![
                 Cell::from(name.as_str()).style(Style::default().fg(Color::Magenta)),
                 Cell::from(desc_short),
@@ -860,7 +1032,6 @@ fn draw_search_overlay(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(overlay);
 
-    // Search input
     let input = Paragraph::new(Line::from(vec![
         Span::styled(" > ", Style::default().fg(Color::Yellow)),
         Span::raw(&app.search_input),
@@ -869,21 +1040,16 @@ fn draw_search_overlay(f: &mut Frame, app: &mut App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Search (Enter to search, Esc to cancel) ")
+            .title(" Search (Enter: search, Del: delete, Esc: cancel) ")
             .title_style(Style::default().fg(Color::Yellow).bold()),
     );
     f.render_widget(input, chunks[0]);
 
-    // Results
     let items: Vec<ListItem> = app
         .search_results
         .iter()
         .map(|m| {
-            let summary = if m.summary.len() > 80 {
-                format!("{}...", &m.summary[..77])
-            } else {
-                m.summary.clone()
-            };
+            let summary = truncate(&m.summary, 77);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("[{}] ", m.topic), Style::default().fg(Color::Cyan)),
                 Span::raw(summary),
@@ -906,7 +1072,134 @@ fn draw_search_overlay(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(results, chunks[1], &mut app.search_state);
 }
 
-// --- Helper functions ---
+fn draw_help_overlay(f: &mut Frame) {
+    let area = f.area();
+    let w = 60u16.min(area.width - 4);
+    let h = 29u16.min(area.height - 4);
+    let overlay = Rect {
+        x: (area.width - w) / 2,
+        y: (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+
+    f.render_widget(Clear, overlay);
+
+    let help_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Navigation",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from("  Tab / 1-5       Switch tab"),
+        Line::from("  j/k or Up/Down  Navigate list"),
+        Line::from("  g / G           Jump to top / bottom"),
+        Line::from("  Enter           Select (Topics -> Memories)"),
+        Line::from("  PgUp/PgDn       Scroll detail view"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Search",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from("  /               Open search"),
+        Line::from("  Enter           Execute search"),
+        Line::from("  Del             Delete selected result"),
+        Line::from("  Esc             Close search"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Actions",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from("  d               Delete selected memory  [Memories]"),
+        Line::from("  c               Consolidate topic       [Topics/Health]"),
+        Line::from("  p               Prune stale memories    [Overview/Health]"),
+        Line::from("  D               Apply decay             [Overview]"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  General",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from("  r               Refresh data"),
+        Line::from("  ?               Toggle this help"),
+        Line::from("  q / Esc         Quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  ICM v{VERSION}"),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let help = Paragraph::new(help_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Help ")
+            .title_style(Style::default().fg(Color::Yellow).bold()),
+    );
+    f.render_widget(help, overlay);
+}
+
+fn draw_confirm_overlay(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let w = 60u16.min(area.width - 4);
+    let h = 7u16;
+    let overlay = Rect {
+        x: (area.width - w) / 2,
+        y: (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+
+    f.render_widget(Clear, overlay);
+
+    let message = match &app.confirm {
+        Confirm::DeleteMemory { summary, .. } => format!("Delete memory: {summary}"),
+        Confirm::ConsolidateTopic { topic } => {
+            let count = app
+                .topics
+                .iter()
+                .find(|(t, _)| t == topic)
+                .map(|(_, c)| *c)
+                .unwrap_or(0);
+            format!("Consolidate topic: {topic} ({count} entries -> 1)")
+        }
+        Confirm::PruneStale => "Prune all stale memories (weight < 0.1)?".to_string(),
+        Confirm::DecayAll => "Apply decay (0.95) to all memories?".to_string(),
+        Confirm::None => return,
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(format!("  {message}")),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y", Style::default().fg(Color::Green).bold()),
+            Span::raw(": confirm    "),
+            Span::styled("any other key", Style::default().fg(Color::Red).bold()),
+            Span::raw(": cancel"),
+        ]),
+    ];
+
+    let confirm = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Confirm ")
+            .title_style(Style::default().fg(Color::Red).bold()),
+    );
+    f.render_widget(confirm, overlay);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    }
+}
 
 fn weight_bar(weight: f32, width: usize) -> String {
     let filled = ((weight.clamp(0.0, 1.0)) * width as f32).round() as usize;
@@ -920,7 +1213,7 @@ fn weight_color(weight: f32) -> Color {
     } else if weight >= 0.5 {
         Color::Yellow
     } else if weight >= 0.3 {
-        Color::Rgb(255, 165, 0) // Orange
+        Color::Rgb(255, 165, 0)
     } else {
         Color::Red
     }
@@ -1084,12 +1377,10 @@ fn memory_detail_text(m: &Memory) -> Vec<Line<'static>> {
         Line::from(""),
     ];
 
-    // Wrap summary text
     for line in m.summary.lines() {
         lines.push(Line::from(format!("  {line}")));
     }
 
-    // Raw excerpt if present
     if let Some(ref raw) = m.raw_excerpt {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(

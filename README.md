@@ -104,6 +104,21 @@ icm init --mode skill
 
 Installs slash commands and rules for Claude Code (`/recall`, `/remember`), Cursor (`.mdc` rule), Roo Code (`.md` rule), and Amp (`/icm-recall`, `/icm-remember`).
 
+### Hooks (Claude Code)
+
+```bash
+icm init --mode hook
+```
+
+Installs all 3 extraction layers as Claude Code hooks:
+
+| Hook | Event | What it does |
+|------|-------|-------------|
+| `icm hook pre` | PreToolUse | Auto-allow `icm` CLI commands (no permission prompt) |
+| `icm hook post` | PostToolUse | Extract facts from tool output every 15 calls |
+| `icm hook compact` | PreCompact | Extract memories from transcript before context compression |
+| `icm hook prompt` | UserPromptSubmit | Inject recalled context at the start of each prompt |
+
 ## CLI
 
 ### Memories (episodic, with decay)
@@ -298,11 +313,13 @@ ICM extracts memories automatically via three layers:
   └──────────────────┘                └──────────────────┘          └──────────────────┘
 ```
 
-| Layer | Status | LLM cost | Description |
-|-------|--------|----------|-------------|
-| Layer 0 | Implemented | 0 | Rule-based keyword extraction via `icm extract` |
-| Layer 1 | Planned | ~500 tok | PreCompact hook captures context before compaction |
-| Layer 2 | Implemented | 0 | `icm recall-context` injects memories at session start |
+| Layer | Status | LLM cost | Hook command | Description |
+|-------|--------|----------|-------------|-------------|
+| Layer 0 | Implemented | 0 | `icm hook post` | Rule-based keyword extraction from tool output |
+| Layer 1 | Implemented | 0 | `icm hook compact` | Extract from transcript before context compression |
+| Layer 2 | Implemented | 0 | `icm hook prompt` | Inject recalled memories on each user prompt |
+
+All 3 layers are installed automatically by `icm init --mode hook`.
 
 ### Comparison with alternatives
 

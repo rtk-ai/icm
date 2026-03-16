@@ -1792,6 +1792,24 @@ icm store -t \"topic\" -c \"summary\"
         let prompt_status =
             inject_claude_hook(&claude_settings_path, "UserPromptSubmit", &prompt_cmd)?;
         println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
+
+        // OpenCode plugin: install JS plugin for tool.execute.after + session.compacting
+        let opencode_plugins_dir = PathBuf::from(&home).join(".config/opencode/plugins");
+        let opencode_plugin_path = opencode_plugins_dir.join("icm.js");
+        if opencode_plugin_path.exists() {
+            println!("[hook] OpenCode plugin: already configured");
+        } else {
+            std::fs::create_dir_all(&opencode_plugins_dir).ok();
+            let plugin_content = include_str!("../../../plugins/opencode-icm.js");
+            // Replace ICM_BIN placeholder with actual binary path
+            let plugin_content = plugin_content.replace(
+                r#"process.env.ICM_BIN || "icm""#,
+                &format!(r#""{icm_bin_str}""#),
+            );
+            std::fs::write(&opencode_plugin_path, plugin_content)
+                .with_context(|| format!("cannot write {}", opencode_plugin_path.display()))?;
+            println!("[hook] OpenCode plugin: installed");
+        }
     }
 
     println!();

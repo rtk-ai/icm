@@ -112,12 +112,35 @@ icm init --mode hook
 
 Installs all 3 extraction layers as Claude Code hooks:
 
+**Claude Code** hooks:
+
 | Hook | Event | What it does |
 |------|-------|-------------|
 | `icm hook pre` | PreToolUse | Auto-allow `icm` CLI commands (no permission prompt) |
 | `icm hook post` | PostToolUse | Extract facts from tool output every 15 calls |
 | `icm hook compact` | PreCompact | Extract memories from transcript before context compression |
 | `icm hook prompt` | UserPromptSubmit | Inject recalled context at the start of each prompt |
+
+**OpenCode** plugin (auto-installed to `~/.config/opencode/plugins/icm.js`):
+
+| OpenCode event | ICM Layer | What it does |
+|---------------|-----------|-------------|
+| `tool.execute.after` | Layer 0 | Extract facts from tool output |
+| `experimental.session.compacting` | Layer 1 | Extract from conversation before compaction |
+| `session.created` | Layer 2 | Recall context at session start |
+
+## CLI vs MCP
+
+ICM can be used via CLI (`icm` commands) or MCP server (`icm serve`). Both access the same database.
+
+| | CLI | MCP |
+|---|-----|-----|
+| **Latency** | ~30ms (direct binary) | ~50ms (JSON-RPC stdio) |
+| **Token cost** | 0 (hook-based, invisible) | ~20-50 tokens/call (tool schema) |
+| **Setup** | `icm init --mode hook` | `icm init --mode mcp` |
+| **Works with** | Claude Code, OpenCode (via hooks/plugins) | All 14 MCP-compatible tools |
+| **Auto-extraction** | Yes (hooks trigger `icm extract`) | Yes (MCP tools call store) |
+| **Best for** | Power users, token savings | Universal compatibility |
 
 ## CLI
 

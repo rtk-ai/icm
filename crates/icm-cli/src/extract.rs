@@ -12,6 +12,16 @@ use icm_store::SqliteStore;
 /// Extract key facts from text and store them in ICM.
 /// Returns the number of facts stored.
 pub fn extract_and_store(store: &SqliteStore, text: &str, project: &str) -> Result<usize> {
+    extract_and_store_with_opts(store, text, project, false)
+}
+
+/// Extract and store with option to store raw text as fallback.
+pub fn extract_and_store_with_opts(
+    store: &SqliteStore,
+    text: &str,
+    project: &str,
+    store_raw: bool,
+) -> Result<usize> {
     let facts = extract_facts(text, project);
     let mut stored = 0;
     for (topic, content, importance) in &facts {
@@ -19,6 +29,23 @@ pub fn extract_and_store(store: &SqliteStore, text: &str, project: &str) -> Resu
         store.store(mem)?;
         stored += 1;
     }
+
+    // Fallback: store truncated raw text as low-importance memory
+    if stored == 0 && store_raw && text.len() >= 50 {
+        let raw = if text.len() > 2000 {
+            &text[text.len() - 2000..]
+        } else {
+            text
+        };
+        let mem = Memory::new(
+            format!("context-{project}"),
+            raw.to_string(),
+            Importance::Low,
+        );
+        store.store(mem)?;
+        stored = 1;
+    }
+
     Ok(stored)
 }
 
@@ -317,6 +344,96 @@ fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)>
             score += 1.5;
         }
 
+        // --- Conversational signals (PreCompact / transcript context) ---
+
+        // Preferences and rules ("always do X", "never do Y", "use X instead of Y")
+        for kw in &[
+            "always ",
+            "never ",
+            "must ",
+            "should not",
+            "shouldn't",
+            "don't ",
+            "do not ",
+            "prefer ",
+            "avoid ",
+            "make sure",
+            "important to",
+            "remember to",
+            "rule:",
+            "convention:",
+        ] {
+            if lower.contains(kw) {
+                score += 2.5;
+                importance = Importance::High;
+            }
+        }
+
+        // Learnings and insights
+        for kw in &[
+            "learned",
+            "realized",
+            "turns out",
+            "the trick is",
+            "the fix was",
+            "the solution",
+            "the key is",
+            "the problem was",
+            "discovered that",
+            "figured out",
+            "gotcha",
+            "caveat",
+            "pitfall",
+            "note to self",
+        ] {
+            if lower.contains(kw) {
+                score += 2.5;
+                importance = Importance::High;
+            }
+        }
+
+        // Project decisions and context from conversation
+        for kw in &[
+            "we're using",
+            "we use ",
+            "we switched",
+            "we migrated",
+            "we deploy",
+            "the project",
+            "the repo ",
+            "the codebase",
+            "our stack",
+            "we went with",
+            "we picked",
+        ] {
+            if lower.contains(kw) {
+                score += 2.5;
+            }
+        }
+
+        // Constraints and blockers
+        for kw in &[
+            "doesn't work",
+            "does not work",
+            "won't work",
+            "will not work",
+            "incompatible",
+            "breaks when",
+            "only works",
+            "doesn't support",
+            "does not support",
+            "limitation",
+            "can't use",
+            "cannot use",
+            "not compatible",
+            "not supported",
+        ] {
+            if lower.contains(kw) {
+                score += 2.5;
+                importance = Importance::High;
+            }
+        }
+
         if score >= 3.0 {
             scored.push((score, s.to_string(), importance));
         }
@@ -427,6 +544,43 @@ mod tests {
         let text = "Configured release-please for Cargo workspace with simple release-type instead of rust";
         let facts = extract_facts(text, "test");
         assert!(!facts.is_empty(), "should extract config facts");
+    }
+
+    #[test]
+    fn test_extract_conversational_preference() {
+        let text = "Always query ALL calendars in Google Calendar API, not just primary";
+        let facts = extract_facts(text, "test");
+        assert!(!facts.is_empty(), "should extract preference/rule");
+    }
+
+    #[test]
+    fn test_extract_conversational_learning() {
+        let text = "Turns out the hooks must be bash scripts not bun or TypeScript for Claude Code";
+        let facts = extract_facts(text, "test");
+        assert!(!facts.is_empty(), "should extract learning/insight");
+    }
+
+    #[test]
+    fn test_extract_conversational_constraint() {
+        let text =
+            "The fastembed crate does not work with cross-compilation for ARM64 on Linux CI runners";
+        let facts = extract_facts(text, "test");
+        assert!(!facts.is_empty(), "should extract constraint");
+    }
+
+    #[test]
+    fn test_extract_conversational_decision() {
+        let text = "We switched from OpenAI embeddings to fastembed because we wanted zero external dependencies";
+        let facts = extract_facts(text, "test");
+        assert!(!facts.is_empty(), "should extract project decision");
+    }
+
+    #[test]
+    fn test_store_raw_fallback() {
+        let store = SqliteStore::in_memory().unwrap();
+        let text = "Just some random conversation text that has no particular keywords but is still somewhat meaningful context about the ongoing work session";
+        let stored = extract_and_store_with_opts(&store, text, "test", true).unwrap();
+        assert_eq!(stored, 1, "should store raw text as fallback");
     }
 
     #[test]

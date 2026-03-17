@@ -599,9 +599,9 @@ fn tool_store(
     }
 
     // Auto-embed if embedder is available
+    let embed_text = format!("{topic} {content}");
     let embed_vec = if let Some(emb) = embedder {
-        let text = format!("{topic} {content}");
-        match emb.embed(&text) {
+        match emb.embed(&embed_text) {
             Ok(vec) => Some(vec),
             Err(e) => {
                 tracing::warn!("embedding failed: {e}");
@@ -618,8 +618,7 @@ fn tool_store(
 
     // Dedup check: if a very similar memory exists in the same topic, update it instead
     if let Some(ref query_emb) = embed_vec {
-        let text = format!("{topic} {content}");
-        if let Ok(similar) = store.search_hybrid(&text, query_emb, 1) {
+        if let Ok(similar) = store.search_hybrid(&embed_text, query_emb, 1) {
             if let Some((existing, score)) = similar.first() {
                 if score > &0.85 && existing.topic == topic {
                     // Very similar content in same topic — update instead of duplicate
@@ -691,6 +690,37 @@ fn tool_store(
     }
 }
 
+fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
+    let mut output = String::new();
+    if compact {
+        for (mem, _) in memories {
+            output.push_str(&format!("[{}] {}\n", mem.topic, mem.summary));
+        }
+    } else {
+        for (mem, score) in memories {
+            if *score >= 0.0 {
+                output.push_str(&format!(
+                    "--- {} [score: {:.3}] ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
+                    mem.id, score, mem.topic, mem.importance, mem.weight, mem.summary
+                ));
+            } else {
+                output.push_str(&format!(
+                    "--- {} ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
+                    mem.id, mem.topic, mem.importance, mem.weight, mem.summary
+                ));
+            }
+            if !mem.keywords.is_empty() {
+                output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
+            }
+            if let Some(ref raw) = mem.raw_excerpt {
+                output.push_str(&format!("  raw: {raw}\n"));
+            }
+            output.push('\n');
+        }
+    }
+    output
+}
+
 fn tool_recall(
     store: &SqliteStore,
     embedder: Option<&dyn Embedder>,
@@ -706,7 +736,6 @@ fn tool_recall(
     };
     let limit = get_i64(args, "limit", 5) as usize;
     let topic = get_str(args, "topic");
-
     let keyword = get_str(args, "keyword");
 
     // Try hybrid search if embedder is available
@@ -715,7 +744,6 @@ fn tool_recall(
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored_results = results;
                 if let Some(t) = topic {
-                    // Prefix matching: "wshm" matches "wshm", "wshm:owner/repo", etc.
                     scored_results
                         .retain(|(m, _)| m.topic == t || m.topic.starts_with(&format!("{t}:")));
                 }
@@ -723,36 +751,15 @@ fn tool_recall(
                     scored_results.retain(|(m, _)| m.keywords.iter().any(|k| k.contains(kw)));
                 }
 
-                // Update access counts
-                for (mem, _) in &scored_results {
-                    let _ = store.update_access(&mem.id);
-                }
+                // Batch update access counts
+                let ids: Vec<&str> = scored_results.iter().map(|(m, _)| m.id.as_str()).collect();
+                let _ = store.batch_update_access(&ids);
 
                 if scored_results.is_empty() {
                     return ToolResult::text("No memories found.".into());
                 }
 
-                let mut output = String::new();
-                if compact {
-                    for (mem, _) in &scored_results {
-                        output.push_str(&format!("[{}] {}\n", mem.topic, mem.summary));
-                    }
-                } else {
-                    for (mem, score) in &scored_results {
-                        output.push_str(&format!(
-                            "--- {} [score: {:.3}] ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
-                            mem.id, score, mem.topic, mem.importance, mem.weight, mem.summary
-                        ));
-                        if !mem.keywords.is_empty() {
-                            output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
-                        }
-                        if let Some(ref raw) = mem.raw_excerpt {
-                            output.push_str(&format!("  raw: {raw}\n"));
-                        }
-                        output.push('\n');
-                    }
-                }
-                return ToolResult::text(output);
+                return ToolResult::text(format_memory_output(&scored_results, compact));
             }
         }
     }
@@ -772,44 +779,23 @@ fn tool_recall(
     }
 
     if let Some(t) = topic {
-        // Prefix matching: "wshm" matches "wshm", "wshm:owner/repo", etc.
         results.retain(|m| m.topic == t || m.topic.starts_with(&format!("{t}:")));
     }
     if let Some(kw) = keyword {
         results.retain(|m| m.keywords.iter().any(|k| k.contains(kw)));
     }
 
-    // Update access counts
-    for mem in &results {
-        let _ = store.update_access(&mem.id);
-    }
+    // Batch update access counts
+    let ids: Vec<&str> = results.iter().map(|m| m.id.as_str()).collect();
+    let _ = store.batch_update_access(&ids);
 
     if results.is_empty() {
         return ToolResult::text("No memories found.".into());
     }
 
-    let mut output = String::new();
-    if compact {
-        for mem in &results {
-            output.push_str(&format!("[{}] {}\n", mem.topic, mem.summary));
-        }
-    } else {
-        for mem in &results {
-            output.push_str(&format!(
-                "--- {} ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
-                mem.id, mem.topic, mem.importance, mem.weight, mem.summary
-            ));
-            if !mem.keywords.is_empty() {
-                output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
-            }
-            if let Some(ref raw) = mem.raw_excerpt {
-                output.push_str(&format!("  raw: {raw}\n"));
-            }
-            output.push('\n');
-        }
-    }
-
-    ToolResult::text(output)
+    // Convert to scored format (no score = -1.0)
+    let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, -1.0)).collect();
+    ToolResult::text(format_memory_output(&scored, compact))
 }
 
 fn tool_forget(store: &SqliteStore, args: &Value) -> ToolResult {

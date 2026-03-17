@@ -536,8 +536,8 @@ impl MemoryStore for SqliteStore {
              ORDER BY fts.rank \
              LIMIT ?2";
 
-        let mut fts_scores: HashMap<String, f32> = HashMap::new();
-        let mut all_memories: HashMap<String, Memory> = HashMap::new();
+        let mut fts_scores: HashMap<String, f32> = HashMap::with_capacity(pool_size);
+        let mut all_memories: HashMap<String, Memory> = HashMap::with_capacity(pool_size);
 
         if !sanitized.is_empty() {
             if let Ok(mut stmt) = self.conn.prepare(fts_sql) {
@@ -560,7 +560,7 @@ impl MemoryStore for SqliteStore {
 
         // 2. Get vector results
         let vec_results = self.search_by_embedding(embedding, pool_size)?;
-        let mut vec_scores: HashMap<String, f32> = HashMap::new();
+        let mut vec_scores: HashMap<String, f32> = HashMap::with_capacity(pool_size);
         for (memory, similarity) in vec_results {
             vec_scores.insert(memory.id.clone(), similarity);
             all_memories.entry(memory.id.clone()).or_insert(memory);
@@ -601,6 +601,31 @@ impl MemoryStore for SqliteStore {
             return Err(IcmError::NotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    fn batch_update_access(&self, ids: &[&str]) -> IcmResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let placeholders: Vec<String> = (2..=ids.len() + 1).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            Vec::with_capacity(ids.len() + 1);
+        params_vec.push(Box::new(now));
+        for id in ids {
+            params_vec.push(Box::new(id.to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let changed = self
+            .conn
+            .execute(&sql, refs.as_slice())
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+        Ok(changed)
     }
 
     fn apply_decay(&self, decay_factor: f32) -> IcmResult<usize> {
@@ -689,19 +714,37 @@ impl MemoryStore for SqliteStore {
     }
 
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()> {
+        self.conn
+            .execute_batch("BEGIN TRANSACTION;")
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
         // Clean vec_memories for entries about to be deleted
-        let _ = self.conn.execute(
+        if let Err(e) = self.conn.execute(
             "DELETE FROM vec_memories WHERE memory_id IN (
                 SELECT id FROM memories WHERE topic = ?1
             )",
             params![topic],
-        );
+        ) {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err(IcmError::Database(e.to_string()));
+        }
+
+        if let Err(e) = self
+            .conn
+            .execute("DELETE FROM memories WHERE topic = ?1", params![topic])
+        {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err(IcmError::Database(e.to_string()));
+        }
+
+        if let Err(e) = self.store(consolidated) {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
 
         self.conn
-            .execute("DELETE FROM memories WHERE topic = ?1", params![topic])
+            .execute_batch("COMMIT;")
             .map_err(|e| IcmError::Database(e.to_string()))?;
-
-        self.store(consolidated)?;
         Ok(())
     }
 
@@ -787,38 +830,34 @@ impl MemoryStore for SqliteStore {
     }
 
     fn stats(&self) -> IcmResult<StoreStats> {
-        let total_memories = self.count()?;
-
-        let total_topics: usize = self
+        let (total_memories, total_topics, avg_weight, oldest_str, newest_str): (
+            usize,
+            usize,
+            f32,
+            Option<String>,
+            Option<String>,
+        ) = self
             .conn
-            .query_row("SELECT COUNT(DISTINCT topic) FROM memories", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT topic), COALESCE(AVG(weight), 0.0), \
+                 MIN(created_at), MAX(created_at) FROM memories",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
             .map_err(|e| IcmError::Database(e.to_string()))?;
 
-        let avg_weight: f32 = if total_memories > 0 {
-            self.conn
-                .query_row("SELECT AVG(weight) FROM memories", [], |row| row.get(0))
-                .map_err(|e| IcmError::Database(e.to_string()))?
-        } else {
-            0.0
-        };
-
-        let oldest_memory: Option<DateTime<Utc>> = self
-            .conn
-            .query_row("SELECT MIN(created_at) FROM memories", [], |row| {
-                row.get::<_, Option<String>>(0)
-            })
-            .map_err(|e| IcmError::Database(e.to_string()))?
+        let oldest_memory = oldest_str
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&Utc));
-
-        let newest_memory: Option<DateTime<Utc>> = self
-            .conn
-            .query_row("SELECT MAX(created_at) FROM memories", [], |row| {
-                row.get::<_, Option<String>>(0)
-            })
-            .map_err(|e| IcmError::Database(e.to_string()))?
+        let newest_memory = newest_str
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&Utc));
 

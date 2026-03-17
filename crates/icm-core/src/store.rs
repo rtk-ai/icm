@@ -22,6 +22,7 @@ pub trait MemoryStore {
 
     // Lifecycle
     fn update_access(&self, id: &str) -> IcmResult<()>;
+    fn batch_update_access(&self, ids: &[&str]) -> IcmResult<usize>;
     fn apply_decay(&self, decay_factor: f32) -> IcmResult<usize>;
     fn prune(&self, weight_threshold: f32) -> IcmResult<usize>;
 

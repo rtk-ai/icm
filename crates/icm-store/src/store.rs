@@ -457,7 +457,7 @@ impl MemoryStore for SqliteStore {
     ) -> IcmResult<Vec<(Memory, f32)>> {
         let query_blob = embedding_to_blob(embedding);
 
-        // First get the KNN results from vec_memories
+        // KNN query on vec0 virtual table (requires LIMIT in the query itself)
         let mut knn_stmt = self
             .conn
             .prepare(
@@ -477,14 +477,42 @@ impl MemoryStore for SqliteStore {
             .filter_map(|r| r.ok())
             .collect();
 
-        // Then fetch the full memory for each result
-        let mut results = Vec::new();
-        for (id, distance) in &knn_rows {
-            if let Some(memory) = self.get(id)? {
-                let similarity = 1.0 - distance;
-                results.push((memory, similarity));
-            }
+        if knn_rows.is_empty() {
+            return Ok(Vec::new());
         }
+
+        // Batch fetch all memories in one query
+        let placeholders: Vec<String> = (1..=knn_rows.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM memories WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let ids: Vec<&str> = knn_rows.iter().map(|(id, _)| id.as_str()).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt
+            .query_map(&*params, row_to_memory)
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let mut memory_map: std::collections::HashMap<String, Memory> = HashMap::new();
+        for row in rows.flatten() {
+            memory_map.insert(row.id.clone(), row);
+        }
+
+        // Reassemble in KNN order with similarity scores
+        let results: Vec<(Memory, f32)> = knn_rows
+            .into_iter()
+            .filter_map(|(id, distance)| memory_map.remove(&id).map(|mem| (mem, 1.0 - distance)))
+            .collect();
+
         Ok(results)
     }
 
@@ -696,73 +724,63 @@ impl MemoryStore for SqliteStore {
     }
 
     fn topic_health(&self, topic: &str) -> IcmResult<TopicHealth> {
-        let entry_count = self.count_by_topic(topic)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    AVG(weight),
+                    AVG(CAST(access_count AS REAL)),
+                    MIN(created_at),
+                    MAX(created_at),
+                    MAX(last_accessed),
+                    SUM(CASE WHEN weight < 0.5
+                         AND julianday('now') - julianday(last_accessed) > 14
+                         THEN 1 ELSE 0 END)
+                 FROM memories WHERE topic = ?1",
+                params![topic],
+                |row| {
+                    Ok((
+                        row.get::<_, usize>(0)?,
+                        row.get::<_, f32>(1)?,
+                        row.get::<_, f32>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, usize>(6)?,
+                    ))
+                },
+            )
+            .map_err(|e| IcmError::Database(e.to_string()))?;
+
+        let (
+            entry_count,
+            avg_weight,
+            avg_access,
+            oldest_str,
+            newest_str,
+            last_accessed_str,
+            stale_count,
+        ) = row;
+
         if entry_count == 0 {
             return Err(IcmError::NotFound(format!("topic: {topic}")));
         }
 
-        let (avg_weight, avg_access): (f32, f32) = self
-            .conn
-            .query_row(
-                "SELECT AVG(weight), AVG(CAST(access_count AS REAL)) FROM memories WHERE topic = ?1",
-                params![topic],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
-
-        let oldest: Option<DateTime<Utc>> = self
-            .conn
-            .query_row(
-                "SELECT MIN(created_at) FROM memories WHERE topic = ?1",
-                params![topic],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(|e| IcmError::Database(e.to_string()))?
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&Utc));
-
-        let newest: Option<DateTime<Utc>> = self
-            .conn
-            .query_row(
-                "SELECT MAX(created_at) FROM memories WHERE topic = ?1",
-                params![topic],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(|e| IcmError::Database(e.to_string()))?
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&Utc));
-
-        let last_accessed: Option<DateTime<Utc>> = self
-            .conn
-            .query_row(
-                "SELECT MAX(last_accessed) FROM memories WHERE topic = ?1",
-                params![topic],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(|e| IcmError::Database(e.to_string()))?
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&Utc));
-
-        // Stale = not accessed in 14 days and weight < 0.5
-        let stale_count: usize = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE topic = ?1
-                 AND weight < 0.5
-                 AND julianday('now') - julianday(last_accessed) > 14",
-                params![topic],
-                |row| row.get(0),
-            )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let parse_dt = |s: &str| -> Option<DateTime<Utc>> {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        };
 
         Ok(TopicHealth {
             topic: topic.to_string(),
             entry_count,
             avg_weight,
             avg_access_count: avg_access,
-            oldest,
-            newest,
-            last_accessed,
+            oldest: oldest_str.as_deref().and_then(parse_dt),
+            newest: newest_str.as_deref().and_then(parse_dt),
+            last_accessed: last_accessed_str.as_deref().and_then(parse_dt),
             needs_consolidation: entry_count > 5,
             stale_count,
         })

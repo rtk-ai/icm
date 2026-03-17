@@ -599,50 +599,56 @@ fn tool_store(
     }
 
     // Auto-embed if embedder is available
-    if let Some(emb) = embedder {
+    let embed_vec = if let Some(emb) = embedder {
         let text = format!("{topic} {content}");
         match emb.embed(&text) {
-            Ok(vec) => memory.embedding = Some(vec),
-            Err(e) => tracing::warn!("embedding failed: {e}"),
+            Ok(vec) => Some(vec),
+            Err(e) => {
+                tracing::warn!("embedding failed: {e}");
+                None
+            }
         }
+    } else {
+        None
+    };
+
+    if let Some(ref vec) = embed_vec {
+        memory.embedding = Some(vec.clone());
     }
 
     // Dedup check: if a very similar memory exists in the same topic, update it instead
-    if let Some(emb) = embedder {
+    if let Some(ref query_emb) = embed_vec {
         let text = format!("{topic} {content}");
-        if let Ok(query_emb) = emb.embed(&text) {
-            if let Ok(similar) = store.search_hybrid(&text, &query_emb, 1) {
-                if let Some((existing, score)) = similar.first() {
-                    if score > &0.85 && existing.topic == topic {
-                        // Very similar content in same topic — update instead of duplicate
-                        let mut updated = existing.clone();
-                        updated.summary = content.to_string();
-                        updated.updated_at = Utc::now();
-                        updated.weight = 1.0; // Reset weight on update
-                        if let Some(raw) = get_str(args, "raw_excerpt") {
-                            updated.raw_excerpt = Some(raw.into());
-                        }
-                        if let Some(keywords_arr) = args.get("keywords").and_then(|v| v.as_array())
-                        {
-                            updated.keywords = keywords_arr
-                                .iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect();
-                        }
-                        updated.importance = importance;
-                        updated.embedding = Some(query_emb);
-                        if let Err(e) = store.update(&updated) {
-                            return ToolResult::error(format!("failed to update: {e}"));
-                        }
-                        return if compact {
-                            ToolResult::text(format!("ok:{}", updated.id))
-                        } else {
-                            ToolResult::text(format!(
-                                "Updated existing memory (similarity {score:.2}): {}",
-                                updated.id
-                            ))
-                        };
+        if let Ok(similar) = store.search_hybrid(&text, query_emb, 1) {
+            if let Some((existing, score)) = similar.first() {
+                if score > &0.85 && existing.topic == topic {
+                    // Very similar content in same topic — update instead of duplicate
+                    let mut updated = existing.clone();
+                    updated.summary = content.to_string();
+                    updated.updated_at = Utc::now();
+                    updated.weight = 1.0; // Reset weight on update
+                    if let Some(raw) = get_str(args, "raw_excerpt") {
+                        updated.raw_excerpt = Some(raw.into());
                     }
+                    if let Some(keywords_arr) = args.get("keywords").and_then(|v| v.as_array()) {
+                        updated.keywords = keywords_arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                    }
+                    updated.importance = importance;
+                    updated.embedding = Some(query_emb.clone());
+                    if let Err(e) = store.update(&updated) {
+                        return ToolResult::error(format!("failed to update: {e}"));
+                    }
+                    return if compact {
+                        ToolResult::text(format!("ok:{}", updated.id))
+                    } else {
+                        ToolResult::text(format!(
+                            "Updated existing memory (similarity {score:.2}): {}",
+                            updated.id
+                        ))
+                    };
                 }
             }
         }

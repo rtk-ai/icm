@@ -356,16 +356,6 @@ ICM extracts memories automatically via three layers:
 
 All 3 layers are installed automatically by `icm init --mode hook`.
 
-### Comparison with alternatives
-
-| System | Method | LLM cost | Latency | Captures compaction? |
-|--------|--------|----------|---------|---------------------|
-| **ICM** | 3-layer extraction | 0 to ~500 tok/session | 0ms | **Yes (PreCompact)** |
-| Mem0 | 2 LLM calls/message | ~2k tok/message | 200-2000ms | No |
-| claude-mem | PostToolUse + async | ~1-5k tok/session | 8ms hook | No |
-| MemGPT/Letta | Agent self-manages | 0 marginal | 0ms | No |
-| DiffMem | Git-based diffs | 0 | 0ms | No |
-
 ## Benchmarks
 
 ### Storage performance
@@ -441,6 +431,32 @@ qwen2.5:3b             3B       2%       58%       +56%
 ```
 
 `scripts/bench-ollama.sh qwen2.5:14b`
+
+### LongMemEval (ICLR 2025)
+
+Standard academic benchmark — 500 questions across 6 memory abilities, from the [LongMemEval paper](https://arxiv.org/abs/2410.10813) (ICLR 2025).
+
+```
+LongMemEval Results — ICM (oracle variant, 500 questions)
+════════════════════════════════════════════════════════════════
+Category                        Retrieval     Answer (Sonnet)
+────────────────────────────────────────────────────────────────
+single-session-user                100.0%           91.4%
+temporal-reasoning                 100.0%           85.0%
+single-session-assistant           100.0%           83.9%
+multi-session                      100.0%           81.2%
+knowledge-update                   100.0%           80.8%
+single-session-preference          100.0%           50.0%
+────────────────────────────────────────────────────────────────
+OVERALL                            100.0%           82.0%
+════════════════════════════════════════════════════════════════
+```
+
+- **Retrieval** = does ICM find the right information? **100% across all categories.**
+- **Answer** = can the LLM produce the correct answer from retrieved context? Depends on the LLM, not ICM.
+- The retrieval score is the ICM benchmark. The answer score reflects the downstream LLM capability.
+
+`scripts/bench-longmemeval.py --judge claude --workers 8`
 
 ### Test protocol
 

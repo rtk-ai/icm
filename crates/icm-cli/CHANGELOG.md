@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.2](https://github.com/rtk-ai/icm/compare/icm-v0.10.1...icm-v0.10.2) (2026-03-17)
+
+
+### Bug Fixes
+
+* blob validation, Vec pre-alloc, replace collect-all-topics N+1 ([9a8a435](https://github.com/rtk-ai/icm/commit/9a8a435016d3a7ae4c098457d2203786b09df0bf))
+* harden input bounds, clamp confidence, deduplicate helpers ([faa3651](https://github.com/rtk-ai/icm/commit/faa36514392c0e95c36543199bf53b95e5fea2be))
+
+
+### Performance Improvements
+
+* fix N+1 queries in memoir operations and dedup inject_claude_hook ([161900b](https://github.com/rtk-ai/icm/commit/161900b71a40cd5e41584305fb244757bf77c0b1))
+
 ## [0.10.1](https://github.com/rtk-ai/icm/compare/icm-v0.10.0...icm-v0.10.1) (2026-03-16)
 
 

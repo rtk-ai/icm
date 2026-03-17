@@ -734,7 +734,7 @@ fn tool_recall(
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
     };
-    let limit = get_i64(args, "limit", 5) as usize;
+    let limit = get_i64(args, "limit", 5).clamp(1, 100) as usize;
     let topic = get_str(args, "topic");
     let keyword = get_str(args, "keyword");
 
@@ -1003,7 +1003,7 @@ fn tool_extract_patterns(store: &SqliteStore, args: &Value) -> ToolResult {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
     };
-    let min_cluster_size = get_i64(args, "min_cluster_size", 3) as usize;
+    let min_cluster_size = get_i64(args, "min_cluster_size", 3).clamp(2, 50) as usize;
     let memoir_name = get_str(args, "memoir");
 
     let patterns = match store.detect_patterns(topic, min_cluster_size) {
@@ -1317,7 +1317,7 @@ fn tool_memoir_search(store: &SqliteStore, args: &Value) -> ToolResult {
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
     };
-    let limit = get_i64(args, "limit", 10) as usize;
+    let limit = get_i64(args, "limit", 10).clamp(1, 100) as usize;
     let label_str = get_str(args, "label");
 
     let memoir = match resolve_memoir(store, memoir_name) {
@@ -1378,7 +1378,7 @@ fn tool_memoir_search_all(store: &SqliteStore, args: &Value) -> ToolResult {
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
     };
-    let limit = get_i64(args, "limit", 10) as usize;
+    let limit = get_i64(args, "limit", 10).clamp(1, 100) as usize;
 
     let results = match store.search_all_concepts_fts(query, limit) {
         Ok(r) => r,
@@ -1476,7 +1476,7 @@ fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
         Some(n) => n,
         None => return ToolResult::error("missing required field: name".into()),
     };
-    let depth = get_i64(args, "depth", 1) as usize;
+    let depth = get_i64(args, "depth", 1).clamp(1, 3) as usize;
 
     let memoir = match resolve_memoir(store, memoir_name) {
         Ok(m) => m,
@@ -1814,7 +1814,7 @@ fn tool_feedback_search(store: &SqliteStore, args: &Value) -> ToolResult {
         None => return ToolResult::error("missing required field: query".into()),
     };
     let topic = get_str(args, "topic");
-    let limit = get_i64(args, "limit", 5) as usize;
+    let limit = get_i64(args, "limit", 5).clamp(1, 100) as usize;
 
     match store.search_feedback(query, topic, limit) {
         Ok(results) => {

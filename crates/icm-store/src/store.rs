@@ -513,7 +513,8 @@ impl MemoryStore for SqliteStore {
         let sanitized = sanitize_fts_query(query);
 
         // 1. Get FTS results with rank scores
-        let fts_sql = "SELECT m.id, m.created_at, m.last_accessed, m.access_count, m.weight, \
+        let fts_sql =
+            "SELECT m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
                     m.topic, m.summary, m.raw_excerpt, m.keywords, \
                     m.importance, m.source_type, m.source_data, m.related_ids, m.embedding, \
                     fts.rank \
@@ -678,7 +679,7 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC"
+                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC LIMIT 10000"
             ))
             .map_err(db_err)?;
 
@@ -1706,7 +1707,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(&format!(
-                    "SELECT {SELECT_COLS} FROM memories WHERE topic LIKE ?1 ORDER BY weight DESC"
+                    "SELECT {SELECT_COLS} FROM memories WHERE topic LIKE ?1 ORDER BY weight DESC LIMIT 500"
                 ))
                 .map_err(db_err)?;
 
@@ -1714,11 +1715,7 @@ impl SqliteStore {
                 .query_map(params![pattern], row_to_memory)
                 .map_err(db_err)?;
 
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row.map_err(db_err)?);
-            }
-            Ok(results)
+            collect_rows(rows)
         } else {
             self.get_by_topic(topic)
         }

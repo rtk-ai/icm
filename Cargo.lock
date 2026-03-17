@@ -1311,7 +1311,6 @@ dependencies = [
  "serde_json",
  "sqlite-vec",
  "tempfile",
- "tracing",
  "zerocopy",
 ]
 

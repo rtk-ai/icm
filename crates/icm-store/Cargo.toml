@@ -10,7 +10,6 @@ sqlite-vec = { workspace = true }
 zerocopy = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

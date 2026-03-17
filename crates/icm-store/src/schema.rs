@@ -2,6 +2,18 @@ use rusqlite::Connection;
 
 use icm_core::IcmError;
 
+use crate::store::db_err;
+
+/// Check if a FTS virtual table exists in sqlite_master.
+fn fts_table_exists(conn: &Connection, name: &str) -> Result<bool, IcmError> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |row| row.get(0),
+    )
+    .map_err(db_err)
+}
+
 /// Initialize the database schema. `embedding_dims` controls the sqlite-vec vector size.
 /// Pass `None` to skip vector table creation (no embeddings feature).
 pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
@@ -78,18 +90,10 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         CREATE INDEX IF NOT EXISTS idx_concept_links_target ON concept_links(target_id);
         ",
     )
-    .map_err(|e| IcmError::Database(e.to_string()))?;
+    .map_err(db_err)?;
 
     // Check if FTS table already exists (memories)
-    let fts_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='memories_fts'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
-
-    if !fts_exists {
+    if !fts_table_exists(conn, "memories_fts")? {
         conn.execute_batch(
             "
             CREATE VIRTUAL TABLE memories_fts USING fts5(
@@ -119,19 +123,11 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             END;
             ",
         )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
     }
 
     // Check if concepts FTS table already exists
-    let concepts_fts_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='concepts_fts'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
-
-    if !concepts_fts_exists {
+    if !fts_table_exists(conn, "concepts_fts")? {
         conn.execute_batch(
             "
             CREATE VIRTUAL TABLE concepts_fts USING fts5(
@@ -161,7 +157,7 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             END;
             ",
         )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
     }
 
     // Metadata key-value table for internal state (e.g. last_decay_at)
@@ -171,7 +167,7 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             value TEXT NOT NULL
         );",
     )
-    .map_err(|e| IcmError::Database(e.to_string()))?;
+    .map_err(db_err)?;
 
     // Feedback table
     conn.execute_batch(
@@ -190,18 +186,10 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         CREATE INDEX IF NOT EXISTS idx_feedback_topic ON feedback(topic);
         ",
     )
-    .map_err(|e| IcmError::Database(e.to_string()))?;
+    .map_err(db_err)?;
 
     // Feedback FTS table
-    let feedback_fts_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='feedback_fts'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
-
-    if !feedback_fts_exists {
+    if !fts_table_exists(conn, "feedback_fts")? {
         conn.execute_batch(
             "
             CREATE VIRTUAL TABLE feedback_fts USING fts5(
@@ -227,32 +215,32 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             END;
             ",
         )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
     }
 
     // Migration: add updated_at column if missing (existing DBs pre-0.3.1)
     let has_updated_at: bool = conn
         .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='updated_at'")
         .and_then(|mut s| s.query_row([], |row| row.get(0)))
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
 
     if !has_updated_at {
         conn.execute_batch(
             "ALTER TABLE memories ADD COLUMN updated_at TEXT;
              UPDATE memories SET updated_at = created_at WHERE updated_at IS NULL;",
         )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
     }
 
     // Migration: add embedding column if missing (existing DBs)
     let has_embedding: bool = conn
         .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='embedding'")
         .and_then(|mut s| s.query_row([], |row| row.get(0)))
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
 
     if !has_embedding {
         conn.execute_batch("ALTER TABLE memories ADD COLUMN embedding BLOB")
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
     }
 
     // sqlite-vec virtual table for vector search (dimension-aware)
@@ -262,7 +250,7 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             [],
             |row| row.get(0),
         )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
 
     if vec_exists {
         // Check if stored dims differ from requested dims — if so, recreate
@@ -277,21 +265,21 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         if stored != embedding_dims {
             // Model changed — drop vec table and clear embeddings
             conn.execute_batch("DROP TABLE IF EXISTS vec_memories")
-                .map_err(|e| IcmError::Database(e.to_string()))?;
+                .map_err(db_err)?;
             conn.execute("UPDATE memories SET embedding = NULL", [])
-                .map_err(|e| IcmError::Database(e.to_string()))?;
+                .map_err(db_err)?;
             conn.execute_batch(&format!(
                 "CREATE VIRTUAL TABLE vec_memories USING vec0(
                     memory_id TEXT PRIMARY KEY,
                     embedding float[{embedding_dims}] distance_metric=cosine
                 )"
             ))
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
             conn.execute(
                 "INSERT OR REPLACE INTO icm_metadata (key, value) VALUES ('embedding_dims', ?1)",
                 [&embedding_dims.to_string()],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         }
     } else {
         conn.execute_batch(&format!(
@@ -300,12 +288,12 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
                 embedding float[{embedding_dims}] distance_metric=cosine
             )"
         ))
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         conn.execute(
             "INSERT OR REPLACE INTO icm_metadata (key, value) VALUES ('embedding_dims', ?1)",
             [&embedding_dims.to_string()],
         )
-        .map_err(|e| IcmError::Database(e.to_string()))?;
+        .map_err(db_err)?;
     }
 
     Ok(())

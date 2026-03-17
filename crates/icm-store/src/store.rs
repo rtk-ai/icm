@@ -14,6 +14,18 @@ use icm_core::{
 
 use crate::schema::{init_db, init_db_with_dims};
 
+/// Convert rusqlite::Error to IcmError::Database
+pub(crate) fn db_err(e: rusqlite::Error) -> IcmError {
+    IcmError::Database(e.to_string())
+}
+
+/// Collect mapped rows into a Vec, converting rusqlite errors.
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> IcmResult<Vec<T>> {
+    rows.collect::<Result<Vec<T>, _>>().map_err(db_err)
+}
+
 static SQLITE_VEC_INIT: Once = Once::new();
 
 fn ensure_sqlite_vec() {
@@ -44,7 +56,7 @@ impl SqliteStore {
         let conn = Connection::open(path)
             .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         init_db_with_dims(&conn, embedding_dims)?;
         Ok(Self { conn })
     }
@@ -62,7 +74,7 @@ impl SqliteStore {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let should_decay = match last {
             Some(ts) => {
@@ -82,7 +94,7 @@ impl SqliteStore {
                      ON CONFLICT(key) DO UPDATE SET value = ?1",
                     params![now.to_rfc3339()],
                 )
-                .map_err(|e| IcmError::Database(e.to_string()))?;
+                .map_err(db_err)?;
         }
 
         Ok(())
@@ -93,7 +105,7 @@ impl SqliteStore {
         let conn = Connection::open_in_memory()
             .map_err(|e| IcmError::Database(format!("cannot open in-memory db: {e}")))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         init_db(&conn)?;
         Ok(Self { conn })
     }
@@ -162,12 +174,6 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     let created_at_str: String = row.get(1)?;
     let updated_at_str: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
     let last_accessed_str: String = row.get(3)?;
-
-    let parse_dt = |s: &str| -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s)
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now())
-    };
 
     let created_at = parse_dt(&created_at_str);
 
@@ -266,7 +272,7 @@ impl MemoryStore for SqliteStore {
                     emb_blob,
                 ],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         // Sync to vec_memories for KNN search
         if let Some(ref emb) = memory.embedding {
@@ -276,7 +282,7 @@ impl MemoryStore for SqliteStore {
                     "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
                     params![memory.id, blob],
                 )
-                .map_err(|e| IcmError::Database(e.to_string()))?;
+                .map_err(db_err)?;
         }
 
         Ok(memory.id)
@@ -286,12 +292,12 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT {SELECT_COLS} FROM memories WHERE id = ?1"))
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let result = stmt
             .query_row(params![id], row_to_memory)
             .optional()
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         Ok(result)
     }
@@ -329,7 +335,7 @@ impl MemoryStore for SqliteStore {
                     emb_blob,
                 ],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(memory.id.clone()));
@@ -348,7 +354,7 @@ impl MemoryStore for SqliteStore {
                     "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
                     params![memory.id, blob],
                 )
-                .map_err(|e| IcmError::Database(e.to_string()))?;
+                .map_err(db_err)?;
         } else {
             // No embedding — remove from vec table
             let _ = self.conn.execute(
@@ -368,7 +374,7 @@ impl MemoryStore for SqliteStore {
         let changed = self
             .conn
             .execute("DELETE FROM memories WHERE id = ?1", params![id])
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
@@ -394,10 +400,7 @@ impl MemoryStore for SqliteStore {
             keywords.len() + 1
         );
 
-        let mut stmt = self
-            .conn
-            .prepare(&query)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let mut stmt = self.conn.prepare(&query).map_err(db_err)?;
 
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = keywords
             .iter()
@@ -410,13 +413,9 @@ impl MemoryStore for SqliteStore {
 
         let rows = stmt
             .query_map(params_ref.as_slice(), row_to_memory)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn search_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Memory>> {
@@ -434,20 +433,13 @@ impl MemoryStore for SqliteStore {
              LIMIT ?2"
         );
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![sanitized, limit as i64], row_to_memory)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn search_by_embedding(
@@ -467,13 +459,13 @@ impl MemoryStore for SqliteStore {
                  ORDER BY distance
                  LIMIT ?2",
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let knn_rows: Vec<(String, f32)> = knn_stmt
             .query_map(params![query_blob, limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
             })
-            .map_err(|e| IcmError::Database(e.to_string()))?
+            .map_err(db_err)?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -487,10 +479,7 @@ impl MemoryStore for SqliteStore {
             "SELECT {SELECT_COLS} FROM memories WHERE id IN ({})",
             placeholders.join(", ")
         );
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
 
         let ids: Vec<&str> = knn_rows.iter().map(|(id, _)| id.as_str()).collect();
         let params: Vec<&dyn rusqlite::types::ToSql> = ids
@@ -498,9 +487,7 @@ impl MemoryStore for SqliteStore {
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
 
-        let rows = stmt
-            .query_map(&*params, row_to_memory)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let rows = stmt.query_map(&*params, row_to_memory).map_err(db_err)?;
 
         let mut memory_map: std::collections::HashMap<String, Memory> = HashMap::new();
         for row in rows.flatten() {
@@ -595,7 +582,7 @@ impl MemoryStore for SqliteStore {
                 "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
                 params![now, id],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
@@ -621,10 +608,7 @@ impl MemoryStore for SqliteStore {
         }
         let refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let changed = self
-            .conn
-            .execute(&sql, refs.as_slice())
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let changed = self.conn.execute(&sql, refs.as_slice()).map_err(db_err)?;
         Ok(changed)
     }
 
@@ -650,7 +634,7 @@ impl MemoryStore for SqliteStore {
                 WHERE importance != 'critical'",
                 params![decay_factor],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         Ok(changed)
     }
@@ -670,7 +654,7 @@ impl MemoryStore for SqliteStore {
                 "DELETE FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')",
                 params![weight_threshold],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         Ok(changed)
     }
@@ -679,44 +663,48 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {SELECT_COLS} FROM memories WHERE topic = ?1 ORDER BY weight DESC"
+                "SELECT {SELECT_COLS} FROM memories WHERE topic = ?1 ORDER BY weight DESC LIMIT 500"
             ))
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![topic], row_to_memory)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
+    }
+
+    fn list_all(&self) -> IcmResult<Vec<Memory>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC"
+            ))
+            .map_err(db_err)?;
+
+        let rows = stmt.query_map([], row_to_memory).map_err(db_err)?;
+        collect_rows(rows)
     }
 
     fn list_topics(&self) -> IcmResult<Vec<(String, usize)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT topic, COUNT(*) FROM memories GROUP BY topic ORDER BY topic")
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
             })
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()> {
         self.conn
             .execute_batch("BEGIN TRANSACTION;")
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         // Clean vec_memories for entries about to be deleted
         if let Err(e) = self.conn.execute(
@@ -742,9 +730,7 @@ impl MemoryStore for SqliteStore {
             return Err(e);
         }
 
-        self.conn
-            .execute_batch("COMMIT;")
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        self.conn.execute_batch("COMMIT;").map_err(db_err)?;
         Ok(())
     }
 
@@ -794,7 +780,7 @@ impl MemoryStore for SqliteStore {
                     ))
                 },
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let (
             entry_count,
@@ -852,7 +838,7 @@ impl MemoryStore for SqliteStore {
                     ))
                 },
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let oldest_memory = oldest_str
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
@@ -957,14 +943,14 @@ impl MemoirStore for SqliteStore {
                     memoir.consolidation_threshold,
                 ],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         Ok(memoir.id)
     }
 
     fn get_memoir(&self, id: &str) -> IcmResult<Option<Memoir>> {
         self.conn
             .prepare(&format!("SELECT {MEMOIR_COLS} FROM memoirs WHERE id = ?1"))
-            .map_err(|e| IcmError::Database(e.to_string()))?
+            .map_err(db_err)?
             .query_row(params![id], row_to_memoir)
             .optional()
             .map_err(|e| IcmError::Database(e.to_string()))
@@ -975,7 +961,7 @@ impl MemoirStore for SqliteStore {
             .prepare(&format!(
                 "SELECT {MEMOIR_COLS} FROM memoirs WHERE name = ?1"
             ))
-            .map_err(|e| IcmError::Database(e.to_string()))?
+            .map_err(db_err)?
             .query_row(params![name], row_to_memoir)
             .optional()
             .map_err(|e| IcmError::Database(e.to_string()))
@@ -995,7 +981,7 @@ impl MemoirStore for SqliteStore {
                     memoir.consolidation_threshold,
                 ],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(memoir.id.clone()));
@@ -1007,7 +993,7 @@ impl MemoirStore for SqliteStore {
         let changed = self
             .conn
             .execute("DELETE FROM memoirs WHERE id = ?1", params![id])
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
@@ -1019,17 +1005,11 @@ impl MemoirStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT {MEMOIR_COLS} FROM memoirs ORDER BY name"))
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let rows = stmt
-            .query_map([], row_to_memoir)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let rows = stmt.query_map([], row_to_memoir).map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     // --- Concept CRUD ---
@@ -1056,7 +1036,7 @@ impl MemoirStore for SqliteStore {
                     source_ids_json,
                 ],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         Ok(concept.id)
     }
 
@@ -1065,7 +1045,7 @@ impl MemoirStore for SqliteStore {
             .prepare(&format!(
                 "SELECT {CONCEPT_COLS} FROM concepts WHERE id = ?1"
             ))
-            .map_err(|e| IcmError::Database(e.to_string()))?
+            .map_err(db_err)?
             .query_row(params![id], row_to_concept)
             .optional()
             .map_err(|e| IcmError::Database(e.to_string()))
@@ -1076,7 +1056,7 @@ impl MemoirStore for SqliteStore {
             .prepare(&format!(
                 "SELECT {CONCEPT_COLS} FROM concepts WHERE memoir_id = ?1 AND name = ?2"
             ))
-            .map_err(|e| IcmError::Database(e.to_string()))?
+            .map_err(db_err)?
             .query_row(params![memoir_id, name], row_to_concept)
             .optional()
             .map_err(|e| IcmError::Database(e.to_string()))
@@ -1104,7 +1084,7 @@ impl MemoirStore for SqliteStore {
                     source_ids_json,
                 ],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(concept.id.clone()));
@@ -1116,7 +1096,7 @@ impl MemoirStore for SqliteStore {
         let changed = self
             .conn
             .execute("DELETE FROM concepts WHERE id = ?1", params![id])
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
@@ -1132,17 +1112,13 @@ impl MemoirStore for SqliteStore {
             .prepare(&format!(
                 "SELECT {CONCEPT_COLS} FROM concepts WHERE memoir_id = ?1 ORDER BY name"
             ))
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![memoir_id], row_to_concept)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn search_concepts_fts(
@@ -1164,20 +1140,13 @@ impl MemoirStore for SqliteStore {
              LIMIT ?3"
         );
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![memoir_id, sanitized, limit as i64], row_to_concept)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn search_all_concepts_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
@@ -1193,20 +1162,13 @@ impl MemoirStore for SqliteStore {
              LIMIT ?2"
         );
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![sanitized, limit as i64], row_to_concept)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn search_concepts_by_label(
@@ -1228,20 +1190,13 @@ impl MemoirStore for SqliteStore {
              LIMIT ?3"
         );
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![memoir_id, pattern, limit as i64], row_to_concept)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     // --- Refinement ---
@@ -1275,7 +1230,7 @@ impl MemoirStore for SqliteStore {
                  WHERE id = ?1",
                 params![id, new_definition, new_confidence, now, source_ids_json],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         Ok(())
     }
@@ -1296,7 +1251,7 @@ impl MemoirStore for SqliteStore {
                     link.created_at.to_rfc3339(),
                 ],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         Ok(link.id)
     }
 
@@ -1306,17 +1261,13 @@ impl MemoirStore for SqliteStore {
             .prepare(&format!(
                 "SELECT {LINK_COLS} FROM concept_links WHERE source_id = ?1"
             ))
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![concept_id], row_to_link)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn get_links_to(&self, concept_id: &str) -> IcmResult<Vec<ConceptLink>> {
@@ -1325,24 +1276,20 @@ impl MemoirStore for SqliteStore {
             .prepare(&format!(
                 "SELECT {LINK_COLS} FROM concept_links WHERE target_id = ?1"
             ))
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![concept_id], row_to_link)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn delete_link(&self, id: &str) -> IcmResult<()> {
         let changed = self
             .conn
             .execute("DELETE FROM concept_links WHERE id = ?1", params![id])
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
@@ -1374,24 +1321,17 @@ impl MemoirStore for SqliteStore {
             sql = base.replace("{filter}", "");
         };
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
 
         let rows = if relation.is_some() {
             stmt.query_map(params![concept_id, p_relation], row_to_concept)
-                .map_err(|e| IcmError::Database(e.to_string()))?
+                .map_err(db_err)?
         } else {
             stmt.query_map(params![concept_id], row_to_concept)
-                .map_err(|e| IcmError::Database(e.to_string()))?
+                .map_err(db_err)?
         };
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-        }
-        Ok(results)
+        collect_rows(rows)
     }
 
     fn get_neighborhood(
@@ -1458,7 +1398,7 @@ impl MemoirStore for SqliteStore {
                 params![memoir_id],
                 |row| row.get(0),
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let total_links: usize = self
             .conn
@@ -1468,7 +1408,7 @@ impl MemoirStore for SqliteStore {
                 params![memoir_id],
                 |row| row.get(0),
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let avg_confidence: f32 = if total_concepts > 0 {
             self.conn
@@ -1477,7 +1417,7 @@ impl MemoirStore for SqliteStore {
                     params![memoir_id],
                     |row| row.get(0),
                 )
-                .map_err(|e| IcmError::Database(e.to_string()))?
+                .map_err(db_err)?
         } else {
             0.0
         };
@@ -1546,7 +1486,7 @@ impl FeedbackStore for SqliteStore {
                     feedback.applied_count,
                 ],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         Ok(feedback.id)
     }
 
@@ -1556,102 +1496,77 @@ impl FeedbackStore for SqliteStore {
         topic: Option<&str>,
         limit: usize,
     ) -> IcmResult<Vec<Feedback>> {
-        // Sanitize FTS query: remove special characters
-        let sanitized: String = query
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect::<String>()
-            .trim()
-            .to_string();
+        let sanitized = sanitize_fts_query(query);
 
         if sanitized.is_empty() {
             return self.list_feedback(topic, limit);
         }
 
-        let results = if let Some(t) = topic {
-            let mut stmt = self
-                .conn
-                .prepare(&format!(
-                    "SELECT {FEEDBACK_COLS} FROM feedback
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let Some(t) = topic {
+                (
+                    format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback
                      WHERE id IN (SELECT id FROM feedback_fts WHERE feedback_fts MATCH ?1)
                      AND topic = ?2
-                     ORDER BY created_at DESC
-                     LIMIT ?3"
-                ))
-                .map_err(|e| IcmError::Database(e.to_string()))?;
-
-            let rows = stmt
-                .query_map(params![sanitized, t, limit as i64], row_to_feedback)
-                .map_err(|e| IcmError::Database(e.to_string()))?;
-
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-            }
-            results
-        } else {
-            let mut stmt = self
-                .conn
-                .prepare(&format!(
-                    "SELECT {FEEDBACK_COLS} FROM feedback
+                     ORDER BY created_at DESC LIMIT ?3"
+                    ),
+                    vec![
+                        Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(t.to_string()),
+                        Box::new(limit as i64),
+                    ],
+                )
+            } else {
+                (
+                    format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback
                      WHERE id IN (SELECT id FROM feedback_fts WHERE feedback_fts MATCH ?1)
-                     ORDER BY created_at DESC
-                     LIMIT ?2"
-                ))
-                .map_err(|e| IcmError::Database(e.to_string()))?;
+                     ORDER BY created_at DESC LIMIT ?2"
+                    ),
+                    vec![
+                        Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(limit as i64),
+                    ],
+                )
+            };
 
-            let rows = stmt
-                .query_map(params![sanitized, limit as i64], row_to_feedback)
-                .map_err(|e| IcmError::Database(e.to_string()))?;
-
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-            }
-            results
-        };
-
-        Ok(results)
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), row_to_feedback)
+            .map_err(db_err)?;
+        collect_rows(rows)
     }
 
     fn list_feedback(&self, topic: Option<&str>, limit: usize) -> IcmResult<Vec<Feedback>> {
-        let results = if let Some(t) = topic {
-            let mut stmt = self
-                .conn
-                .prepare(&format!(
-                    "SELECT {FEEDBACK_COLS} FROM feedback WHERE topic = ?1 ORDER BY created_at DESC LIMIT ?2"
-                ))
-                .map_err(|e| IcmError::Database(e.to_string()))?;
-
-            let rows = stmt
-                .query_map(params![t, limit as i64], row_to_feedback)
-                .map_err(|e| IcmError::Database(e.to_string()))?;
-
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-            }
-            results
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(t) =
+            topic
+        {
+            (
+                    format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback WHERE topic = ?1 ORDER BY created_at DESC LIMIT ?2"
+                    ),
+                    vec![
+                        Box::new(t.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(limit as i64),
+                    ],
+                )
         } else {
-            let mut stmt = self
-                .conn
-                .prepare(&format!(
-                    "SELECT {FEEDBACK_COLS} FROM feedback ORDER BY created_at DESC LIMIT ?1"
-                ))
-                .map_err(|e| IcmError::Database(e.to_string()))?;
-
-            let rows = stmt
-                .query_map(params![limit as i64], row_to_feedback)
-                .map_err(|e| IcmError::Database(e.to_string()))?;
-
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
-            }
-            results
+            (
+                format!("SELECT {FEEDBACK_COLS} FROM feedback ORDER BY created_at DESC LIMIT ?1"),
+                vec![Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>],
+            )
         };
 
-        Ok(results)
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), row_to_feedback)
+            .map_err(db_err)?;
+        collect_rows(rows)
     }
 
     fn increment_applied(&self, id: &str) -> IcmResult<()> {
@@ -1661,7 +1576,7 @@ impl FeedbackStore for SqliteStore {
                 "UPDATE feedback SET applied_count = applied_count + 1 WHERE id = ?1",
                 params![id],
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
@@ -1673,7 +1588,7 @@ impl FeedbackStore for SqliteStore {
         let changed = self
             .conn
             .execute("DELETE FROM feedback WHERE id = ?1", params![id])
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
@@ -1685,16 +1600,16 @@ impl FeedbackStore for SqliteStore {
         let total: usize = self
             .conn
             .query_row("SELECT COUNT(*) FROM feedback", [], |row| row.get(0))
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let mut stmt = self
             .conn
             .prepare("SELECT topic, COUNT(*) as cnt FROM feedback GROUP BY topic ORDER BY cnt DESC")
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let by_topic: Vec<(String, usize)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| IcmError::Database(e.to_string()))?
+            .map_err(db_err)?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -1703,11 +1618,11 @@ impl FeedbackStore for SqliteStore {
             .prepare(
                 "SELECT id, applied_count FROM feedback WHERE applied_count > 0 ORDER BY applied_count DESC LIMIT 10",
             )
-            .map_err(|e| IcmError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
         let most_applied: Vec<(String, u32)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| IcmError::Database(e.to_string()))?
+            .map_err(db_err)?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -1793,15 +1708,15 @@ impl SqliteStore {
                 .prepare(&format!(
                     "SELECT {SELECT_COLS} FROM memories WHERE topic LIKE ?1 ORDER BY weight DESC"
                 ))
-                .map_err(|e| IcmError::Database(e.to_string()))?;
+                .map_err(db_err)?;
 
             let rows = stmt
                 .query_map(params![pattern], row_to_memory)
-                .map_err(|e| IcmError::Database(e.to_string()))?;
+                .map_err(db_err)?;
 
             let mut results = Vec::new();
             for row in rows {
-                results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+                results.push(row.map_err(db_err)?);
             }
             Ok(results)
         } else {
@@ -1819,17 +1734,17 @@ impl SqliteStore {
                     .prepare(
                         "SELECT topic, COUNT(*) FROM memories WHERE topic LIKE ?1 GROUP BY topic ORDER BY topic",
                     )
-                    .map_err(|e| IcmError::Database(e.to_string()))?;
+                    .map_err(db_err)?;
 
                 let rows = stmt
                     .query_map(params![pattern], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
                     })
-                    .map_err(|e| IcmError::Database(e.to_string()))?;
+                    .map_err(db_err)?;
 
                 let mut results = Vec::new();
                 for row in rows {
-                    results.push(row.map_err(|e| IcmError::Database(e.to_string()))?);
+                    results.push(row.map_err(db_err)?);
                 }
                 Ok(results)
             }

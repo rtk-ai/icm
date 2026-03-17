@@ -27,6 +27,7 @@ pub trait MemoryStore {
     fn prune(&self, weight_threshold: f32) -> IcmResult<usize>;
 
     // Organization
+    fn list_all(&self) -> IcmResult<Vec<Memory>>;
     fn get_by_topic(&self, topic: &str) -> IcmResult<Vec<Memory>>;
     fn list_topics(&self) -> IcmResult<Vec<(String, usize)>>;
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()>;

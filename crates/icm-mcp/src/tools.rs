@@ -1078,25 +1078,17 @@ fn tool_embed_all(
 
     let topic_filter = get_str(args, "topic");
 
-    // Get all memories, filtered by topic if specified
+    // Get all memories in a single query
     let memories = if let Some(t) = topic_filter {
         match store.get_by_topic(t) {
             Ok(m) => m,
             Err(e) => return ToolResult::error(format!("failed to list memories: {e}")),
         }
     } else {
-        // Get all by listing topics
-        let topics = match store.list_topics() {
-            Ok(t) => t,
-            Err(e) => return ToolResult::error(format!("failed to list topics: {e}")),
-        };
-        let mut all = Vec::new();
-        for (t, _) in &topics {
-            if let Ok(mems) = store.get_by_topic(t) {
-                all.extend(mems);
-            }
+        match store.list_all() {
+            Ok(m) => m,
+            Err(e) => return ToolResult::error(format!("failed to list memories: {e}")),
         }
-        all
     };
 
     // Filter to only those without embeddings
@@ -1107,22 +1099,29 @@ fn tool_embed_all(
     }
 
     let total = to_embed.len();
+
+    // Batch embed all texts at once
+    let texts: Vec<String> = to_embed
+        .iter()
+        .map(|m| format!("{} {}", m.topic, m.summary))
+        .collect();
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+    let embeddings = match embedder.embed_batch(&text_refs) {
+        Ok(vecs) => vecs,
+        Err(e) => return ToolResult::error(format!("batch embedding failed: {e}")),
+    };
+
     let mut embedded = 0;
     let mut errors = 0;
 
-    for mem in &to_embed {
-        let text = format!("{} {}", mem.topic, mem.summary);
-        match embedder.embed(&text) {
-            Ok(vec) => {
-                let mut updated = (*mem).clone();
-                updated.embedding = Some(vec);
-                if store.update(&updated).is_ok() {
-                    embedded += 1;
-                } else {
-                    errors += 1;
-                }
-            }
-            Err(_) => errors += 1,
+    for (mem, vec) in to_embed.iter().zip(embeddings) {
+        let mut updated = (*mem).clone();
+        updated.embedding = Some(vec);
+        if store.update(&updated).is_ok() {
+            embedded += 1;
+        } else {
+            errors += 1;
         }
     }
 

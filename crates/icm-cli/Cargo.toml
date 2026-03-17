@@ -1,6 +1,6 @@
 [package]
 name = "icm-cli"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2021"
 description = "Permanent memory for AI agents"
 license = "LicenseRef-Proprietary"

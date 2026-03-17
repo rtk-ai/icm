@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.3](https://github.com/rtk-ai/icm/compare/icm-v0.10.2...icm-v0.10.3) (2026-03-17)
+
+
+### Features
+
+* make ICM store instructions mandatory with explicit triggers ([7a60af3](https://github.com/rtk-ai/icm/commit/7a60af33d3bbc87760e89886f71e631c882166a2))
+* mandatory ICM store triggers for all AI tools ([2d0298a](https://github.com/rtk-ai/icm/commit/2d0298a19bbe549f07aff96ab9ced11c6432f58d))
+
 ## [0.10.2](https://github.com/rtk-ai/icm/compare/icm-v0.10.1...icm-v0.10.2) (2026-03-17)
 
 

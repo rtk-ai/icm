@@ -979,12 +979,7 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
     let mut memories = if let Some(t) = topic {
         store.get_by_topic(t)?
     } else if all {
-        let topics = store.list_topics()?;
-        let mut all_mems = Vec::new();
-        for (t, _) in &topics {
-            all_mems.extend(store.get_by_topic(t)?);
-        }
-        all_mems
+        store.list_all()?
     } else {
         println!("Use --topic <name> or --all to list memories.");
         return Ok(());
@@ -2315,12 +2310,7 @@ fn cmd_embed(
     let memories = if let Some(t) = topic {
         store.get_by_topic(t)?
     } else {
-        let topics = store.list_topics()?;
-        let mut all = Vec::new();
-        for (t, _) in &topics {
-            all.extend(store.get_by_topic(t)?);
-        }
-        all
+        store.list_all()?
     };
 
     let to_embed: Vec<&Memory> = if force {
@@ -4001,13 +3991,7 @@ fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
                 store.get_by_topic(t)?
             } else {
                 use icm_core::MemoryStore;
-                // Get all memories — list topics then fetch each
-                let topics = store.list_topics()?;
-                let mut all = Vec::new();
-                for (t, _) in &topics {
-                    all.extend(store.get_by_topic(t)?);
-                }
-                all
+                store.list_all()?
             };
 
             let mut synced = 0;

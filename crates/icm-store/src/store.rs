@@ -144,6 +144,12 @@ fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
 }
 
 fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+    if !blob.len().is_multiple_of(4) {
+        eprintln!(
+            "[icm] warning: embedding blob size {} not divisible by 4, truncating",
+            blob.len()
+        );
+    }
     blob.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
@@ -551,7 +557,7 @@ impl MemoryStore for SqliteStore {
         }
 
         // 3. Combine scores: 30% FTS + 70% vector
-        let mut scored: Vec<(String, f32)> = Vec::new();
+        let mut scored: Vec<(String, f32)> = Vec::with_capacity(all_memories.len());
         for id in all_memories.keys() {
             let fts_score = fts_scores.get(id).copied().unwrap_or(0.0);
             let vec_score = vec_scores.get(id).copied().unwrap_or(0.0);

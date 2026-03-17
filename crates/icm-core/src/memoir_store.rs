@@ -59,6 +59,12 @@ pub trait MemoirStore {
         depth: usize,
     ) -> IcmResult<(Vec<Concept>, Vec<ConceptLink>)>;
 
+    /// Get all links for concepts belonging to a memoir (batch, avoids N+1).
+    fn get_links_for_memoir(&self, memoir_id: &str) -> IcmResult<Vec<ConceptLink>>;
+
     // --- Stats ---
     fn memoir_stats(&self, memoir_id: &str) -> IcmResult<MemoirStats>;
+
+    /// Get concept counts for all memoirs in a single query.
+    fn batch_memoir_concept_counts(&self) -> IcmResult<std::collections::HashMap<String, usize>>;
 }

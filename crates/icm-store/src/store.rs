@@ -1416,13 +1416,21 @@ impl MemoirStore for SqliteStore {
             0.0
         };
 
-        // Count distinct label namespace:value pairs
-        let concepts = self.list_concepts(memoir_id)?;
-        let mut label_map: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for c in &concepts {
-            for l in &c.labels {
-                *label_map.entry(l.to_string()).or_insert(0) += 1;
+        // Count labels via SQL — avoids loading all concepts into memory
+        let mut label_stmt = self
+            .conn
+            .prepare("SELECT labels FROM concepts WHERE memoir_id = ?1 AND labels != '[]'")
+            .map_err(db_err)?;
+        let label_rows = label_stmt
+            .query_map(params![memoir_id], |row| row.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut label_map: HashMap<String, usize> = HashMap::new();
+        for row in label_rows {
+            let raw = row.map_err(db_err)?;
+            if let Ok(labels) = serde_json::from_str::<Vec<Label>>(&raw) {
+                for l in labels {
+                    *label_map.entry(l.to_string()).or_insert(0) += 1;
+                }
             }
         }
         let mut label_counts: Vec<(String, usize)> = label_map.into_iter().collect();
@@ -1434,6 +1442,43 @@ impl MemoirStore for SqliteStore {
             avg_confidence,
             label_counts,
         })
+    }
+
+    fn get_links_for_memoir(&self, memoir_id: &str) -> IcmResult<Vec<ConceptLink>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {LINK_COLS} FROM concept_links
+                 WHERE source_id IN (SELECT id FROM concepts WHERE memoir_id = ?1)
+                 LIMIT 5000"
+            ))
+            .map_err(db_err)?;
+
+        let rows = stmt
+            .query_map(params![memoir_id], row_to_link)
+            .map_err(db_err)?;
+
+        collect_rows(rows)
+    }
+
+    fn batch_memoir_concept_counts(&self) -> IcmResult<HashMap<String, usize>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT memoir_id, COUNT(*) FROM concepts GROUP BY memoir_id")
+            .map_err(db_err)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+            })
+            .map_err(db_err)?;
+
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, count) = row.map_err(db_err)?;
+            map.insert(id, count);
+        }
+        Ok(map)
     }
 }
 

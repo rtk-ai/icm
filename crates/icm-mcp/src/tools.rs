@@ -1147,10 +1147,10 @@ fn tool_memoir_list(store: &SqliteStore) -> ToolResult {
         return ToolResult::text("No memoirs yet.".into());
     }
 
+    let counts = store.batch_memoir_concept_counts().unwrap_or_default();
     let mut output = String::from("Memoirs:\n");
     for m in &memoirs {
-        let stats = store.memoir_stats(&m.id).ok();
-        let concept_count = stats.map(|s| s.total_concepts).unwrap_or(0);
+        let concept_count = counts.get(&m.id).copied().unwrap_or(0);
         output.push_str(&format!(
             "  {} ({} concepts) — {}\n",
             m.name, concept_count, m.description
@@ -1515,14 +1515,11 @@ fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
         Err(e) => return ToolResult::error(format!("db error: {e}")),
     };
 
-    // Collect all outgoing links
-    let mut links = Vec::new();
-    for c in &concepts {
-        match store.get_links_from(&c.id) {
-            Ok(l) => links.extend(l),
-            Err(e) => return ToolResult::error(format!("db error: {e}")),
-        }
-    }
+    // Batch load all links for this memoir (single query)
+    let links = match store.get_links_for_memoir(&memoir.id) {
+        Ok(l) => l,
+        Err(e) => return ToolResult::error(format!("db error: {e}")),
+    };
 
     let id_to_name: std::collections::HashMap<&str, &str> = concepts
         .iter()

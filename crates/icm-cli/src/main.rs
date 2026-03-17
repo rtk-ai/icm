@@ -1788,23 +1788,46 @@ icm store -t \"topic\" -c \"summary\"
 
         // PreToolUse hook: `icm hook pre` (auto-allow icm commands)
         let pre_cmd = format!("{} hook pre", icm_bin_str);
-        let pre_status = inject_claude_pretool_hook(&claude_settings_path, &pre_cmd)?;
+        let pre_status = inject_claude_hook(
+            &claude_settings_path,
+            "PreToolUse",
+            &pre_cmd,
+            Some("Bash"),
+            &["icm-pretool", "icm hook pre"],
+        )?;
         println!("[hook] Claude Code PreToolUse (auto-allow): {pre_status}");
 
         // PostToolUse hook: `icm hook post` (auto-extract context)
         let post_cmd = format!("{} hook post", icm_bin_str);
-        let post_status = inject_claude_hook(&claude_settings_path, "PostToolUse", &post_cmd)?;
+        let post_status = inject_claude_hook(
+            &claude_settings_path,
+            "PostToolUse",
+            &post_cmd,
+            None,
+            &["icm hook", "icm-post-tool"],
+        )?;
         println!("[hook] Claude Code PostToolUse (auto-extract): {post_status}");
 
         // PreCompact hook: `icm hook compact` (extract from transcript before compression)
         let compact_cmd = format!("{} hook compact", icm_bin_str);
-        let compact_status = inject_claude_hook(&claude_settings_path, "PreCompact", &compact_cmd)?;
+        let compact_status = inject_claude_hook(
+            &claude_settings_path,
+            "PreCompact",
+            &compact_cmd,
+            None,
+            &["icm hook", "icm-post-tool"],
+        )?;
         println!("[hook] Claude Code PreCompact (transcript extract): {compact_status}");
 
         // UserPromptSubmit hook: `icm hook prompt` (recall context on each prompt)
         let prompt_cmd = format!("{} hook prompt", icm_bin_str);
-        let prompt_status =
-            inject_claude_hook(&claude_settings_path, "UserPromptSubmit", &prompt_cmd)?;
+        let prompt_status = inject_claude_hook(
+            &claude_settings_path,
+            "UserPromptSubmit",
+            &prompt_cmd,
+            None,
+            &["icm hook", "icm-post-tool"],
+        )?;
         println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
 
         // OpenCode plugin: install JS plugin for tool.execute.after + session.compacting
@@ -1859,10 +1882,14 @@ fn inject_icm_block(path: &PathBuf, block: &str) -> Result<String> {
 }
 
 /// Inject ICM hook into Claude Code settings.json for a given event name.
+/// `matcher` is optional — if set (e.g. "Bash"), adds a matcher field to the hook entry.
+/// `detect_patterns` lists substrings to detect if the hook is already present.
 fn inject_claude_hook(
     settings_path: &PathBuf,
     event_name: &str,
     hook_command: &str,
+    matcher: Option<&str>,
+    detect_patterns: &[&str],
 ) -> Result<String> {
     let mut config: Value = if settings_path.exists() {
         let content = std::fs::read_to_string(settings_path)
@@ -1898,7 +1925,7 @@ fn inject_claude_hook(
                 hooks.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|c| c.contains("icm hook") || c.contains("icm-post-tool"))
+                        .map(|c| detect_patterns.iter().any(|p| c.contains(p)))
                         .unwrap_or(false)
                 })
             })
@@ -1910,76 +1937,19 @@ fn inject_claude_hook(
     }
 
     // Add ICM hook entry
-    event_arr.push(serde_json::json!({
+    let mut entry = serde_json::json!({
         "hooks": [{
             "type": "command",
             "command": hook_command
         }]
-    }));
-
-    let output = serde_json::to_string_pretty(&config)?;
-    std::fs::write(settings_path, output)
-        .with_context(|| format!("cannot write {}", settings_path.display()))?;
-
-    Ok("configured".into())
-}
-
-/// Inject ICM PreToolUse hook into Claude Code settings.json
-/// This hook auto-allows `icm` CLI commands (no permission prompt).
-fn inject_claude_pretool_hook(settings_path: &PathBuf, hook_command: &str) -> Result<String> {
-    let mut config: Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(settings_path)
-            .with_context(|| format!("cannot read {}", settings_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("cannot parse {}", settings_path.display()))?
-    } else {
-        serde_json::json!({})
-    };
-
-    let hooks = config
-        .as_object_mut()
-        .context("settings is not a JSON object")?
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let pre_tool = hooks
-        .as_object_mut()
-        .context("hooks is not a JSON object")?
-        .entry("PreToolUse")
-        .or_insert_with(|| serde_json::json!([]));
-
-    let pre_tool_arr = pre_tool
-        .as_array_mut()
-        .context("PreToolUse is not an array")?;
-
-    // Check if ICM pretool hook already exists
-    let already = pre_tool_arr.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|c| c.contains("icm-pretool") || c.contains("icm hook pre"))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
     });
-
-    if already {
-        return Ok("already configured".into());
+    if let Some(m) = matcher {
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("matcher".into(), serde_json::json!(m));
     }
-
-    // Add ICM PreToolUse hook entry (matcher: Bash — auto-allow icm commands)
-    pre_tool_arr.push(serde_json::json!({
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": hook_command
-        }]
-    }));
+    event_arr.push(entry);
 
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(settings_path, output)
@@ -3502,14 +3472,15 @@ fn cmd_memoir_list(store: &SqliteStore) -> Result<()> {
         return Ok(());
     }
 
+    let counts = store.batch_memoir_concept_counts().unwrap_or_default();
     println!("{:<25} {:<8} Description", "Name", "Concepts");
     println!("{}", "-".repeat(60));
     for m in &memoirs {
-        let stats = store.memoir_stats(&m.id)?;
+        let concept_count = counts.get(&m.id).copied().unwrap_or(0);
         println!(
             "{:<25} {:<8} {}",
             m.name,
-            stats.total_concepts,
+            concept_count,
             truncate(&m.description, 40)
         );
     }
@@ -3746,11 +3717,8 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
     let memoir = resolve_memoir(store, memoir_name)?;
     let concepts = store.list_concepts(&memoir.id)?;
 
-    // Collect all outgoing links
-    let mut links = Vec::new();
-    for c in &concepts {
-        links.extend(store.get_links_from(&c.id)?);
-    }
+    // Batch load all links for this memoir (single query)
+    let links = store.get_links_for_memoir(&memoir.id)?;
 
     // Name lookup for links
     let id_to_name: std::collections::HashMap<&str, &str> = concepts

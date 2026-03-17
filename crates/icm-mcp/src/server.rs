@@ -111,11 +111,14 @@ Use ICM (Infinite Context Memory) proactively to maintain long-term memory acros
 RECALL (icm_memory_recall): At the start of a task, search for relevant past context — decisions, \
 resolved errors, user preferences. Search only what is relevant, do not dump everything.\n\
 \n\
-STORE (icm_memory_store): Automatically store important information:\n\
-- Architecture decisions → topic: \"decisions-{project}\"\n\
-- Resolved errors with solutions → topic: \"errors-resolved\"\n\
-- User preferences discovered in session → topic: \"preferences\"\n\
-- Project context after significant work → topic: \"context-{project}\"\n\
+STORE (icm_memory_store): You MUST store when ANY of these triggers occur:\n\
+1. Error resolved → topic: \"errors-resolved\", importance: high\n\
+2. Architecture/design decision made → topic: \"decisions-{project}\", importance: high\n\
+3. User preference discovered (correction, feedback) → topic: \"preferences\", importance: critical\n\
+4. Significant task completed (feature, fix, config, review) → topic: \"context-{project}\", importance: high\n\
+5. Conversation exceeds ~20 tool calls without a store → store a progress summary\n\
+\n\
+Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
 Do NOT store: trivial details, information already in CLAUDE.md, ephemeral state.\n\
 \n\

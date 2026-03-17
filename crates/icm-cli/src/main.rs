@@ -1659,29 +1659,35 @@ fn cmd_init(mode: InitMode) -> Result<()> {
 
         let icm_block = "\
 <!-- icm:start -->\n\
-## Persistent memory (ICM)\n\
+## Persistent memory (ICM) — MANDATORY\n\
 \n\
 This project uses [ICM](https://github.com/rtk-ai/icm) for persistent memory across sessions.\n\
+You MUST use it actively. Not optional.\n\
 \n\
 ### Recall (before starting work)\n\
 ```bash\n\
-icm recall \"topic keywords\"              # search memories\n\
-icm recall-context \"query\" --limit 5     # formatted for prompt injection\n\
+icm recall \"query\"                        # search memories\n\
+icm recall \"query\" -t \"topic-name\"        # filter by topic\n\
+icm recall-context \"query\" --limit 5      # formatted for prompt injection\n\
 ```\n\
 \n\
-### Store (after completing significant work)\n\
-```bash\n\
-icm store -t \"topic\" -c \"summary\" -i medium   # importance: critical|high|medium|low\n\
-icm store -t \"decisions\" -c \"chose X over Y because...\" -i high\n\
-icm store -t \"errors-resolved\" -c \"fix: ...\" -k \"error,fix\"\n\
-```\n\
+### Store — MANDATORY triggers\n\
+You MUST call `icm store` when ANY of the following happens:\n\
+1. **Error resolved** → `icm store -t errors-resolved -c \"description\" -i high -k \"keyword1,keyword2\"`\n\
+2. **Architecture/design decision** → `icm store -t decisions-{project} -c \"description\" -i high`\n\
+3. **User preference discovered** → `icm store -t preferences -c \"description\" -i critical`\n\
+4. **Significant task completed** → `icm store -t context-{project} -c \"summary of work done\" -i high`\n\
+5. **Conversation exceeds ~20 tool calls without a store** → store a progress summary\n\
+\n\
+Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
+\n\
+Do NOT store: trivial details, info already in CLAUDE.md, ephemeral state (build logs, git status).\n\
 \n\
 ### Other commands\n\
 ```bash\n\
 icm update <id> -c \"updated content\"     # edit memory in-place\n\
 icm health                                # topic hygiene audit\n\
 icm topics                                # list all topics\n\
-icm feedback record -t \"topic\" -c \"context\" -p \"predicted\" --corrected \"actual\"\n\
 ```\n\
 <!-- icm:end -->";
 
@@ -1741,17 +1747,21 @@ globs:
 alwaysApply: true
 ---
 
-This project uses ICM (Infinite Context Memory) for persistent memory.
+This project uses ICM (Infinite Context Memory) for persistent memory. Usage is MANDATORY.
 
-At the start of each task, recall relevant context:
+**Recall** — at the start of each task, search for relevant past context:
 ```bash
-icm recall \"topic keywords\"
+icm recall \"query\"
 ```
 
-After completing significant work, store a summary:
-```bash
-icm store -t \"topic\" -c \"summary\"
-```
+**Store** — you MUST store when any of these happens:
+1. Error resolved → `icm store -t errors-resolved -c \"description\" -i high`
+2. Architecture decision → `icm store -t decisions-{project} -c \"description\" -i high`
+3. User preference discovered → `icm store -t preferences -c \"description\" -i critical`
+4. Significant task completed → `icm store -t context-{project} -c \"summary\" -i high`
+5. Conversation exceeds ~20 tool calls without a store → store progress summary
+
+Do this BEFORE responding to the user. Not optional.
 ";
         install_skill(&cursor_rules_dir, "icm.mdc", cursor_icm_rule, "Cursor rule")?;
 

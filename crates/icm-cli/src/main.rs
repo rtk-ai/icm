@@ -941,7 +941,7 @@ fn cmd_recall(
 
                 for (mem, score) in &scored {
                     let _ = store.update_access(&mem.id);
-                    print_memory_scored(mem, *score);
+                    print_memory_detail(mem, Some(*score));
                 }
                 return Ok(());
             }
@@ -970,7 +970,7 @@ fn cmd_recall(
 
     for mem in &results {
         let _ = store.update_access(&mem.id);
-        print_memory(mem);
+        print_memory_detail(mem, None);
     }
 
     Ok(())
@@ -1003,7 +1003,7 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
     }
 
     for mem in &memories {
-        print_memory(mem);
+        print_memory_detail(mem, None);
     }
 
     Ok(())
@@ -2373,10 +2373,7 @@ fn cmd_embed(
     let mut errors = 0;
 
     for chunk in to_embed.chunks(batch_size) {
-        let texts: Vec<String> = chunk
-            .iter()
-            .map(|m| format!("{} {}", m.topic, m.summary))
-            .collect();
+        let texts: Vec<String> = chunk.iter().map(|m| m.embed_text()).collect();
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
         match embedder.embed_batch(&text_refs) {
@@ -2406,8 +2403,11 @@ fn cmd_embed(
     Ok(())
 }
 
-fn print_memory(mem: &Memory) {
-    println!("--- {} ---", mem.id);
+fn print_memory_detail(mem: &Memory, score: Option<f32>) {
+    match score {
+        Some(s) => println!("--- {} [score: {:.3}] ---", mem.id, s),
+        None => println!("--- {} ---", mem.id),
+    }
     println!("  topic:      {}", mem.topic);
     println!("  importance: {}", mem.importance);
     println!("  weight:     {:.3}", mem.weight);
@@ -2424,29 +2424,8 @@ fn print_memory(mem: &Memory) {
     if let Some(ref raw) = mem.raw_excerpt {
         println!("  raw:        {raw}");
     }
-    if mem.embedding.is_some() {
+    if score.is_none() && mem.embedding.is_some() {
         println!("  embedding:  yes");
-    }
-    println!();
-}
-
-fn print_memory_scored(mem: &Memory, score: f32) {
-    println!("--- {} [score: {:.3}] ---", mem.id, score);
-    println!("  topic:      {}", mem.topic);
-    println!("  importance: {}", mem.importance);
-    println!("  weight:     {:.3}", mem.weight);
-    println!("  created:    {}", mem.created_at.format("%Y-%m-%d %H:%M"));
-    println!(
-        "  accessed:   {} (x{})",
-        mem.last_accessed.format("%Y-%m-%d %H:%M"),
-        mem.access_count
-    );
-    println!("  summary:    {}", mem.summary);
-    if !mem.keywords.is_empty() {
-        println!("  keywords:   {}", mem.keywords.join(", "));
-    }
-    if let Some(ref raw) = mem.raw_excerpt {
-        println!("  raw:        {raw}");
     }
     println!();
 }

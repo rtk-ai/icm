@@ -1093,10 +1093,7 @@ fn tool_embed_all(
     let total = to_embed.len();
 
     // Batch embed all texts at once
-    let texts: Vec<String> = to_embed
-        .iter()
-        .map(|m| format!("{} {}", m.topic, m.summary))
-        .collect();
+    let texts: Vec<String> = to_embed.iter().map(|m| m.embed_text()).collect();
     let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
     let embeddings = match embedder.embed_batch(&text_refs) {
@@ -1484,18 +1481,14 @@ fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
     if links.is_empty() {
         output.push_str("\n(no links)\n");
     } else {
+        let name_map: std::collections::HashMap<&str, &str> = neighbors
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str()))
+            .collect();
         output.push_str(&format!("\nGraph (depth={depth}):\n"));
         for link in &links {
-            let src = neighbors
-                .iter()
-                .find(|c| c.id == link.source_id)
-                .map(|c| c.name.as_str())
-                .unwrap_or("?");
-            let tgt = neighbors
-                .iter()
-                .find(|c| c.id == link.target_id)
-                .map(|c| c.name.as_str())
-                .unwrap_or("?");
+            let src = name_map.get(link.source_id.as_str()).unwrap_or(&"?");
+            let tgt = name_map.get(link.target_id.as_str()).unwrap_or(&"?");
             output.push_str(&format!("  {src} --{}--> {tgt}\n", link.relation));
         }
     }

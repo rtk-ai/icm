@@ -275,8 +275,7 @@ impl MemoryStore for SqliteStore {
             .map_err(db_err)?;
 
         // Sync to vec_memories for KNN search
-        if let Some(ref emb) = memory.embedding {
-            let blob = embedding_to_blob(emb);
+        if let Some(ref blob) = emb_blob {
             self.conn
                 .execute(
                     "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
@@ -341,26 +340,18 @@ impl MemoryStore for SqliteStore {
             return Err(IcmError::NotFound(memory.id.clone()));
         }
 
-        // Sync vec_memories
-        if let Some(ref emb) = memory.embedding {
-            let blob = embedding_to_blob(emb);
-            // Delete old entry then insert new
-            let _ = self.conn.execute(
-                "DELETE FROM vec_memories WHERE memory_id = ?1",
-                params![memory.id],
-            );
+        // Sync vec_memories: always delete old, re-insert if embedding exists
+        let _ = self.conn.execute(
+            "DELETE FROM vec_memories WHERE memory_id = ?1",
+            params![memory.id],
+        );
+        if let Some(ref blob) = emb_blob {
             self.conn
                 .execute(
                     "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
                     params![memory.id, blob],
                 )
                 .map_err(db_err)?;
-        } else {
-            // No embedding — remove from vec table
-            let _ = self.conn.execute(
-                "DELETE FROM vec_memories WHERE memory_id = ?1",
-                params![memory.id],
-            );
         }
 
         Ok(())
@@ -1005,7 +996,9 @@ impl MemoirStore for SqliteStore {
     fn list_memoirs(&self) -> IcmResult<Vec<Memoir>> {
         let mut stmt = self
             .conn
-            .prepare(&format!("SELECT {MEMOIR_COLS} FROM memoirs ORDER BY name"))
+            .prepare(&format!(
+                "SELECT {MEMOIR_COLS} FROM memoirs ORDER BY name LIMIT 500"
+            ))
             .map_err(db_err)?;
 
         let rows = stmt.query_map([], row_to_memoir).map_err(db_err)?;
@@ -1111,7 +1104,7 @@ impl MemoirStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {CONCEPT_COLS} FROM concepts WHERE memoir_id = ?1 ORDER BY name"
+                "SELECT {CONCEPT_COLS} FROM concepts WHERE memoir_id = ?1 ORDER BY name LIMIT 1000"
             ))
             .map_err(db_err)?;
 

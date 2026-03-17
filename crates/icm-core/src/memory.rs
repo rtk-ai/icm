@@ -30,6 +30,11 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Build the text used for embedding this memory.
+    pub fn embed_text(&self) -> String {
+        format!("{} {}", self.topic, self.summary)
+    }
+
     pub fn new(topic: String, summary: String, importance: Importance) -> Self {
         let now = Utc::now();
         Self {

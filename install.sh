@@ -21,7 +21,8 @@ detect_os() {
     case "$(uname -s)" in
         Darwin*) OS="darwin"; TARGET_SUFFIX="apple-darwin";;
         Linux*)  OS="linux";  TARGET_SUFFIX="unknown-linux-gnu";;
-        *)       error "Unsupported OS: $(uname -s). icm supports macOS and Linux.";;
+        MINGW*|MSYS*|CYGWIN*) OS="windows"; TARGET_SUFFIX="pc-windows-msvc";;
+        *)       error "Unsupported OS: $(uname -s). icm supports macOS, Linux and Windows.";;
     esac
 }
 
@@ -45,9 +46,17 @@ install() {
     info "Detected: ${OS} ${ARCH}"
     info "Version: ${VERSION}"
 
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY_NAME}-${TARGET}.tar.gz"
+    if [ "$OS" = "windows" ]; then
+        EXT="zip"
+        INSTALL_DIR="${LOCALAPPDATA:-$HOME}/icm/bin"
+        mkdir -p "$INSTALL_DIR"
+    else
+        EXT="tar.gz"
+    fi
+
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY_NAME}-${TARGET}.${EXT}"
     TEMP_DIR=$(mktemp -d)
-    ARCHIVE="${TEMP_DIR}/${BINARY_NAME}.tar.gz"
+    ARCHIVE="${TEMP_DIR}/${BINARY_NAME}.${EXT}"
 
     info "Downloading from: ${DOWNLOAD_URL}"
     if ! curl -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE"; then
@@ -55,18 +64,21 @@ install() {
     fi
 
     info "Extracting..."
-    tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
-
-    if [ -w "$INSTALL_DIR" ]; then
-        mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/"
+    if [ "$OS" = "windows" ]; then
+        unzip -o "$ARCHIVE" -d "$TEMP_DIR"
+        mv "${TEMP_DIR}/${BINARY_NAME}.exe" "${INSTALL_DIR}/"
     else
-        info "Requesting sudo to install to ${INSTALL_DIR}"
-        sudo mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/"
+        tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
+        if [ -w "$INSTALL_DIR" ]; then
+            mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/"
+        else
+            info "Requesting sudo to install to ${INSTALL_DIR}"
+            sudo mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/"
+        fi
+        chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
     fi
 
-    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
     rm -rf "$TEMP_DIR"
-
     info "Successfully installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
 }
 

@@ -124,7 +124,7 @@ jobs:
     container: fedora:latest
     steps:
       - name: Install dependencies
-        run: dnf install -y git rust cargo rpm-build openssl-devel pkg-config perl-FindBin perl-File-Compare
+        run: dnf install -y git rust cargo rpm-build openssl-devel pkg-config perl-FindBin perl-File-Compare gcc-c++
 
       - name: Checkout
         uses: actions/checkout@v4

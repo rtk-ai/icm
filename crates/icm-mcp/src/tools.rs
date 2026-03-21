@@ -2,8 +2,8 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
-    Concept, ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation,
+    keyword_matches, topic_matches, Concept, ConceptLink, Embedder, Feedback, FeedbackStore, Label,
+    Memoir, MemoirStore, Memory, MemoryStore, Relation, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -11,6 +11,15 @@ use crate::protocol::ToolResult;
 
 /// Default threshold for auto-consolidation (can be overridden by config).
 const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
+
+/// Similarity score above which a new memory is considered a duplicate of an existing one.
+const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.85;
+
+/// Maximum allowed length for topic names.
+const MAX_TOPIC_LEN: usize = 255;
+
+/// Maximum allowed length for content/summary text.
+const MAX_CONTENT_LEN: usize = 100_000;
 
 /// Parse a JSON keywords array from tool arguments.
 fn parse_keywords(args: &Value) -> Vec<String> {
@@ -22,16 +31,6 @@ fn parse_keywords(args: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Check if a memory topic matches a filter (exact or prefix match).
-fn topic_matches(memory_topic: &str, filter: &str) -> bool {
-    memory_topic == filter || memory_topic.starts_with(&format!("{filter}:"))
-}
-
-/// Check if memory keywords contain a substring match.
-fn keyword_matches(keywords: &[String], filter: &str) -> bool {
-    keywords.iter().any(|k| k.contains(filter))
 }
 
 /// Try to auto-consolidate a topic if it exceeds the threshold.
@@ -602,6 +601,21 @@ fn tool_store(
         Some(c) => c,
         None => return ToolResult::error("missing required field: content".into()),
     };
+
+    // Input length validation
+    if topic.len() > MAX_TOPIC_LEN {
+        return ToolResult::error(format!(
+            "topic exceeds maximum length ({} > {MAX_TOPIC_LEN} chars)",
+            topic.len()
+        ));
+    }
+    if content.len() > MAX_CONTENT_LEN {
+        return ToolResult::error(format!(
+            "content exceeds maximum length ({} > {MAX_CONTENT_LEN} chars)",
+            content.len()
+        ));
+    }
+
     let importance_str = get_str(args, "importance").unwrap_or("medium");
     let importance = importance_str
         .parse()
@@ -640,21 +654,34 @@ fn tool_store(
     if let Some(ref query_emb) = embed_vec {
         if let Ok(similar) = store.search_hybrid(&embed_text, query_emb, 1) {
             if let Some((existing, score)) = similar.first() {
-                if score > &0.85 && existing.topic == topic {
+                if *score > DEDUP_SIMILARITY_THRESHOLD && existing.topic == topic {
                     // Very similar content in same topic — update instead of duplicate
-                    let mut updated = existing.clone();
-                    updated.summary = content.to_string();
-                    updated.updated_at = Utc::now();
-                    updated.weight = 1.0; // Reset weight on update
-                    if let Some(raw) = get_str(args, "raw_excerpt") {
-                        updated.raw_excerpt = Some(raw.into());
-                    }
-                    let kw = parse_keywords(args);
-                    if !kw.is_empty() {
-                        updated.keywords = kw;
-                    }
-                    updated.importance = importance;
-                    updated.embedding = Some(query_emb.clone());
+                    let updated = Memory {
+                        id: existing.id.clone(),
+                        created_at: existing.created_at,
+                        last_accessed: existing.last_accessed,
+                        access_count: existing.access_count,
+                        weight: 1.0, // Reset weight on update
+                        topic: existing.topic.clone(),
+                        summary: content.to_string(),
+                        raw_excerpt: get_str(args, "raw_excerpt")
+                            .map(|r| r.into())
+                            .or_else(|| existing.raw_excerpt.clone()),
+                        keywords: {
+                            let kw = parse_keywords(args);
+                            if kw.is_empty() {
+                                existing.keywords.clone()
+                            } else {
+                                kw
+                            }
+                        },
+                        embedding: Some(query_emb.clone()),
+                        importance,
+                        source: existing.source.clone(),
+                        related_ids: existing.related_ids.clone(),
+                        updated_at: Utc::now(),
+                        scope: existing.scope,
+                    };
                     if let Err(e) = store.update(&updated) {
                         return ToolResult::error(format!("failed to update: {e}"));
                     }
@@ -746,7 +773,9 @@ fn tool_recall(
     compact: bool,
 ) -> ToolResult {
     // Auto-decay if >24h since last decay
-    let _ = store.maybe_auto_decay();
+    if let Err(e) = store.maybe_auto_decay() {
+        tracing::warn!(error = %e, "auto-decay failed during recall");
+    }
 
     let query = match get_str(args, "query") {
         Some(q) => q,
@@ -773,7 +802,7 @@ fn tool_recall(
                 let _ = store.batch_update_access(&ids);
 
                 if scored_results.is_empty() {
-                    return ToolResult::text("No memories found.".into());
+                    return ToolResult::text(MSG_NO_MEMORIES.into());
                 }
 
                 return ToolResult::text(format_memory_output(&scored_results, compact));
@@ -807,7 +836,7 @@ fn tool_recall(
     let _ = store.batch_update_access(&ids);
 
     if results.is_empty() {
-        return ToolResult::text("No memories found.".into());
+        return ToolResult::text(MSG_NO_MEMORIES.into());
     }
 
     // Convert to scored format (no score = -1.0)
@@ -2069,14 +2098,31 @@ mod tests {
     }
 
     #[test]
-    fn test_store_very_large_content() {
+    fn test_store_very_large_content_rejected() {
         let store = test_store();
-        let huge = "x".repeat(500_000);
+        let huge = "x".repeat(MAX_CONTENT_LEN + 1);
         let result = call_tool(
             &store,
             None,
             "icm_memory_store",
             &json!({"topic": "big", "content": huge}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0]
+            .text
+            .contains("content exceeds maximum length"));
+    }
+
+    #[test]
+    fn test_store_large_content_within_limit_ok() {
+        let store = test_store();
+        let big = "x".repeat(MAX_CONTENT_LEN);
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "big", "content": big}),
             false,
         );
         assert!(!result.is_error);
@@ -2369,6 +2415,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_recall_empty_query() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": ""}),
+            false,
+        );
+        // Should return empty results, not error
+        assert!(!result.is_error);
+    }
+
     // === Feedback tool tests ===
 
     #[test]
@@ -2498,5 +2558,55 @@ mod tests {
         assert!(result.content[0].text.contains("Feedback total: 2"));
         assert!(result.content[0].text.contains("triage"));
         assert!(result.content[0].text.contains("pr-review"));
+    }
+
+    // === Input validation tests ===
+
+    #[test]
+    fn test_store_topic_too_long() {
+        let store = test_store();
+        let long_topic = "a".repeat(MAX_TOPIC_LEN + 1);
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": long_topic, "content": "hello"}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0]
+            .text
+            .contains("topic exceeds maximum length"));
+    }
+
+    #[test]
+    fn test_store_content_too_long() {
+        let store = test_store();
+        let long_content = "x".repeat(MAX_CONTENT_LEN + 1);
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "test", "content": long_content}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0]
+            .text
+            .contains("content exceeds maximum length"));
+    }
+
+    #[test]
+    fn test_store_topic_at_max_length_ok() {
+        let store = test_store();
+        let max_topic = "a".repeat(MAX_TOPIC_LEN);
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": max_topic, "content": "hello"}),
+            false,
+        );
+        assert!(!result.is_error);
     }
 }

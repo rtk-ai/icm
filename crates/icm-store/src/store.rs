@@ -43,7 +43,7 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn new(path: &Path) -> IcmResult<Self> {
-        Self::with_dims(path, 384)
+        Self::with_dims(path, icm_core::DEFAULT_EMBEDDING_DIMS)
     }
 
     /// Open or create a store with a specific embedding dimension.
@@ -145,9 +145,9 @@ fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
 
 fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
     if !blob.len().is_multiple_of(4) {
-        eprintln!(
-            "[icm] warning: embedding blob size {} not divisible by 4, truncating",
-            blob.len()
+        tracing::warn!(
+            blob_size = blob.len(),
+            "embedding blob size not divisible by 4, truncating"
         );
     }
     blob.chunks_exact(4)
@@ -218,6 +218,13 @@ const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_cou
 ///
 /// This function strips special chars and wraps each token in double quotes.
 fn sanitize_fts_query(query: &str) -> String {
+    // Limit input length to prevent abuse
+    let query = if query.len() > 10_000 {
+        &query[..10_000]
+    } else {
+        query
+    };
+
     // Replace FTS5 operator chars with spaces, then quote each resulting token.
     // FTS5 tokenizer (unicode61) splits on `-` too, so we must keep tokens separate.
     let cleaned: String = query
@@ -237,7 +244,12 @@ fn sanitize_fts_query(query: &str) -> String {
     let tokens: Vec<String> = cleaned
         .split_whitespace()
         .filter(|w| !w.is_empty())
-        .map(|w| format!("\"{w}\""))
+        .take(100) // Limit token count to prevent excessive query complexity
+        .map(|w| {
+            // Strip any remaining quotes from tokens before wrapping in quotes
+            let stripped = w.replace('"', "");
+            format!("\"{stripped}\"")
+        })
         .collect();
     tokens.join(" ")
 }
@@ -386,7 +398,7 @@ impl MemoryStore for SqliteStore {
 
         // Cap keywords to avoid massive SQL generation
         let keywords = &keywords[..keywords.len().min(50)];
-        let limit = limit.min(1000);
+        let limit = limit.min(100);
 
         let where_parts: Vec<String> = (0..keywords.len())
             .map(|i| {
@@ -420,6 +432,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn search_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Memory>> {
+        let limit = limit.min(100);
         let sanitized = sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
@@ -557,12 +570,13 @@ impl MemoryStore for SqliteStore {
         }
 
         // 3. Combine scores: 30% FTS + 70% vector
-        let mut scored: Vec<(String, f32)> = Vec::with_capacity(all_memories.len());
-        for id in all_memories.keys() {
-            let fts_score = fts_scores.get(id).copied().unwrap_or(0.0);
-            let vec_score = vec_scores.get(id).copied().unwrap_or(0.0);
+        let keys: Vec<String> = all_memories.keys().cloned().collect();
+        let mut scored: Vec<(String, f32)> = Vec::with_capacity(keys.len());
+        for id in keys {
+            let fts_score = fts_scores.get(&id).copied().unwrap_or(0.0);
+            let vec_score = vec_scores.get(&id).copied().unwrap_or(0.0);
             let combined = 0.3 * fts_score + 0.7 * vec_score;
-            scored.push((id.clone(), combined));
+            scored.push((id, combined));
         }
 
         // Sort by combined score descending
@@ -716,6 +730,7 @@ impl MemoryStore for SqliteStore {
             )",
             params![topic],
         ) {
+            tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after vec_memories delete failed");
             let _ = self.conn.execute_batch("ROLLBACK;");
             return Err(IcmError::Database(e.to_string()));
         }
@@ -724,11 +739,13 @@ impl MemoryStore for SqliteStore {
             .conn
             .execute("DELETE FROM memories WHERE topic = ?1", params![topic])
         {
+            tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after memories delete failed");
             let _ = self.conn.execute_batch("ROLLBACK;");
             return Err(IcmError::Database(e.to_string()));
         }
 
         if let Err(e) = self.store(consolidated) {
+            tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after store failed");
             let _ = self.conn.execute_batch("ROLLBACK;");
             return Err(e);
         }
@@ -740,6 +757,7 @@ impl MemoryStore for SqliteStore {
             .conn
             .execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")
         {
+            tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after FTS rebuild failed");
             let _ = self.conn.execute_batch("ROLLBACK;");
             return Err(IcmError::Database(e.to_string()));
         }
@@ -811,9 +829,13 @@ impl MemoryStore for SqliteStore {
         }
 
         let parse_dt = |s: &str| -> Option<DateTime<Utc>> {
-            DateTime::parse_from_rfc3339(s)
-                .ok()
-                .map(|d| d.with_timezone(&Utc))
+            match DateTime::parse_from_rfc3339(s) {
+                Ok(d) => Some(d.with_timezone(&Utc)),
+                Err(e) => {
+                    tracing::warn!("invalid timestamp '{}': {}", s, e);
+                    None
+                }
+            }
         };
 
         Ok(TopicHealth {
@@ -1882,15 +1904,15 @@ impl SqliteStore {
             }
 
             // Representative = the highest-weight memory in the cluster
-            let best_idx = *indices
-                .iter()
-                .max_by(|&&a, &&b| {
-                    memories[a]
-                        .weight
-                        .partial_cmp(&memories[b].weight)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap();
+            let best_idx = match indices.iter().max_by(|&&a, &&b| {
+                memories[a]
+                    .weight
+                    .partial_cmp(&memories[b].weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                Some(&idx) => idx,
+                None => continue, // empty cluster, skip
+            };
 
             // Collect all unique keywords from the cluster
             let mut all_kw: Vec<String> = Vec::new();
@@ -3557,5 +3579,204 @@ mod tests {
         assert_eq!(stats.by_topic[0].1, 3);
         assert_eq!(stats.most_applied.len(), 1);
         assert_eq!(stats.most_applied[0].1, 1);
+    }
+
+    // === sanitize_fts_query tests ===
+
+    #[test]
+    fn test_sanitize_fts_empty() {
+        assert_eq!(sanitize_fts_query(""), "");
+        assert_eq!(sanitize_fts_query("   "), "");
+    }
+
+    #[test]
+    fn test_sanitize_fts_special_chars() {
+        // All FTS5 operators should be stripped
+        assert_eq!(sanitize_fts_query("hello-world"), "\"hello\" \"world\"");
+        assert_eq!(sanitize_fts_query("foo*bar"), "\"foo\" \"bar\"");
+        assert_eq!(sanitize_fts_query("a:b"), "\"a\" \"b\"");
+        assert_eq!(sanitize_fts_query("(test)"), "\"test\"");
+        assert_eq!(sanitize_fts_query("x^y+z~w"), "\"x\" \"y\" \"z\" \"w\"");
+    }
+
+    #[test]
+    fn test_sanitize_fts_quotes_stripped() {
+        // Embedded quotes must be removed before wrapping in quotes
+        assert_eq!(sanitize_fts_query("say \"hello\""), "\"say\" \"hello\"");
+    }
+
+    #[test]
+    fn test_sanitize_fts_unicode() {
+        assert_eq!(sanitize_fts_query("café résumé"), "\"café\" \"résumé\"");
+        assert_eq!(sanitize_fts_query("日本語テスト"), "\"日本語テスト\"");
+    }
+
+    #[test]
+    fn test_sanitize_fts_long_input_truncated() {
+        let long = "a ".repeat(6000); // 12000 chars
+        let result = sanitize_fts_query(&long);
+        // Input is truncated to 10_000 chars, then tokens are capped at 100
+        let token_count = result.split_whitespace().count();
+        assert!(token_count <= 100);
+    }
+
+    #[test]
+    fn test_sanitize_fts_many_tokens_capped() {
+        // 200 tokens should be capped to 100
+        let many_tokens: String = (0..200)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = sanitize_fts_query(&many_tokens);
+        let token_count = result.split_whitespace().count();
+        assert_eq!(token_count, 100);
+    }
+
+    // === search limit cap tests ===
+
+    #[test]
+    fn test_search_fts_limit_capped() {
+        let store = test_store();
+        // Store a memory so search has something to find
+        store.store(make_memory("test", "hello world")).unwrap();
+
+        // Even with a huge limit, it should not error (capped internally)
+        let results = store.search_fts("hello", 999_999).unwrap();
+        assert!(results.len() <= 100);
+    }
+
+    #[test]
+    fn test_search_by_keywords_limit_capped() {
+        let store = test_store();
+        let mut mem = make_memory("test", "keyword search test");
+        mem.keywords = vec!["findme".into()];
+        store.store(mem).unwrap();
+
+        let results = store.search_by_keywords(&["findme"], 999_999).unwrap();
+        assert!(results.len() <= 100);
+    }
+
+    // === Additional MemoryStore coverage ===
+
+    #[test]
+    fn test_search_fts_empty_query() {
+        let store = test_store();
+        store.store(make_memory("topic", "hello world")).unwrap();
+        let results = store.search_fts("", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_by_keywords_empty() {
+        let store = test_store();
+        let results = store.search_by_keywords(&[], 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_update_nonexistent_memory() {
+        let store = test_store();
+        let mut mem = make_memory("t", "s");
+        mem.id = "nonexistent-id".to_string();
+        let result = store.update(&mem);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_nonexistent_memory() {
+        let store = test_store();
+        let result = store.delete("nonexistent-id");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_update_access() {
+        let store = test_store();
+        let id1 = store.store(make_memory("t", "one")).unwrap();
+        let id2 = store.store(make_memory("t", "two")).unwrap();
+        store.batch_update_access(&[&id1, &id2]).unwrap();
+        let m1 = store.get(&id1).unwrap().unwrap();
+        let m2 = store.get(&id2).unwrap().unwrap();
+        assert_eq!(m1.access_count, 1);
+        assert_eq!(m2.access_count, 1);
+    }
+
+    #[test]
+    fn test_auto_consolidate_below_threshold() {
+        let store = test_store();
+        store.store(make_memory("t", "one")).unwrap();
+        store.store(make_memory("t", "two")).unwrap();
+        // Threshold is 10, so no consolidation
+        let result = store.auto_consolidate("t", 10).unwrap();
+        assert!(!result);
+        assert_eq!(store.count_by_topic("t").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_auto_consolidate_above_threshold() {
+        let store = test_store();
+        for i in 0..12 {
+            store
+                .store(make_memory("bulk", &format!("entry {i}")))
+                .unwrap();
+        }
+        let result = store.auto_consolidate("bulk", 10).unwrap();
+        assert!(result);
+        assert_eq!(store.count_by_topic("bulk").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_apply_decay_with_aggressive_factor() {
+        let store = test_store();
+        store.store(make_memory("t", "decayable")).unwrap();
+        let affected = store.apply_decay(0.5).unwrap();
+        assert!(affected > 0);
+        let mems = store.get_by_topic("t").unwrap();
+        assert!(mems[0].weight < 1.0);
+    }
+
+    #[test]
+    fn test_prune_low_weight() {
+        let store = test_store();
+        store.store(make_memory("t", "will be pruned")).unwrap();
+        // Apply aggressive decay
+        store.apply_decay(0.01).unwrap();
+        let pruned = store.prune(0.5).unwrap();
+        assert!(pruned > 0);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_list_topics_multiple() {
+        let store = test_store();
+        store.store(make_memory("alpha", "a")).unwrap();
+        store.store(make_memory("beta", "b")).unwrap();
+        store.store(make_memory("alpha", "c")).unwrap();
+        let topics = store.list_topics().unwrap();
+        assert_eq!(topics.len(), 2);
+    }
+
+    #[test]
+    fn test_stats_multi_topic() {
+        let store = test_store();
+        store.store(make_memory("t1", "one")).unwrap();
+        store.store(make_memory("t2", "two")).unwrap();
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.total_memories, 2);
+        assert_eq!(stats.total_topics, 2);
+    }
+
+    #[test]
+    fn test_get_by_topic_prefix() {
+        let store = test_store();
+        store
+            .store(make_memory("project:web", "web stuff"))
+            .unwrap();
+        store
+            .store(make_memory("project:api", "api stuff"))
+            .unwrap();
+        store.store(make_memory("other", "unrelated")).unwrap();
+        let results = store.get_by_topic_prefix("project:*").unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

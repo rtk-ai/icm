@@ -14,8 +14,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    Concept, ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation,
+    keyword_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance,
+    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -678,7 +678,7 @@ fn main() -> Result<()> {
             use icm_core::Embedder;
             e.dimensions()
         })
-        .unwrap_or(384);
+        .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
     let store = open_store(cli.db, embedding_dims)?;
 
@@ -774,7 +774,10 @@ fn main() -> Result<()> {
         } => {
             #[cfg(feature = "embeddings")]
             {
-                let emb = embedder.as_ref().expect("embeddings feature enabled");
+                let emb = match embedder.as_ref() {
+                    Some(e) => e,
+                    None => bail!("embeddings not available — check your configuration"),
+                };
                 cmd_embed(&store, emb, topic.as_deref(), force, batch_size)
             }
             #[cfg(not(feature = "embeddings"))]
@@ -919,7 +922,9 @@ fn cmd_recall(
     keyword: Option<&str>,
 ) -> Result<()> {
     // Auto-decay if >24h since last decay
-    let _ = store.maybe_auto_decay();
+    if let Err(e) = store.maybe_auto_decay() {
+        tracing::warn!(error = %e, "auto-decay failed during recall");
+    }
 
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
@@ -927,19 +932,20 @@ fn cmd_recall(
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored = results;
                 if let Some(t) = topic {
-                    scored.retain(|(m, _)| m.topic == t);
+                    scored.retain(|(m, _)| topic_matches(&m.topic, t));
                 }
                 if let Some(kw) = keyword {
-                    scored.retain(|(m, _)| m.keywords.iter().any(|k| k.contains(kw)));
+                    scored.retain(|(m, _)| keyword_matches(&m.keywords, kw));
                 }
 
                 if scored.is_empty() {
-                    println!("No memories found.");
+                    println!("{MSG_NO_MEMORIES}");
                     return Ok(());
                 }
 
+                let ids: Vec<&str> = scored.iter().map(|(m, _)| m.id.as_str()).collect();
+                let _ = store.batch_update_access(&ids);
                 for (mem, score) in &scored {
-                    let _ = store.update_access(&mem.id);
                     print_memory_detail(mem, Some(*score));
                 }
                 return Ok(());
@@ -956,19 +962,20 @@ fn cmd_recall(
     }
 
     if let Some(t) = topic {
-        results.retain(|m| m.topic == t);
+        results.retain(|m| topic_matches(&m.topic, t));
     }
     if let Some(kw) = keyword {
-        results.retain(|m| m.keywords.iter().any(|k| k.contains(kw)));
+        results.retain(|m| keyword_matches(&m.keywords, kw));
     }
 
     if results.is_empty() {
-        println!("No memories found.");
+        println!("{MSG_NO_MEMORIES}");
         return Ok(());
     }
 
+    let ids: Vec<&str> = results.iter().map(|m| m.id.as_str()).collect();
+    let _ = store.batch_update_access(&ids);
     for mem in &results {
-        let _ = store.update_access(&mem.id);
         print_memory_detail(mem, None);
     }
 
@@ -992,7 +999,7 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
     }
 
     if memories.is_empty() {
-        println!("No memories found.");
+        println!("{MSG_NO_MEMORIES}");
         return Ok(());
     }
 

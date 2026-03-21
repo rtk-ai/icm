@@ -15,6 +15,12 @@ fn fts_table_exists(conn: &Connection, name: &str) -> Result<bool, IcmError> {
 }
 
 fn create_vec_table(conn: &Connection, embedding_dims: usize) -> Result<(), IcmError> {
+    if !(64..=4096).contains(&embedding_dims) {
+        return Err(IcmError::Config(format!(
+            "embedding_dims must be between 64 and 4096, got {embedding_dims}"
+        )));
+    }
+
     conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE vec_memories USING vec0(
             memory_id TEXT PRIMARY KEY,
@@ -33,7 +39,7 @@ fn create_vec_table(conn: &Connection, embedding_dims: usize) -> Result<(), IcmE
 /// Initialize the database schema. `embedding_dims` controls the sqlite-vec vector size.
 /// Pass `None` to skip vector table creation (no embeddings feature).
 pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
-    init_db_with_dims(conn, 384)
+    init_db_with_dims(conn, icm_core::DEFAULT_EMBEDDING_DIMS)
 }
 
 pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(), IcmError> {
@@ -282,7 +288,9 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
                 |row| row.get(0),
             )
             .ok();
-        let stored: usize = stored_dims.and_then(|s| s.parse().ok()).unwrap_or(384);
+        let stored: usize = stored_dims
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
         if stored != embedding_dims {
             // Model changed — drop vec table and clear embeddings
             conn.execute_batch("DROP TABLE IF EXISTS vec_memories")
@@ -350,6 +358,40 @@ mod tests {
         init_db(&conn).unwrap();
         // Second call should be idempotent
         init_db(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_embedding_dims_too_small() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        // dims < 64 should fail
+        let result = init_db_with_dims(&conn, 32);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("embedding_dims"),
+            "error should mention embedding_dims: {err}"
+        );
+    }
+
+    #[test]
+    fn test_embedding_dims_too_large() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        // dims > 4096 should fail
+        let result = init_db_with_dims(&conn, 8192);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_embedding_dims_boundary_valid() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        // 64 and 4096 are valid boundary values
+        assert!(init_db_with_dims(&conn, 64).is_ok());
+
+        let conn2 = Connection::open_in_memory().unwrap();
+        assert!(init_db_with_dims(&conn2, 4096).is_ok());
     }
 
     #[test]

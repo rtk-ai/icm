@@ -77,6 +77,14 @@ pub fn save_credentials(creds: &Credentials) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(creds)?;
     std::fs::write(&path, json)?;
+
+    // Restrict file permissions to owner-only on Unix (0o600)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
     Ok(())
 }
 
@@ -459,51 +467,6 @@ pub fn pull_memories(
     Ok(memories)
 }
 
-/// Delete a memory from RTK Cloud.
-/// DELETE {endpoint}/api/icm/memories/{id}
-pub fn delete_cloud_memory(creds: &Credentials, memory_id: &str) -> Result<()> {
-    let url = format!(
-        "{}/api/icm/memories/{}",
-        creds.endpoint.trim_end_matches('/'),
-        memory_id
-    );
-
-    let resp = ureq::delete(&url)
-        .set("Authorization", &format!("Bearer {}", creds.token))
-        .set("X-Org-Id", &creds.org_id)
-        .timeout(std::time::Duration::from_secs(5))
-        .call()
-        .context("Failed to delete cloud memory")?;
-
-    let status = resp.status();
-    if status != 200 && status != 204 {
-        let body = resp.into_string().unwrap_or_default();
-        anyhow::bail!("Cloud delete failed ({}): {}", status, body);
-    }
-
-    Ok(())
-}
-
-/// Fire-and-forget sync: push memory in a background thread.
-/// Used after store/update operations to sync without blocking.
-pub fn sync_memory_background(memory: Memory) {
-    let creds = match load_credentials() {
-        Some(c) => c,
-        None => return,
-    };
-
-    // Only sync project/org scoped memories
-    if memory.scope == Scope::User {
-        return;
-    }
-
-    std::thread::spawn(move || {
-        if let Err(e) = sync_memory(&creds, &memory) {
-            tracing::warn!("Cloud sync failed: {}", e);
-        }
-    });
-}
-
 /// Check if cloud sync is available (credentials exist and scope requires it).
 pub fn requires_cloud(scope: Scope) -> bool {
     scope != Scope::User
@@ -539,6 +502,28 @@ mod tests {
         assert_eq!(url_decode("user%40example.com"), "user@example.com");
         assert_eq!(url_decode("hello+world"), "hello world");
         assert_eq!(url_decode("no_encoding"), "no_encoding");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_credentials_file_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Create a temp file, apply the same permission logic as save_credentials
+        let dir = std::env::temp_dir().join(format!("icm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test-credentials.json");
+
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credentials file should be owner-only (0o600)");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.5](https://github.com/rtk-ai/icm/compare/icm-v0.10.4...icm-v0.10.5) (2026-03-21)
+
+
+### Bug Fixes
+
+* comprehensive audit fixes — security, performance, tech debt, tests ([#51](https://github.com/rtk-ai/icm/issues/51)) ([c3555c9](https://github.com/rtk-ai/icm/commit/c3555c9bdceb2d66829a724a7cd4aeb6bb0c6c52))
+
 ## [0.10.4](https://github.com/rtk-ai/icm/compare/icm-v0.10.3...icm-v0.10.4) (2026-03-21)
 
 

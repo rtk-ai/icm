@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.4](https://github.com/rtk-ai/icm/compare/icm-v0.10.3...icm-v0.10.4) (2026-03-21)
+
+
+### Features
+
+* add .deb and .rpm packages, drop Windows ARM64 ([#47](https://github.com/rtk-ai/icm/issues/47)) ([c7f8775](https://github.com/rtk-ai/icm/commit/c7f87750a78d91907757e02a3e0a7fa2caa79d5e))
+
 ## [0.10.3](https://github.com/rtk-ai/icm/compare/icm-v0.10.2...icm-v0.10.3) (2026-03-17)
 
 

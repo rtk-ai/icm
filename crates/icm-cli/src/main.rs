@@ -1186,6 +1186,8 @@ fn cmd_feedback_stats(store: &SqliteStore) -> Result<()> {
 
 /// PreToolUse hook: auto-allow `icm` CLI commands.
 /// Reads JSON from stdin, outputs hook response JSON to stdout.
+/// Supports both Claude Code ("Bash") and Cursor ("Shell") tool names,
+/// and outputs the appropriate response format for each runtime.
 fn cmd_hook_pre() -> Result<()> {
     use std::io::Read;
     let mut input = String::new();
@@ -1196,9 +1198,8 @@ fn cmd_hook_pre() -> Result<()> {
         Err(_) => return Ok(()), // Malformed input — pass through silently
     };
 
-    // Only handle Bash tool calls
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-    if tool_name != "Bash" {
+    if tool_name != "Bash" && tool_name != "Shell" {
         return Ok(());
     }
 
@@ -1211,25 +1212,31 @@ fn cmd_hook_pre() -> Result<()> {
         return Ok(());
     }
 
-    // Check if command involves `icm`
     if !is_icm_command(cmd) {
         return Ok(());
     }
 
-    // Auto-allow: output hook response JSON
     let tool_input = json
         .get("tool_input")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let response = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "permissionDecisionReason": "ICM auto-allow",
-            "updatedInput": tool_input
-        }
-    });
+    // Cursor sends `cursor_version` in all hook inputs
+    let response = if json.get("cursor_version").is_some() {
+        serde_json::json!({
+            "permission": "allow",
+            "updated_input": tool_input
+        })
+    } else {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "ICM auto-allow",
+                "updatedInput": tool_input
+            }
+        })
+    };
 
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
@@ -1857,6 +1864,37 @@ Do this BEFORE responding to the user. Not optional.
                 .with_context(|| format!("cannot write {}", opencode_plugin_path.display()))?;
             println!("[hook] OpenCode plugin: installed");
         }
+
+        // Cursor: ~/.cursor/hooks.json (native format)
+        let cursor_hooks_path = PathBuf::from(&home).join(".cursor/hooks.json");
+        let detect = &["icm hook", "icm-pretool"];
+
+        let pre_status = inject_cursor_hook(
+            &cursor_hooks_path,
+            "preToolUse",
+            &pre_cmd,
+            Some("Shell"),
+            detect,
+        )?;
+        println!("[hook] Cursor preToolUse (auto-allow): {pre_status}");
+
+        let post_status = inject_cursor_hook(
+            &cursor_hooks_path,
+            "postToolUse",
+            &post_cmd,
+            None,
+            detect,
+        )?;
+        println!("[hook] Cursor postToolUse (auto-extract): {post_status}");
+
+        let compact_status = inject_cursor_hook(
+            &cursor_hooks_path,
+            "preCompact",
+            &compact_cmd,
+            None,
+            detect,
+        )?;
+        println!("[hook] Cursor preCompact (transcript extract): {compact_status}");
     }
 
     println!();
@@ -1964,6 +2002,74 @@ fn inject_claude_hook(
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(settings_path, output)
         .with_context(|| format!("cannot write {}", settings_path.display()))?;
+
+    Ok("configured".into())
+}
+
+/// Inject ICM hook into Cursor hooks.json for a given event name.
+/// Cursor uses a flat format: `hooks.eventName[].command` (no nested `hooks` array).
+fn inject_cursor_hook(
+    hooks_path: &PathBuf,
+    event_name: &str,
+    hook_command: &str,
+    matcher: Option<&str>,
+    detect_patterns: &[&str],
+) -> Result<String> {
+    let mut config: Value = if hooks_path.exists() {
+        let content = std::fs::read_to_string(hooks_path)
+            .with_context(|| format!("cannot read {}", hooks_path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("cannot parse {}", hooks_path.display()))?
+    } else {
+        serde_json::json!({"version": 1, "hooks": {}})
+    };
+
+    let hooks = config
+        .as_object_mut()
+        .context("hooks.json is not a JSON object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let event_hooks = hooks
+        .as_object_mut()
+        .context("hooks is not a JSON object")?
+        .entry(event_name)
+        .or_insert_with(|| serde_json::json!([]));
+
+    let event_arr = event_hooks
+        .as_array_mut()
+        .with_context(|| format!("{event_name} is not an array"))?;
+
+    let already = event_arr.iter().any(|entry| {
+        entry
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|c| detect_patterns.iter().any(|p| c.contains(p)))
+            .unwrap_or(false)
+    });
+
+    if already {
+        return Ok("already configured".into());
+    }
+
+    let mut entry = serde_json::json!({ "command": hook_command });
+    if let Some(m) = matcher {
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("matcher".into(), serde_json::json!(m));
+    }
+    event_arr.push(entry);
+
+    config
+        .as_object_mut()
+        .unwrap()
+        .entry("version")
+        .or_insert_with(|| serde_json::json!(1));
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(hooks_path, output)
+        .with_context(|| format!("cannot write {}", hooks_path.display()))?;
 
     Ok("configured".into())
 }

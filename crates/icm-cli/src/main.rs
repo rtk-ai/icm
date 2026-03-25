@@ -1703,6 +1703,8 @@ icm topics                                # list all topics\n\
             ("Claude Code", cwd.join("CLAUDE.md")),
             ("Codex", cwd.join("AGENTS.md")),
             ("Gemini", PathBuf::from(&home).join(".gemini/GEMINI.md")),
+            ("Copilot", cwd.join(".github/copilot-instructions.md")),
+            ("Windsurf", cwd.join(".windsurfrules")),
         ];
 
         for (tool_name, path) in &instruction_files {

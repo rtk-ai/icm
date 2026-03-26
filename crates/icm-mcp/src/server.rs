@@ -16,6 +16,10 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Number of non-store tool calls before we nudge the agent to store.
 const STORE_NUDGE_THRESHOLD: u32 = 10;
 
+/// Maximum allowed line length (10 MB). Lines exceeding this are rejected
+/// without parsing to prevent memory exhaustion.
+const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
+
 /// Run the MCP server on stdio. Blocks until stdin is closed.
 pub fn run_server(
     store: &SqliteStore,
@@ -37,6 +41,17 @@ pub fn run_server(
 
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+
+        if line.len() > MAX_LINE_LEN {
+            error!("line too long: {} bytes (max {MAX_LINE_LEN})", line.len());
+            let resp = JsonRpcResponse::err(
+                Value::Null,
+                -32600,
+                format!("line too long: {} bytes (max {MAX_LINE_LEN})", line.len()),
+            );
+            write_response(&mut stdout, &resp)?;
             continue;
         }
 

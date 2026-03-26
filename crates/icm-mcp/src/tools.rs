@@ -1171,7 +1171,16 @@ fn tool_memoir_create(store: &SqliteStore, args: &Value) -> ToolResult {
         Some(n) => n,
         None => return ToolResult::error("missing required field: name".into()),
     };
+    if name.len() > 255 {
+        return ToolResult::error(format!("name too long: {} chars (max 255)", name.len()));
+    }
     let description = get_str(args, "description").unwrap_or("");
+    if description.len() > 10_000 {
+        return ToolResult::error(format!(
+            "description too long: {} chars (max 10000)",
+            description.len()
+        ));
+    }
 
     let memoir = Memoir::new(name.into(), description.into());
     match store.create_memoir(memoir) {
@@ -1268,10 +1277,22 @@ fn tool_memoir_add_concept(store: &SqliteStore, args: &Value) -> ToolResult {
         Some(n) => n,
         None => return ToolResult::error("missing required field: name".into()),
     };
+    if name.len() > 255 {
+        return ToolResult::error(format!(
+            "concept name too long: {} chars (max 255)",
+            name.len()
+        ));
+    }
     let definition = match get_str(args, "definition") {
         Some(d) => d,
         None => return ToolResult::error("missing required field: definition".into()),
     };
+    if definition.len() > 10_000 {
+        return ToolResult::error(format!(
+            "definition too long: {} chars (max 10000)",
+            definition.len()
+        ));
+    }
 
     let memoir = match resolve_memoir(store, memoir_name) {
         Ok(m) => m,

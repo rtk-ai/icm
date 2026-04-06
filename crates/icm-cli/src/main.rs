@@ -319,7 +319,7 @@ enum HookCommands {
     Pre,
     /// PostToolUse hook: auto-extract context every N tool calls
     Post {
-        /// Extract every N tool calls
+        /// Extract every N tool calls (default from config, fallback: 10)
         #[arg(long, default_value = "15")]
         every: usize,
     },
@@ -864,7 +864,14 @@ fn main() -> Result<()> {
         }
         Commands::Hook { command } => match command {
             HookCommands::Pre => cmd_hook_pre(),
-            HookCommands::Post { every } => cmd_hook_post(&store, every),
+            HookCommands::Post { every } => {
+                let extract_every = if every != 15 {
+                    every // CLI flag overrides config
+                } else {
+                    cfg.extraction.extract_every
+                };
+                cmd_hook_post(&store, extract_every, cfg.extraction.store_raw)
+            }
             HookCommands::Compact => cmd_hook_compact(&store),
             HookCommands::Prompt => cmd_hook_prompt(&store),
         },
@@ -1249,7 +1256,7 @@ fn is_icm_command(cmd: &str) -> bool {
 
 /// PostToolUse hook: auto-extract context every N tool calls.
 /// Reads JSON from stdin. Runs extraction asynchronously.
-fn cmd_hook_post(store: &SqliteStore, extract_every: usize) -> Result<()> {
+fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> Result<()> {
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -1308,8 +1315,8 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize) -> Result<()> {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "project".to_string());
 
-    // Extract facts and store directly
-    match extract::extract_and_store(store, tool_output, &project) {
+    // Extract facts and store (with raw text fallback if enabled)
+    match extract::extract_and_store_with_opts(store, tool_output, &project, store_raw) {
         Ok(n) if n > 0 => eprintln!("[icm] auto-extracted {n} facts from tool output"),
         _ => {}
     }
@@ -2272,6 +2279,8 @@ fn cmd_config() -> Result<()> {
     println!("  enabled = {}", cfg.extraction.enabled);
     println!("  min_score = {}", cfg.extraction.min_score);
     println!("  max_facts = {}", cfg.extraction.max_facts);
+    println!("  extract_every = {}", cfg.extraction.extract_every);
+    println!("  store_raw = {}", cfg.extraction.store_raw);
     println!();
     println!("[recall]");
     println!("  enabled = {}", cfg.recall.enabled);

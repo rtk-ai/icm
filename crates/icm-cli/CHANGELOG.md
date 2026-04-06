@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.8](https://github.com/rtk-ai/icm/compare/icm-v0.10.7...icm-v0.10.8) (2026-04-06)
+
+
+### Bug Fixes
+
+* rewrite OpenCode plugin with native @opencode-ai/plugin SDK ([#64](https://github.com/rtk-ai/icm/issues/64)) ([#65](https://github.com/rtk-ai/icm/issues/65)) ([a74a94d](https://github.com/rtk-ai/icm/commit/a74a94df5e878358b211b3968fa1e4f43c26373d))
+
 ## [0.10.7](https://github.com/rtk-ai/icm/compare/icm-v0.10.6...icm-v0.10.7) (2026-04-06)
 
 

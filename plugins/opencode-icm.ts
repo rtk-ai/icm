@@ -6,9 +6,23 @@
 // Layer 2: session.created → inject recalled context
 
 import type { Plugin } from "@opencode-ai/plugin"
+import { execFileSync } from "child_process"
 
 const EXTRACT_EVERY = 3
 let toolCallCount = 0
+
+function icmExtract(args: string[], input: string): void {
+  try {
+    execFileSync("icm", args, {
+      encoding: "utf-8",
+      timeout: 10000,
+      input,
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+  } catch {
+    // silent — extraction is best-effort
+  }
+}
 
 export const IcmPlugin: Plugin = async ({ $, directory }) => {
   const project = directory?.split("/").pop() || "project"
@@ -26,25 +40,28 @@ export const IcmPlugin: Plugin = async ({ $, directory }) => {
 
   return {
     // Layer 0: extract facts from tool output every N calls
-    "tool.execute.after": async ({ tool, output }) => {
+    "tool.execute.after": async (input: any, result: any) => {
+      const tool = String(input?.tool ?? "")
       if (!tool || tool.startsWith("icm") || tool.startsWith("mcp__icm__")) return
 
       toolCallCount++
       if (toolCallCount < EXTRACT_EVERY) return
       toolCallCount = 0
 
+      // OpenCode puts tool output in result.metadata.output
+      const output =
+        result?.metadata?.output ?? result?.output ?? (typeof result === "string" ? result : "")
       if (!output || typeof output !== "string" || output.length < 20) return
 
       try {
-        const text = output.slice(0, 4000)
-        await $`echo ${text} | icm extract --store-raw -p ${project}`.quiet().nothrow()
+        icmExtract(["extract", "--store-raw", "-p", project], output.slice(0, 4000))
       } catch {
         // silent
       }
     },
 
     // Layer 1: extract from conversation before compaction
-    "experimental.session.compacting": async ({ messages }) => {
+    "experimental.session.compacting": async ({ messages }: any) => {
       if (!messages || !Array.isArray(messages)) return
 
       const text = messages
@@ -65,7 +82,7 @@ export const IcmPlugin: Plugin = async ({ $, directory }) => {
       if (text.length < 50) return
 
       try {
-        await $`echo ${text} | icm extract --store-raw -p ${project}`.quiet().nothrow()
+        icmExtract(["extract", "--store-raw", "-p", project], text)
       } catch {
         // silent
       }

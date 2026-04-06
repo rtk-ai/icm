@@ -1873,19 +1873,19 @@ Do this BEFORE responding to the user. Not optional.
         )?;
         println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
 
-        // OpenCode plugin: install JS plugin for tool.execute.after + session.compacting
+        // OpenCode plugin: install TS plugin using native @opencode-ai/plugin SDK
         let opencode_plugins_dir = PathBuf::from(&home).join(".config/opencode/plugins");
-        let opencode_plugin_path = opencode_plugins_dir.join("icm.js");
+        let opencode_plugin_path = opencode_plugins_dir.join("icm.ts");
+        // Remove old .js plugin if it exists
+        let old_js_plugin = opencode_plugins_dir.join("icm.js");
+        if old_js_plugin.exists() {
+            std::fs::remove_file(&old_js_plugin).ok();
+        }
         if opencode_plugin_path.exists() {
             println!("[hook] OpenCode plugin: already configured");
         } else {
             std::fs::create_dir_all(&opencode_plugins_dir).ok();
-            let plugin_content = include_str!("../../../plugins/opencode-icm.js");
-            // Replace ICM_BIN placeholder with actual binary path
-            let plugin_content = plugin_content.replace(
-                r#"process.env.ICM_BIN || "icm""#,
-                &format!(r#""{icm_bin_str}""#),
-            );
+            let plugin_content = include_str!("../../../plugins/opencode-icm.ts");
             std::fs::write(&opencode_plugin_path, plugin_content)
                 .with_context(|| format!("cannot write {}", opencode_plugin_path.display()))?;
             println!("[hook] OpenCode plugin: installed");

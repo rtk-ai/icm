@@ -5,7 +5,7 @@
 // Layer 1: experimental.session.compacting → extract from conversation before compaction
 // Layer 2: session.created → inject recalled context
 
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 
 const ICM_BIN = process.env.ICM_BIN || "icm";
 let toolCallCount = 0;
@@ -13,9 +13,23 @@ const EXTRACT_EVERY = 15;
 
 function icm(...args) {
   try {
-    return execSync(`${ICM_BIN} --no-embeddings ${args.join(" ")}`, {
+    return execFileSync(ICM_BIN, args, {
       encoding: "utf-8",
-      timeout: 5000,
+      timeout: 10000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+// Pass text via stdin to avoid shell escaping issues
+function icmWithStdin(args, input) {
+  try {
+    return execFileSync(ICM_BIN, args, {
+      encoding: "utf-8",
+      timeout: 10000,
+      input: input,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
   } catch {
@@ -31,11 +45,19 @@ function getProject(directory) {
 export const IcmPlugin = async ({ directory }) => {
   const project = getProject(directory);
 
+  // Verify icm binary is available
+  const version = icm("--version");
+  if (!version) {
+    console.error("[icm] icm binary not found in PATH — plugin disabled");
+    return {};
+  }
+  console.error(`[icm] plugin loaded (${version})`);
+
   return {
     // Layer 0: extract facts from tool output every N calls
     "tool.execute.after": async ({ tool, output }) => {
       // Skip ICM's own tools
-      if (tool?.startsWith("icm") || tool?.startsWith("mcp__icm__")) return;
+      if (!tool || tool.startsWith("icm") || tool.startsWith("mcp__icm__")) return;
 
       toolCallCount++;
       if (toolCallCount < EXTRACT_EVERY) return;
@@ -44,8 +66,8 @@ export const IcmPlugin = async ({ directory }) => {
       if (!output || typeof output !== "string" || output.length < 20) return;
 
       try {
-        const escaped = output.slice(0, 4000).replace(/'/g, "'\\''");
-        icm("extract", "-p", project, "-t", `'${escaped}'`);
+        // Use stdin instead of -t flag to avoid shell escaping issues
+        icmWithStdin(["extract", "-p", project], output.slice(0, 4000));
       } catch {
         // silent
       }
@@ -74,8 +96,8 @@ export const IcmPlugin = async ({ directory }) => {
       if (text.length < 50) return;
 
       try {
-        const escaped = text.replace(/'/g, "'\\''");
-        icm("extract", "--store-raw", "-p", project, "-t", `'${escaped}'`);
+        // Use stdin instead of -t flag to avoid shell escaping issues
+        icmWithStdin(["extract", "--store-raw", "-p", project], text);
       } catch {
         // silent
       }
@@ -84,7 +106,7 @@ export const IcmPlugin = async ({ directory }) => {
     // Layer 2: recall context at session start
     "session.created": async () => {
       try {
-        const ctx = icm("recall-context", `"${project}"`, "--limit", "5");
+        const ctx = icm("recall-context", project, "--limit", "5");
         if (ctx) {
           console.error(`[icm] recalled ${ctx.split("\n").length} lines of context`);
         }

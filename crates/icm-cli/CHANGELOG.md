@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.7](https://github.com/rtk-ai/icm/compare/icm-v0.10.6...icm-v0.10.7) (2026-04-06)
+
+
+### Bug Fixes
+
+* lower extraction threshold + configurable settings ([#61](https://github.com/rtk-ai/icm/issues/61)) ([#62](https://github.com/rtk-ai/icm/issues/62)) ([f8f904d](https://github.com/rtk-ai/icm/commit/f8f904de3c631a9218da5f77b4c65c687886ab78))
+
 ## [0.10.6](https://github.com/rtk-ai/icm/compare/icm-v0.10.5...icm-v0.10.6) (2026-04-06)
 
 

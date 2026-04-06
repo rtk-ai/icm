@@ -72,6 +72,10 @@ pub struct ExtractionConfig {
     pub min_score: f32,
     /// Maximum facts per extraction pass.
     pub max_facts: usize,
+    /// Extract every N tool calls (hook counter).
+    pub extract_every: usize,
+    /// Store raw text as fallback when no facts are extracted.
+    pub store_raw: bool,
 }
 
 /// Context recall/injection settings (Layer 2).
@@ -134,8 +138,10 @@ impl Default for ExtractionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_score: 3.0,
-            max_facts: 10,
+            min_score: 2.0,
+            max_facts: 20,
+            extract_every: 3,
+            store_raw: true,
         }
     }
 }
@@ -240,6 +246,8 @@ prune_threshold = 0.2
 enabled = false
 min_score = 5.0
 max_facts = 5
+extract_every = 20
+store_raw = false
 
 [recall]
 enabled = true
@@ -252,6 +260,8 @@ instructions = "Custom instructions here"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.store.path.as_deref(), Some("/tmp/test.db"));
         assert!(!config.extraction.enabled);
+        assert_eq!(config.extraction.extract_every, 20);
+        assert!(!config.extraction.store_raw);
         assert_eq!(config.recall.limit, 20);
         assert!(config.mcp.instructions.is_some());
     }

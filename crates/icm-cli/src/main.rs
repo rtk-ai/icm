@@ -319,7 +319,7 @@ enum HookCommands {
     Pre,
     /// PostToolUse hook: auto-extract context every N tool calls
     Post {
-        /// Extract every N tool calls
+        /// Extract every N tool calls (default from config, fallback: 10)
         #[arg(long, default_value = "15")]
         every: usize,
     },
@@ -864,7 +864,14 @@ fn main() -> Result<()> {
         }
         Commands::Hook { command } => match command {
             HookCommands::Pre => cmd_hook_pre(),
-            HookCommands::Post { every } => cmd_hook_post(&store, every),
+            HookCommands::Post { every } => {
+                let extract_every = if every != 15 {
+                    every // CLI flag overrides config
+                } else {
+                    cfg.extraction.extract_every
+                };
+                cmd_hook_post(&store, extract_every, cfg.extraction.store_raw)
+            }
             HookCommands::Compact => cmd_hook_compact(&store),
             HookCommands::Prompt => cmd_hook_prompt(&store),
         },
@@ -1249,7 +1256,7 @@ fn is_icm_command(cmd: &str) -> bool {
 
 /// PostToolUse hook: auto-extract context every N tool calls.
 /// Reads JSON from stdin. Runs extraction asynchronously.
-fn cmd_hook_post(store: &SqliteStore, extract_every: usize) -> Result<()> {
+fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> Result<()> {
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -1270,18 +1277,11 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize) -> Result<()> {
     let counter_file =
         std::env::var("ICM_HOOK_COUNTER").unwrap_or_else(|_| "/tmp/icm-hook-counter".to_string());
 
-    let mut count: usize = std::fs::read_to_string(&counter_file)
+    let count: usize = std::fs::read_to_string(&counter_file)
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-
-    // Reset on voluntary store
-    if tool_name == "icm_memory_store" || tool_name == "mcp__icm__icm_memory_store" {
-        let _ = std::fs::write(&counter_file, "0");
-        return Ok(());
-    }
-
-    count += 1;
+        .unwrap_or(0)
+        + 1;
     let _ = std::fs::write(&counter_file, count.to_string());
 
     // Not time to extract yet
@@ -1308,8 +1308,8 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize) -> Result<()> {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "project".to_string());
 
-    // Extract facts and store directly
-    match extract::extract_and_store(store, tool_output, &project) {
+    // Extract facts and store (with raw text fallback if enabled)
+    match extract::extract_and_store_with_opts(store, tool_output, &project, store_raw) {
         Ok(n) if n > 0 => eprintln!("[icm] auto-extracted {n} facts from tool output"),
         _ => {}
     }
@@ -1340,23 +1340,54 @@ fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
         Err(_) => return Ok(()), // Can't read transcript — fail silently
     };
 
-    // Extract assistant text from the last 100 JSONL lines
+    // Extract assistant text from the last 100 JSONL lines.
+    // Supported formats:
+    //   Claude Code: {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
+    //   Codex:       {"type":"response_item","payload":{"role":"developer","content":[{"type":"text","text":"..."}]}}
+    //   Simple:      {"role":"assistant","content":"..."}
     let mut assistant_text = String::new();
     for line in transcript.lines().rev().take(100) {
         if let Ok(entry) = serde_json::from_str::<Value>(line) {
-            if entry.get("type").and_then(|t| t.as_str()) == Some("assistant") {
-                if let Some(content) = entry.pointer("/message/content") {
-                    if let Some(arr) = content.as_array() {
-                        for block in arr {
-                            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                    assistant_text.push_str(text);
-                                    assistant_text.push('\n');
-                                }
-                            }
+            // Find the message object (varies by format)
+            let msg = if entry.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                // Claude Code: type=assistant, content in message.*
+                entry.get("message")
+            } else if entry.get("type").and_then(|t| t.as_str()) == Some("response_item") {
+                // Codex: type=response_item, content in payload.*
+                entry.get("payload")
+            } else if entry.get("role").is_some() {
+                // Simple format: role+content at top level
+                Some(&entry)
+            } else {
+                None
+            };
+
+            let msg = match msg {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // Check role (assistant, developer, model — varies by tool)
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if !matches!(role, "assistant" | "developer" | "model") {
+                continue;
+            }
+
+            // Content as array of {type: "text", text: "..."}
+            if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                for block in arr {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            assistant_text.push_str(text);
+                            assistant_text.push('\n');
                         }
                     }
                 }
+            }
+            // Content as plain string
+            else if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                assistant_text.push_str(content);
+                assistant_text.push('\n');
             }
         }
     }
@@ -1379,7 +1410,7 @@ fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
 
-    match extract::extract_and_store(store, text, &project) {
+    match extract::extract_and_store_with_opts(store, text, &project, true) {
         Ok(n) if n > 0 => eprintln!("[icm] pre-compact: extracted {n} facts from transcript"),
         _ => {}
     }
@@ -2272,6 +2303,8 @@ fn cmd_config() -> Result<()> {
     println!("  enabled = {}", cfg.extraction.enabled);
     println!("  min_score = {}", cfg.extraction.min_score);
     println!("  max_facts = {}", cfg.extraction.max_facts);
+    println!("  extract_every = {}", cfg.extraction.extract_every);
+    println!("  store_raw = {}", cfg.extraction.store_raw);
     println!();
     println!("[recall]");
     println!("  enabled = {}", cfg.recall.enabled);

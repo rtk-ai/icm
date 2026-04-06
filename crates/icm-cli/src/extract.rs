@@ -91,6 +91,16 @@ pub fn extract_facts_public(text: &str, project: &str) -> Vec<(String, String, I
 
 /// Extract key facts from text using keyword scoring.
 fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)> {
+    extract_facts_with_threshold(text, project, 2.0, 20)
+}
+
+/// Extract key facts with configurable threshold and limit.
+fn extract_facts_with_threshold(
+    text: &str,
+    project: &str,
+    min_score: f32,
+    max_facts: usize,
+) -> Vec<(String, String, Importance)> {
     let sentences = split_sentences(text);
     let mut scored: Vec<(f32, String, Importance)> = Vec::new();
 
@@ -434,13 +444,13 @@ fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)>
             }
         }
 
-        if score >= 3.0 {
+        if score >= min_score {
             scored.push((score, s.to_string(), importance));
         }
     }
 
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    scored.truncate(30);
+    scored.truncate(max_facts.max(1) * 2); // Keep 2x for dedup pass
 
     // Dedup similar sentences
     let mut facts: Vec<(String, String, Importance)> = Vec::new();
@@ -453,7 +463,7 @@ fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)>
         }
     }
 
-    facts.truncate(20);
+    facts.truncate(max_facts);
     facts
 }
 

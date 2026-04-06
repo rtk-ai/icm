@@ -67,7 +67,7 @@ cargo install --path crates/icm-cli
 icm init
 ```
 
-Configures **14 tools** in one command:
+Configures **14 tools** in one command ([full integration guide](docs/integrations.md)):
 
 | Tool | Config file | Format |
 |------|------------|--------|
@@ -105,6 +105,22 @@ icm init --mode skill
 ```
 
 Installs slash commands and rules for Claude Code (`/recall`, `/remember`), Cursor (`.mdc` rule), Roo Code (`.md` rule), and Amp (`/icm-recall`, `/icm-remember`).
+
+### CLI instructions
+
+```bash
+icm init --mode cli
+```
+
+Injects ICM instructions into each tool's instruction file:
+
+| Tool | File |
+|------|------|
+| Claude Code | `CLAUDE.md` |
+| GitHub Copilot | `.github/copilot-instructions.md` |
+| Windsurf | `.windsurfrules` |
+| OpenAI Codex | `AGENTS.md` |
+| Gemini | `~/.gemini/GEMINI.md` |
 
 ### Hooks (Claude Code)
 
@@ -470,6 +486,7 @@ All benchmarks use **real API calls** — no mocks, no simulated responses, no c
 
 | Document | Description |
 |----------|-------------|
+| [Integration Guide](docs/integrations.md) | Setup for all 14 tools: Claude Code, Copilot, Cursor, Windsurf, Zed, Amp, etc. |
 | [Technical Architecture](docs/architecture.md) | Crate structure, search pipeline, decay model, sqlite-vec integration, testing |
 | [User Guide](docs/guide.md) | Installation, topic organization, consolidation, extraction, troubleshooting |
 | [Product Overview](docs/product.md) | Use cases, benchmarks, comparison with alternatives |

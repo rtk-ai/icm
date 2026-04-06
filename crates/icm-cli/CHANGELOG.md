@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.6](https://github.com/rtk-ai/icm/compare/icm-v0.10.5...icm-v0.10.6) (2026-04-06)
+
+
+### Features
+
+* add Copilot/Windsurf CLI instructions + integration docs ([#55](https://github.com/rtk-ai/icm/issues/55)) ([344df6a](https://github.com/rtk-ai/icm/commit/344df6a3935a4da2157c33868708a4a27d9d321b))
+
+
+### Bug Fixes
+
+* JSONC parsing in init + OpenCode plugin extraction ([#57](https://github.com/rtk-ai/icm/issues/57), [#58](https://github.com/rtk-ai/icm/issues/58)) ([#60](https://github.com/rtk-ai/icm/issues/60)) ([a3a7967](https://github.com/rtk-ai/icm/commit/a3a796717ff815dcc8456fb41811169b8b2d56ef))
+
 ## [0.10.5](https://github.com/rtk-ai/icm/compare/icm-v0.10.4...icm-v0.10.5) (2026-03-21)
 
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.9](https://github.com/rtk-ai/icm/compare/icm-v0.10.8...icm-v0.10.9) (2026-04-06)
+
+
+### Bug Fixes
+
+* ensure OpenCode plugin update triggers release ([2f33879](https://github.com/rtk-ai/icm/commit/2f338791436c8f1ce4164348a835e0e5e95f8bf5))
+
 ## [0.10.8](https://github.com/rtk-ai/icm/compare/icm-v0.10.7...icm-v0.10.8) (2026-04-06)
 
 

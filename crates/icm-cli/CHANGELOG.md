@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.10](https://github.com/rtk-ai/icm/compare/icm-v0.10.9...icm-v0.10.10) (2026-04-06)
+
+
+### Features
+
+* add recall-project and save-project commands ([#70](https://github.com/rtk-ai/icm/issues/70)) ([51185fe](https://github.com/rtk-ai/icm/commit/51185fe4614764794ae9b5fd7b0f028ae9a70c3e)), closes [#69](https://github.com/rtk-ai/icm/issues/69)
+
 ## [0.10.9](https://github.com/rtk-ai/icm/compare/icm-v0.10.8...icm-v0.10.9) (2026-04-06)
 
 

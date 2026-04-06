@@ -140,7 +140,7 @@ impl Default for ExtractionConfig {
             enabled: true,
             min_score: 2.0,
             max_facts: 20,
-            extract_every: 10,
+            extract_every: 3,
             store_raw: true,
         }
     }

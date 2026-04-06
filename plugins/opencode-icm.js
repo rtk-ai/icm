@@ -9,7 +9,7 @@ import { execFileSync, execSync } from "child_process";
 
 const ICM_BIN = process.env.ICM_BIN || "icm";
 let toolCallCount = 0;
-const EXTRACT_EVERY = 10;
+const EXTRACT_EVERY = 3;
 
 function icm(...args) {
   try {

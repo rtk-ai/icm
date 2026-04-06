@@ -1873,7 +1873,7 @@ Do this BEFORE responding to the user. Not optional.
         )?;
         println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
 
-        // OpenCode plugin: install TS plugin using native @opencode-ai/plugin SDK
+        // OpenCode plugin: install TS plugin using native @opencode-ai/plugin SDK (v2)
         let opencode_plugins_dir = PathBuf::from(&home).join(".config/opencode/plugins");
         let opencode_plugin_path = opencode_plugins_dir.join("icm.ts");
         // Remove old .js plugin if it exists

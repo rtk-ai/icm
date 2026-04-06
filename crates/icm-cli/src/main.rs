@@ -247,6 +247,27 @@ enum Commands {
         limit: usize,
     },
 
+    /// Auto-recall context for the current project (detects from PWD / git remote)
+    RecallProject {
+        /// Maximum memories to include
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Auto-save context for the current project (detects from PWD / git remote)
+    SaveProject {
+        /// Summary of what was done in this session
+        content: String,
+
+        /// Importance level
+        #[arg(short, long, default_value = "medium")]
+        importance: CliImportance,
+
+        /// Additional keywords (comma-separated)
+        #[arg(short, long)]
+        keywords: Option<String>,
+    },
+
     /// Benchmark memory recall accuracy with and without ICM
     BenchRecall {
         /// Model to use
@@ -839,6 +860,11 @@ fn main() -> Result<()> {
             store_raw,
         } => cmd_extract(&store, &project, text, dry_run, store_raw),
         Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
+        Commands::RecallProject { limit } => cmd_recall_project(&store, limit),
+        Commands::SaveProject { content, importance, keywords } => {
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            cmd_save_project(&store, emb_ref, &content, importance.into(), keywords)
+        }
         Commands::Config => cmd_config(),
         Commands::Bench { count } => cmd_bench(count),
         Commands::BenchRecall {
@@ -2412,6 +2438,70 @@ fn cmd_recall_context(store: &SqliteStore, query: &str, limit: usize) -> Result<
         print!("{ctx}");
     }
     Ok(())
+}
+
+/// Detect the current project name from PWD and git remote.
+/// Returns the best project identifier for topic matching.
+fn detect_project() -> String {
+    // Try git remote first (most unique identifier)
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+    {
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !url.is_empty() {
+            // Extract repo name: "git@github.com:user/repo.git" -> "repo"
+            // or "https://github.com/user/repo.git" -> "repo"
+            let name = url
+                .rsplit('/')
+                .next()
+                .unwrap_or(&url)
+                .trim_end_matches(".git")
+                .to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+
+    // Fallback: basename of current directory
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(name) = cwd.file_name() {
+            return name.to_string_lossy().to_string();
+        }
+    }
+
+    "unknown".to_string()
+}
+
+fn cmd_recall_project(store: &SqliteStore, limit: usize) -> Result<()> {
+    let project = detect_project();
+    eprintln!("Project: {project}");
+
+    // Search across project-related topics: context-<project>, decisions-<project>, errors-resolved
+    let query = &project;
+    let ctx = extract::recall_context(store, query, limit)?;
+    if ctx.is_empty() {
+        eprintln!("No context found for project '{project}'.");
+    } else {
+        print!("{ctx}");
+    }
+    Ok(())
+}
+
+fn cmd_save_project(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    content: &str,
+    importance: Importance,
+    keywords: Option<String>,
+) -> Result<()> {
+    let project = detect_project();
+    let topic = format!("context-{project}");
+    eprintln!("Project: {project}");
+
+    // Reuse cmd_store logic
+    cmd_store(store, embedder, topic, content.to_string(), importance, keywords, None)
 }
 
 #[cfg(feature = "embeddings")]

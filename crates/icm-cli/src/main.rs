@@ -1904,10 +1904,7 @@ fn inject_claude_hook(
     detect_patterns: &[&str],
 ) -> Result<String> {
     let mut config: Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(settings_path)
-            .with_context(|| format!("cannot read {}", settings_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("cannot parse {}", settings_path.display()))?
+        parse_json_config(settings_path)?
     } else {
         serde_json::json!({})
     };
@@ -1983,6 +1980,82 @@ fn install_skill(dir: &PathBuf, filename: &str, content: &str, label: &str) -> R
     Ok(())
 }
 
+/// Strip JSONC comments (// and /* */) and handle empty/whitespace-only content.
+/// Returns valid JSON or an empty object.
+fn strip_jsonc_comments(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return "{}".to_string();
+    }
+    let mut result = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    while let Some(c) = chars.next() {
+        if escape_next {
+            result.push(c);
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                escape_next = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            result.push(c);
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                result.push(c);
+            }
+            '/' => match chars.peek() {
+                Some('/') => {
+                    chars.next();
+                    // Skip until end of line
+                    for ch in chars.by_ref() {
+                        if ch == '\n' {
+                            result.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    // Skip until */
+                    let mut prev = ' ';
+                    for ch in chars.by_ref() {
+                        if prev == '*' && ch == '/' {
+                            break;
+                        }
+                        prev = ch;
+                    }
+                }
+                _ => result.push(c),
+            },
+            _ => result.push(c),
+        }
+    }
+    let r = result.trim();
+    if r.is_empty() {
+        "{}".to_string()
+    } else {
+        result
+    }
+}
+
+/// Parse a JSON/JSONC config file, handling comments and empty files gracefully.
+fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("cannot read {}", config_path.display()))?;
+    let clean = strip_jsonc_comments(&content);
+    serde_json::from_str(&clean)
+        .with_context(|| format!("invalid JSON in {}", config_path.display()))
+}
+
 /// Inject ICM MCP server into a JSON config file. Returns a status string.
 /// `servers_key` is the JSON key for the servers object (e.g. "mcpServers", "servers", "context_servers").
 fn inject_mcp_server(
@@ -1993,12 +2066,8 @@ fn inject_mcp_server(
 ) -> Result<String> {
     // Read existing config or create empty object
     let mut config: Value = if config_path.exists() {
-        let content = std::fs::read_to_string(config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("invalid JSON in {}", config_path.display()))?
+        parse_json_config(config_path)?
     } else {
-        // Create parent dirs if needed
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -2049,10 +2118,7 @@ fn inject_mcp_server(
 /// Inject ICM MCP server into Zed settings.json (uses `context_servers` with nested `command` object).
 fn inject_zed_mcp_server(config_path: &PathBuf, name: &str, bin_path: &str) -> Result<String> {
     let mut config: Value = if config_path.exists() {
-        let content = std::fs::read_to_string(config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("invalid JSON in {}", config_path.display()))?
+        parse_json_config(config_path)?
     } else {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -2143,10 +2209,7 @@ fn inject_codex_mcp_server(config_path: &PathBuf, name: &str, icm_bin: &str) -> 
 /// Inject ICM MCP server into OpenCode config (uses "mcp" key, command is array).
 fn inject_opencode_mcp_server(config_path: &PathBuf, name: &str, icm_bin: &str) -> Result<String> {
     let mut config: Value = if config_path.exists() {
-        let content = std::fs::read_to_string(config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("invalid JSON in {}", config_path.display()))?
+        parse_json_config(config_path)?
     } else {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent).ok();

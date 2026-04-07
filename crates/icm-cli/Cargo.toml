@@ -37,6 +37,9 @@ rpassword = { workspace = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 

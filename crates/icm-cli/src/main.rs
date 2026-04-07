@@ -3,6 +3,7 @@ mod bench_knowledge;
 pub mod cloud;
 mod config;
 mod extract;
+mod import;
 #[cfg(test)]
 mod learn_tests;
 #[cfg(feature = "tui")]
@@ -241,6 +242,24 @@ enum Commands {
         /// Store raw text as low-importance memory when no facts are extracted
         #[arg(long)]
         store_raw: bool,
+    },
+
+    /// Import conversations from external sources (Claude.ai, ChatGPT, Claude Code, Slack, text)
+    Import {
+        /// Path to file or directory to import
+        path: PathBuf,
+
+        /// Format (auto-detected if omitted)
+        #[arg(short, long, default_value = "auto")]
+        format: CliImportFormat,
+
+        /// Project name for topic namespacing
+        #[arg(short, long, default_value = "project")]
+        project: String,
+
+        /// Preview without storing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Output recalled context formatted for prompt injection
@@ -615,6 +634,16 @@ impl From<CliImportance> for Importance {
 }
 
 #[derive(Clone, ValueEnum)]
+enum CliImportFormat {
+    Auto,
+    ClaudeAi,
+    Chatgpt,
+    ClaudeCode,
+    Slack,
+    Text,
+}
+
+#[derive(Clone, ValueEnum)]
 enum CliRelation {
     PartOf,
     DependsOn,
@@ -876,6 +905,22 @@ fn main() -> Result<()> {
             dry_run,
             store_raw,
         } => cmd_extract(&store, &project, text, dry_run, store_raw),
+        Commands::Import {
+            path,
+            format,
+            project,
+            dry_run,
+        } => {
+            let fmt = match format {
+                CliImportFormat::Auto => None,
+                CliImportFormat::ClaudeAi => Some(import::ImportFormat::ClaudeAi),
+                CliImportFormat::Chatgpt => Some(import::ImportFormat::ChatGpt),
+                CliImportFormat::ClaudeCode => Some(import::ImportFormat::ClaudeCode),
+                CliImportFormat::Slack => Some(import::ImportFormat::Slack),
+                CliImportFormat::Text => Some(import::ImportFormat::Text),
+            };
+            import::cmd_import(&store, path, fmt, project, dry_run)
+        }
         Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
         Commands::RecallProject { limit } => cmd_recall_project(&store, limit),
         Commands::SaveProject {

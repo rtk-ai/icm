@@ -1,6 +1,6 @@
 {
   "packages": {
-    "crates/icm-cli": {
+    ".": {
       "release-type": "rust",
       "package-name": "icm",
       "component": "icm",
@@ -9,9 +9,10 @@
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": true,
       "extra-files": [
-        "plugins/opencode-icm.ts",
-        "install.sh",
-        "install.ps1"
+        "crates/icm-cli/Cargo.toml",
+        "crates/icm-core/Cargo.toml",
+        "crates/icm-store/Cargo.toml",
+        "crates/icm-mcp/Cargo.toml"
       ]
     }
   }

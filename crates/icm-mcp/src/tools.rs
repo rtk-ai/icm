@@ -130,6 +130,37 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         json!({
+            "name": "icm_memory_forget_topic",
+            "description": "Delete ALL memories in a topic. Use to clear an entire topic at once.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic whose memories should all be deleted"
+                    }
+                },
+                "required": ["topic"]
+            }
+        }),
+        json!({
+            "name": "icm_learn",
+            "description": "Scan a project directory and create a Memoir knowledge graph with its structure, dependencies, modules, and config files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Project directory to scan (default: current working directory)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Memoir name (default: directory name)"
+                    }
+                }
+            }
+        }),
+        json!({
             "name": "icm_memory_consolidate",
             "description": "Consolidate all memories of a topic into a single summary. Useful when a topic accumulates too many entries.",
             "inputSchema": {
@@ -538,6 +569,7 @@ pub fn call_tool(
         "icm_memory_store" => tool_store(store, embedder, args, compact),
         "icm_memory_recall" => tool_recall(store, embedder, args, compact),
         "icm_memory_forget" => tool_forget(store, args),
+        "icm_memory_forget_topic" => tool_forget_topic(store, args),
         "icm_memory_update" => tool_update(store, embedder, args),
         "icm_memory_consolidate" => tool_consolidate(store, args),
         "icm_memory_list_topics" => tool_list_topics(store),
@@ -556,6 +588,8 @@ pub fn call_tool(
         "icm_memoir_link" => tool_memoir_link(store, args),
         "icm_memoir_inspect" => tool_memoir_inspect(store, args),
         "icm_memoir_export" => tool_memoir_export(store, args),
+        // Learn tool
+        "icm_learn" => tool_learn(store, args),
         // Feedback tools
         "icm_feedback_record" => tool_feedback_record(store, args, compact),
         "icm_feedback_search" => tool_feedback_search(store, args),
@@ -853,6 +887,43 @@ fn tool_forget(store: &SqliteStore, args: &Value) -> ToolResult {
     match store.delete(id) {
         Ok(()) => ToolResult::text(format!("Deleted memory: {id}")),
         Err(e) => ToolResult::error(format!("failed to delete: {e}")),
+    }
+}
+
+fn tool_forget_topic(store: &SqliteStore, args: &Value) -> ToolResult {
+    let topic = match get_str(args, "topic") {
+        Some(t) => t,
+        None => return ToolResult::error("missing required field: topic".into()),
+    };
+
+    let memories = match store.get_by_topic(topic) {
+        Ok(m) => m,
+        Err(e) => return ToolResult::error(format!("failed to get memories: {e}")),
+    };
+
+    let count = memories.len();
+    for m in &memories {
+        if let Err(e) = store.delete(&m.id) {
+            return ToolResult::error(format!("failed to delete memory {}: {e}", m.id));
+        }
+    }
+
+    ToolResult::text(format!("Deleted {count} memories from topic: {topic}"))
+}
+
+fn tool_learn(store: &SqliteStore, args: &Value) -> ToolResult {
+    let dir_str = get_str(args, "directory").unwrap_or(".");
+    let dir = std::path::PathBuf::from(dir_str);
+
+    if !dir.exists() || !dir.is_dir() {
+        return ToolResult::error(format!("directory not found: {}", dir.display()));
+    }
+
+    let name = get_str(args, "name");
+
+    match icm_core::learn_project(store, &dir, name) {
+        Ok(result) => ToolResult::text(result.to_string()),
+        Err(e) => ToolResult::error(format!("learn failed: {e}")),
     }
 }
 
@@ -2629,5 +2700,109 @@ mod tests {
             false,
         );
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn test_forget_topic() {
+        let store = test_store();
+
+        // Store 3 memories in topic "doomed"
+        for i in 0..3 {
+            let r = call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({"topic": "doomed", "content": format!("memory {i}")}),
+                false,
+            );
+            assert!(!r.is_error);
+        }
+
+        // Verify they exist
+        let topics = call_tool(&store, None, "icm_memory_list_topics", &json!({}), false);
+        assert!(topics.content[0].text.contains("doomed"));
+
+        // Forget the topic
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_forget_topic",
+            &json!({"topic": "doomed"}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("Deleted 3 memories"));
+
+        // Verify topic is gone
+        let memories = store.get_by_topic("doomed").unwrap();
+        assert!(memories.is_empty());
+    }
+
+    #[test]
+    fn test_forget_topic_missing_field() {
+        let store = test_store();
+        let result = call_tool(&store, None, "icm_memory_forget_topic", &json!({}), false);
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("topic"));
+    }
+
+    #[test]
+    fn test_forget_topic_empty() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_forget_topic",
+            &json!({"topic": "nonexistent"}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("Deleted 0 memories"));
+    }
+
+    #[test]
+    fn test_mcp_learn() {
+        let store = test_store();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("test-proj");
+        std::fs::create_dir_all(project_dir.join("src")).unwrap();
+        std::fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "test-proj"
+version = "0.1.0"
+edition = "2021"
+description = "A test project"
+"#,
+        )
+        .unwrap();
+        std::fs::write(project_dir.join("src/main.rs"), "fn main() {}").unwrap();
+
+        let result = call_tool(
+            &store,
+            None,
+            "icm_learn",
+            &json!({"directory": project_dir.to_str().unwrap()}),
+            false,
+        );
+        assert!(!result.is_error, "learn failed: {}", result.content[0].text);
+        assert!(result.content[0].text.contains("Learned test-proj"));
+        assert!(result.content[0].text.contains("concepts"));
+    }
+
+    #[test]
+    fn test_mcp_learn_invalid_dir() {
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_learn",
+            &json!({"directory": "/nonexistent/path/xyz"}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("directory not found"));
     }
 }

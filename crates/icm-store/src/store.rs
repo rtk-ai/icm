@@ -3845,4 +3845,28 @@ mod tests {
         // (9998 + 4 = 10002 > 10000, so the emoji at 9998 is excluded; end = 9998)
         // Result should just be the 'a' tokens
     }
+
+    #[test]
+    fn test_forget_topic() {
+        let store = test_store();
+
+        // Create 3 memories in topic "ephemeral"
+        for i in 0..3 {
+            let m = make_memory("ephemeral", &format!("item {i}"));
+            store.store(m).unwrap();
+        }
+
+        // Verify they exist
+        let before = store.get_by_topic("ephemeral").unwrap();
+        assert_eq!(before.len(), 3);
+
+        // Delete all memories in the topic
+        for m in &before {
+            store.delete(&m.id).unwrap();
+        }
+
+        // Verify 0 remain
+        let after = store.get_by_topic("ephemeral").unwrap();
+        assert!(after.is_empty());
+    }
 }

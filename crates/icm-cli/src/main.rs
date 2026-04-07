@@ -3,6 +3,7 @@ mod bench_knowledge;
 pub mod cloud;
 mod config;
 mod extract;
+mod learn;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -266,6 +267,17 @@ enum Commands {
         /// Additional keywords (comma-separated)
         #[arg(short, long)]
         keywords: Option<String>,
+    },
+
+    /// Scan a project and save its structure as a Memoir knowledge graph
+    Learn {
+        /// Directory to scan (default: current directory)
+        #[arg(short, long)]
+        dir: Option<String>,
+
+        /// Memoir name (default: directory name)
+        #[arg(short, long)]
+        name: Option<String>,
     },
 
     /// Benchmark memory recall accuracy with and without ICM
@@ -861,9 +873,20 @@ fn main() -> Result<()> {
         } => cmd_extract(&store, &project, text, dry_run, store_raw),
         Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
         Commands::RecallProject { limit } => cmd_recall_project(&store, limit),
-        Commands::SaveProject { content, importance, keywords } => {
+        Commands::SaveProject {
+            content,
+            importance,
+            keywords,
+        } => {
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             cmd_save_project(&store, emb_ref, &content, importance.into(), keywords)
+        }
+        Commands::Learn { dir, name } => {
+            let dir = dir
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            learn::learn_project(&store, &dir, name.as_deref())?;
+            Ok(())
         }
         Commands::Config => cmd_config(),
         Commands::Bench { count } => cmd_bench(count),
@@ -2501,7 +2524,15 @@ fn cmd_save_project(
     eprintln!("Project: {project}");
 
     // Reuse cmd_store logic
-    cmd_store(store, embedder, topic, content.to_string(), importance, keywords, None)
+    cmd_store(
+        store,
+        embedder,
+        topic,
+        content.to_string(),
+        importance,
+        keywords,
+        None,
+    )
 }
 
 #[cfg(feature = "embeddings")]

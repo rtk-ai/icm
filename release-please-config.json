@@ -6,7 +6,13 @@
       "component": "icm",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
-      "changelog-path": "CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true,
+      "extra-files": [
+        "plugins/opencode-icm.ts",
+        "install.sh",
+        "install.ps1"
+      ]
     }
   }
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.11](https://github.com/rtk-ai/icm/compare/icm-v0.10.10...icm-v0.10.11) (2026-04-07)
+
+
+### Features
+
+* add icm learn command — scan project into memoir knowledge graph ([#72](https://github.com/rtk-ai/icm/issues/72)) ([#74](https://github.com/rtk-ai/icm/issues/74)) ([0801e7f](https://github.com/rtk-ai/icm/commit/0801e7ff9239040bc0b69030fbb8a5237a8e422b))
+
 ## [0.10.10](https://github.com/rtk-ai/icm/compare/icm-v0.10.9...icm-v0.10.10) (2026-04-06)
 
 

@@ -402,7 +402,7 @@ fn collect_cargo_deps(dir: &Path) -> Option<Vec<(String, String)>> {
     for section in &["workspace.dependencies", "dependencies"] {
         let table = section
             .split('.')
-            .fold(Some(&parsed), |acc, key| acc.and_then(|v| v.get(key)));
+            .try_fold(&parsed, |acc, key| acc.get(key));
         if let Some(toml::Value::Table(table)) = table {
             for (name, val) in table {
                 let version = match val {

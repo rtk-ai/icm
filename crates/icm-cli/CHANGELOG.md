@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.13](https://github.com/rtk-ai/icm/compare/icm-v0.10.12...icm-v0.10.13) (2026-04-07)
+
+
+### Features
+
+* icm import — conversations from Claude, ChatGPT, Slack ([#78](https://github.com/rtk-ai/icm/issues/78)) ([6f036c8](https://github.com/rtk-ai/icm/commit/6f036c80cc120dd2561d8c8a8eb6200410f92c7e))
+
 ## [0.10.12](https://github.com/rtk-ai/icm/compare/icm-v0.10.11...icm-v0.10.12) (2026-04-07)
 
 

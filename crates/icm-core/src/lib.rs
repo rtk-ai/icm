@@ -4,6 +4,7 @@ pub mod error;
 pub mod fastembed_embedder;
 pub mod feedback;
 pub mod feedback_store;
+pub mod learn;
 pub mod memoir;
 pub mod memoir_store;
 pub mod memory;
@@ -24,6 +25,8 @@ pub use memory::{
     Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
 };
 pub use store::MemoryStore;
+
+pub use learn::{learn_project, LearnResult};
 
 /// Common message for empty search results.
 pub const MSG_NO_MEMORIES: &str = "No memories found.";

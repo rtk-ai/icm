@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.8"
+version = "0.10.11"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1269,6 +1269,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1285,6 +1286,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
  "ulid",
 ]
 
@@ -1298,6 +1300,7 @@ dependencies = [
  "icm-store",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 

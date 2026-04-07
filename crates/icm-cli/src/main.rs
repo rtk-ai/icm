@@ -3,7 +3,8 @@ mod bench_knowledge;
 pub mod cloud;
 mod config;
 mod extract;
-mod learn;
+#[cfg(test)]
+mod learn_tests;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -97,10 +98,14 @@ enum Commands {
         sort: SortField,
     },
 
-    /// Delete a memory by ID
+    /// Forget (delete) a memory by ID, or all memories in a topic
     Forget {
-        /// Memory ID
-        id: String,
+        /// Memory ID to forget
+        id: Option<String>,
+
+        /// Delete all memories in this topic
+        #[arg(short, long)]
+        topic: Option<String>,
     },
 
     /// Update an existing memory in-place
@@ -757,7 +762,7 @@ fn main() -> Result<()> {
             )
         }
         Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
-        Commands::Forget { id } => cmd_forget(&store, &id),
+        Commands::Forget { id, topic } => cmd_forget(&store, id.as_deref(), topic.as_deref()),
         Commands::Update {
             id,
             content,
@@ -885,7 +890,8 @@ fn main() -> Result<()> {
             let dir = dir
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            learn::learn_project(&store, &dir, name.as_deref())?;
+            let result = icm_core::learn_project(&store, &dir, name.as_deref())?;
+            println!("{result}");
             Ok(())
         }
         Commands::Config => cmd_config(),
@@ -1066,9 +1072,24 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
     Ok(())
 }
 
-fn cmd_forget(store: &SqliteStore, id: &str) -> Result<()> {
-    store.delete(id)?;
-    println!("Deleted: {id}");
+fn cmd_forget(store: &SqliteStore, id: Option<&str>, topic: Option<&str>) -> Result<()> {
+    match (id, topic) {
+        (_, Some(topic)) => {
+            let memories = store.get_by_topic(topic)?;
+            let count = memories.len();
+            for m in &memories {
+                store.delete(&m.id)?;
+            }
+            println!("Deleted {count} memories from topic: {topic}");
+        }
+        (Some(id), None) => {
+            store.delete(id)?;
+            println!("Deleted: {id}");
+        }
+        (None, None) => {
+            anyhow::bail!("either --topic or a memory ID is required");
+        }
+    }
     Ok(())
 }
 

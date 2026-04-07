@@ -1,19 +1,40 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use icm_core::{Concept, ConceptLink, Label, Memoir, MemoirStore, Relation};
-use icm_store::SqliteStore;
-use tracing::info;
+use crate::error::IcmResult;
+use crate::memoir::{Concept, ConceptLink, Label, Memoir, Relation};
+use crate::memoir_store::MemoirStore;
+
+/// Result of learning a project.
+#[derive(Debug, Clone)]
+pub struct LearnResult {
+    pub memoir_id: String,
+    pub project_name: String,
+    pub total_concepts: usize,
+    pub link_count: usize,
+}
+
+impl std::fmt::Display for LearnResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Learned {}: {} concepts, {} links (memoir: {})",
+            self.project_name, self.total_concepts, self.link_count, self.memoir_id
+        )
+    }
+}
 
 /// Learn a project by scanning its directory and creating a Memoir knowledge graph.
-pub fn learn_project(store: &SqliteStore, dir: &Path, name: Option<&str>) -> Result<String> {
+pub fn learn_project(
+    store: &dyn MemoirStore,
+    dir: &Path,
+    name: Option<&str>,
+) -> IcmResult<LearnResult> {
     let project_name = name
         .or_else(|| dir.file_name().and_then(|f| f.to_str()))
         .unwrap_or("project");
 
     // Check if memoir already exists — delete and recreate
     if let Ok(Some(existing)) = store.get_memoir_by_name(project_name) {
-        info!("Memoir '{}' already exists — replacing", project_name);
         store.delete_memoir(&existing.id)?;
     }
 
@@ -96,11 +117,12 @@ pub fn learn_project(store: &SqliteStore, dir: &Path, name: Option<&str>) -> Res
         + config_ids.len()
         + script_ids.len();
 
-    println!(
-        "Learned {project_name}: {total_concepts} concepts, {link_count} links (memoir: {memoir_id})"
-    );
-
-    Ok(memoir_id)
+    Ok(LearnResult {
+        memoir_id,
+        project_name: project_name.to_string(),
+        total_concepts,
+        link_count,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -108,12 +130,12 @@ pub fn learn_project(store: &SqliteStore, dir: &Path, name: Option<&str>) -> Res
 // ---------------------------------------------------------------------------
 
 fn add_concept(
-    store: &SqliteStore,
+    store: &dyn MemoirStore,
     memoir_id: &str,
     name: &str,
     definition: &str,
     kind: &str,
-) -> Result<String> {
+) -> IcmResult<String> {
     let mut concept = Concept::new(
         memoir_id.to_string(),
         name.to_string(),
@@ -131,11 +153,11 @@ fn add_concept(
 
 /// Read project identity from Cargo.toml / package.json / pyproject.toml / go.mod.
 fn scan_project_identity(
-    store: &SqliteStore,
+    store: &dyn MemoirStore,
     memoir_id: &str,
     dir: &Path,
     project_name: &str,
-) -> Result<String> {
+) -> IcmResult<String> {
     let mut description = format!("Project: {project_name}");
 
     if let Some(info) = read_cargo_toml(dir) {
@@ -148,12 +170,15 @@ fn scan_project_identity(
         description = info;
     }
 
-    info!("Project identity: {}", project_name);
     add_concept(store, memoir_id, project_name, &description, "project")
 }
 
 /// Extract top dependencies from config files.
-fn scan_dependencies(store: &SqliteStore, memoir_id: &str, dir: &Path) -> Result<Vec<String>> {
+fn scan_dependencies(
+    store: &dyn MemoirStore,
+    memoir_id: &str,
+    dir: &Path,
+) -> IcmResult<Vec<String>> {
     let mut dep_ids = Vec::new();
     let deps = collect_dependencies(dir);
 
@@ -163,7 +188,6 @@ fn scan_dependencies(store: &SqliteStore, memoir_id: &str, dir: &Path) -> Result
         } else {
             format!("Dependency: {name} ({version})")
         };
-        info!("Dependency: {}", name);
         let id = add_concept(store, memoir_id, &name, &def, "dependency")?;
         dep_ids.push(id);
     }
@@ -173,12 +197,15 @@ fn scan_dependencies(store: &SqliteStore, memoir_id: &str, dir: &Path) -> Result
 
 /// Scan workspace members / top-level modules.
 /// Returns (concept_id, module_name) pairs.
-fn scan_modules(store: &SqliteStore, memoir_id: &str, dir: &Path) -> Result<Vec<(String, String)>> {
+fn scan_modules(
+    store: &dyn MemoirStore,
+    memoir_id: &str,
+    dir: &Path,
+) -> IcmResult<Vec<(String, String)>> {
     let mut module_ids = Vec::new();
     let modules = collect_modules(dir);
 
     for (name, def) in &modules {
-        info!("Module: {}", name);
         let id = add_concept(store, memoir_id, name, def, "module")?;
         module_ids.push((id, name.clone()));
     }
@@ -189,22 +216,17 @@ fn scan_modules(store: &SqliteStore, memoir_id: &str, dir: &Path) -> Result<Vec<
 /// Find entry point files (main.rs, lib.rs, index.ts, etc.).
 /// Returns (concept_id, Option<parent_module_name>).
 fn scan_entrypoints(
-    store: &SqliteStore,
+    store: &dyn MemoirStore,
     memoir_id: &str,
     dir: &Path,
     modules: &[(String, String)],
-) -> Result<Vec<(String, Option<String>)>> {
+) -> IcmResult<Vec<(String, Option<String>)>> {
     let mut result = Vec::new();
     let entrypoints = collect_entrypoints(dir);
 
     for (rel_path, parent) in &entrypoints {
-        let name = rel_path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("unknown");
         let path_str = rel_path.display().to_string();
         let def = format!("Entry point: {path_str}");
-        info!("Entrypoint: {}", path_str);
 
         // Resolve parent module
         let parent_module = parent
@@ -213,7 +235,6 @@ fn scan_entrypoints(
 
         let concept_name = path_str;
         let id = add_concept(store, memoir_id, &concept_name, &def, "entrypoint")?;
-        let _ = name; // used for logging context only
         result.push((id, parent_module));
     }
 
@@ -221,13 +242,12 @@ fn scan_entrypoints(
 }
 
 /// Find config/CI files.
-fn scan_configs(store: &SqliteStore, memoir_id: &str, dir: &Path) -> Result<Vec<String>> {
+fn scan_configs(store: &dyn MemoirStore, memoir_id: &str, dir: &Path) -> IcmResult<Vec<String>> {
     let mut ids = Vec::new();
     let configs = collect_configs(dir);
 
     for (rel_path, def) in &configs {
         let path_str = rel_path.display().to_string();
-        info!("Config: {}", path_str);
         let id = add_concept(store, memoir_id, &path_str, def, "config")?;
         ids.push(id);
     }
@@ -236,13 +256,12 @@ fn scan_configs(store: &SqliteStore, memoir_id: &str, dir: &Path) -> Result<Vec<
 }
 
 /// Find scripts (Makefile, justfile, etc.).
-fn scan_scripts(store: &SqliteStore, memoir_id: &str, dir: &Path) -> Result<Vec<String>> {
+fn scan_scripts(store: &dyn MemoirStore, memoir_id: &str, dir: &Path) -> IcmResult<Vec<String>> {
     let mut ids = Vec::new();
     let scripts = collect_scripts(dir);
 
     for (rel_path, def) in &scripts {
         let path_str = rel_path.display().to_string();
-        info!("Script: {}", path_str);
         let id = add_concept(store, memoir_id, &path_str, def, "script")?;
         ids.push(id);
     }
@@ -825,200 +844,4 @@ fn collect_scripts(dir: &Path) -> Vec<(PathBuf, String)> {
     }
 
     result
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    fn test_store() -> (TempDir, SqliteStore) {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let db_path = tmp.path().join("test.db");
-        let store = SqliteStore::with_dims(&db_path, 384).expect("failed to create store");
-        (tmp, store)
-    }
-
-    #[test]
-    fn test_learn_rust_project() {
-        let (tmp, store) = test_store();
-
-        // Create a fake Rust workspace project
-        let project_dir = tmp.path().join("my-project");
-        fs::create_dir_all(project_dir.join("crates/core/src")).unwrap();
-        fs::create_dir_all(project_dir.join("crates/cli/src")).unwrap();
-        fs::create_dir_all(project_dir.join(".github/workflows")).unwrap();
-        fs::create_dir_all(project_dir.join("scripts")).unwrap();
-
-        // Root Cargo.toml (workspace)
-        fs::write(
-            project_dir.join("Cargo.toml"),
-            r#"
-[workspace]
-resolver = "2"
-members = ["crates/*"]
-
-[workspace.dependencies]
-serde = "1.0"
-tokio = { version = "1", features = ["full"] }
-anyhow = "1"
-"#,
-        )
-        .unwrap();
-
-        // Core crate
-        fs::write(
-            project_dir.join("crates/core/Cargo.toml"),
-            r#"
-[package]
-name = "my-core"
-version = "0.1.0"
-edition = "2021"
-description = "Core library"
-"#,
-        )
-        .unwrap();
-        fs::write(
-            project_dir.join("crates/core/src/lib.rs"),
-            "pub fn hello() {}",
-        )
-        .unwrap();
-
-        // CLI crate
-        fs::write(
-            project_dir.join("crates/cli/Cargo.toml"),
-            r#"
-[package]
-name = "my-cli"
-version = "0.1.0"
-edition = "2021"
-description = "CLI tool"
-"#,
-        )
-        .unwrap();
-        fs::write(project_dir.join("crates/cli/src/main.rs"), "fn main() {}").unwrap();
-
-        // GitHub workflow
-        fs::write(
-            project_dir.join(".github/workflows/ci.yml"),
-            "name: CI\non: push\n",
-        )
-        .unwrap();
-
-        // Script
-        fs::write(
-            project_dir.join("scripts/build.sh"),
-            "#!/bin/bash\ncargo build",
-        )
-        .unwrap();
-
-        // Makefile
-        fs::write(project_dir.join("Makefile"), "build:\n\tcargo build").unwrap();
-
-        // Run learn
-        let memoir_id = learn_project(&store, &project_dir, None).expect("learn_project failed");
-
-        // Verify memoir was created
-        let memoir = store.get_memoir(&memoir_id).unwrap().unwrap();
-        assert_eq!(memoir.name, "my-project");
-
-        // Verify concepts
-        let concepts = store.list_concepts(&memoir_id).unwrap();
-        let kinds: Vec<String> = concepts
-            .iter()
-            .flat_map(|c| {
-                c.labels
-                    .iter()
-                    .map(|l| format!("{}:{}", l.namespace, l.value))
-            })
-            .collect();
-
-        assert!(kinds.contains(&"kind:project".to_string()));
-        assert!(kinds.contains(&"kind:dependency".to_string()));
-        assert!(kinds.contains(&"kind:module".to_string()));
-        assert!(kinds.contains(&"kind:entrypoint".to_string()));
-        assert!(kinds.contains(&"kind:config".to_string()));
-        assert!(kinds.contains(&"kind:script".to_string()));
-
-        // Verify links exist
-        let links = store.get_links_for_memoir(&memoir_id).unwrap();
-        assert!(!links.is_empty(), "should have created links");
-
-        // Verify we have at least: 1 project + 3 deps + 2 modules + entrypoints + configs + scripts
-        assert!(
-            concepts.len() >= 7,
-            "expected at least 7 concepts, got {}",
-            concepts.len()
-        );
-    }
-
-    #[test]
-    fn test_learn_node_project() {
-        let (tmp, store) = test_store();
-
-        let project_dir = tmp.path().join("my-node-app");
-        fs::create_dir_all(project_dir.join("src")).unwrap();
-
-        fs::write(
-            project_dir.join("package.json"),
-            r#"{
-  "name": "my-node-app",
-  "version": "1.0.0",
-  "description": "A Node.js app",
-  "dependencies": {
-    "express": "^4.18.0",
-    "lodash": "^4.17.0"
-  }
-}"#,
-        )
-        .unwrap();
-
-        fs::write(project_dir.join("index.ts"), "console.log('hello')").unwrap();
-        fs::write(project_dir.join("tsconfig.json"), "{}").unwrap();
-
-        let memoir_id =
-            learn_project(&store, &project_dir, Some("node-test")).expect("learn failed");
-
-        let memoir = store.get_memoir(&memoir_id).unwrap().unwrap();
-        assert_eq!(memoir.name, "node-test");
-
-        let concepts = store.list_concepts(&memoir_id).unwrap();
-        assert!(
-            concepts.len() >= 4,
-            "expected at least 4 concepts (project + 2 deps + entrypoint), got {}",
-            concepts.len()
-        );
-    }
-
-    #[test]
-    fn test_learn_replaces_existing_memoir() {
-        let (tmp, store) = test_store();
-
-        let project_dir = tmp.path().join("replace-test");
-        fs::create_dir_all(&project_dir).unwrap();
-        fs::write(
-            project_dir.join("Cargo.toml"),
-            r#"
-[package]
-name = "replace-test"
-version = "0.1.0"
-edition = "2021"
-"#,
-        )
-        .unwrap();
-
-        // First learn
-        let id1 = learn_project(&store, &project_dir, Some("replace-test")).unwrap();
-        // Second learn should replace
-        let id2 = learn_project(&store, &project_dir, Some("replace-test")).unwrap();
-
-        assert_ne!(id1, id2, "should create a new memoir");
-        // Old memoir should be gone
-        assert!(store.get_memoir(&id1).unwrap().is_none());
-    }
 }

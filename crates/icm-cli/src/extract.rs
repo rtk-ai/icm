@@ -494,35 +494,171 @@ fn split_sentences(text: &str) -> Vec<String> {
 
 /// Words that look capitalized mid-sentence but are not person/project names.
 const ENTITY_STOP_WORDS: &[&str] = &[
-    "The", "This", "That", "These", "Those", "When", "Where", "What", "Which", "How",
-    "But", "And", "Also", "However", "Furthermore", "Moreover", "Therefore", "Because",
-    "After", "Before", "During", "Since", "Until", "While", "Although", "Though",
-    "Some", "Many", "Most", "Each", "Every", "All", "Any", "Both", "Other",
-    "Here", "There", "Now", "Then", "Just", "Only", "Even", "Still", "Yet",
-    "Yes", "No", "Not", "Can", "Could", "Would", "Should", "Will", "May", "Might",
-    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-    "January", "February", "March", "April", "May", "June", "July", "August",
-    "September", "October", "November", "December",
-    "API", "CLI", "URL", "HTTP", "HTTPS", "JSON", "HTML", "CSS", "SQL", "SSH",
-    "DNS", "TCP", "UDP", "TLS", "SSL", "REST", "GRPC", "OAuth", "JWT",
-    "AWS", "GCP", "Azure", "Docker", "Linux", "Mac", "Windows",
-    "Rust", "Python", "Java", "Node", "React", "Vue", "Svelte", "Next",
-    "Git", "Github", "Gitlab", "Slack", "Chrome", "Firefox", "Safari",
-    "Postgres", "Redis", "Mongo", "SQLite", "MySQL",
-    "True", "False", "None", "Null", "Ok", "Err",
+    "The",
+    "This",
+    "That",
+    "These",
+    "Those",
+    "When",
+    "Where",
+    "What",
+    "Which",
+    "How",
+    "But",
+    "And",
+    "Also",
+    "However",
+    "Furthermore",
+    "Moreover",
+    "Therefore",
+    "Because",
+    "After",
+    "Before",
+    "During",
+    "Since",
+    "Until",
+    "While",
+    "Although",
+    "Though",
+    "Some",
+    "Many",
+    "Most",
+    "Each",
+    "Every",
+    "All",
+    "Any",
+    "Both",
+    "Other",
+    "Here",
+    "There",
+    "Now",
+    "Then",
+    "Just",
+    "Only",
+    "Even",
+    "Still",
+    "Yet",
+    "Yes",
+    "No",
+    "Not",
+    "Can",
+    "Could",
+    "Would",
+    "Should",
+    "Will",
+    "May",
+    "Might",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+    "API",
+    "CLI",
+    "URL",
+    "HTTP",
+    "HTTPS",
+    "JSON",
+    "HTML",
+    "CSS",
+    "SQL",
+    "SSH",
+    "DNS",
+    "TCP",
+    "UDP",
+    "TLS",
+    "SSL",
+    "REST",
+    "GRPC",
+    "OAuth",
+    "JWT",
+    "AWS",
+    "GCP",
+    "Azure",
+    "Docker",
+    "Linux",
+    "Mac",
+    "Windows",
+    "Rust",
+    "Python",
+    "Java",
+    "Node",
+    "React",
+    "Vue",
+    "Svelte",
+    "Next",
+    "Git",
+    "Github",
+    "Gitlab",
+    "Slack",
+    "Chrome",
+    "Firefox",
+    "Safari",
+    "Postgres",
+    "Redis",
+    "Mongo",
+    "SQLite",
+    "MySQL",
+    "True",
+    "False",
+    "None",
+    "Null",
+    "Ok",
+    "Err",
 ];
 
 const ENTITY_PATTERNS_BEFORE: &[&str] = &[
-    "with ", "from ", "ask ", "tell ", "cc ", "ping ", "by ", "per ",
-    "asked ", "told ", "called ", "messaged ", "emailed ",
-    "thank ", "thanks ",
+    "with ",
+    "from ",
+    "ask ",
+    "tell ",
+    "cc ",
+    "ping ",
+    "by ",
+    "per ",
+    "asked ",
+    "told ",
+    "called ",
+    "messaged ",
+    "emailed ",
+    "thank ",
+    "thanks ",
 ];
 
 const ENTITY_PATTERNS_AFTER: &[&str] = &[
-    " said", " mentioned", " suggested", " proposed", " agreed",
-    " thinks", " wants", " noted", " confirmed", " replied",
-    " approved", " reviewed", " reported", " fixed", " built",
-    "'s ", "'s,", "'s.", "'s:",
+    " said",
+    " mentioned",
+    " suggested",
+    " proposed",
+    " agreed",
+    " thinks",
+    " wants",
+    " noted",
+    " confirmed",
+    " replied",
+    " approved",
+    " reviewed",
+    " reported",
+    " fixed",
+    " built",
+    "'s ",
+    "'s,",
+    "'s.",
+    "'s:",
 ];
 
 /// Classify a fact into kind tags based on keyword matching.
@@ -531,35 +667,74 @@ pub fn classify_fact(content: &str) -> Vec<String> {
     let mut tags = Vec::new();
 
     let decision_kw = [
-        "decided", "chose", "chosen", "went with", "picked", "switched to",
-        "instead of", "rather than", "trade-off", "trade off", "we chose",
-        "settled on", "opted for",
+        "decided",
+        "chose",
+        "chosen",
+        "went with",
+        "picked",
+        "switched to",
+        "instead of",
+        "rather than",
+        "trade-off",
+        "trade off",
+        "we chose",
+        "settled on",
+        "opted for",
     ];
     if decision_kw.iter().any(|kw| lower.contains(kw)) {
         tags.push("kind:decision".to_string());
     }
 
     let preference_kw = [
-        "always ", "never ", "prefer ", "avoid ", "convention:", "rule:",
-        "make sure", "important to", "must ", "should not", "shouldn't",
-        "don't ", "do not ",
+        "always ",
+        "never ",
+        "prefer ",
+        "avoid ",
+        "convention:",
+        "rule:",
+        "make sure",
+        "important to",
+        "must ",
+        "should not",
+        "shouldn't",
+        "don't ",
+        "do not ",
     ];
     if preference_kw.iter().any(|kw| lower.contains(kw)) {
         tags.push("kind:preference".to_string());
     }
 
     let problem_kw = [
-        "bug", "error:", "failed:", "root cause", "workaround",
-        "doesn't work", "does not work", "breaks when", "limitation",
-        "incompatible", "regression", "crash",
+        "bug",
+        "error:",
+        "failed:",
+        "root cause",
+        "workaround",
+        "doesn't work",
+        "does not work",
+        "breaks when",
+        "limitation",
+        "incompatible",
+        "regression",
+        "crash",
     ];
     if problem_kw.iter().any(|kw| lower.contains(kw)) {
         tags.push("kind:problem".to_string());
     }
 
     let milestone_kw = [
-        "shipped", "launched", "deployed", "released", "migrated",
-        "completed", "go live", "went live", "milestone", "v1.", "v2.", "v3.",
+        "shipped",
+        "launched",
+        "deployed",
+        "released",
+        "migrated",
+        "completed",
+        "go live",
+        "went live",
+        "milestone",
+        "v1.",
+        "v2.",
+        "v3.",
     ];
     if milestone_kw.iter().any(|kw| lower.contains(kw)) {
         tags.push("kind:milestone".to_string());
@@ -622,7 +797,10 @@ pub fn detect_entities(content: &str) -> Vec<String> {
         }
     }
 
-    found.into_iter().map(|name| format!("entity:{name}")).collect()
+    found
+        .into_iter()
+        .map(|name| format!("entity:{name}"))
+        .collect()
 }
 
 /// Extract facts with classification and entity detection.
@@ -812,8 +990,7 @@ mod tests {
 
     #[test]
     fn test_detect_entities_no_false_positives() {
-        let entities =
-            detect_entities("The HTTP API returns JSON when called on Monday");
+        let entities = detect_entities("The HTTP API returns JSON when called on Monday");
         assert!(entities.is_empty());
     }
 

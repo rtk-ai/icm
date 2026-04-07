@@ -63,8 +63,8 @@ pub fn detect_format(path: &Path) -> Result<ImportFormat> {
     }
 
     // Peek JSON content to discriminate formats
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let peek = if content.len() > 4096 {
         &content[..4096]
     } else {
@@ -91,8 +91,7 @@ pub fn detect_format(path: &Path) -> Result<ImportFormat> {
 /// Format: {"uuid":"...", "chat_messages":[{"sender":"human"|"assistant","text":"..."}]}
 /// Or array of such objects.
 pub fn parse_claude_ai(content: &str) -> Result<(Vec<Exchange>, String)> {
-    let val: serde_json::Value =
-        serde_json::from_str(content).context("invalid Claude.ai JSON")?;
+    let val: serde_json::Value = serde_json::from_str(content).context("invalid Claude.ai JSON")?;
 
     // Could be a single conversation or an array
     let conversations = if val.is_array() {
@@ -140,8 +139,7 @@ pub fn parse_claude_ai(content: &str) -> Result<(Vec<Exchange>, String)> {
 /// Parse ChatGPT conversations.json export.
 /// Format: {"conversation_id":"...", "mapping":{"node_id":{"message":{"author":{"role":"..."},"content":{"parts":["..."]}}}}}
 pub fn parse_chatgpt(content: &str) -> Result<(Vec<Exchange>, String)> {
-    let val: serde_json::Value =
-        serde_json::from_str(content).context("invalid ChatGPT JSON")?;
+    let val: serde_json::Value = serde_json::from_str(content).context("invalid ChatGPT JSON")?;
 
     // Could be array of conversations or single
     let conversations = if val.is_array() {
@@ -168,7 +166,10 @@ pub fn parse_chatgpt(content: &str) -> Result<(Vec<Exchange>, String)> {
             .values()
             .filter_map(|node| {
                 let msg = node.get("message")?;
-                let ct = msg.get("create_time").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let ct = msg
+                    .get("create_time")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
                 Some((ct, msg))
             })
             .collect();
@@ -233,18 +234,17 @@ pub fn parse_claude_code(content: &str) -> Result<(Vec<Exchange>, String)> {
         let msg_content = entry.pointer("/message/content");
         let text = match msg_content {
             Some(serde_json::Value::String(s)) => s.clone(),
-            Some(serde_json::Value::Array(arr)) => {
-                arr.iter()
-                    .filter_map(|item| {
-                        if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                            item.get("text").and_then(|v| v.as_str()).map(String::from)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|item| {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        item.get("text").and_then(|v| v.as_str()).map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             _ => continue,
         };
 
@@ -262,7 +262,11 @@ pub fn parse_claude_code(content: &str) -> Result<(Vec<Exchange>, String)> {
         .lines()
         .next()
         .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(String::from))
+        .and_then(|v| {
+            v.get("session_id")
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        })
         .unwrap_or_else(|| "claude-code".to_string());
 
     Ok((exchanges, thread_id))
@@ -314,7 +318,10 @@ pub fn parse_text(content: &str, path: &Path) -> Result<(Vec<Exchange>, String)>
 
     // Check if text has > markers (transcript format)
     let lines: Vec<&str> = content.lines().collect();
-    let quote_count = lines.iter().filter(|l| l.trim_start().starts_with('>')).count();
+    let quote_count = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with('>'))
+        .count();
 
     if quote_count >= 3 {
         // Parse as transcript: > lines are user, rest is assistant
@@ -452,8 +459,8 @@ pub fn cmd_import(
             None => detect_format(file)?,
         };
 
-        let content = std::fs::read_to_string(file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let content =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
 
         if content.trim().is_empty() {
             continue;
@@ -512,7 +519,11 @@ pub fn cmd_import(
                     thread_id: thread_id.clone(),
                 };
                 mem.keywords = extra_kw;
-                let raw = if text.len() > 500 { &text[..500] } else { &text };
+                let raw = if text.len() > 500 {
+                    &text[..500]
+                } else {
+                    &text
+                };
                 mem.raw_excerpt = Some(raw.to_string());
                 store.store(mem)?;
             }

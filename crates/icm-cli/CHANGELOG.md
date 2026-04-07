@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.12](https://github.com/rtk-ai/icm/compare/icm-v0.10.11...icm-v0.10.12) (2026-04-07)
+
+
+### Features
+
+* add MCP icm_learn tool + forget --topic ([#72](https://github.com/rtk-ai/icm/issues/72)) ([#76](https://github.com/rtk-ai/icm/issues/76)) ([60420a9](https://github.com/rtk-ai/icm/commit/60420a96fc4757c7cd51cd4dfef37f7bb3ed62d8))
+
 ## [0.10.11](https://github.com/rtk-ai/icm/compare/icm-v0.10.10...icm-v0.10.11) (2026-04-07)
 
 

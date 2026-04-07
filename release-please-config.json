@@ -1,19 +1,12 @@
 {
   "packages": {
-    ".": {
+    "crates/icm-cli": {
       "release-type": "rust",
       "package-name": "icm",
       "component": "icm",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
-      "changelog-path": "CHANGELOG.md",
-      "include-component-in-tag": true,
-      "extra-files": [
-        "crates/icm-cli/Cargo.toml",
-        "crates/icm-core/Cargo.toml",
-        "crates/icm-store/Cargo.toml",
-        "crates/icm-mcp/Cargo.toml"
-      ]
+      "changelog-path": "CHANGELOG.md"
     }
   }
 }

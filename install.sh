@@ -6,7 +6,7 @@ set -e
 
 REPO="rtk-ai/icm"
 BINARY_NAME="icm"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${HOME}/.local/bin"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,10 +49,11 @@ install() {
     if [ "$OS" = "windows" ]; then
         EXT="zip"
         INSTALL_DIR="${LOCALAPPDATA:-$HOME}/icm/bin"
-        mkdir -p "$INSTALL_DIR"
     else
         EXT="tar.gz"
     fi
+
+    mkdir -p "$INSTALL_DIR"
 
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY_NAME}-${TARGET}.${EXT}"
     TEMP_DIR=$(mktemp -d)
@@ -69,12 +70,7 @@ install() {
         mv "${TEMP_DIR}/${BINARY_NAME}.exe" "${INSTALL_DIR}/"
     else
         tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
-        if [ -w "$INSTALL_DIR" ]; then
-            mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/"
-        else
-            info "Requesting sudo to install to ${INSTALL_DIR}"
-            sudo mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/"
-        fi
+        mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/"
         chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
     fi
 

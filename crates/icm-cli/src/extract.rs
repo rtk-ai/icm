@@ -490,6 +490,348 @@ fn split_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
+// ── Fact classification ──────────────────────────────────────────────────
+
+/// Words that look capitalized mid-sentence but are not person/project names.
+const ENTITY_STOP_WORDS: &[&str] = &[
+    "The",
+    "This",
+    "That",
+    "These",
+    "Those",
+    "When",
+    "Where",
+    "What",
+    "Which",
+    "How",
+    "But",
+    "And",
+    "Also",
+    "However",
+    "Furthermore",
+    "Moreover",
+    "Therefore",
+    "Because",
+    "After",
+    "Before",
+    "During",
+    "Since",
+    "Until",
+    "While",
+    "Although",
+    "Though",
+    "Some",
+    "Many",
+    "Most",
+    "Each",
+    "Every",
+    "All",
+    "Any",
+    "Both",
+    "Other",
+    "Here",
+    "There",
+    "Now",
+    "Then",
+    "Just",
+    "Only",
+    "Even",
+    "Still",
+    "Yet",
+    "Yes",
+    "No",
+    "Not",
+    "Can",
+    "Could",
+    "Would",
+    "Should",
+    "Will",
+    "May",
+    "Might",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+    "API",
+    "CLI",
+    "URL",
+    "HTTP",
+    "HTTPS",
+    "JSON",
+    "HTML",
+    "CSS",
+    "SQL",
+    "SSH",
+    "DNS",
+    "TCP",
+    "UDP",
+    "TLS",
+    "SSL",
+    "REST",
+    "GRPC",
+    "OAuth",
+    "JWT",
+    "AWS",
+    "GCP",
+    "Azure",
+    "Docker",
+    "Linux",
+    "Mac",
+    "Windows",
+    "Rust",
+    "Python",
+    "Java",
+    "Node",
+    "React",
+    "Vue",
+    "Svelte",
+    "Next",
+    "Git",
+    "Github",
+    "Gitlab",
+    "Slack",
+    "Chrome",
+    "Firefox",
+    "Safari",
+    "Postgres",
+    "Redis",
+    "Mongo",
+    "SQLite",
+    "MySQL",
+    "True",
+    "False",
+    "None",
+    "Null",
+    "Ok",
+    "Err",
+];
+
+const ENTITY_PATTERNS_BEFORE: &[&str] = &[
+    "with ",
+    "from ",
+    "ask ",
+    "tell ",
+    "cc ",
+    "ping ",
+    "by ",
+    "per ",
+    "asked ",
+    "told ",
+    "called ",
+    "messaged ",
+    "emailed ",
+    "thank ",
+    "thanks ",
+];
+
+const ENTITY_PATTERNS_AFTER: &[&str] = &[
+    " said",
+    " mentioned",
+    " suggested",
+    " proposed",
+    " agreed",
+    " thinks",
+    " wants",
+    " noted",
+    " confirmed",
+    " replied",
+    " approved",
+    " reviewed",
+    " reported",
+    " fixed",
+    " built",
+    "'s ",
+    "'s,",
+    "'s.",
+    "'s:",
+];
+
+/// Classify a fact into kind tags based on keyword matching.
+pub fn classify_fact(content: &str) -> Vec<String> {
+    let lower = content.to_lowercase();
+    let mut tags = Vec::new();
+
+    let decision_kw = [
+        "decided",
+        "chose",
+        "chosen",
+        "went with",
+        "picked",
+        "switched to",
+        "instead of",
+        "rather than",
+        "trade-off",
+        "trade off",
+        "we chose",
+        "settled on",
+        "opted for",
+    ];
+    if decision_kw.iter().any(|kw| lower.contains(kw)) {
+        tags.push("kind:decision".to_string());
+    }
+
+    let preference_kw = [
+        "always ",
+        "never ",
+        "prefer ",
+        "avoid ",
+        "convention:",
+        "rule:",
+        "make sure",
+        "important to",
+        "must ",
+        "should not",
+        "shouldn't",
+        "don't ",
+        "do not ",
+    ];
+    if preference_kw.iter().any(|kw| lower.contains(kw)) {
+        tags.push("kind:preference".to_string());
+    }
+
+    let problem_kw = [
+        "bug",
+        "error:",
+        "failed:",
+        "root cause",
+        "workaround",
+        "doesn't work",
+        "does not work",
+        "breaks when",
+        "limitation",
+        "incompatible",
+        "regression",
+        "crash",
+    ];
+    if problem_kw.iter().any(|kw| lower.contains(kw)) {
+        tags.push("kind:problem".to_string());
+    }
+
+    let milestone_kw = [
+        "shipped",
+        "launched",
+        "deployed",
+        "released",
+        "migrated",
+        "completed",
+        "go live",
+        "went live",
+        "milestone",
+        "v1.",
+        "v2.",
+        "v3.",
+    ];
+    if milestone_kw.iter().any(|kw| lower.contains(kw)) {
+        tags.push("kind:milestone".to_string());
+    }
+
+    tags
+}
+
+/// Detect person/project entity names in text using heuristic patterns.
+pub fn detect_entities(content: &str) -> Vec<String> {
+    let stop_set: HashSet<&str> = ENTITY_STOP_WORDS.iter().copied().collect();
+    let mut found: HashSet<String> = HashSet::new();
+
+    let words: Vec<&str> = content.split_whitespace().collect();
+    let lower = content.to_lowercase();
+
+    for (i, word) in words.iter().enumerate() {
+        let clean = word
+            .trim_start_matches('@')
+            .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '\'');
+        let base = clean.trim_end_matches("'s").trim_end_matches("\u{2019}s");
+        if base.len() < 2 || base.len() > 15 {
+            continue;
+        }
+        let first = base.chars().next().unwrap_or('a');
+        if !first.is_uppercase() {
+            continue;
+        }
+        if base.chars().all(|c| c.is_uppercase() || !c.is_alphabetic()) {
+            continue;
+        }
+        if i == 0 {
+            continue;
+        }
+        if i > 0 {
+            let prev = words[i - 1];
+            if prev.ends_with('.') || prev.ends_with('!') || prev.ends_with('?') {
+                continue;
+            }
+        }
+        if stop_set.contains(base) {
+            continue;
+        }
+
+        let is_possessive = clean.ends_with("'s") || clean.ends_with("\u{2019}s");
+        let base_lower = base.to_lowercase();
+
+        let has_before_pattern = ENTITY_PATTERNS_BEFORE.iter().any(|pat| {
+            let search = format!("{pat}{base_lower}");
+            lower.contains(&search)
+        });
+        let has_after_pattern = ENTITY_PATTERNS_AFTER.iter().any(|pat| {
+            let search = format!("{base_lower}{pat}");
+            lower.contains(&search)
+        });
+        let has_mention = content.contains(&format!("@{base}"));
+
+        if has_before_pattern || has_after_pattern || has_mention || is_possessive {
+            found.insert(base.to_string());
+        }
+    }
+
+    found
+        .into_iter()
+        .map(|name| format!("entity:{name}"))
+        .collect()
+}
+
+/// Extract facts with classification and entity detection.
+pub fn extract_and_classify(
+    text: &str,
+    project: &str,
+) -> Vec<(String, String, Importance, Vec<String>)> {
+    let facts = extract_facts(text, project);
+    let global_entities = detect_entities(text);
+
+    facts
+        .into_iter()
+        .map(|(topic, content, importance)| {
+            let mut extra_kw = classify_fact(&content);
+            let local_entities = detect_entities(&content);
+            for e in local_entities {
+                if !extra_kw.contains(&e) {
+                    extra_kw.push(e);
+                }
+            }
+            for e in &global_entities {
+                let name = e.strip_prefix("entity:").unwrap_or(e);
+                if content.contains(name) && !extra_kw.contains(e) {
+                    extra_kw.push(e.clone());
+                }
+            }
+            (topic, content, importance, extra_kw)
+        })
+        .collect()
+}
+
 fn jaccard_similar(a: &str, b: &str) -> bool {
     let a_words: HashSet<&str> = a.split_whitespace().collect();
     let b_words: HashSet<&str> = b.split_whitespace().collect();
@@ -612,5 +954,58 @@ mod tests {
         let ctx = recall_context(&store, "parsing algorithm", 5).unwrap();
         assert!(!ctx.is_empty());
         assert!(ctx.contains("Pratt") || ctx.contains("parsing") || ctx.contains("algorithm"));
+    }
+
+    #[test]
+    fn test_classify_decision() {
+        let tags = classify_fact("We decided to use SQLite instead of Postgres for simplicity");
+        assert!(tags.contains(&"kind:decision".to_string()));
+    }
+
+    #[test]
+    fn test_classify_preference() {
+        let tags = classify_fact("Always use snake_case for Rust function names");
+        assert!(tags.contains(&"kind:preference".to_string()));
+    }
+
+    #[test]
+    fn test_classify_problem() {
+        let tags = classify_fact("Bug: the connection pool doesn't work under high concurrency");
+        assert!(tags.contains(&"kind:problem".to_string()));
+    }
+
+    #[test]
+    fn test_classify_milestone() {
+        let tags = classify_fact("We shipped v2.0 to production last Friday");
+        assert!(tags.contains(&"kind:milestone".to_string()));
+    }
+
+    #[test]
+    fn test_detect_entities_conversational() {
+        let entities =
+            detect_entities("The API was slow, Sarah mentioned it, and Bob's PR fixed it");
+        assert!(entities.contains(&"entity:Sarah".to_string()));
+        assert!(entities.contains(&"entity:Bob".to_string()));
+    }
+
+    #[test]
+    fn test_detect_entities_no_false_positives() {
+        let entities = detect_entities("The HTTP API returns JSON when called on Monday");
+        assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn test_detect_entities_at_mention() {
+        let entities = detect_entities("Can you check with @Alice on the deployment");
+        assert!(entities.contains(&"entity:Alice".to_string()));
+    }
+
+    #[test]
+    fn test_extract_and_classify_enriches() {
+        let text = "We decided to use SQLite because Postgres was overkill";
+        let results = extract_and_classify(text, "test");
+        assert!(!results.is_empty());
+        let (_, _, _, kw) = &results[0];
+        assert!(kw.iter().any(|k| k.starts_with("kind:")));
     }
 }

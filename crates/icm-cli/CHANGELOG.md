@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.14](https://github.com/rtk-ai/icm/compare/icm-v0.10.13...icm-v0.10.14) (2026-04-09)
+
+
+### Bug Fixes
+
+* preserve JSON key order in config files ([#80](https://github.com/rtk-ai/icm/issues/80)) ([4dc4e83](https://github.com/rtk-ai/icm/commit/4dc4e83bbfe00cd125f780229cbbcddb3ad6bbea))
+
 ## [0.10.13](https://github.com/rtk-ai/icm/compare/icm-v0.10.12...icm-v0.10.13) (2026-04-07)
 
 

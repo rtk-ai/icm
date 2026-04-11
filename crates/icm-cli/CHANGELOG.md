@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.15](https://github.com/rtk-ai/icm/compare/icm-v0.10.14...icm-v0.10.15) (2026-04-11)
+
+
+### Features
+
+* add `icm wake-up` command + `icm_wake_up` MCP tool ([#84](https://github.com/rtk-ai/icm/issues/84)) ([51a1081](https://github.com/rtk-ai/icm/commit/51a1081a1b988a02686acc1a9d3b9988e26359a7))
+
 ## [0.10.14](https://github.com/rtk-ai/icm/compare/icm-v0.10.13...icm-v0.10.14) (2026-04-09)
 
 

@@ -17,8 +17,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    keyword_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance,
-    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, MSG_NO_MEMORIES,
+    build_wake_up, keyword_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore,
+    Importance, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
+    WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -277,6 +278,29 @@ enum Commands {
         /// Maximum memories to include
         #[arg(short, long, default_value = "10")]
         limit: usize,
+    },
+
+    /// Print a compact critical-facts pack for LLM system-prompt injection
+    ///
+    /// Selects critical/high memories (and preferences) optionally scoped by
+    /// project, ranks them by importance × recency × weight, then truncates
+    /// to fit the token budget. Inspired by MemPalace's `wake-up` command.
+    WakeUp {
+        /// Project filter (default: auto-detect from PWD/git remote; use "-" to disable)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Approximate token budget (1 token ≈ 4 characters)
+        #[arg(short = 't', long, default_value = "200")]
+        max_tokens: usize,
+
+        /// Output format
+        #[arg(short, long, default_value = "markdown")]
+        format: CliWakeUpFormat,
+
+        /// Exclude global preferences/identity memories
+        #[arg(long)]
+        no_preferences: bool,
     },
 
     /// Auto-save context for the current project (detects from PWD / git remote)
@@ -633,6 +657,21 @@ impl From<CliImportance> for Importance {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CliWakeUpFormat {
+    Markdown,
+    Plain,
+}
+
+impl From<CliWakeUpFormat> for WakeUpFormat {
+    fn from(val: CliWakeUpFormat) -> Self {
+        match val {
+            CliWakeUpFormat::Markdown => WakeUpFormat::Markdown,
+            CliWakeUpFormat::Plain => WakeUpFormat::Plain,
+        }
+    }
+}
+
 #[derive(Clone, ValueEnum)]
 enum CliImportFormat {
     Auto,
@@ -923,6 +962,12 @@ fn main() -> Result<()> {
         }
         Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
         Commands::RecallProject { limit } => cmd_recall_project(&store, limit),
+        Commands::WakeUp {
+            project,
+            max_tokens,
+            format,
+            no_preferences,
+        } => cmd_wake_up(&store, project, max_tokens, format, no_preferences),
         Commands::SaveProject {
             content,
             importance,
@@ -2575,6 +2620,45 @@ fn cmd_recall_project(store: &SqliteStore, limit: usize) -> Result<()> {
     } else {
         print!("{ctx}");
     }
+    Ok(())
+}
+
+/// Build and print a wake-up pack for LLM system-prompt injection.
+///
+/// Selects critical/high memories (plus preferences) optionally scoped to a
+/// project, ranks by importance × recency × weight, and truncates to fit the
+/// token budget.
+fn cmd_wake_up(
+    store: &SqliteStore,
+    project: Option<String>,
+    max_tokens: usize,
+    format: CliWakeUpFormat,
+    no_preferences: bool,
+) -> Result<()> {
+    // Resolve project: explicit "-" disables, None auto-detects, Some(name) uses it.
+    let detected;
+    let project_ref: Option<&str> = match project.as_deref() {
+        Some("-") => None,
+        Some(p) => Some(p),
+        None => {
+            detected = detect_project();
+            if detected.is_empty() || detected == "unknown" {
+                None
+            } else {
+                Some(detected.as_str())
+            }
+        }
+    };
+
+    let opts = WakeUpOptions {
+        project: project_ref,
+        max_tokens,
+        format: format.into(),
+        include_preferences: !no_preferences,
+    };
+
+    let pack = build_wake_up(store, &opts)?;
+    print!("{pack}");
     Ok(())
 }
 

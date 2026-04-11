@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.16](https://github.com/rtk-ai/icm/compare/icm-v0.10.15...icm-v0.10.16) (2026-04-11)
+
+
+### Features
+
+* add SessionStart Claude Code hook that injects wake-up pack ([#86](https://github.com/rtk-ai/icm/issues/86)) ([23692e2](https://github.com/rtk-ai/icm/commit/23692e2caebb9f27bb06655a739e04c3e6e785ac))
+
 ## [0.10.15](https://github.com/rtk-ai/icm/compare/icm-v0.10.14...icm-v0.10.15) (2026-04-11)
 
 

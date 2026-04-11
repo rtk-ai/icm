@@ -637,7 +637,12 @@ pub fn call_tool(
 // ---------------------------------------------------------------------------
 
 fn tool_wake_up(store: &SqliteStore, args: &Value) -> ToolResult {
-    let project = get_str(args, "project");
+    // Normalize the project filter: empty string or "-" both mean "disabled",
+    // mirroring the CLI convention.
+    let project = match get_str(args, "project") {
+        Some("") | Some("-") => None,
+        other => other,
+    };
     // Clamp token budget to [20, 4000] to guard against accidental blowups.
     let max_tokens = get_i64(args, "max_tokens", 200).clamp(20, 4000) as usize;
     let format = match get_str(args, "format").unwrap_or("markdown") {

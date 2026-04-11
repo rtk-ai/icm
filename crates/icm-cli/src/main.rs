@@ -2645,6 +2645,9 @@ fn cmd_wake_up(
             if detected.is_empty() || detected == "unknown" {
                 None
             } else {
+                // Make auto-detection visible so users understand why
+                // specific topics show (or don't).
+                eprintln!("Project: {detected} (auto-detected; use --project - to disable)");
                 Some(detected.as_str())
             }
         }

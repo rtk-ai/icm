@@ -100,6 +100,7 @@ pub fn build_wake_up<S: MemoryStore + ?Sized>(
 }
 
 /// Build a wake-up pack from an in-memory list (pure, testable).
+#[must_use]
 pub fn build_wake_up_from_memories(memories: Vec<Memory>, opts: &WakeUpOptions<'_>) -> String {
     let now = Utc::now();
 
@@ -148,8 +149,13 @@ fn is_preference_topic(topic: &str) -> bool {
         || lower.starts_with("user.")
 }
 
-/// Return true if a topic matches the project filter (substring match),
-/// or if the filter is absent.
+/// Return true if a topic matches the project filter, or if the filter is
+/// absent. Matching is **segment-aware**: both the topic and the project
+/// filter are split on `-`, `.`, `_`, `/`, `:` and every project segment must
+/// appear as a complete topic segment (case-insensitive). This avoids false
+/// positives like `"icm"` matching `"icmp-notes"` while still allowing
+/// `"icm"` to match `"decisions-icm-core"` (via the `"icm"` segment) and
+/// `"icm-core"` to match `"decisions-icm-core"` (via both segments).
 fn project_matches(topic: &str, project: Option<&str>) -> bool {
     let Some(proj) = project else {
         return true;
@@ -161,9 +167,24 @@ fn project_matches(topic: &str, project: Option<&str>) -> bool {
     if is_preference_topic(topic) {
         return true;
     }
-    let lower_topic = topic.to_lowercase();
-    let lower_proj = proj.to_lowercase();
-    lower_topic.contains(&lower_proj)
+
+    let is_delim = |c: char| matches!(c, '-' | '.' | '_' | '/' | ':');
+    let topic_segs: Vec<String> = topic
+        .split(is_delim)
+        .map(str::to_lowercase)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let proj_segs: Vec<String> = proj
+        .split(is_delim)
+        .map(str::to_lowercase)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if proj_segs.is_empty() {
+        return true;
+    }
+
+    proj_segs.iter().all(|ps| topic_segs.contains(ps))
 }
 
 fn compute_score(m: &Memory, now: DateTime<Utc>) -> f32 {
@@ -173,7 +194,10 @@ fn compute_score(m: &Memory, now: DateTime<Utc>) -> f32 {
         Importance::Medium => 2.0,
         Importance::Low => 0.5,
     };
-    let days = (now - m.created_at).num_days().max(0) as f32;
+    // Recency is access-aware: use the more recent of created_at and
+    // last_accessed, so memories that are frequently recalled stay fresh.
+    let reference = m.created_at.max(m.last_accessed);
+    let days = (now - reference).num_days().max(0) as f32;
     // Recency factor: 1.0 at day 0, ~0.5 at day 30, ~0.25 at day 90.
     let recency = 1.0 / (1.0 + days / 30.0);
     let stored_weight = m.weight.max(0.01);
@@ -210,12 +234,14 @@ fn categorize(m: &Memory) -> Category {
 
 /// Greedy selection that stops once the accumulated character budget is exceeded.
 /// Always includes at least one memory if any candidate exists.
+/// Counts user-visible characters (not bytes) so multibyte summaries aren't
+/// over-penalized.
 fn truncate_by_budget(candidates: Vec<ScoredMemory>, max_chars: usize) -> Vec<ScoredMemory> {
     let mut total = 0usize;
     let mut out = Vec::new();
     for c in candidates {
         // Account for bullet prefix + newline.
-        let line_len = c.memory.summary.len().saturating_add(4);
+        let line_len = c.memory.summary.chars().count().saturating_add(4);
         if !out.is_empty() && total.saturating_add(line_len) > max_chars {
             break;
         }
@@ -225,8 +251,33 @@ fn truncate_by_budget(candidates: Vec<ScoredMemory>, max_chars: usize) -> Vec<Sc
     out
 }
 
+/// Approximate token count for a rendered body: `chars / 4`, rounded up.
+/// Uses characters (not bytes) so the displayed count is honest for non-ASCII.
 fn approx_tokens(s: &str) -> usize {
-    s.len().div_ceil(4)
+    s.chars().count().div_ceil(4)
+}
+
+/// Flatten a summary into a single-line safe string: trim surrounding space,
+/// replace newlines with spaces so an embedded heading can't break section
+/// structure in the rendered Markdown.
+fn sanitize_summary(summary: &str) -> String {
+    let flattened: String = summary
+        .trim()
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    // Collapse runs of spaces that result from the flattening.
+    let mut out = String::with_capacity(flattened.len());
+    let mut prev_space = false;
+    for c in flattened.chars() {
+        let is_space = c == ' ';
+        if is_space && prev_space {
+            continue;
+        }
+        out.push(c);
+        prev_space = is_space;
+    }
+    out
 }
 
 fn render(selected: &[ScoredMemory], opts: &WakeUpOptions<'_>) -> String {
@@ -282,22 +333,21 @@ fn render_body(selected: &[ScoredMemory], format: WakeUpFormat) -> String {
             WakeUpFormat::Markdown => {
                 out.push_str(&format!("## {}\n", cat.label()));
                 for s in &group {
-                    out.push_str(&format!("- {}\n", s.memory.summary.trim()));
+                    out.push_str(&format!("- {}\n", sanitize_summary(&s.memory.summary)));
                 }
                 out.push('\n');
             }
             WakeUpFormat::Plain => {
                 out.push_str(&format!("[{}]\n", cat.label()));
                 for s in &group {
-                    out.push_str(&format!("- {}\n", s.memory.summary.trim()));
+                    out.push_str(&format!("- {}\n", sanitize_summary(&s.memory.summary)));
                 }
                 out.push('\n');
             }
         }
     }
-    // Sort the categories output (we iterate in `all_ordered` already).
-    // Ensure we don't end with multiple blank lines.
-    while out.ends_with("\n\n\n") {
+    // Collapse trailing blank lines to a single newline.
+    while out.ends_with("\n\n") {
         out.pop();
     }
     out
@@ -489,10 +539,147 @@ mod tests {
     }
 
     #[test]
-    fn project_matches_substring() {
+    fn project_matches_segment_aware() {
+        // Positive: exact segment across various separators
         assert!(project_matches("decisions-icm", Some("icm")));
         assert!(project_matches("context-icm-core", Some("icm")));
+        assert!(project_matches("icm.decisions", Some("icm")));
+        assert!(project_matches("project:icm/notes", Some("icm")));
+        assert!(project_matches("icm_errors", Some("icm")));
+
+        // Positive: multi-segment project filter where all segments appear
+        assert!(project_matches("decisions-icm-core", Some("icm-core")));
+        assert!(project_matches("context.icm.core", Some("icm.core")));
+
+        // Negative: unrelated
         assert!(!project_matches("decisions-ramiga", Some("icm")));
+
+        // Negative: substring that would have matched under a naive
+        // contains() impl but is not a real segment.
+        assert!(
+            !project_matches("icmp-notes", Some("icm")),
+            "icmp should not match icm"
+        );
+        assert!(
+            !project_matches("picm-rules", Some("icm")),
+            "picm should not match icm"
+        );
+
+        // Negative: multi-segment project with one missing segment
+        assert!(
+            !project_matches("decisions-icm", Some("icm-core")),
+            "icm-core should not match plain decisions-icm"
+        );
+
+        // None filter → pass all
         assert!(project_matches("anything", None));
+        // Empty filter → pass all
+        assert!(project_matches("anything", Some("")));
+    }
+
+    #[test]
+    fn include_preferences_false_drops_preference_memories() {
+        let memories = vec![
+            mem("decisions-icm", "Critical decision", Importance::Critical),
+            mem("preferences", "User prefers French", Importance::Medium),
+        ];
+        let opts = WakeUpOptions {
+            include_preferences: false,
+            ..Default::default()
+        };
+        let pack = build_wake_up_from_memories(memories, &opts);
+        assert!(pack.contains("Critical decision"));
+        assert!(!pack.contains("French"), "preferences should be excluded");
+        assert!(!pack.contains("## Identity"));
+    }
+
+    #[test]
+    fn sanitize_summary_flattens_newlines_and_collapses_spaces() {
+        let input = "  line one\nline two\r\n## injected header  ";
+        let out = sanitize_summary(input);
+        assert_eq!(out, "line one line two ## injected header");
+    }
+
+    #[test]
+    fn renders_without_breaking_on_multiline_summary() {
+        let memories = vec![mem(
+            "decisions-icm",
+            "First line\n## Fake section header\nSecond line",
+            Importance::Critical,
+        )];
+        let pack = build_wake_up_from_memories(memories, &WakeUpOptions::default());
+        // There should be exactly ONE `## ` section header (Critical decisions),
+        // never two from the injected fake header.
+        let header_count = pack.matches("\n## ").count();
+        assert_eq!(
+            header_count, 1,
+            "injected markdown header leaked into render: {pack}"
+        );
+    }
+
+    #[test]
+    fn respects_token_budget_with_multibyte_chars() {
+        // 20 long French summaries with accents (multibyte).
+        let memories: Vec<Memory> = (0..20)
+            .map(|i| {
+                mem(
+                    "decisions-icm",
+                    &format!("Décision numéro {i} très très importante ").repeat(10),
+                    Importance::Critical,
+                )
+            })
+            .collect();
+        let opts = WakeUpOptions {
+            project: Some("icm"),
+            max_tokens: 40,
+            ..Default::default()
+        };
+        let pack = build_wake_up_from_memories(memories, &opts);
+        // Budget is 40 tok ≈ 160 chars; with the header and section label
+        // we expect the body to be bounded under 600 chars.
+        assert!(
+            pack.chars().count() < 600,
+            "char count {} should be bounded",
+            pack.chars().count()
+        );
+    }
+
+    #[test]
+    fn compute_score_uses_last_accessed_when_more_recent() {
+        // Create memory "long ago" then update last_accessed to now.
+        let mut m = mem("decisions-icm", "Old decision", Importance::Critical);
+        let long_ago = Utc::now() - chrono::Duration::days(180);
+        m.created_at = long_ago;
+        m.last_accessed = Utc::now();
+
+        let fresh_score = compute_score(&m, Utc::now());
+
+        // Same memory, never re-accessed.
+        let mut stale = mem("decisions-icm", "Old decision", Importance::Critical);
+        stale.created_at = long_ago;
+        stale.last_accessed = long_ago;
+        let stale_score = compute_score(&stale, Utc::now());
+
+        assert!(
+            fresh_score > stale_score,
+            "recently-accessed memory should outscore stale peer ({fresh_score} vs {stale_score})"
+        );
+    }
+
+    #[test]
+    fn plain_format_omits_header_and_token_count() {
+        let memories = vec![mem("decisions-icm", "Use SQLite", Importance::Critical)];
+        let opts = WakeUpOptions {
+            format: WakeUpFormat::Plain,
+            project: Some("icm"),
+            ..Default::default()
+        };
+        let pack = build_wake_up_from_memories(memories, &opts);
+        assert!(!pack.starts_with("# ICM Wake-up"));
+        assert!(
+            !pack.contains("~"),
+            "plain format should not have token count"
+        );
+        assert!(pack.contains("[Critical decisions]"));
     }
 }

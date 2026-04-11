@@ -2,8 +2,9 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
-    keyword_matches, topic_matches, Concept, ConceptLink, Embedder, Feedback, FeedbackStore, Label,
-    Memoir, MemoirStore, Memory, MemoryStore, Relation, MSG_NO_MEMORIES,
+    build_wake_up, keyword_matches, topic_matches, Concept, ConceptLink, Embedder, Feedback,
+    FeedbackStore, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
+    WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -532,6 +533,37 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "properties": {}
             }
         }),
+        json!({
+            "name": "icm_wake_up",
+            "description": "Build a compact critical-facts pack for LLM system-prompt injection. Selects critical/high memories (and preferences) optionally scoped by project, ranks by importance × recency × weight, and truncates to a token budget. Use at session start to hydrate an agent with the most load-bearing context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project name filter (substring match against topic). Preferences/identity memories are always included."
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "default": 200,
+                        "minimum": 20,
+                        "maximum": 4000,
+                        "description": "Approximate token budget (1 token ≈ 4 characters)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["markdown", "plain"],
+                        "default": "markdown",
+                        "description": "Output format"
+                    },
+                    "include_preferences": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Include global preferences/identity memories regardless of the project filter"
+                    }
+                }
+            }
+        }),
     ];
 
     if has_embedder {
@@ -594,7 +626,44 @@ pub fn call_tool(
         "icm_feedback_record" => tool_feedback_record(store, args, compact),
         "icm_feedback_search" => tool_feedback_search(store, args),
         "icm_feedback_stats" => tool_feedback_stats(store),
+        // Wake-up tool
+        "icm_wake_up" => tool_wake_up(store, args),
         _ => ToolResult::error(format!("unknown tool: {name}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wake-up tool handler
+// ---------------------------------------------------------------------------
+
+fn tool_wake_up(store: &SqliteStore, args: &Value) -> ToolResult {
+    // Normalize the project filter: empty string or "-" both mean "disabled",
+    // mirroring the CLI convention.
+    let project = match get_str(args, "project") {
+        Some("") | Some("-") => None,
+        other => other,
+    };
+    // Clamp token budget to [20, 4000] to guard against accidental blowups.
+    let max_tokens = get_i64(args, "max_tokens", 200).clamp(20, 4000) as usize;
+    let format = match get_str(args, "format").unwrap_or("markdown") {
+        "plain" => WakeUpFormat::Plain,
+        _ => WakeUpFormat::Markdown,
+    };
+    let include_preferences = args
+        .get("include_preferences")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let opts = WakeUpOptions {
+        project,
+        max_tokens,
+        format,
+        include_preferences,
+    };
+
+    match build_wake_up(store, &opts) {
+        Ok(pack) => ToolResult::text(pack),
+        Err(e) => ToolResult::error(format!("wake_up failed: {e}")),
     }
 }
 
@@ -2804,5 +2873,184 @@ description = "A test project"
         );
         assert!(result.is_error);
         assert!(result.content[0].text.contains("directory not found"));
+    }
+
+    // ── icm_wake_up ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mcp_wake_up_empty_store() {
+        let store = test_store();
+        let result = call_tool(&store, None, "icm_wake_up", &json!({}), false);
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("no critical memories"));
+    }
+
+    #[test]
+    fn test_mcp_wake_up_filters_and_renders() {
+        let store = test_store();
+        // Seed: 1 critical decision, 1 low-importance (should be filtered), 1 preference
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "decisions-icm",
+                "content": "Use SQLite with FTS5 for hybrid search",
+                "importance": "critical"
+            }),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "noise",
+                "content": "This is low-importance noise",
+                "importance": "low"
+            }),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "preferences",
+                "content": "User prefers French responses",
+                "importance": "medium"
+            }),
+            false,
+        );
+
+        let result = call_tool(&store, None, "icm_wake_up", &json!({}), false);
+        assert!(!result.is_error);
+        let text = &result.content[0].text;
+        assert!(text.contains("SQLite"), "decision missing: {text}");
+        assert!(text.contains("French"), "preference missing: {text}");
+        assert!(
+            !text.contains("noise"),
+            "low-imp should be filtered: {text}"
+        );
+        assert!(text.contains("## Identity"));
+        assert!(text.contains("## Critical decisions"));
+    }
+
+    #[test]
+    fn test_mcp_wake_up_project_filter() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "decisions-icm",
+                "content": "ICM uses multilingual embeddings",
+                "importance": "critical"
+            }),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "decisions-grit",
+                "content": "GRIT uses AST-level locks",
+                "importance": "critical"
+            }),
+            false,
+        );
+
+        let result = call_tool(
+            &store,
+            None,
+            "icm_wake_up",
+            &json!({"project": "icm"}),
+            false,
+        );
+        assert!(!result.is_error);
+        let text = &result.content[0].text;
+        assert!(text.contains("ICM uses"));
+        assert!(!text.contains("GRIT uses"), "project filter leaked: {text}");
+        assert!(text.contains("project: icm"));
+    }
+
+    #[test]
+    fn test_mcp_wake_up_plain_format() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "decisions-icm",
+                "content": "Use SQLite",
+                "importance": "critical"
+            }),
+            false,
+        );
+        let result = call_tool(
+            &store,
+            None,
+            "icm_wake_up",
+            &json!({"format": "plain"}),
+            false,
+        );
+        assert!(!result.is_error);
+        let text = &result.content[0].text;
+        assert!(text.contains("[Critical decisions]"));
+        assert!(!text.contains("## Critical"));
+    }
+
+    #[test]
+    fn test_mcp_wake_up_clamps_max_tokens() {
+        let store = test_store();
+        // Budget out of range: should clamp to [20, 4000]
+        let result = call_tool(
+            &store,
+            None,
+            "icm_wake_up",
+            &json!({"max_tokens": 999999}),
+            false,
+        );
+        assert!(!result.is_error, "should not error on huge budget");
+    }
+
+    #[test]
+    fn test_mcp_wake_up_exclude_preferences() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "preferences",
+                "content": "User prefers French",
+                "importance": "medium"
+            }),
+            false,
+        );
+        let result = call_tool(
+            &store,
+            None,
+            "icm_wake_up",
+            &json!({"include_preferences": false}),
+            false,
+        );
+        assert!(!result.is_error);
+        // With preferences excluded and nothing else critical, pack should say no memories
+        assert!(result.content[0].text.contains("no critical memories"));
+    }
+
+    #[test]
+    fn test_mcp_wake_up_appears_in_tools_list() {
+        let defs = tool_definitions(false);
+        let tools = defs.get("tools").and_then(|v| v.as_array()).unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"icm_wake_up"), "tool not listed: {names:?}");
     }
 }

@@ -280,10 +280,16 @@ fn sanitize_summary(summary: &str) -> String {
     out
 }
 
+/// Placeholder header written by `build_wake_up*` when no critical/high
+/// memories match the options. Exposed as a constant so callers (notably
+/// the SessionStart hook) can detect the empty case without coupling to
+/// the exact wording of the body.
+pub const EMPTY_PACK_HEADER: &str = "# ICM Wake-up (empty)";
+
 fn render(selected: &[ScoredMemory], opts: &WakeUpOptions<'_>) -> String {
     if selected.is_empty() {
-        return String::from(
-            "# ICM Wake-up\n\n(no critical memories yet — use `icm store` to seed)\n",
+        return format!(
+            "{EMPTY_PACK_HEADER}\n\n(no critical memories yet — use `icm store` to seed)\n"
         );
     }
 

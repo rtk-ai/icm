@@ -408,6 +408,12 @@ enum HookCommands {
     Compact,
     /// UserPromptSubmit hook: inject recalled context at the start of each prompt
     Prompt,
+    /// SessionStart hook: inject a wake-up pack of critical facts into the session
+    Start {
+        /// Approximate token budget for the wake-up pack
+        #[arg(long, default_value = "200")]
+        max_tokens: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1019,6 +1025,7 @@ fn main() -> Result<()> {
             }
             HookCommands::Compact => cmd_hook_compact(&store),
             HookCommands::Prompt => cmd_hook_prompt(&store),
+            HookCommands::Start { max_tokens } => cmd_hook_start(&store, max_tokens),
         },
         #[cfg(feature = "tui")]
         Commands::Dashboard => {
@@ -1631,6 +1638,95 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
+/// SessionStart hook (Layer 0): inject a wake-up pack of critical memories at
+/// session start. Reads `cwd` from the Claude Code hook JSON to auto-detect
+/// the project, builds the pack via `build_wake_up`, and writes it to stdout.
+///
+/// Claude Code injects stdout from SessionStart hooks as additional system
+/// context for the session. If the pack is empty (no critical memories), we
+/// write nothing so the session starts unchanged.
+///
+/// **Trust boundary**: the pack content is drawn from the user's own ICM
+/// store and auto-injected into the session without user confirmation.
+/// Summaries are sanitized (newlines flattened in `wake_up::sanitize_summary`)
+/// but backticks / code fences / prompt-injection markers are NOT escaped.
+/// This is acceptable because ICM memories are user-authored — the user is
+/// the only party who can influence the injected content.
+///
+/// Set `ICM_HOOK_DEBUG=1` in the environment to get stderr diagnostics when
+/// the hook decides to suppress output (empty store, no matching memories).
+fn cmd_hook_start(store: &SqliteStore, max_tokens: usize) -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+
+    let pack = build_hook_start_pack(store, &input, max_tokens)?;
+    if pack.is_empty() {
+        if std::env::var("ICM_HOOK_DEBUG").is_ok() {
+            eprintln!("[icm hook start] suppressed (empty store or no matching memories)");
+        }
+        return Ok(());
+    }
+    print!("{pack}");
+    Ok(())
+}
+
+/// Build the SessionStart wake-up pack from hook stdin + store. Pure helper
+/// for unit testing: no I/O beyond the store query.
+///
+/// Returns the pack as a String, or an empty string if there is nothing
+/// meaningful to inject (empty store, or placeholder output).
+fn build_hook_start_pack(
+    store: &SqliteStore,
+    stdin_json: &str,
+    max_tokens: usize,
+) -> Result<String> {
+    // Tolerate missing/malformed stdin — fall back to PWD-based detection.
+    let cwd: Option<String> = serde_json::from_str::<Value>(stdin_json)
+        .ok()
+        .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(String::from));
+
+    let project_name = match cwd.as_deref() {
+        Some(path) if !path.is_empty() => project_from_path(path),
+        _ => {
+            let detected = detect_project();
+            if detected.is_empty() || detected == "unknown" {
+                None
+            } else {
+                Some(detected)
+            }
+        }
+    };
+
+    let opts = icm_core::WakeUpOptions {
+        project: project_name.as_deref(),
+        max_tokens,
+        format: icm_core::WakeUpFormat::Markdown,
+        include_preferences: true,
+    };
+
+    let pack = icm_core::build_wake_up(store, &opts)?;
+
+    // If the store is empty, skip injecting the placeholder output into the
+    // session — let the user start clean. We detect the empty case via the
+    // exported header constant, not substring matching the body, to stay
+    // decoupled from the exact wording in `icm_core::wake_up::render()`.
+    if pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER) {
+        return Ok(String::new());
+    }
+
+    Ok(pack)
+}
+
+/// Extract a project name from a filesystem path (basename), treating empty
+/// or root paths as "no project".
+fn project_from_path(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty() && s != "/")
+}
+
 fn cmd_topics(store: &SqliteStore) -> Result<()> {
     let topics = store.list_topics()?;
     if topics.is_empty() {
@@ -2032,6 +2128,17 @@ Do this BEFORE responding to the user. Not optional.
             &["icm hook", "icm-post-tool"],
         )?;
         println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
+
+        // SessionStart hook: `icm hook start` (inject wake-up pack of critical facts)
+        let start_cmd = format!("{} hook start", icm_bin_str);
+        let start_status = inject_claude_hook(
+            &claude_settings_path,
+            "SessionStart",
+            &start_cmd,
+            None,
+            &["icm hook start", "icm hook", "icm-post-tool"],
+        )?;
+        println!("[hook] Claude Code SessionStart (wake-up pack): {start_status}");
 
         // OpenCode plugin: install TS plugin using native @opencode-ai/plugin SDK
         let opencode_plugins_dir = PathBuf::from(&home).join(".config/opencode/plugins");
@@ -4422,5 +4529,175 @@ fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
             eprintln!("Pulled {} memories from cloud (scope: {})", imported, scope);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod hook_start_tests {
+    use super::*;
+    use icm_core::Importance;
+
+    fn seed_store() -> SqliteStore {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "decisions-icm".into(),
+                "Use SQLite with FTS5 and sqlite-vec".into(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "decisions-other".into(),
+                "OTHER project uses Postgres".into(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "preferences".into(),
+                "User prefers French responses".into(),
+                Importance::High,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "low-noise".into(),
+                "Irrelevant low-importance trivia".into(),
+                Importance::Low,
+            ))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn project_from_path_extracts_basename() {
+        assert_eq!(
+            project_from_path("/Users/patrick/dev/rtk-ai/icm"),
+            Some("icm".into())
+        );
+        assert_eq!(
+            project_from_path("/tmp/my-project"),
+            Some("my-project".into())
+        );
+        assert_eq!(project_from_path(""), None);
+    }
+
+    #[test]
+    fn hook_start_pack_scopes_to_cwd_project() {
+        let store = seed_store();
+        let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm","session_id":"abc"}"#;
+        let pack = build_hook_start_pack(&store, stdin_json, 200).unwrap();
+        assert!(pack.contains("SQLite"), "icm decision missing: {pack}");
+        assert!(pack.contains("French"), "preference missing: {pack}");
+        assert!(
+            !pack.contains("Postgres"),
+            "other project leaked into icm session: {pack}"
+        );
+        assert!(pack.contains("project: icm"));
+    }
+
+    #[test]
+    fn hook_start_pack_empty_on_empty_store() {
+        let store = SqliteStore::in_memory().unwrap();
+        let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm"}"#;
+        let pack = build_hook_start_pack(&store, stdin_json, 200).unwrap();
+        assert!(
+            pack.is_empty(),
+            "expected empty pack for empty store, got: {pack}"
+        );
+    }
+
+    #[test]
+    fn hook_start_pack_tolerates_malformed_stdin() {
+        let store = seed_store();
+        // Not JSON at all — should fall back to project auto-detection or None
+        let pack = build_hook_start_pack(&store, "garbage not json", 200).unwrap();
+        // Either it auto-detected nothing (then all memories pass) or auto-detected a
+        // real repo name — either way, must not panic and must produce valid output.
+        assert!(!pack.is_empty());
+        assert!(pack.starts_with("# ICM Wake-up"));
+    }
+
+    #[test]
+    fn hook_start_pack_tolerates_missing_cwd_field() {
+        let store = seed_store();
+        let stdin_json = r#"{"session_id":"abc","transcript_path":"/tmp/t.jsonl"}"#;
+        let pack = build_hook_start_pack(&store, stdin_json, 200).unwrap();
+        // No cwd → falls back to detect_project() which will use current test
+        // process PWD. We don't assert on the specific project but we do verify
+        // the call doesn't fail and we get some output.
+        assert!(pack.starts_with("# ICM Wake-up"));
+    }
+
+    #[test]
+    fn hook_start_pack_respects_token_budget() {
+        let store = SqliteStore::in_memory().unwrap();
+        for i in 0..50 {
+            store
+                .store(Memory::new(
+                    "decisions-icm".into(),
+                    format!("Critical decision {i} with a reasonably long description text here"),
+                    Importance::Critical,
+                ))
+                .unwrap();
+        }
+        let stdin_json = r#"{"cwd":"/path/icm"}"#;
+
+        let small = build_hook_start_pack(&store, stdin_json, 50).unwrap();
+        let large = build_hook_start_pack(&store, stdin_json, 500).unwrap();
+
+        assert!(small.len() < large.len(), "budget should shrink output");
+        assert!(
+            small.len() < 500,
+            "50 tok budget should stay under 500 chars"
+        );
+    }
+
+    #[test]
+    fn hook_start_pack_skips_placeholder_output() {
+        let store = SqliteStore::in_memory().unwrap();
+        // Only low-importance noise — wake-up would return the "(no critical
+        // memories yet ...)" placeholder, which cmd_hook_start should suppress.
+        store
+            .store(Memory::new(
+                "noise".into(),
+                "nothing important".into(),
+                Importance::Low,
+            ))
+            .unwrap();
+        let pack = build_hook_start_pack(&store, r#"{"cwd":"/p/x"}"#, 200).unwrap();
+        assert!(
+            pack.is_empty(),
+            "placeholder output should be suppressed to keep session clean: {pack}"
+        );
+    }
+
+    #[test]
+    fn hook_start_placeholder_detection_uses_exported_header() {
+        // Regression guard: build an empty wake-up pack via icm_core and
+        // assert it starts with the header that cmd_hook_start checks. If
+        // someone reformats the placeholder in wake_up.rs, this test fails
+        // and forces an update rather than silently breaking suppression.
+        let empty_pack =
+            icm_core::build_wake_up_from_memories(Vec::new(), &icm_core::WakeUpOptions::default());
+        assert!(
+            empty_pack.starts_with(icm_core::EMPTY_PACK_HEADER),
+            "empty wake-up pack no longer starts with EMPTY_PACK_HEADER — \
+             update the constant or adjust suppression logic: {empty_pack}"
+        );
+    }
+
+    #[test]
+    fn hook_start_pack_with_empty_cwd_string_falls_back() {
+        let store = seed_store();
+        // Edge case: cwd present but empty string — should fall through to
+        // detect_project() rather than matching "" against topics.
+        let stdin_json = r#"{"cwd":""}"#;
+        let pack = build_hook_start_pack(&store, stdin_json, 200).unwrap();
+        // We don't assert on which project was picked; we just require the
+        // call does not panic and returns a valid, non-empty pack.
+        assert!(!pack.is_empty());
+        assert!(pack.starts_with("# ICM Wake-up"));
     }
 }

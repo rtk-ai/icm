@@ -26,7 +26,9 @@ pub use memory::{
     Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
 };
 pub use store::MemoryStore;
-pub use wake_up::{build_wake_up, build_wake_up_from_memories, WakeUpFormat, WakeUpOptions};
+pub use wake_up::{
+    build_wake_up, build_wake_up_from_memories, WakeUpFormat, WakeUpOptions, EMPTY_PACK_HEADER,
+};
 
 pub use learn::{learn_project, LearnResult};
 

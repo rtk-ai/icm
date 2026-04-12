@@ -16,6 +16,7 @@ path = "src/main.rs"
 default = ["embeddings", "tui"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
 tui = ["dep:ratatui", "dep:crossterm"]
+web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess", "dep:getrandom"]
 vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
@@ -36,6 +37,12 @@ ureq = { workspace = true }
 rpassword = { workspace = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+rust-embed = { workspace = true, optional = true }
+mime_guess = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -8,6 +8,8 @@ mod import;
 mod learn_tests;
 #[cfg(feature = "tui")]
 mod tui;
+#[cfg(feature = "web")]
+mod web;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -376,6 +378,11 @@ enum Commands {
         /// Compact output mode (shorter responses to save tokens)
         #[arg(long)]
         compact: bool,
+
+        /// Launch web dashboard instead of MCP stdio server
+        #[cfg(feature = "web")]
+        #[arg(long)]
+        expose: bool,
     },
 
     /// Claude Code hook handlers (read JSON from stdin, output hook response)
@@ -1004,7 +1011,22 @@ fn main() -> Result<()> {
             verbose,
         } => cmd_bench_agent(sessions, &model, runs, verbose),
         Commands::Cloud { command } => cmd_cloud(command, &store),
-        Commands::Serve { compact } => {
+        Commands::Serve {
+            compact,
+            #[cfg(feature = "web")]
+            expose,
+        } => {
+            #[cfg(feature = "web")]
+            if expose {
+                let password = web::resolve_password(&cfg.web)?;
+                return web::run_web_server(
+                    store,
+                    &cfg.web.host,
+                    cfg.web.port,
+                    cfg.web.username.clone(),
+                    password,
+                );
+            }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]

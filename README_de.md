@@ -67,24 +67,27 @@ cargo install --path crates/icm-cli
 icm init
 ```
 
-Konfiguriert **14 Tools** mit einem einzigen Befehl:
+Konfiguriert **17 Tools** mit einem einzigen Befehl ([vollständige Integrationsanleitung](docs/integrations.md)):
 
-| Tool | Konfigurationsdatei | Format |
-|------|---------------------|--------|
-| Claude Code | `~/.claude.json` | JSON |
-| Claude Desktop | `~/Library/.../claude_desktop_config.json` | JSON |
-| Cursor | `~/.cursor/mcp.json` | JSON |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON |
-| VS Code / Copilot | `~/Library/.../Code/User/mcp.json` | JSON |
-| Gemini Code Assist | `~/.gemini/settings.json` | JSON |
-| Zed | `~/.zed/settings.json` | JSON |
-| Amp | `~/.config/amp/settings.json` | JSON |
-| Amazon Q | `~/.aws/amazonq/mcp.json` | JSON |
-| Cline | VS Code globalStorage | JSON |
-| Roo Code | VS Code globalStorage | JSON |
-| Kilo Code | VS Code globalStorage | JSON |
-| OpenAI Codex CLI | `~/.codex/config.toml` | TOML |
-| OpenCode | `~/.config/opencode/opencode.json` | JSON |
+| Tool | MCP | Hooks | CLI | Skills |
+|------|:---:|:-----:|:---:|:------:|
+| Claude Code | `~/.claude.json` | 5 Hooks | `CLAUDE.md` | `/recall` `/remember` |
+| Claude Desktop | JSON | — | — | — |
+| Gemini CLI | `~/.gemini/settings.json` | 5 Hooks | `GEMINI.md` | — |
+| Codex CLI | `~/.codex/config.toml` | 4 Hooks | `AGENTS.md` | — |
+| Copilot CLI | `~/.copilot/mcp-config.json` | 4 Hooks | `.github/copilot-instructions.md` | — |
+| Cursor | `~/.cursor/mcp.json` | — | — | `.mdc`-Regel |
+| Windsurf | JSON | — | `.windsurfrules` | — |
+| VS Code | `~/Library/.../Code/User/mcp.json` | — | — | — |
+| Amp | JSON | — | — | `/icm-recall` `/icm-remember` |
+| Amazon Q | JSON | — | — | — |
+| Cline | VS Code globalStorage | — | — | — |
+| Roo Code | VS Code globalStorage | — | — | `.md`-Regel |
+| Kilo Code | VS Code globalStorage | — | — | — |
+| Zed | `~/.zed/settings.json` | — | — | — |
+| OpenCode | JSON | TS-Plugin | — | — |
+| Continue.dev | `~/.continue/config.yaml` | — | — | — |
+| Aider | — | — | `.aider.conventions.md` | — |
 
 Oder manuell:
 
@@ -106,30 +109,31 @@ icm init --mode skill
 
 Installiert Slash-Befehle und Regeln für Claude Code (`/recall`, `/remember`), Cursor (`.mdc`-Regel), Roo Code (`.md`-Regel) und Amp (`/icm-recall`, `/icm-remember`).
 
-### Hooks (Claude Code)
+### Hooks (5 Tools)
 
 ```bash
 icm init --mode hook
 ```
 
-Installiert alle 3 Extraktionsebenen als Claude Code Hooks:
+Installiert Auto-Extraktions- und Auto-Abruf-Hooks für alle unterstützten Tools:
 
-**Claude Code** Hooks:
+| Tool | SessionStart | PreTool | PostTool | Compact | PromptRecall | Config |
+|------|:-----------:|:-------:|:--------:|:-------:|:------------:|--------|
+| Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
+| Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
+| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.codex/hooks.json` |
+| Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
+| OpenCode | session start | — | tool extract | compaction | — | `~/.config/opencode/plugins/icm.ts` |
 
-| Hook | Ereignis | Funktion |
-|------|----------|----------|
-| `icm hook pre` | PreToolUse | `icm` CLI-Befehle automatisch erlauben (keine Berechtigungsabfrage) |
-| `icm hook post` | PostToolUse | Fakten aus Tool-Ausgaben alle 15 Aufrufe extrahieren |
-| `icm hook compact` | PreCompact | Erinnerungen aus Transkript vor der Kontextkomprimierung extrahieren |
-| `icm hook prompt` | UserPromptSubmit | Abgerufenen Kontext am Anfang jeder Eingabe einfügen |
+**Was jeder Hook macht:**
 
-**OpenCode** Plugin (automatisch installiert nach `~/.config/opencode/plugins/icm.js`):
-
-| OpenCode-Ereignis | ICM-Ebene | Funktion |
-|-------------------|-----------|----------|
-| `tool.execute.after` | Layer 0 | Fakten aus Tool-Ausgaben extrahieren |
-| `experimental.session.compacting` | Layer 1 | Aus Konversation vor der Komprimierung extrahieren |
-| `session.created` | Layer 2 | Kontext beim Sitzungsstart abrufen |
+| Hook | Funktion |
+|------|----------|
+| `icm hook start` | Injiziert ein Startpaket mit kritischen/wichtigen Erinnerungen bei Sitzungsbeginn (~500 Tokens) |
+| `icm hook pre` | `icm` CLI-Befehle automatisch erlauben (keine Berechtigungsabfrage) |
+| `icm hook post` | Fakten aus Tool-Ausgaben alle N Aufrufe extrahieren (Auto-Extraktion) |
+| `icm hook compact` | Erinnerungen aus Transkript vor der Kontextkomprimierung extrahieren |
+| `icm hook prompt` | Abgerufenen Kontext am Anfang jeder Benutzereingabe einfügen |
 
 ## CLI vs MCP
 
@@ -140,7 +144,7 @@ ICM kann über die CLI (`icm`-Befehle) oder den MCP-Server (`icm serve`) verwend
 | **Latenz** | ~30ms (direkte Binärdatei) | ~50ms (JSON-RPC stdio) |
 | **Token-Kosten** | 0 (hook-basiert, unsichtbar) | ~20-50 Tokens/Aufruf (Tool-Schema) |
 | **Einrichtung** | `icm init --mode hook` | `icm init --mode mcp` |
-| **Kompatibel mit** | Claude Code, OpenCode (über Hooks/Plugins) | Allen 14 MCP-kompatiblen Tools |
+| **Kompatibel mit** | Claude Code, Gemini, Codex, Copilot, OpenCode (über Hooks) | Allen 17 MCP-kompatiblen Tools |
 | **Auto-Extraktion** | Ja (Hooks lösen `icm extract` aus) | Ja (MCP-Tools rufen store auf) |
 | **Geeignet für** | Power-User, Token-Einsparung | Universelle Kompatibilität |
 
@@ -441,10 +445,50 @@ Alle Benchmarks verwenden **echte API-Aufrufe** — keine Mocks, keine simuliert
 - **Wissenserhalt**: Verwendet ein fiktives technisches Dokument (das „Meridian Protocol"). Bewertet Antworten durch Schlüsselwortabgleich mit erwarteten Fakten. 120s Zeitlimit pro Aufruf.
 - **Isolation**: Jeder Lauf verwendet ein eigenes temporäres Verzeichnis und eine frische SQLite-Datenbank. Keine Sitzungspersistenz.
 
+### Einheitliches Multi-Agenten-Gedächtnis
+
+Alle 17 Tools teilen dieselbe SQLite-Datenbank. Eine von Claude gespeicherte Erinnerung ist sofort für Gemini, Codex, Copilot, Cursor und jedes andere Tool verfügbar.
+
+```
+ICM Multi-Agent Efficiency Benchmark (10 seeded facts, 5 CLI agents)
+╔══════════════╦═══════╦══════════╦════════╦═══════════╦═══════╗
+║ Agent        ║ Facts ║ Accuracy ║ Detail ║ Latency   ║ Score ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ Claude Code  ║ 10/10 ║   100%   ║  5/5   ║    ~15s   ║   99  ║
+║ Gemini CLI   ║ 10/10 ║   100%   ║  5/5   ║    ~33s   ║   94  ║
+║ Copilot CLI  ║ 10/10 ║   100%   ║  5/5   ║    ~10s   ║  100  ║
+║ Cursor Agent ║ 10/10 ║   100%   ║  5/5   ║    ~16s   ║   99  ║
+║ Aider        ║ 10/10 ║   100%   ║  5/5   ║     ~5s   ║  100  ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ AVERAGE      ║       ║          ║        ║           ║   98  ║
+╚══════════════╩═══════╩══════════╩════════╩═══════════╩═══════╝
+```
+
+Score = 60% Abruf-Genauigkeit + 30% Faktendetail + 10% Geschwindigkeit. **98% Multi-Agenten-Effizienz.**
+
+## Warum ICM
+
+| Fähigkeit | ICM | Mem0 | Engram | AgentMemory |
+|-----------|:---:|:----:|:------:|:-----------:|
+| Tool-Unterstützung | **17** | Nur SDK | ~6-8 | ~10 |
+| Ein-Befehl-Einrichtung | `icm init` | manuelles SDK | manuell | manuell |
+| Hooks (Auto-Abruf beim Start) | 5 Tools | keine | über MCP | 1 Tool |
+| Hybridsuche (FTS5 + Vektor) | 30/70 gewichtet | nur Vektor | nur FTS5 | FTS5+Vektor |
+| Mehrsprachige Embeddings | 100+ Sprachen (768d) | abhängig | keine | Englisch 384d |
+| Wissensgraph | Memoir-System | keiner | keiner | keiner |
+| Zeitlicher Verfall + Konsolidierung | zugriffsbewusst | keiner | einfach | einfach |
+| TUI-Dashboard | `icm dashboard` | keines | ja | Web-Viewer |
+| Auto-Extraktion aus Tool-Ausgaben | 3 Ebenen, kein LLM | keine | keine | keine |
+| Feedback-/Korrekturschleife | `icm_feedback_*` | keine | keine | keine |
+| Laufzeit | Einzelne Rust-Binärdatei | Python | Go | Node.js |
+| Local-first, keine Abhängigkeiten | SQLite-Datei | cloud-first | SQLite | SQLite |
+| Multi-Agenten-Abrufgenauigkeit | **98%** | N/A | N/A | 95,2% |
+
 ## Dokumentation
 
 | Dokument | Beschreibung |
 |----------|--------------|
+| [Integrationsanleitung](docs/integrations.md) | Einrichtung für alle 17 Tools: Claude Code, Copilot, Cursor, Windsurf, Zed, Amp, usw. |
 | [Technische Architektur](docs/architecture.md) | Crate-Struktur, Such-Pipeline, Verfallsmodell, sqlite-vec-Integration, Tests |
 | [Benutzerhandbuch](docs/guide.md) | Installation, Themenorganisation, Konsolidierung, Extraktion, Fehlerbehebung |
 | [Produktübersicht](docs/product.md) | Anwendungsfälle, Benchmarks, Vergleich mit Alternativen |

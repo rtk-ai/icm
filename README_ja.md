@@ -67,24 +67,27 @@ cargo install --path crates/icm-cli
 icm init
 ```
 
-1つのコマンドで **14のツール** を設定します:
+1つのコマンドで **17のツール** を設定します（[完全な統合ガイド](docs/integrations.md)）:
 
-| ツール | 設定ファイル | フォーマット |
-|--------|------------|--------|
-| Claude Code | `~/.claude.json` | JSON |
-| Claude Desktop | `~/Library/.../claude_desktop_config.json` | JSON |
-| Cursor | `~/.cursor/mcp.json` | JSON |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON |
-| VS Code / Copilot | `~/Library/.../Code/User/mcp.json` | JSON |
-| Gemini Code Assist | `~/.gemini/settings.json` | JSON |
-| Zed | `~/.zed/settings.json` | JSON |
-| Amp | `~/.config/amp/settings.json` | JSON |
-| Amazon Q | `~/.aws/amazonq/mcp.json` | JSON |
-| Cline | VS Code globalStorage | JSON |
-| Roo Code | VS Code globalStorage | JSON |
-| Kilo Code | VS Code globalStorage | JSON |
-| OpenAI Codex CLI | `~/.codex/config.toml` | TOML |
-| OpenCode | `~/.config/opencode/opencode.json` | JSON |
+| ツール | MCP | フック | CLI | スキル |
+|--------|:---:|:-----:|:---:|:------:|
+| Claude Code | `~/.claude.json` | 5フック | `CLAUDE.md` | `/recall` `/remember` |
+| Claude Desktop | JSON | — | — | — |
+| Gemini CLI | `~/.gemini/settings.json` | 5フック | `GEMINI.md` | — |
+| Codex CLI | `~/.codex/config.toml` | 4フック | `AGENTS.md` | — |
+| Copilot CLI | `~/.copilot/mcp-config.json` | 4フック | `.github/copilot-instructions.md` | — |
+| Cursor | `~/.cursor/mcp.json` | — | — | `.mdc` ルール |
+| Windsurf | JSON | — | `.windsurfrules` | — |
+| VS Code | `~/Library/.../Code/User/mcp.json` | — | — | — |
+| Amp | JSON | — | — | `/icm-recall` `/icm-remember` |
+| Amazon Q | JSON | — | — | — |
+| Cline | VS Code globalStorage | — | — | — |
+| Roo Code | VS Code globalStorage | — | — | `.md` ルール |
+| Kilo Code | VS Code globalStorage | — | — | — |
+| Zed | `~/.zed/settings.json` | — | — | — |
+| OpenCode | JSON | TSプラグイン | — | — |
+| Continue.dev | `~/.continue/config.yaml` | — | — | — |
+| Aider | — | — | `.aider.conventions.md` | — |
 
 または手動で:
 
@@ -106,30 +109,31 @@ icm init --mode skill
 
 Claude Code（`/recall`、`/remember`）、Cursor（`.mdc` ルール）、Roo Code（`.md` ルール）、Amp（`/icm-recall`、`/icm-remember`）用のスラッシュコマンドとルールをインストールします。
 
-### フック（Claude Code）
+### フック（5ツール）
 
 ```bash
 icm init --mode hook
 ```
 
-3つの抽出レイヤーすべてをClaude Codeフックとしてインストールします:
+サポートされているすべてのツールに自動抽出・自動想起フックをインストールします:
 
-**Claude Code** フック:
+| ツール | SessionStart | PreTool | PostTool | Compact | PromptRecall | 設定 |
+|--------|:-----------:|:-------:|:--------:|:-------:|:------------:|--------|
+| Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
+| Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
+| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.codex/hooks.json` |
+| Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
+| OpenCode | セッション開始 | — | ツール抽出 | コンパクション | — | `~/.config/opencode/plugins/icm.ts` |
 
-| フック | イベント | 動作 |
-|--------|-------|-------------|
-| `icm hook pre` | PreToolUse | `icm` CLIコマンドを自動許可（許可プロンプトなし） |
-| `icm hook post` | PostToolUse | 15回のツール呼び出しごとにツール出力からファクトを抽出 |
-| `icm hook compact` | PreCompact | コンテキスト圧縮前にトランスクリプトからメモリを抽出 |
-| `icm hook prompt` | UserPromptSubmit | 各プロンプトの先頭に想起したコンテキストを注入 |
+**各フックの動作:**
 
-**OpenCode** プラグイン（`~/.config/opencode/plugins/icm.js` に自動インストール）:
-
-| OpenCodeイベント | ICMレイヤー | 動作 |
-|---------------|-----------|-------------|
-| `tool.execute.after` | Layer 0 | ツール出力からファクトを抽出 |
-| `experimental.session.compacting` | Layer 1 | 圧縮前に会話から抽出 |
-| `session.created` | Layer 2 | セッション開始時にコンテキストを想起 |
+| フック | 動作 |
+|--------|-------------|
+| `icm hook start` | セッション開始時にcritical/highメモリのウェイクアップパックを注入（約500トークン） |
+| `icm hook pre` | `icm` CLIコマンドを自動許可（許可プロンプトなし） |
+| `icm hook post` | N回のツール呼び出しごとにツール出力からファクトを抽出（自動抽出） |
+| `icm hook compact` | コンテキスト圧縮前にトランスクリプトからメモリを抽出 |
+| `icm hook prompt` | 各ユーザープロンプトの先頭に想起したコンテキストを注入 |
 
 ## CLI vs MCP
 
@@ -140,7 +144,7 @@ ICMはCLI（`icm` コマンド）またはMCPサーバー（`icm serve`）経由
 | **レイテンシ** | ~30ms（直接バイナリ） | ~50ms（JSON-RPC stdio） |
 | **トークンコスト** | 0（フックベース、不可視） | ~20-50トークン/呼び出し（ツールスキーマ） |
 | **セットアップ** | `icm init --mode hook` | `icm init --mode mcp` |
-| **対応ツール** | Claude Code、OpenCode（フック/プラグイン経由） | MCP対応の全14ツール |
+| **対応ツール** | Claude Code、Gemini、Codex、Copilot、OpenCode（フック経由） | MCP対応の全17ツール |
 | **自動抽出** | あり（フックが `icm extract` を起動） | あり（MCPツールがstoreを呼び出し） |
 | **最適用途** | パワーユーザー、トークン節約 | ユニバーサル互換性 |
 
@@ -440,10 +444,50 @@ qwen2.5:3b             3B       2%       58%       +56%
 - **知識保持**: 架空の技術文書（「Meridian Protocol」）を使用。期待されるファクトに対するキーワードマッチングで回答を採点。呼び出しごとに120秒タイムアウト。
 - **分離**: 各実行は独自のtempdir と新鮮なSQLite DBを使用。セッション持続性なし。
 
+### マルチエージェント統合メモリ
+
+17のツールすべてが同じSQLiteデータベースを共有します。Claudeが保存したメモリは、Gemini、Codex、Copilot、Cursor、その他すべてのツールから即座にアクセスできます。
+
+```
+ICM Multi-Agent Efficiency Benchmark (10 seeded facts, 5 CLI agents)
+╔══════════════╦═══════╦══════════╦════════╦═══════════╦═══════╗
+║ Agent        ║ Facts ║ Accuracy ║ Detail ║ Latency   ║ Score ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ Claude Code  ║ 10/10 ║   100%   ║  5/5   ║    ~15s   ║   99  ║
+║ Gemini CLI   ║ 10/10 ║   100%   ║  5/5   ║    ~33s   ║   94  ║
+║ Copilot CLI  ║ 10/10 ║   100%   ║  5/5   ║    ~10s   ║  100  ║
+║ Cursor Agent ║ 10/10 ║   100%   ║  5/5   ║    ~16s   ║   99  ║
+║ Aider        ║ 10/10 ║   100%   ║  5/5   ║     ~5s   ║  100  ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ AVERAGE      ║       ║          ║        ║           ║   98  ║
+╚══════════════╩═══════╩══════════╩════════╩═══════════╩═══════╝
+```
+
+スコア = 想起精度60% + ファクト詳細度30% + 速度10%。**マルチエージェント効率98%。**
+
+## ICMを選ぶ理由
+
+| 機能 | ICM | Mem0 | Engram | AgentMemory |
+|------|:---:|:----:|:------:|:-----------:|
+| ツールサポート | **17** | SDKのみ | ~6-8 | ~10 |
+| ワンコマンドセットアップ | `icm init` | 手動SDK | 手動 | 手動 |
+| フック（起動時の自動想起） | 5ツール | なし | MCP経由 | 1ツール |
+| ハイブリッド検索（FTS5 + ベクター） | 30/70加重 | ベクターのみ | FTS5のみ | FTS5+ベクター |
+| 多言語埋め込み | 100+言語（768次元） | 依存 | なし | 英語384次元 |
+| ナレッジグラフ | Memoirシステム | なし | なし | なし |
+| 時間的減衰 + 統合 | アクセス考慮型 | なし | 基本的 | 基本的 |
+| TUIダッシュボード | `icm dashboard` | なし | あり | Webビューア |
+| ツール出力からの自動抽出 | 3レイヤー、LLMコストなし | なし | なし | なし |
+| フィードバック/修正ループ | `icm_feedback_*` | なし | なし | なし |
+| ランタイム | Rustシングルバイナリ | Python | Go | Node.js |
+| ローカルファースト、依存関係なし | SQLiteファイル | クラウドファースト | SQLite | SQLite |
+| マルチエージェント想起精度 | **98%** | N/A | N/A | 95.2% |
+
 ## ドキュメント
 
 | ドキュメント | 説明 |
 |----------|-------------|
+| [統合ガイド](docs/integrations.md) | 全17ツールのセットアップ: Claude Code、Copilot、Cursor、Windsurf、Zed、Ampなど |
 | [技術アーキテクチャ](docs/architecture.md) | クレート構造、検索パイプライン、減衰モデル、sqlite-vec統合、テスト |
 | [ユーザーガイド](docs/guide.md) | インストール、トピック整理、統合、抽出、トラブルシューティング |
 | [製品概要](docs/product.md) | ユースケース、ベンチマーク、代替手段との比較 |

@@ -232,7 +232,7 @@ SqliteStore::in_memory() -> IcmResult<Self>                     // for tests
 | `concepts` | regular | Knowledge graph nodes with UNIQUE(memoir_id, name) |
 | `concepts_fts` | FTS5 virtual | Full-text search on concept id, name, definition, labels |
 | `concept_links` | regular | Typed edges with CHECK(source_id != target_id) |
-| `icm_metadata` | regular | Key-value store (embedding_dims, last_decay_at) |
+| `icm_metadata` | regular | Key-value store (embedding_dims, last_decay_at, hook_counter) |
 
 FTS tables are synchronized via AFTER INSERT/UPDATE/DELETE triggers.
 

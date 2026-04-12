@@ -1019,12 +1019,14 @@ fn main() -> Result<()> {
             #[cfg(feature = "web")]
             if expose {
                 let password = web::resolve_password(&cfg.web)?;
+                let config_toml = config::load_config_raw().unwrap_or_default();
                 return web::run_web_server(
                     store,
                     &cfg.web.host,
                     cfg.web.port,
                     cfg.web.username.clone(),
                     password,
+                    config_toml,
                 );
             }
             #[cfg(feature = "embeddings")]

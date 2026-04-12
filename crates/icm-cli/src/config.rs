@@ -228,6 +228,16 @@ pub fn load_config() -> Result<Config> {
     Ok(Config::default())
 }
 
+/// Load the raw TOML content of the config file (for display in the web dashboard).
+pub fn load_config_raw() -> Option<String> {
+    let path = config_path()?;
+    if path.exists() {
+        std::fs::read_to_string(&path).ok()
+    } else {
+        None
+    }
+}
+
 /// Resolve the config file path (cross-platform via `directories`).
 fn config_path() -> Option<PathBuf> {
     // 1. Environment variable

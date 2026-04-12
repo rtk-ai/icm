@@ -1998,8 +1998,7 @@ fn cmd_init(mode: InitMode) -> Result<()> {
 
         // Copilot CLI uses mcpServers key with explicit "type": "local"
         let copilot_path = PathBuf::from(&home).join(".copilot/mcp-config.json");
-        let copilot_status =
-            inject_copilot_cli_mcp_server(&copilot_path, "icm", &icm_bin_str)?;
+        let copilot_status = inject_copilot_cli_mcp_server(&copilot_path, "icm", &icm_bin_str)?;
         println!("[mcp] {:<16} {copilot_status}", "Copilot CLI");
     }
 
@@ -2715,18 +2714,15 @@ fn inject_copilot_cli_mcp_server(
         }
     }
 
-    servers
-        .as_object_mut()
-        .unwrap()
-        .insert(
-            name.to_string(),
-            serde_json::json!({
-                "type": "local",
-                "command": icm_bin,
-                "args": ["serve"],
-                "tools": ["*"]
-            }),
-        );
+    servers.as_object_mut().unwrap().insert(
+        name.to_string(),
+        serde_json::json!({
+            "type": "local",
+            "command": icm_bin,
+            "args": ["serve"],
+            "tools": ["*"]
+        }),
+    );
 
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.23](https://github.com/rtk-ai/icm/compare/icm-v0.10.22...icm-v0.10.23) (2026-04-12)
+
+
+### Bug Fixes
+
+* **upgrade:** refuse to upgrade Homebrew-managed binary ([#105](https://github.com/rtk-ai/icm/issues/105)) ([d6a90e5](https://github.com/rtk-ai/icm/commit/d6a90e53616f39062db48d42804797b79ece049d))
+
 ## [0.10.22](https://github.com/rtk-ai/icm/compare/icm-v0.10.21...icm-v0.10.22) (2026-04-12)
 
 

@@ -113,8 +113,8 @@ async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    // /health is public
-    if req.uri().path() == "/health" {
+    // /_health is public (no auth)
+    if req.uri().path() == "/_health" {
         return next.run(req).await;
     }
 
@@ -192,8 +192,8 @@ fn api_router() -> Router<AppState> {
         // Memoirs
         .route("/api/memoirs", get(api_memoirs))
         .route("/api/memoirs/{id}", get(api_memoir_detail))
-        // Public
-        .route("/health", get(api_health_check))
+        // Public health check (no auth, no SPA conflict)
+        .route("/_health", get(api_health_check))
 }
 
 fn spa_router() -> Router<AppState> {

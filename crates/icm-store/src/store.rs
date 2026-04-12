@@ -1793,6 +1793,63 @@ impl SqliteStore {
         Ok(true)
     }
 
+    /// Graph expansion: given a list of `(Memory, score)` results from a
+    /// primary search, follow each memory's `related_ids` one hop and fetch
+    /// the neighbors that are not already in the result set.
+    ///
+    /// Each neighbor is scored as `parent_score * hop_discount` (default
+    /// 0.5) so it ranks below its direct-match parent but above unrelated
+    /// low-score results. Returns the combined, deduped, score-descending
+    /// list capped at `max_total` (pass `usize::MAX` for no cap).
+    ///
+    /// This is the core of the graph-aware recall feature: it lets the
+    /// recall path surface memories that are semantically or causally
+    /// linked to the query's direct matches, even if they don't match the
+    /// query text themselves.
+    pub fn expand_with_neighbors(
+        &self,
+        initial: &[(Memory, f32)],
+        max_neighbors: usize,
+        hop_discount: f32,
+        max_total: usize,
+    ) -> IcmResult<Vec<(Memory, f32)>> {
+        if max_neighbors == 0 || initial.is_empty() {
+            let mut out = initial.to_vec();
+            out.truncate(max_total);
+            return Ok(out);
+        }
+
+        let initial_ids: HashSet<String> = initial.iter().map(|(m, _)| m.id.clone()).collect();
+        let mut neighbors: Vec<(Memory, f32)> = Vec::new();
+        let mut seen_neighbors: HashSet<String> = HashSet::new();
+
+        // Walk initial results in score order (they're already sorted).
+        for (mem, score) in initial {
+            for neighbor_id in &mem.related_ids {
+                if initial_ids.contains(neighbor_id) || seen_neighbors.contains(neighbor_id) {
+                    continue;
+                }
+                if let Some(n) = self.get(neighbor_id)? {
+                    seen_neighbors.insert(n.id.clone());
+                    neighbors.push((n, score * hop_discount));
+                    if neighbors.len() >= max_neighbors {
+                        break;
+                    }
+                }
+            }
+            if neighbors.len() >= max_neighbors {
+                break;
+            }
+        }
+
+        // Merge initial + neighbors, then sort descending by score.
+        let mut combined: Vec<(Memory, f32)> = initial.to_vec();
+        combined.extend(neighbors);
+        combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        combined.truncate(max_total);
+        Ok(combined)
+    }
+
     /// Get memories by topic prefix (e.g., "wshm" matches "wshm:owner/repo").
     ///
     /// If `topic` ends with `*`, uses LIKE matching. Otherwise exact match.
@@ -3791,6 +3848,188 @@ mod tests {
         store.store(make_memory("other", "unrelated")).unwrap();
         let results = store.get_by_topic_prefix("project:*").unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // ── expand_with_neighbors ────────────────────────────────────────────
+
+    #[test]
+    fn test_expand_with_neighbors_brings_hop_1() {
+        let store = test_store();
+        // Create 3 memories. m1 is a direct query hit; m2 and m3 are
+        // related to m1 via related_ids; m3 is unrelated.
+        let mut m1 = make_memory("decisions", "primary hit");
+        let mut m2 = make_memory("decisions", "related neighbor");
+        let m3 = make_memory("unrelated", "far away");
+
+        // Set up the edges before storing.
+        m1.related_ids.push(m2.id.clone());
+        m2.related_ids.push(m1.id.clone());
+
+        let id1 = store.store(m1.clone()).unwrap();
+        let _id2 = store.store(m2.clone()).unwrap();
+        let _id3 = store.store(m3.clone()).unwrap();
+
+        let m1_full = store.get(&id1).unwrap().unwrap();
+        let initial = vec![(m1_full, 0.9_f32)];
+
+        let expanded = store.expand_with_neighbors(&initial, 5, 0.5, 10).unwrap();
+
+        assert_eq!(expanded.len(), 2, "primary + 1 neighbor");
+        assert!(expanded.iter().any(|(m, _)| m.id == m1.id));
+        assert!(
+            expanded.iter().any(|(m, _)| m.id == m2.id),
+            "neighbor should be pulled in"
+        );
+        assert!(
+            expanded.iter().all(|(m, _)| m.id != m3.id),
+            "unrelated memory must not be pulled in: {expanded:?}"
+        );
+    }
+
+    #[test]
+    fn test_expand_with_neighbors_dedupes_initial() {
+        let store = test_store();
+        let mut m1 = make_memory("t", "hit 1");
+        let mut m2 = make_memory("t", "hit 2");
+        m1.related_ids.push(m2.id.clone());
+        m2.related_ids.push(m1.id.clone());
+
+        let id1 = store.store(m1.clone()).unwrap();
+        let id2 = store.store(m2.clone()).unwrap();
+
+        // Both already in the initial set — no neighbor to add.
+        let m1_full = store.get(&id1).unwrap().unwrap();
+        let m2_full = store.get(&id2).unwrap().unwrap();
+        let initial = vec![(m1_full, 0.9_f32), (m2_full, 0.85_f32)];
+
+        let expanded = store.expand_with_neighbors(&initial, 5, 0.5, 10).unwrap();
+        assert_eq!(expanded.len(), 2, "no duplicates when both already present");
+    }
+
+    #[test]
+    fn test_expand_with_neighbors_respects_max_neighbors() {
+        let store = test_store();
+        // m1 has 5 neighbors. Cap max_neighbors at 2.
+        let mut m1 = make_memory("t", "hub");
+        let n1 = make_memory("t", "neighbor 1");
+        let n2 = make_memory("t", "neighbor 2");
+        let n3 = make_memory("t", "neighbor 3");
+        let n4 = make_memory("t", "neighbor 4");
+        let n5 = make_memory("t", "neighbor 5");
+        m1.related_ids.extend([
+            n1.id.clone(),
+            n2.id.clone(),
+            n3.id.clone(),
+            n4.id.clone(),
+            n5.id.clone(),
+        ]);
+
+        let id1 = store.store(m1.clone()).unwrap();
+        for n in [&n1, &n2, &n3, &n4, &n5] {
+            store.store(n.clone()).unwrap();
+        }
+
+        let m1_full = store.get(&id1).unwrap().unwrap();
+        let initial = vec![(m1_full, 0.9_f32)];
+
+        let expanded = store.expand_with_neighbors(&initial, 2, 0.5, 10).unwrap();
+        // 1 primary + 2 neighbors = 3.
+        assert_eq!(expanded.len(), 3);
+    }
+
+    #[test]
+    fn test_expand_with_neighbors_applies_discount() {
+        let store = test_store();
+        let mut m1 = make_memory("t", "primary");
+        let m2 = make_memory("t", "neighbor");
+        m1.related_ids.push(m2.id.clone());
+
+        let id1 = store.store(m1.clone()).unwrap();
+        store.store(m2.clone()).unwrap();
+
+        let m1_full = store.get(&id1).unwrap().unwrap();
+        let initial = vec![(m1_full, 0.9_f32)];
+
+        let expanded = store.expand_with_neighbors(&initial, 5, 0.5, 10).unwrap();
+
+        // Find neighbor score: should be 0.9 * 0.5 = 0.45
+        let neighbor_score = expanded
+            .iter()
+            .find(|(m, _)| m.id == m2.id)
+            .map(|(_, s)| *s)
+            .unwrap();
+        assert!(
+            (neighbor_score - 0.45).abs() < 1e-5,
+            "neighbor discount wrong: {neighbor_score}"
+        );
+    }
+
+    #[test]
+    fn test_expand_with_neighbors_respects_max_total() {
+        let store = test_store();
+        // 3 primaries + 3 neighbors, but max_total=4 caps output.
+        let mut m1 = make_memory("t", "p1");
+        let mut m2 = make_memory("t", "p2");
+        let mut m3 = make_memory("t", "p3");
+        let n1 = make_memory("t", "n1");
+        let n2 = make_memory("t", "n2");
+        let n3 = make_memory("t", "n3");
+        m1.related_ids.push(n1.id.clone());
+        m2.related_ids.push(n2.id.clone());
+        m3.related_ids.push(n3.id.clone());
+
+        let id1 = store.store(m1.clone()).unwrap();
+        let id2 = store.store(m2.clone()).unwrap();
+        let id3 = store.store(m3.clone()).unwrap();
+        store.store(n1).unwrap();
+        store.store(n2).unwrap();
+        store.store(n3).unwrap();
+
+        let initial = vec![
+            (store.get(&id1).unwrap().unwrap(), 0.9),
+            (store.get(&id2).unwrap().unwrap(), 0.85),
+            (store.get(&id3).unwrap().unwrap(), 0.8),
+        ];
+
+        let expanded = store.expand_with_neighbors(&initial, 5, 0.5, 4).unwrap();
+        assert_eq!(expanded.len(), 4, "must respect max_total cap");
+        // Top scorer remains first.
+        assert!((expanded[0].1 - 0.9).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_expand_with_neighbors_empty_initial_passthrough() {
+        let store = test_store();
+        let expanded = store.expand_with_neighbors(&[], 5, 0.5, 10).unwrap();
+        assert!(expanded.is_empty());
+    }
+
+    #[test]
+    fn test_expand_with_neighbors_zero_neighbors_disables() {
+        let store = test_store();
+        let mut m1 = make_memory("t", "primary");
+        let m2 = make_memory("t", "would-be neighbor");
+        m1.related_ids.push(m2.id.clone());
+
+        let id1 = store.store(m1.clone()).unwrap();
+        store.store(m2).unwrap();
+
+        let initial = vec![(store.get(&id1).unwrap().unwrap(), 0.9)];
+        let expanded = store.expand_with_neighbors(&initial, 0, 0.5, 10).unwrap();
+        assert_eq!(expanded.len(), 1, "max_neighbors=0 disables expansion");
+    }
+
+    #[test]
+    fn test_expand_with_neighbors_skips_missing_targets() {
+        let store = test_store();
+        // m1 points to a ghost id that no longer exists (e.g., deleted).
+        let mut m1 = make_memory("t", "has ghost link");
+        m1.related_ids.push("01GHOSTID".into());
+        let id1 = store.store(m1.clone()).unwrap();
+
+        let initial = vec![(store.get(&id1).unwrap().unwrap(), 0.9)];
+        let expanded = store.expand_with_neighbors(&initial, 5, 0.5, 10).unwrap();
+        assert_eq!(expanded.len(), 1, "ghost link must be silently skipped");
     }
 
     #[test]

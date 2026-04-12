@@ -1,3 +1,4 @@
+pub mod auto_link;
 pub mod embedder;
 pub mod error;
 #[cfg(feature = "embeddings")]
@@ -14,6 +15,7 @@ pub mod wake_up;
 /// Default embedding vector dimensions (used when no embedder is configured).
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
+pub use auto_link::{add_backrefs, auto_link_memory, AutoLinkOptions};
 pub use embedder::Embedder;
 pub use error::{IcmError, IcmResult};
 #[cfg(feature = "embeddings")]

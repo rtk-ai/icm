@@ -137,6 +137,26 @@ pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Detect package-managed installations — refuse to avoid breaking metadata
+    let current_exe =
+        std::env::current_exe().context("cannot determine current executable path")?;
+    let path_str = current_exe.to_string_lossy();
+    if path_str.contains("/Cellar/") || path_str.contains("/homebrew/") {
+        bail!(
+            "Detected Homebrew installation ({}).\nUse 'brew upgrade icm' instead to keep metadata consistent.",
+            current_exe.display()
+        );
+    }
+    if path_str.starts_with("/usr/bin/")
+        || path_str.starts_with("/opt/") && !path_str.contains("/homebrew/")
+    {
+        eprintln!(
+            "Warning: {} may be managed by a package manager (apt/dnf/rpm).",
+            current_exe.display()
+        );
+        eprintln!("Consider using your package manager to upgrade instead.");
+    }
+
     // 2. Detect target
     let (target, ext) = detect_target()?;
     let archive_name = format!("{BINARY_NAME}-{target}.{ext}");
@@ -170,8 +190,6 @@ pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
     let new_binary = extract_binary(&archive_bytes, is_zip)?;
 
     // 6. Replace running binary atomically
-    let current_exe =
-        std::env::current_exe().context("cannot determine current executable path")?;
     let backup_path: PathBuf = current_exe.with_extension("old");
     let new_path: PathBuf = current_exe.with_extension("new");
 

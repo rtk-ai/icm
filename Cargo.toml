@@ -26,6 +26,7 @@ fastembed = "4"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_json_lenient = { version = "0.2", features = ["preserve_order"] }
 toml = "0.8"
 
 # Error handling

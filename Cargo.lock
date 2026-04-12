@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.19"
+version = "0.10.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -1332,6 +1332,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "serde_json_lenient",
  "tempfile",
  "tokio",
  "toml",
@@ -2832,6 +2833,19 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_lenient"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e033097bf0d2b59a62b42c18ebbb797503839b26afdda2c4e1415cb6c813540"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

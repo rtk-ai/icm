@@ -64,6 +64,34 @@ install() {
         error "Failed to download binary"
     fi
 
+    # SHA256 checksum verification (mandatory for security)
+    CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
+    CHECKSUMS_FILE="${TEMP_DIR}/checksums.txt"
+    info "Downloading checksums: ${CHECKSUMS_URL}"
+    if ! curl -fsSL "$CHECKSUMS_URL" -o "$CHECKSUMS_FILE"; then
+        error "Failed to download checksums.txt (required for integrity verification)"
+    fi
+
+    ARCHIVE_NAME="${BINARY_NAME}-${TARGET}.${EXT}"
+    EXPECTED_SHA=$(grep "  ${ARCHIVE_NAME}$" "$CHECKSUMS_FILE" | awk '{print $1}')
+    if [ -z "$EXPECTED_SHA" ]; then
+        error "No checksum found for ${ARCHIVE_NAME} in checksums.txt"
+    fi
+
+    # Compute actual SHA256 (shasum on macOS, sha256sum on Linux)
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL_SHA=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        ACTUAL_SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+    else
+        error "Neither sha256sum nor shasum found — cannot verify integrity"
+    fi
+
+    if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+        error "SHA256 mismatch! Expected: ${EXPECTED_SHA}, got: ${ACTUAL_SHA}"
+    fi
+    info "SHA256 verified: ${ACTUAL_SHA}"
+
     info "Extracting..."
     if [ "$OS" = "windows" ]; then
         unzip -o "$ARCHIVE" -d "$TEMP_DIR"

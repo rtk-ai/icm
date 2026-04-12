@@ -35,6 +35,9 @@ tracing-subscriber = { workspace = true }
 openssl = { version = "0.10", optional = true }
 ureq = { workspace = true }
 rpassword = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }

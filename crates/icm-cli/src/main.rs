@@ -8,6 +8,7 @@ mod import;
 mod learn_tests;
 #[cfg(feature = "tui")]
 mod tui;
+mod upgrade;
 #[cfg(feature = "web")]
 mod web;
 
@@ -366,6 +367,17 @@ enum Commands {
 
     /// Show current configuration
     Config,
+
+    /// Upgrade icm to the latest release (with SHA256 verification)
+    Upgrade {
+        /// Download and install the new binary (required for actual upgrade)
+        #[arg(long)]
+        apply: bool,
+
+        /// Only check if an update is available (don't prompt to apply)
+        #[arg(long)]
+        check: bool,
+    },
 
     /// RTK Cloud commands (login, sync, status)
     Cloud {
@@ -998,6 +1010,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Config => cmd_config(),
+        Commands::Upgrade { apply, check } => upgrade::cmd_upgrade(apply, check),
         Commands::Bench { count } => cmd_bench(count),
         Commands::BenchRecall {
             model,

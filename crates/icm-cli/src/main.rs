@@ -410,8 +410,8 @@ enum HookCommands {
     Prompt,
     /// SessionStart hook: inject a wake-up pack of critical facts into the session
     Start {
-        /// Approximate token budget for the wake-up pack
-        #[arg(long, default_value = "200")]
+        /// Approximate token budget for the wake-up pack (0 = use config value)
+        #[arg(long, default_value = "0")]
         max_tokens: usize,
     },
 }
@@ -1025,7 +1025,14 @@ fn main() -> Result<()> {
             }
             HookCommands::Compact => cmd_hook_compact(&store),
             HookCommands::Prompt => cmd_hook_prompt(&store),
-            HookCommands::Start { max_tokens } => cmd_hook_start(&store, max_tokens),
+            HookCommands::Start { max_tokens } => {
+                let tokens = if max_tokens > 0 {
+                    max_tokens
+                } else {
+                    cfg.wakeup.max_tokens
+                };
+                cmd_hook_start(&store, tokens)
+            }
         },
         #[cfg(feature = "tui")]
         Commands::Dashboard => {

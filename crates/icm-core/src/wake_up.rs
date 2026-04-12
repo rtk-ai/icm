@@ -37,7 +37,7 @@ impl Default for WakeUpOptions<'_> {
     fn default() -> Self {
         Self {
             project: None,
-            max_tokens: 200,
+            max_tokens: 500,
             format: WakeUpFormat::Markdown,
             include_preferences: true,
         }

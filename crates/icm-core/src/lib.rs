@@ -37,9 +37,14 @@ pub use learn::{learn_project, LearnResult};
 /// Common message for empty search results.
 pub const MSG_NO_MEMORIES: &str = "No memories found.";
 
-/// Check if a memory's topic matches a filter (supports prefix with ':').
+/// Check if a memory's topic matches a filter.
+/// Matching is case-insensitive and bidirectional: the filter can be a
+/// substring of the topic or vice-versa. This allows `"pi-api"` to match
+/// `"context-pi-api"` and `"context-pi-api"` to match `"pi-api"`.
 pub fn topic_matches(memory_topic: &str, filter: &str) -> bool {
-    memory_topic == filter || memory_topic.starts_with(&format!("{filter}:"))
+    let topic = memory_topic.to_lowercase();
+    let f = filter.to_lowercase();
+    topic == f || topic.contains(&f) || f.contains(&topic)
 }
 
 /// Check if any keyword contains the filter string.

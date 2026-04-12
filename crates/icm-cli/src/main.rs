@@ -2604,12 +2604,20 @@ fn strip_jsonc_comments(content: &str) -> String {
 }
 
 /// Parse a JSON/JSONC config file, handling comments and empty files gracefully.
+/// Parse a JSON config file with lenient parsing: accepts trailing commas
+/// and JSONC comments (// and /* */). This is the only place we use lenient
+/// parsing — all other JSON handling uses strict serde_json.
 fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("cannot read {}", config_path.display()))?;
     let clean = strip_jsonc_comments(&content);
-    serde_json::from_str(&clean)
-        .with_context(|| format!("invalid JSON in {}", config_path.display()))
+    // Use serde_json_lenient to accept trailing commas in user-edited configs,
+    // then round-trip to serde_json::Value for compatibility with the rest of the codebase.
+    let lenient: serde_json_lenient::Value = serde_json_lenient::from_str(&clean)
+        .with_context(|| format!("invalid JSON in {}", config_path.display()))?;
+    let strict: Value = serde_json::from_str(&lenient.to_string())
+        .with_context(|| format!("JSON conversion error in {}", config_path.display()))?;
+    Ok(strict)
 }
 
 /// Inject ICM MCP server into a JSON config file. Returns a status string.

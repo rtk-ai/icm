@@ -19,6 +19,7 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     pub extraction: ExtractionConfig,
     pub recall: RecallConfig,
+    pub wakeup: WakeUpConfig,
     pub mcp: McpConfig,
     pub cloud: CloudConfig,
 }
@@ -85,6 +86,25 @@ pub struct RecallConfig {
     pub enabled: bool,
     /// Maximum memories to inject.
     pub limit: usize,
+}
+
+/// Wake-up pack settings (SessionStart hook).
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct WakeUpConfig {
+    /// Maximum token budget for the wake-up pack (~4 chars/token).
+    pub max_tokens: usize,
+    /// Include preference/identity memories regardless of project filter.
+    pub include_preferences: bool,
+}
+
+impl Default for WakeUpConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 500,
+            include_preferences: true,
+        }
+    }
 }
 
 /// MCP server settings.

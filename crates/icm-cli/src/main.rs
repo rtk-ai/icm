@@ -383,6 +383,16 @@ enum Commands {
         #[cfg(feature = "web")]
         #[arg(long)]
         expose: bool,
+
+        /// TLS certificate path (PEM). Overrides config.toml [web].tls_cert
+        #[cfg(feature = "web")]
+        #[arg(long)]
+        tls_cert: Option<String>,
+
+        /// TLS private key path (PEM). Overrides config.toml [web].tls_key
+        #[cfg(feature = "web")]
+        #[arg(long)]
+        tls_key: Option<String>,
     },
 
     /// Claude Code hook handlers (read JSON from stdin, output hook response)
@@ -1015,11 +1025,26 @@ fn main() -> Result<()> {
             compact,
             #[cfg(feature = "web")]
             expose,
+            #[cfg(feature = "web")]
+            tls_cert,
+            #[cfg(feature = "web")]
+            tls_key,
         } => {
             #[cfg(feature = "web")]
             if expose {
                 let password = web::resolve_password(&cfg.web)?;
                 let config_toml = config::load_config_raw().unwrap_or_default();
+                // TLS: CLI flags > env vars > config.toml
+                let cert = tls_cert
+                    .or_else(|| std::env::var("ICM_TLS_CERT").ok())
+                    .or(cfg.web.tls_cert.clone());
+                let key = tls_key
+                    .or_else(|| std::env::var("ICM_TLS_KEY").ok())
+                    .or(cfg.web.tls_key.clone());
+                let tls = match (cert, key) {
+                    (Some(c), Some(k)) => Some((c, k)),
+                    _ => None,
+                };
                 return web::run_web_server(
                     store,
                     &cfg.web.host,
@@ -1027,6 +1052,7 @@ fn main() -> Result<()> {
                     cfg.web.username.clone(),
                     password,
                     config_toml,
+                    tls,
                 );
             }
             #[cfg(feature = "embeddings")]

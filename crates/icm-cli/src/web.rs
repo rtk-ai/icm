@@ -221,6 +221,7 @@ pub async fn run_web_server(
     username: String,
     password: String,
     config_toml: String,
+    tls: Option<(String, String)>,
 ) -> Result<()> {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
@@ -239,13 +240,51 @@ pub async fn run_web_server(
         .with_state(state);
 
     let bind = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to bind {bind}: {e}"))?;
 
-    eprintln!("[icm web] Dashboard running on http://{bind}");
-    axum::serve(listener, app).await?;
+    if let Some((cert_path, key_path)) = tls {
+        // HTTPS with TLS — install ring as the crypto provider
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
+        let rustls_config = load_rustls_config(&cert_path, &key_path).await?;
+        let addr: std::net::SocketAddr = bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid bind address {bind}: {e}"))?;
+        eprintln!("[icm web] Dashboard running on https://{bind}");
+        axum_server::bind_rustls(addr, rustls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        // HTTP plain
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to bind {bind}: {e}"))?;
+        eprintln!("[icm web] Dashboard running on http://{bind}");
+        axum::serve(listener, app).await?;
+    }
+
     Ok(())
+}
+
+/// Load TLS certificate and private key from PEM files.
+async fn load_rustls_config(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    use axum_server::tls_rustls::RustlsConfig;
+
+    if !std::path::Path::new(cert_path).exists() {
+        anyhow::bail!("TLS certificate not found: {cert_path}");
+    }
+    if !std::path::Path::new(key_path).exists() {
+        anyhow::bail!("TLS private key not found: {key_path}");
+    }
+
+    eprintln!("[icm web] TLS cert: {cert_path}");
+    eprintln!("[icm web] TLS key:  {key_path}");
+
+    let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+    Ok(config)
 }
 
 // ---------------------------------------------------------------------------

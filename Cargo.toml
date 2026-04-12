@@ -60,3 +60,6 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 rust-embed = "8"
 mime_guess = "2"
 getrandom = "0.2"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"

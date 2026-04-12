@@ -131,6 +131,10 @@ pub struct WebConfig {
     pub username: String,
     /// Basic auth password. Empty = auto-generate or use ICM_WEB_PASSWORD env.
     pub password: String,
+    /// Path to TLS certificate (PEM). Or use ICM_TLS_CERT env.
+    pub tls_cert: Option<String>,
+    /// Path to TLS private key (PEM). Or use ICM_TLS_KEY env.
+    pub tls_key: Option<String>,
 }
 
 impl Default for WebConfig {
@@ -140,6 +144,8 @@ impl Default for WebConfig {
             port: 8420,
             username: "admin".into(),
             password: String::new(),
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }

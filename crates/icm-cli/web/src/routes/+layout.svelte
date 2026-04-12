@@ -33,10 +33,11 @@
 		style="width: {collapsed ? '48px' : '200px'}"
 	>
 		<!-- Logo header -->
-		<div class="flex items-center gap-2 px-3 py-3 border-b border-[var(--border)]">
-			<img src="/banner.png" alt="ICM" class="h-7 flex-shrink-0 {collapsed ? 'w-7 object-cover object-left' : ''}" />
-			{#if !collapsed}
-				<span class="text-sm font-bold text-[var(--accent-light)] truncate">ICM</span>
+		<div class="flex items-center border-b border-[var(--border)] {collapsed ? 'justify-center py-2' : 'px-3 py-3 gap-2'}">
+			{#if collapsed}
+				<img src="/icon.png" alt="ICM" class="w-8 h-8 rounded" />
+			{:else}
+				<img src="/banner.png" alt="ICM" class="h-8 rounded" />
 			{/if}
 		</div>
 

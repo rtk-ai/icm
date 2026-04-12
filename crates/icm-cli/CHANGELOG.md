@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.20](https://github.com/rtk-ai/icm/compare/icm-v0.10.19...icm-v0.10.20) (2026-04-12)
+
+
+### Features
+
+* add web dashboard with Svelte frontend ([#99](https://github.com/rtk-ai/icm/issues/99)) ([d3ea043](https://github.com/rtk-ai/icm/commit/d3ea04317127248359bd16724b43a72b3eb35348))
+
 ## [0.10.19](https://github.com/rtk-ai/icm/compare/icm-v0.10.18...icm-v0.10.19) (2026-04-12)
 
 

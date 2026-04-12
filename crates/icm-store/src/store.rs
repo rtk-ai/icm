@@ -88,6 +88,34 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Atomically increment the hook call counter and return the new value.
+    /// Uses RETURNING for single-statement atomic increment-and-read.
+    pub fn increment_hook_counter(&self) -> IcmResult<usize> {
+        let count: usize = self
+            .conn
+            .query_row(
+                "INSERT INTO icm_metadata (key, value) VALUES ('hook_counter', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+                 RETURNING CAST(value AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(count)
+    }
+
+    /// Reset the hook call counter to 0.
+    pub fn reset_hook_counter(&self) -> IcmResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO icm_metadata (key, value) VALUES ('hook_counter', '0')
+                 ON CONFLICT(key) DO UPDATE SET value = '0'",
+                [],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     pub fn in_memory() -> IcmResult<Self> {
         ensure_sqlite_vec();
         let conn = Connection::open_in_memory()
@@ -3868,5 +3896,59 @@ mod tests {
         // Verify 0 remain
         let after = store.get_by_topic("ephemeral").unwrap();
         assert!(after.is_empty());
+    }
+
+    // === Hook counter tests ===
+
+    #[test]
+    fn test_hook_counter_starts_at_one() {
+        let store = test_store();
+        let count = store.increment_hook_counter().unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_hook_counter_increments() {
+        let store = test_store();
+        for expected in 1..=5 {
+            let count = store.increment_hook_counter().unwrap();
+            assert_eq!(count, expected);
+        }
+    }
+
+    #[test]
+    fn test_hook_counter_reset() {
+        let store = test_store();
+        // Increment a few times
+        store.increment_hook_counter().unwrap();
+        store.increment_hook_counter().unwrap();
+        store.increment_hook_counter().unwrap();
+
+        // Reset
+        store.reset_hook_counter().unwrap();
+
+        // Next increment should return 1 again
+        let count = store.increment_hook_counter().unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_hook_counter_reset_then_increment_cycle() {
+        let store = test_store();
+
+        // First cycle: increment to 3
+        for expected in 1..=3 {
+            let count = store.increment_hook_counter().unwrap();
+            assert_eq!(count, expected);
+        }
+
+        // Reset
+        store.reset_hook_counter().unwrap();
+
+        // Second cycle: increment to 3 again (mimics extract_every=3)
+        for expected in 1..=3 {
+            let count = store.increment_hook_counter().unwrap();
+            assert_eq!(count, expected);
+        }
     }
 }

@@ -1440,24 +1440,16 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> 
         return Ok(());
     }
 
-    // Counter file for tracking tool calls between invocations
-    let counter_file =
-        std::env::var("ICM_HOOK_COUNTER").unwrap_or_else(|_| "/tmp/icm-hook-counter".to_string());
-
-    let count: usize = std::fs::read_to_string(&counter_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-        + 1;
-    let _ = std::fs::write(&counter_file, count.to_string());
+    // Track tool calls in SQLite (atomic, persists across reboots)
+    let count = store.increment_hook_counter().unwrap_or(1);
 
     // Not time to extract yet
     if count < extract_every {
         return Ok(());
     }
 
-    // Reset counter
-    let _ = std::fs::write(&counter_file, "0");
+    // Reset counter after triggering extraction
+    let _ = store.reset_hook_counter();
 
     // Extract from tool output
     let tool_output = json
@@ -4699,5 +4691,66 @@ mod hook_start_tests {
         // call does not panic and returns a valid, non-empty pack.
         assert!(!pack.is_empty());
         assert!(pack.starts_with("# ICM Wake-up"));
+    }
+}
+
+#[cfg(test)]
+mod hook_post_tests {
+    use icm_store::SqliteStore;
+
+    /// Simulates the hook post counter logic: increment, check threshold, reset.
+    /// Returns true if extraction should trigger (count >= extract_every).
+    fn should_extract(store: &SqliteStore, extract_every: usize) -> bool {
+        let count = store.increment_hook_counter().unwrap_or(1);
+        if count >= extract_every {
+            let _ = store.reset_hook_counter();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[test]
+    fn counter_increments_across_calls() {
+        let store = SqliteStore::in_memory().unwrap();
+        // extract_every = 100 so extraction never triggers
+        for i in 1..=10 {
+            let count = store.increment_hook_counter().unwrap();
+            assert_eq!(count, i, "call {i} should return {i}");
+        }
+    }
+
+    #[test]
+    fn extraction_triggers_at_threshold() {
+        let store = SqliteStore::in_memory().unwrap();
+        let extract_every = 3;
+
+        assert!(!should_extract(&store, extract_every)); // call 1
+        assert!(!should_extract(&store, extract_every)); // call 2
+        assert!(should_extract(&store, extract_every)); // call 3 → triggers + resets
+    }
+
+    #[test]
+    fn counter_resets_after_extraction() {
+        let store = SqliteStore::in_memory().unwrap();
+        let extract_every = 3;
+
+        // First cycle: 1, 2, 3 → extract
+        assert!(!should_extract(&store, extract_every));
+        assert!(!should_extract(&store, extract_every));
+        assert!(should_extract(&store, extract_every));
+
+        // Second cycle: counter should start fresh at 1
+        assert!(!should_extract(&store, extract_every)); // 1
+        assert!(!should_extract(&store, extract_every)); // 2
+        assert!(should_extract(&store, extract_every)); // 3 → extract again
+    }
+
+    #[test]
+    fn extract_every_one_triggers_every_call() {
+        let store = SqliteStore::in_memory().unwrap();
+        for _ in 0..5 {
+            assert!(should_extract(&store, 1));
+        }
     }
 }

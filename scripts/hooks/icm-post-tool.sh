@@ -6,6 +6,10 @@
 # Input (stdin): JSON with tool_name, tool_input, tool_output, etc.
 # Output: nothing (PostToolUse hooks are fire-and-forget)
 
+# NOTE: The Rust binary (icm hook post) now persists the hook counter in SQLite
+# (icm_metadata table) for reliable, atomic, reboot-safe counting.
+# This shell script retains the file-based /tmp counter for standalone/legacy usage.
+
 set -euo pipefail
 
 # Config

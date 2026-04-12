@@ -88,6 +88,33 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Atomically increment the hook call counter and return the new value.
+    pub fn increment_hook_counter(&self) -> IcmResult<usize> {
+        let count: usize = self
+            .conn
+            .query_row(
+                "INSERT INTO icm_metadata (key, value) VALUES ('hook_counter', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+                 RETURNING CAST(value AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(count)
+    }
+
+    /// Reset the hook call counter to 0.
+    pub fn reset_hook_counter(&self) -> IcmResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO icm_metadata (key, value) VALUES ('hook_counter', '0')
+                 ON CONFLICT(key) DO UPDATE SET value = '0'",
+                [],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     pub fn in_memory() -> IcmResult<Self> {
         ensure_sqlite_vec();
         let conn = Connection::open_in_memory()

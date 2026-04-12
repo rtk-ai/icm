@@ -1515,24 +1515,16 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> 
         return Ok(());
     }
 
-    // Counter file for tracking tool calls between invocations
-    let counter_file =
-        std::env::var("ICM_HOOK_COUNTER").unwrap_or_else(|_| "/tmp/icm-hook-counter".to_string());
-
-    let count: usize = std::fs::read_to_string(&counter_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-        + 1;
-    let _ = std::fs::write(&counter_file, count.to_string());
+    // Track tool calls in SQLite (atomic, persists across reboots)
+    let count = store.increment_hook_counter().unwrap_or(1);
 
     // Not time to extract yet
     if count < extract_every {
         return Ok(());
     }
 
-    // Reset counter
-    let _ = std::fs::write(&counter_file, "0");
+    // Reset counter after triggering extraction
+    let _ = store.reset_hook_counter();
 
     // Extract from tool output
     let tool_output = json

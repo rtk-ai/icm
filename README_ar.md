@@ -67,24 +67,27 @@ cargo install --path crates/icm-cli
 icm init
 ```
 
-يضبط **14 أداة** بأمر واحد:
+يضبط **17 أداة** بأمر واحد ([دليل التكامل الكامل](docs/integrations.md)):
 
-| الأداة | ملف الضبط | الصيغة |
-|--------|-----------|--------|
-| Claude Code | `~/.claude.json` | JSON |
-| Claude Desktop | `~/Library/.../claude_desktop_config.json` | JSON |
-| Cursor | `~/.cursor/mcp.json` | JSON |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON |
-| VS Code / Copilot | `~/Library/.../Code/User/mcp.json` | JSON |
-| Gemini Code Assist | `~/.gemini/settings.json` | JSON |
-| Zed | `~/.zed/settings.json` | JSON |
-| Amp | `~/.config/amp/settings.json` | JSON |
-| Amazon Q | `~/.aws/amazonq/mcp.json` | JSON |
-| Cline | VS Code globalStorage | JSON |
-| Roo Code | VS Code globalStorage | JSON |
-| Kilo Code | VS Code globalStorage | JSON |
-| OpenAI Codex CLI | `~/.codex/config.toml` | TOML |
-| OpenCode | `~/.config/opencode/opencode.json` | JSON |
+| الأداة | MCP | الخطافات | CLI | المهارات |
+|--------|:---:|:--------:|:---:|:--------:|
+| Claude Code | `~/.claude.json` | 5 خطافات | `CLAUDE.md` | `/recall` `/remember` |
+| Claude Desktop | JSON | — | — | — |
+| Gemini CLI | `~/.gemini/settings.json` | 5 خطافات | `GEMINI.md` | — |
+| Codex CLI | `~/.codex/config.toml` | 4 خطافات | `AGENTS.md` | — |
+| Copilot CLI | `~/.copilot/mcp-config.json` | 4 خطافات | `.github/copilot-instructions.md` | — |
+| Cursor | `~/.cursor/mcp.json` | — | — | قاعدة `.mdc` |
+| Windsurf | JSON | — | `.windsurfrules` | — |
+| VS Code | `~/Library/.../Code/User/mcp.json` | — | — | — |
+| Amp | JSON | — | — | `/icm-recall` `/icm-remember` |
+| Amazon Q | JSON | — | — | — |
+| Cline | VS Code globalStorage | — | — | — |
+| Roo Code | VS Code globalStorage | — | — | قاعدة `.md` |
+| Kilo Code | VS Code globalStorage | — | — | — |
+| Zed | `~/.zed/settings.json` | — | — | — |
+| OpenCode | JSON | إضافة TS | — | — |
+| Continue.dev | `~/.continue/config.yaml` | — | — | — |
+| Aider | — | — | `.aider.conventions.md` | — |
 
 أو يدويًا:
 
@@ -106,30 +109,31 @@ icm init --mode skill
 
 يثبّت أوامر الشريطة المائلة والقواعد لـ Claude Code (`/recall`، `/remember`)، وCursor (قاعدة `.mdc`)، وRoo Code (قاعدة `.md`)، وAmp (`/icm-recall`، `/icm-remember`).
 
-### الخطافات (Claude Code)
+### الخطافات (5 أدوات)
 
 ```bash
 icm init --mode hook
 ```
 
-يثبّت الطبقات الثلاث للاستخراج كخطافات Claude Code:
+يثبّت خطافات الاستخراج والاسترجاع التلقائي لجميع الأدوات المدعومة:
 
-**خطافات Claude Code:**
+| الأداة | SessionStart | PreTool | PostTool | Compact | PromptRecall | الضبط |
+|--------|:-----------:|:-------:|:--------:|:-------:|:------------:|--------|
+| Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
+| Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
+| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.codex/hooks.json` |
+| Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
+| OpenCode | session start | — | tool extract | compaction | — | `~/.config/opencode/plugins/icm.ts` |
 
-| الخطاف | الحدث | ما يفعله |
-|--------|-------|----------|
-| `icm hook pre` | PreToolUse | السماح تلقائيًا لأوامر `icm` CLI (بدون طلب إذن) |
-| `icm hook post` | PostToolUse | استخراج الحقائق من مخرجات الأداة كل 15 استدعاء |
-| `icm hook compact` | PreCompact | استخراج الذكريات من النص قبل ضغط السياق |
-| `icm hook prompt` | UserPromptSubmit | حقن السياق المستعاد في بداية كل موجه |
+**ما يفعله كل خطاف:**
 
-**إضافة OpenCode** (تُثبَّت تلقائيًا في `~/.config/opencode/plugins/icm.js`):
-
-| حدث OpenCode | طبقة ICM | ما تفعله |
-|--------------|----------|----------|
-| `tool.execute.after` | الطبقة 0 | استخراج الحقائق من مخرجات الأداة |
-| `experimental.session.compacting` | الطبقة 1 | الاستخراج من المحادثة قبل الضغط |
-| `session.created` | الطبقة 2 | استرجاع السياق عند بدء الجلسة |
+| الخطاف | ما يفعله |
+|--------|----------|
+| `icm hook start` | حقن حزمة إيقاظ من الذكريات الحرجة/عالية الأهمية عند بدء الجلسة (حوالي 500 رمز) |
+| `icm hook pre` | السماح تلقائيًا لأوامر `icm` CLI (بدون طلب إذن) |
+| `icm hook post` | استخراج الحقائق من مخرجات الأداة كل N استدعاء (استخراج تلقائي) |
+| `icm hook compact` | استخراج الذكريات من النص قبل ضغط السياق |
+| `icm hook prompt` | حقن السياق المستعاد في بداية كل موجه مستخدم |
 
 ## CLI مقابل MCP
 
@@ -140,7 +144,7 @@ icm init --mode hook
 | **زمن الاستجابة** | ~30ms (ملف ثنائي مباشر) | ~50ms (JSON-RPC stdio) |
 | **تكلفة الرموز** | 0 (قائم على الخطافات، غير مرئي) | ~20-50 رمز/استدعاء (مخطط الأداة) |
 | **الإعداد** | `icm init --mode hook` | `icm init --mode mcp` |
-| **يعمل مع** | Claude Code، OpenCode (عبر الخطافات/الإضافات) | جميع الأدوات الـ14 المتوافقة مع MCP |
+| **يعمل مع** | Claude Code، Gemini، Codex، Copilot، OpenCode (عبر الخطافات) | جميع الأدوات الـ17 المتوافقة مع MCP |
 | **الاستخراج التلقائي** | نعم (الخطافات تشغّل `icm extract`) | نعم (أدوات MCP تستدعي store) |
 | **الأفضل لـ** | المستخدمين المتقدمين، توفير الرموز | التوافق الشامل |
 
@@ -440,10 +444,50 @@ qwen2.5:3b             3B       2%       58%       +56%
 - **احتفاظ المعرفة**: يستخدم وثيقة تقنية خيالية ("بروتوكول ميريديان"). يُسجّل الإجابات بمطابقة الكلمات المفتاحية مع الحقائق المتوقعة. مهلة 120 ثانية لكل استدعاء.
 - **العزل**: كل تشغيل يستخدم مجلده المؤقت الخاص وقاعدة بيانات SQLite جديدة. لا استمرارية للجلسة.
 
+### ذاكرة موحدة متعددة العملاء
+
+تتشارك جميع الأدوات الـ17 نفس قاعدة بيانات SQLite. الذاكرة المُخزَّنة بواسطة Claude تصبح متاحة فورًا لـ Gemini وCodex وCopilot وCursor وجميع الأدوات الأخرى.
+
+```
+ICM Multi-Agent Efficiency Benchmark (10 seeded facts, 5 CLI agents)
+╔══════════════╦═══════╦══════════╦════════╦═══════════╦═══════╗
+║ Agent        ║ Facts ║ Accuracy ║ Detail ║ Latency   ║ Score ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ Claude Code  ║ 10/10 ║   100%   ║  5/5   ║    ~15s   ║   99  ║
+║ Gemini CLI   ║ 10/10 ║   100%   ║  5/5   ║    ~33s   ║   94  ║
+║ Copilot CLI  ║ 10/10 ║   100%   ║  5/5   ║    ~10s   ║  100  ║
+║ Cursor Agent ║ 10/10 ║   100%   ║  5/5   ║    ~16s   ║   99  ║
+║ Aider        ║ 10/10 ║   100%   ║  5/5   ║     ~5s   ║  100  ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ AVERAGE      ║       ║          ║        ║           ║   98  ║
+╚══════════════╩═══════╩══════════╩════════╩═══════════╩═══════╝
+```
+
+النتيجة = 60% دقة الاسترجاع + 30% تفاصيل الحقائق + 10% السرعة. **98% كفاءة متعددة العملاء.**
+
+## لماذا ICM
+
+| القدرة | ICM | Mem0 | Engram | AgentMemory |
+|--------|:---:|:----:|:------:|:-----------:|
+| دعم الأدوات | **17** | SDK فقط | ~6-8 | ~10 |
+| إعداد بأمر واحد | `icm init` | SDK يدوي | يدوي | يدوي |
+| الخطافات (استرجاع تلقائي عند البدء) | 5 أدوات | لا يوجد | عبر MCP | أداة واحدة |
+| بحث هجين (FTS5 + شعاعي) | 30/70 موزون | شعاعي فقط | FTS5 فقط | FTS5+شعاعي |
+| تضمينات متعددة اللغات | 100+ لغة (768d) | حسب الحالة | لا يوجد | إنجليزي 384d |
+| رسم بياني للمعرفة | نظام Memoir | لا يوجد | لا يوجد | لا يوجد |
+| تلاشٍ زمني + دمج | واعٍ بالوصول | لا يوجد | أساسي | أساسي |
+| لوحة تحكم TUI | `icm dashboard` | لا يوجد | نعم | عارض ويب |
+| استخراج تلقائي من مخرجات الأداة | 3 طبقات، صفر LLM | لا يوجد | لا يوجد | لا يوجد |
+| حلقة تغذية راجعة/تصحيح | `icm_feedback_*` | لا يوجد | لا يوجد | لا يوجد |
+| بيئة التشغيل | Rust ملف تنفيذي واحد | Python | Go | Node.js |
+| محلي أولًا، صفر تبعيات | ملف SQLite | سحابي أولًا | SQLite | SQLite |
+| دقة استرجاع متعددة العملاء | **98%** | غ/م | غ/م | 95.2% |
+
 ## التوثيق
 
 | الوثيقة | الوصف |
 |---------|-------|
+| [دليل التكامل](docs/integrations.md) | إعداد جميع الأدوات الـ17: Claude Code، Copilot، Cursor، Windsurf، Zed، Amp، إلخ |
 | [البنية التقنية](docs/architecture.md) | هيكل الحزم، مسار البحث، نموذج التلاشي، تكامل sqlite-vec، الاختبار |
 | [دليل المستخدم](docs/guide.md) | التثبيت، تنظيم المواضيع، الدمج، الاستخراج، استكشاف الأخطاء |
 | [نظرة عامة على المنتج](docs/product.md) | حالات الاستخدام، المعايير، المقارنة مع البدائل |

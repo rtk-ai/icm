@@ -67,24 +67,27 @@ cargo install --path crates/icm-cli
 icm init
 ```
 
-한 번의 명령으로 **14개 도구**를 구성합니다:
+한 번의 명령으로 **17개 도구**를 구성합니다 ([전체 통합 가이드](docs/integrations.md)):
 
-| 도구 | 설정 파일 | 형식 |
-|------|------------|--------|
-| Claude Code | `~/.claude.json` | JSON |
-| Claude Desktop | `~/Library/.../claude_desktop_config.json` | JSON |
-| Cursor | `~/.cursor/mcp.json` | JSON |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON |
-| VS Code / Copilot | `~/Library/.../Code/User/mcp.json` | JSON |
-| Gemini Code Assist | `~/.gemini/settings.json` | JSON |
-| Zed | `~/.zed/settings.json` | JSON |
-| Amp | `~/.config/amp/settings.json` | JSON |
-| Amazon Q | `~/.aws/amazonq/mcp.json` | JSON |
-| Cline | VS Code globalStorage | JSON |
-| Roo Code | VS Code globalStorage | JSON |
-| Kilo Code | VS Code globalStorage | JSON |
-| OpenAI Codex CLI | `~/.codex/config.toml` | TOML |
-| OpenCode | `~/.config/opencode/opencode.json` | JSON |
+| 도구 | MCP | 훅 | CLI | 스킬 |
+|------|:---:|:-----:|:---:|:------:|
+| Claude Code | `~/.claude.json` | 5개 훅 | `CLAUDE.md` | `/recall` `/remember` |
+| Claude Desktop | JSON | — | — | — |
+| Gemini CLI | `~/.gemini/settings.json` | 5개 훅 | `GEMINI.md` | — |
+| Codex CLI | `~/.codex/config.toml` | 4개 훅 | `AGENTS.md` | — |
+| Copilot CLI | `~/.copilot/mcp-config.json` | 4개 훅 | `.github/copilot-instructions.md` | — |
+| Cursor | `~/.cursor/mcp.json` | — | — | `.mdc` 규칙 |
+| Windsurf | JSON | — | `.windsurfrules` | — |
+| VS Code | `~/Library/.../Code/User/mcp.json` | — | — | — |
+| Amp | JSON | — | — | `/icm-recall` `/icm-remember` |
+| Amazon Q | JSON | — | — | — |
+| Cline | VS Code globalStorage | — | — | — |
+| Roo Code | VS Code globalStorage | — | — | `.md` 규칙 |
+| Kilo Code | VS Code globalStorage | — | — | — |
+| Zed | `~/.zed/settings.json` | — | — | — |
+| OpenCode | JSON | TS 플러그인 | — | — |
+| Continue.dev | `~/.continue/config.yaml` | — | — | — |
+| Aider | — | — | `.aider.conventions.md` | — |
 
 또는 수동으로:
 
@@ -106,30 +109,31 @@ icm init --mode skill
 
 Claude Code(`/recall`, `/remember`), Cursor(`.mdc` 규칙), Roo Code(`.md` 규칙), Amp(`/icm-recall`, `/icm-remember`)에 슬래시 명령과 규칙을 설치합니다.
 
-### 훅 (Claude Code)
+### 훅 (5개 도구)
 
 ```bash
 icm init --mode hook
 ```
 
-모든 3가지 추출 레이어를 Claude Code 훅으로 설치합니다:
+지원되는 모든 도구에 자동 추출 및 자동 회상 훅을 설치합니다:
 
-**Claude Code** 훅:
+| 도구 | SessionStart | PreTool | PostTool | Compact | PromptRecall | 설정 |
+|------|:-----------:|:-------:|:--------:|:-------:|:------------:|--------|
+| Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
+| Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
+| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.codex/hooks.json` |
+| Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
+| OpenCode | session start | — | tool extract | compaction | — | `~/.config/opencode/plugins/icm.ts` |
 
-| 훅 | 이벤트 | 동작 |
-|------|-------|-------------|
-| `icm hook pre` | PreToolUse | `icm` CLI 명령 자동 허용 (권한 프롬프트 없음) |
-| `icm hook post` | PostToolUse | 15번 호출마다 도구 출력에서 사실 추출 |
-| `icm hook compact` | PreCompact | 컨텍스트 압축 전 스크립트에서 메모리 추출 |
-| `icm hook prompt` | UserPromptSubmit | 각 프롬프트 시작 시 회상된 컨텍스트 주입 |
+**각 훅의 역할:**
 
-**OpenCode** 플러그인 (`~/.config/opencode/plugins/icm.js`에 자동 설치):
-
-| OpenCode 이벤트 | ICM 레이어 | 동작 |
-|---------------|-----------|-------------|
-| `tool.execute.after` | Layer 0 | 도구 출력에서 사실 추출 |
-| `experimental.session.compacting` | Layer 1 | 압축 전 대화에서 추출 |
-| `session.created` | Layer 2 | 세션 시작 시 컨텍스트 회상 |
+| 훅 | 역할 |
+|------|-------------|
+| `icm hook start` | 세션 시작 시 중요/높은 중요도 메모리의 웨이크업 팩 주입 (~500 토큰) |
+| `icm hook pre` | `icm` CLI 명령 자동 허용 (권한 프롬프트 없음) |
+| `icm hook post` | N번 호출마다 도구 출력에서 사실 추출 (자동 추출) |
+| `icm hook compact` | 컨텍스트 압축 전 대화 스크립트에서 메모리 추출 |
+| `icm hook prompt` | 각 사용자 프롬프트 시작 시 회상된 컨텍스트 주입 |
 
 ## CLI vs MCP
 
@@ -140,7 +144,7 @@ ICM은 CLI(`icm` 명령) 또는 MCP 서버(`icm serve`)를 통해 사용할 수 
 | **지연 시간** | ~30ms (직접 바이너리) | ~50ms (JSON-RPC stdio) |
 | **토큰 비용** | 0 (훅 기반, 보이지 않음) | ~20-50 토큰/호출 (도구 스키마) |
 | **설정** | `icm init --mode hook` | `icm init --mode mcp` |
-| **호환 도구** | Claude Code, OpenCode (훅/플러그인 통해) | 14개 MCP 호환 도구 모두 |
+| **호환 도구** | Claude Code, Gemini, Codex, Copilot, OpenCode (훅 통해) | 17개 MCP 호환 도구 모두 |
 | **자동 추출** | 예 (훅이 `icm extract` 트리거) | 예 (MCP 도구가 store 호출) |
 | **최적 용도** | 파워 유저, 토큰 절약 | 범용 호환성 |
 
@@ -440,10 +444,50 @@ qwen2.5:3b             3B       2%       58%       +56%
 - **지식 보존**: 가상의 기술 문서("Meridian Protocol")를 사용합니다. 예상 사실에 대한 키워드 매칭으로 답변 채점. 호출당 120초 타임아웃.
 - **격리**: 각 실행은 자체 임시 디렉터리와 새로운 SQLite DB를 사용합니다. 세션 지속성 없음.
 
+### 멀티 에이전트 통합 메모리
+
+17개 도구 모두 동일한 SQLite 데이터베이스를 공유합니다. Claude가 저장한 메모리는 즉시 Gemini, Codex, Copilot, Cursor 및 모든 다른 도구에서 사용할 수 있습니다.
+
+```
+ICM Multi-Agent Efficiency Benchmark (10 seeded facts, 5 CLI agents)
+╔══════════════╦═══════╦══════════╦════════╦═══════════╦═══════╗
+║ Agent        ║ Facts ║ Accuracy ║ Detail ║ Latency   ║ Score ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ Claude Code  ║ 10/10 ║   100%   ║  5/5   ║    ~15s   ║   99  ║
+║ Gemini CLI   ║ 10/10 ║   100%   ║  5/5   ║    ~33s   ║   94  ║
+║ Copilot CLI  ║ 10/10 ║   100%   ║  5/5   ║    ~10s   ║  100  ║
+║ Cursor Agent ║ 10/10 ║   100%   ║  5/5   ║    ~16s   ║   99  ║
+║ Aider        ║ 10/10 ║   100%   ║  5/5   ║     ~5s   ║  100  ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ AVERAGE      ║       ║          ║        ║           ║   98  ║
+╚══════════════╩═══════╩══════════╩════════╩═══════════╩═══════╝
+```
+
+점수 = 60% 회상 정확도 + 30% 사실 세부 정보 + 10% 속도. **98% 멀티 에이전트 효율성.**
+
+## ICM을 선택하는 이유
+
+| 기능 | ICM | Mem0 | Engram | AgentMemory |
+|-----------|:---:|:----:|:------:|:-----------:|
+| 도구 지원 | **17** | SDK만 | ~6-8 | ~10 |
+| 원커맨드 설정 | `icm init` | 수동 SDK | 수동 | 수동 |
+| 훅 (시작 시 자동 회상) | 5개 도구 | 없음 | MCP 통해 | 1개 도구 |
+| 하이브리드 검색 (FTS5 + 벡터) | 30/70 가중치 | 벡터만 | FTS5만 | FTS5+벡터 |
+| 다국어 임베딩 | 100+ 언어 (768d) | 상황에 따라 | 없음 | 영어 384d |
+| 지식 그래프 | Memoir 시스템 | 없음 | 없음 | 없음 |
+| 시간적 감쇠 + 통합 | 접근 인식 | 없음 | 기본 | 기본 |
+| TUI 대시보드 | `icm dashboard` | 없음 | 있음 | 웹 뷰어 |
+| 도구 출력에서 자동 추출 | 3 레이어, 제로 LLM | 없음 | 없음 | 없음 |
+| 피드백/수정 루프 | `icm_feedback_*` | 없음 | 없음 | 없음 |
+| 런타임 | Rust 단일 바이너리 | Python | Go | Node.js |
+| 로컬 우선, 제로 의존성 | SQLite 파일 | 클라우드 우선 | SQLite | SQLite |
+| 멀티 에이전트 회상 정확도 | **98%** | N/A | N/A | 95.2% |
+
 ## 문서
 
 | 문서 | 설명 |
 |----------|-------------|
+| [통합 가이드](docs/integrations.md) | 17개 도구 모두 설정: Claude Code, Copilot, Cursor, Windsurf, Zed, Amp 등 |
 | [기술 아키텍처](docs/architecture.md) | 크레이트 구조, 검색 파이프라인, 감쇠 모델, sqlite-vec 통합, 테스트 |
 | [사용자 가이드](docs/guide.md) | 설치, 토픽 구성, 통합, 추출, 문제 해결 |
 | [제품 개요](docs/product.md) | 사용 사례, 벤치마크, 대안과의 비교 |

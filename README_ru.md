@@ -67,24 +67,27 @@ cargo install --path crates/icm-cli
 icm init
 ```
 
-Настраивает **14 инструментов** одной командой:
+Настраивает **17 инструментов** одной командой ([полное руководство по интеграции](docs/integrations.md)):
 
-| Инструмент | Файл конфигурации | Формат |
-|------------|-------------------|--------|
-| Claude Code | `~/.claude.json` | JSON |
-| Claude Desktop | `~/Library/.../claude_desktop_config.json` | JSON |
-| Cursor | `~/.cursor/mcp.json` | JSON |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON |
-| VS Code / Copilot | `~/Library/.../Code/User/mcp.json` | JSON |
-| Gemini Code Assist | `~/.gemini/settings.json` | JSON |
-| Zed | `~/.zed/settings.json` | JSON |
-| Amp | `~/.config/amp/settings.json` | JSON |
-| Amazon Q | `~/.aws/amazonq/mcp.json` | JSON |
-| Cline | VS Code globalStorage | JSON |
-| Roo Code | VS Code globalStorage | JSON |
-| Kilo Code | VS Code globalStorage | JSON |
-| OpenAI Codex CLI | `~/.codex/config.toml` | TOML |
-| OpenCode | `~/.config/opencode/opencode.json` | JSON |
+| Инструмент | MCP | Хуки | CLI | Навыки |
+|------------|:---:|:----:|:---:|:------:|
+| Claude Code | `~/.claude.json` | 5 хуков | `CLAUDE.md` | `/recall` `/remember` |
+| Claude Desktop | JSON | — | — | — |
+| Gemini CLI | `~/.gemini/settings.json` | 5 хуков | `GEMINI.md` | — |
+| Codex CLI | `~/.codex/config.toml` | 4 хука | `AGENTS.md` | — |
+| Copilot CLI | `~/.copilot/mcp-config.json` | 4 хука | `.github/copilot-instructions.md` | — |
+| Cursor | `~/.cursor/mcp.json` | — | — | правило `.mdc` |
+| Windsurf | JSON | — | `.windsurfrules` | — |
+| VS Code | `~/Library/.../Code/User/mcp.json` | — | — | — |
+| Amp | JSON | — | — | `/icm-recall` `/icm-remember` |
+| Amazon Q | JSON | — | — | — |
+| Cline | VS Code globalStorage | — | — | — |
+| Roo Code | VS Code globalStorage | — | — | правило `.md` |
+| Kilo Code | VS Code globalStorage | — | — | — |
+| Zed | `~/.zed/settings.json` | — | — | — |
+| OpenCode | JSON | TS-плагин | — | — |
+| Continue.dev | `~/.continue/config.yaml` | — | — | — |
+| Aider | — | — | `.aider.conventions.md` | — |
 
 Или вручную:
 
@@ -106,30 +109,31 @@ icm init --mode skill
 
 Устанавливает слэш-команды и правила для Claude Code (`/recall`, `/remember`), Cursor (правило `.mdc`), Roo Code (правило `.md`) и Amp (`/icm-recall`, `/icm-remember`).
 
-### Хуки (Claude Code)
+### Хуки (5 инструментов)
 
 ```bash
 icm init --mode hook
 ```
 
-Устанавливает все 3 слоя извлечения в виде хуков Claude Code:
+Устанавливает хуки автоматического извлечения и автоматического вспоминания для всех поддерживаемых инструментов:
 
-**Хуки Claude Code:**
+| Инструмент | SessionStart | PreTool | PostTool | Compact | PromptRecall | Конфигурация |
+|------------|:-----------:|:-------:|:--------:|:-------:|:------------:|--------|
+| Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
+| Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
+| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.codex/hooks.json` |
+| Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
+| OpenCode | старт сессии | — | извлечение из инструментов | сжатие | — | `~/.config/opencode/plugins/icm.ts` |
 
-| Хук | Событие | Действие |
-|-----|---------|----------|
-| `icm hook pre` | PreToolUse | Автоматическое разрешение команд `icm` CLI (без запроса подтверждения) |
-| `icm hook post` | PostToolUse | Извлечение фактов из вывода инструмента каждые 15 вызовов |
-| `icm hook compact` | PreCompact | Извлечение воспоминаний из транскрипта перед сжатием контекста |
-| `icm hook prompt` | UserPromptSubmit | Внедрение извлечённого контекста в начало каждого запроса |
+**Что делает каждый хук:**
 
-**Плагин OpenCode** (автоматически устанавливается в `~/.config/opencode/plugins/icm.js`):
-
-| Событие OpenCode | Слой ICM | Действие |
-|-----------------|----------|----------|
-| `tool.execute.after` | Layer 0 | Извлечение фактов из вывода инструмента |
-| `experimental.session.compacting` | Layer 1 | Извлечение из разговора перед сжатием |
-| `session.created` | Layer 2 | Загрузка контекста при старте сессии |
+| Хук | Что делает |
+|-----|------------|
+| `icm hook start` | Внедряет пакет критических/важных воспоминаний при старте сессии (~500 токенов) |
+| `icm hook pre` | Автоматическое разрешение команд `icm` CLI (без запроса подтверждения) |
+| `icm hook post` | Извлечение фактов из вывода инструмента каждые N вызовов (автоматическое извлечение) |
+| `icm hook compact` | Извлечение воспоминаний из транскрипта перед сжатием контекста |
+| `icm hook prompt` | Внедрение извлечённого контекста в начало каждого запроса пользователя |
 
 ## CLI vs MCP
 
@@ -140,7 +144,7 @@ ICM можно использовать через CLI (команды `icm`) и
 | **Задержка** | ~30ms (прямой бинарный файл) | ~50ms (JSON-RPC stdio) |
 | **Стоимость токенов** | 0 (на основе хуков, невидимо) | ~20-50 токенов/вызов (схема инструмента) |
 | **Настройка** | `icm init --mode hook` | `icm init --mode mcp` |
-| **Работает с** | Claude Code, OpenCode (через хуки/плагины) | Все 14 MCP-совместимых инструментов |
+| **Работает с** | Claude Code, Gemini, Codex, Copilot, OpenCode (через хуки) | Все 17 MCP-совместимых инструментов |
 | **Авто-извлечение** | Да (хуки запускают `icm extract`) | Да (MCP-инструменты вызывают store) |
 | **Лучше для** | Опытных пользователей, экономия токенов | Универсальная совместимость |
 
@@ -440,10 +444,50 @@ qwen2.5:3b             3B       2%       58%       +56%
 - **Сохранение знаний**: Использует вымышленный технический документ («Протокол Меридиан»). Оценивает ответы по совпадению ключевых слов с ожидаемыми фактами. Таймаут 120 секунд на вызов.
 - **Изоляция**: Каждый запуск использует собственную временную директорию и чистую базу данных SQLite. Без сохранения между сессиями.
 
+### Единая память для нескольких агентов
+
+Все 17 инструментов используют одну и ту же базу данных SQLite. Воспоминание, сохранённое Claude, мгновенно доступно Gemini, Codex, Copilot, Cursor и любому другому инструменту.
+
+```
+ICM Multi-Agent Efficiency Benchmark (10 seeded facts, 5 CLI agents)
+╔══════════════╦═══════╦══════════╦════════╦═══════════╦═══════╗
+║ Agent        ║ Facts ║ Accuracy ║ Detail ║ Latency   ║ Score ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ Claude Code  ║ 10/10 ║   100%   ║  5/5   ║    ~15s   ║   99  ║
+║ Gemini CLI   ║ 10/10 ║   100%   ║  5/5   ║    ~33s   ║   94  ║
+║ Copilot CLI  ║ 10/10 ║   100%   ║  5/5   ║    ~10s   ║  100  ║
+║ Cursor Agent ║ 10/10 ║   100%   ║  5/5   ║    ~16s   ║   99  ║
+║ Aider        ║ 10/10 ║   100%   ║  5/5   ║     ~5s   ║  100  ║
+╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
+║ AVERAGE      ║       ║          ║        ║           ║   98  ║
+╚══════════════╩═══════╩══════════╩════════╩═══════════╩═══════╝
+```
+
+Оценка = 60% точность вспоминания + 30% детальность фактов + 10% скорость. **98% эффективности мультиагентной работы.**
+
+## Почему ICM
+
+| Возможность | ICM | Mem0 | Engram | AgentMemory |
+|-------------|:---:|:----:|:------:|:-----------:|
+| Поддержка инструментов | **17** | только SDK | ~6-8 | ~10 |
+| Настройка одной командой | `icm init` | SDK вручную | вручную | вручную |
+| Хуки (авто-вспоминание при запуске) | 5 инструментов | нет | через MCP | 1 инструмент |
+| Гибридный поиск (FTS5 + вектор) | 30/70 взвешенный | только вектор | только FTS5 | FTS5+вектор |
+| Многоязычные эмбеддинги | 100+ языков (768d) | зависит | нет | английский 384d |
+| Граф знаний | Система Memoir | нет | нет | нет |
+| Временное затухание + консолидация | с учётом обращений | нет | базовое | базовое |
+| TUI-дашборд | `icm dashboard` | нет | да | веб-просмотрщик |
+| Автоматическое извлечение из вывода инструмента | 3 слоя, без LLM | нет | нет | нет |
+| Цикл обратной связи/коррекций | `icm_feedback_*` | нет | нет | нет |
+| Среда исполнения | Rust, один бинарный файл | Python | Go | Node.js |
+| Локальное, без зависимостей | файл SQLite | облачное | SQLite | SQLite |
+| Точность вспоминания нескольких агентов | **98%** | Н/Д | Н/Д | 95,2% |
+
 ## Документация
 
 | Документ | Описание |
 |----------|----------|
+| [Руководство по интеграции](docs/integrations.md) | Настройка для всех 17 инструментов: Claude Code, Copilot, Cursor, Windsurf, Zed, Amp и др. |
 | [Техническая архитектура](docs/architecture.md) | Структура крейтов, конвейер поиска, модель затухания, интеграция sqlite-vec, тестирование |
 | [Руководство пользователя](docs/guide.md) | Установка, организация тем, консолидация, извлечение, устранение неполадок |
 | [Обзор продукта](docs/product.md) | Сценарии использования, бенчмарки, сравнение с альтернативами |

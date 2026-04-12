@@ -2693,12 +2693,9 @@ fn inject_zed_mcp_server(config_path: &PathBuf, name: &str, bin_path: &str) -> R
     }
 
     let zed_entry = serde_json::json!({
-        "command": {
-            "path": bin_path,
-            "args": ["serve"],
-            "env": {}
-        },
-        "settings": {}
+        "command": bin_path,
+        "args": ["serve"],
+        "env": {},
     });
 
     servers

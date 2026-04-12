@@ -16,5 +16,8 @@
     "vite": "^6.0.0",
     "@tailwindcss/vite": "^4.0.0",
     "tailwindcss": "^4.0.0"
+  },
+  "dependencies": {
+    "3d-force-graph": "^1.80.0"
   }
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.18](https://github.com/rtk-ai/icm/compare/icm-v0.10.17...icm-v0.10.18) (2026-04-12)
+
+
+### Bug Fixes
+
+* improve recall coverage for Claude and Codex agents ([#93](https://github.com/rtk-ai/icm/issues/93)) ([1e7c562](https://github.com/rtk-ai/icm/commit/1e7c562e4134c9f447334190802f6c6b044526b4))
+
 ## [0.10.17](https://github.com/rtk-ai/icm/compare/icm-v0.10.16...icm-v0.10.17) (2026-04-12)
 
 

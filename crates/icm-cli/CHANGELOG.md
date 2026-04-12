@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.17](https://github.com/rtk-ai/icm/compare/icm-v0.10.16...icm-v0.10.17) (2026-04-12)
+
+
+### Features
+
+* add graph-aware recall, auto-linking, and multi-tool hooks ([#91](https://github.com/rtk-ai/icm/issues/91)) ([20ae926](https://github.com/rtk-ai/icm/commit/20ae9264e44509109a38d38f9fbc5734c3e4a597))
+
 ## [0.10.16](https://github.com/rtk-ai/icm/compare/icm-v0.10.15...icm-v0.10.16) (2026-04-11)
 
 

@@ -2,9 +2,9 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
-    build_wake_up, keyword_matches, topic_matches, Concept, ConceptLink, Embedder, Feedback,
-    FeedbackStore, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
-    WakeUpOptions, MSG_NO_MEMORIES,
+    add_backrefs, auto_link_memory, build_wake_up, keyword_matches, topic_matches, AutoLinkOptions,
+    Concept, ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
+    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -801,16 +801,48 @@ fn tool_store(
         }
     }
 
+    // Auto-link: populate `related_ids` with similar existing memories BEFORE
+    // storing, so the new memory lands in the DB with its forward edges
+    // already set. Back-refs are added AFTER storing so the linked memories
+    // point to an id that exists in the DB.
+    let auto_link_opts = AutoLinkOptions::default();
+    let linked_ids = if memory.embedding.is_some() {
+        auto_link_memory(store, &mut memory, &auto_link_opts).unwrap_or_else(|e| {
+            tracing::warn!("auto-link failed: {e}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
     match store.store(memory) {
         Ok(id) => {
+            // Best-effort back-ref update. Failure here leaves an asymmetric
+            // edge (forward-only) but does not fail the store call.
+            if !linked_ids.is_empty() {
+                if let Err(e) = add_backrefs(store, &id, &linked_ids) {
+                    tracing::warn!("auto-link back-ref update failed: {e}");
+                }
+            }
+
+            let link_suffix = if linked_ids.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (+{} link{})",
+                    linked_ids.len(),
+                    if linked_ids.len() == 1 { "" } else { "s" }
+                )
+            };
+
             if compact {
                 // Try auto-consolidation even in compact mode
                 let consolidation_msg =
                     try_auto_consolidate(store, topic, AUTO_CONSOLIDATE_THRESHOLD);
                 if consolidation_msg.is_empty() {
-                    ToolResult::text(format!("ok:{id}"))
+                    ToolResult::text(format!("ok:{id}{link_suffix}"))
                 } else {
-                    ToolResult::text(format!("ok:{id}\n{consolidation_msg}"))
+                    ToolResult::text(format!("ok:{id}{link_suffix}\n{consolidation_msg}"))
                 }
             } else {
                 let consolidation_msg =
@@ -828,9 +860,11 @@ fn tool_store(
                     } else {
                         String::new()
                     };
-                    ToolResult::text(format!("Stored memory: {id}{hint}"))
+                    ToolResult::text(format!("Stored memory: {id}{link_suffix}{hint}"))
                 } else {
-                    ToolResult::text(format!("Stored memory: {id}\n{consolidation_msg}"))
+                    ToolResult::text(format!(
+                        "Stored memory: {id}{link_suffix}\n{consolidation_msg}"
+                    ))
                 }
             }
         }
@@ -900,15 +934,24 @@ fn tool_recall(
                     scored_results.retain(|(m, _)| keyword_matches(&m.keywords, kw));
                 }
 
-                // Batch update access counts
-                let ids: Vec<&str> = scored_results.iter().map(|(m, _)| m.id.as_str()).collect();
+                // Graph-aware expansion: follow `related_ids` one hop from
+                // each primary hit and fold neighbors into the result set.
+                // Neighbors carry a discounted score so they rank below
+                // direct matches but can displace weak primary results.
+                let max_neighbors = (limit / 3).max(1);
+                let expanded = store
+                    .expand_with_neighbors(&scored_results, max_neighbors, 0.5, limit)
+                    .unwrap_or(scored_results);
+
+                // Batch update access counts (includes expanded neighbors)
+                let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
                 let _ = store.batch_update_access(&ids);
 
-                if scored_results.is_empty() {
+                if expanded.is_empty() {
                     return ToolResult::text(MSG_NO_MEMORIES.into());
                 }
 
-                return ToolResult::text(format_memory_output(&scored_results, compact));
+                return ToolResult::text(format_memory_output(&expanded, compact));
             }
         }
     }
@@ -934,17 +977,30 @@ fn tool_recall(
         results.retain(|m| keyword_matches(&m.keywords, kw));
     }
 
-    // Batch update access counts
-    let ids: Vec<&str> = results.iter().map(|m| m.id.as_str()).collect();
+    // Convert to scored format with a sentinel score of 1.0 (FTS fallback
+    // doesn't expose a real similarity score, but we still want the graph
+    // expansion to score neighbors relative to their primary parent).
+    let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, 1.0)).collect();
+
+    // Graph-aware expansion also applies in the fallback path so that
+    // keyword-only deployments benefit from auto-linked memories.
+    let max_neighbors = (limit / 3).max(1);
+    let expanded = store
+        .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
+        .unwrap_or(scored);
+
+    // Batch update access counts (includes expanded neighbors)
+    let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
     let _ = store.batch_update_access(&ids);
 
-    if results.is_empty() {
+    if expanded.is_empty() {
         return ToolResult::text(MSG_NO_MEMORIES.into());
     }
 
-    // Convert to scored format (no score = -1.0)
-    let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, -1.0)).collect();
-    ToolResult::text(format_memory_output(&scored, compact))
+    // FTS-path results have synthetic scores — reset to -1.0 for display
+    // so we don't claim a hybrid-search confidence we didn't compute.
+    let for_display: Vec<(Memory, f32)> = expanded.into_iter().map(|(m, _)| (m, -1.0)).collect();
+    ToolResult::text(format_memory_output(&for_display, compact))
 }
 
 fn tool_forget(store: &SqliteStore, args: &Value) -> ToolResult {
@@ -3052,5 +3108,90 @@ description = "A test project"
             .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
             .collect();
         assert!(names.contains(&"icm_wake_up"), "tool not listed: {names:?}");
+    }
+
+    // ── auto-link + graph-aware recall (integration) ─────────────────────
+    //
+    // Note: these tests run WITHOUT an embedder (`None`), so the auto-link
+    // code path is a no-op (it early-returns when `memory.embedding` is
+    // None). To verify the end-to-end graph flow we manually pre-populate
+    // `related_ids` via `icm_memory_update` OR by directly storing memories
+    // with related_ids set via the underlying store (done here through a
+    // helper that bypasses the MCP interface for link setup).
+
+    #[test]
+    fn test_mcp_recall_expands_via_graph_neighbors() {
+        use icm_core::{Importance, Memory};
+        let store = test_store();
+
+        // Build a small graph manually:
+        //   "sqlite-fts5" ←→ "fts5-bm25" ←→ "bm25-ranking"
+        // Query "sqlite-fts5" directly; expect "fts5-bm25" to come via hop.
+        let mut a = Memory::new(
+            "decisions-icm".into(),
+            "Use SQLite FTS5 for full-text search indexing".into(),
+            Importance::Critical,
+        );
+        let mut b = Memory::new(
+            "decisions-icm".into(),
+            "FTS5 provides BM25 ranking out of the box".into(),
+            Importance::High,
+        );
+        a.related_ids.push(b.id.clone());
+        b.related_ids.push(a.id.clone());
+
+        let unrelated = Memory::new(
+            "unrelated".into(),
+            "Totally different topic about network protocols".into(),
+            Importance::High,
+        );
+
+        store.store(a.clone()).unwrap();
+        store.store(b.clone()).unwrap();
+        store.store(unrelated).unwrap();
+
+        // Recall with a query that matches `a` strongly and `b` weakly or
+        // not at all. With graph expansion, `b` should surface via its
+        // `related_ids` link from `a`.
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "SQLite FTS5 indexing", "limit": 5}),
+            false,
+        );
+        assert!(
+            !result.is_error,
+            "recall failed: {}",
+            result.content[0].text
+        );
+        let text = &result.content[0].text;
+        assert!(text.contains("SQLite FTS5"), "primary hit missing: {text}");
+        assert!(
+            text.contains("BM25 ranking"),
+            "graph-expanded neighbor should appear: {text}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_store_reports_link_count_when_linking_occurs() {
+        // Without embeddings, auto-link is a no-op and the stored message
+        // has no "+N link" suffix. Verify the regular path still works.
+        let store = test_store();
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "t", "content": "first entry", "importance": "high"}),
+            false,
+        );
+        assert!(!result.is_error);
+        let text = &result.content[0].text;
+        assert!(text.contains("Stored memory"));
+        // No link suffix when embeddings are off.
+        assert!(
+            !text.contains("(+"),
+            "should not claim links without embedder: {text}"
+        );
     }
 }

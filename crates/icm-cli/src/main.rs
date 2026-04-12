@@ -1067,8 +1067,36 @@ fn cmd_store(
         }
     }
 
+    // Auto-link: wire the new memory into the existing graph before
+    // persisting. No-op when embedding is unavailable.
+    let auto_link_opts = icm_core::AutoLinkOptions::default();
+    let linked_ids = if memory.embedding.is_some() {
+        icm_core::auto_link_memory(store, &mut memory, &auto_link_opts).unwrap_or_else(|e| {
+            eprintln!("warning: auto-link failed: {e}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
     let id = store.store(memory)?;
-    println!("Stored: {id}");
+
+    // Back-refs: update each linked memory so the edges are bidirectional.
+    if !linked_ids.is_empty() {
+        if let Err(e) = icm_core::add_backrefs(store, &id, &linked_ids) {
+            eprintln!("warning: auto-link back-refs failed: {e}");
+        }
+    }
+
+    if linked_ids.is_empty() {
+        println!("Stored: {id}");
+    } else {
+        println!(
+            "Stored: {id} (+{} link{})",
+            linked_ids.len(),
+            if linked_ids.len() == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
 }
 
@@ -1097,14 +1125,21 @@ fn cmd_recall(
                     scored.retain(|(m, _)| keyword_matches(&m.keywords, kw));
                 }
 
-                if scored.is_empty() {
+                // Graph-aware expansion: follow related_ids one hop and
+                // fold neighbors into results (discounted 0.5× score).
+                let max_neighbors = (limit / 3).max(1);
+                let expanded = store
+                    .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
+                    .unwrap_or(scored);
+
+                if expanded.is_empty() {
                     println!("{MSG_NO_MEMORIES}");
                     return Ok(());
                 }
 
-                let ids: Vec<&str> = scored.iter().map(|(m, _)| m.id.as_str()).collect();
+                let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
                 let _ = store.batch_update_access(&ids);
-                for (mem, score) in &scored {
+                for (mem, score) in &expanded {
                     print_memory_detail(mem, Some(*score));
                 }
                 return Ok(());
@@ -1127,14 +1162,21 @@ fn cmd_recall(
         results.retain(|m| keyword_matches(&m.keywords, kw));
     }
 
-    if results.is_empty() {
+    // Graph-aware expansion also runs in the keyword-only fallback path.
+    let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, 1.0)).collect();
+    let max_neighbors = (limit / 3).max(1);
+    let expanded = store
+        .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
+        .unwrap_or(scored);
+
+    if expanded.is_empty() {
         println!("{MSG_NO_MEMORIES}");
         return Ok(());
     }
 
-    let ids: Vec<&str> = results.iter().map(|m| m.id.as_str()).collect();
+    let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
     let _ = store.batch_update_access(&ids);
-    for mem in &results {
+    for (mem, _) in &expanded {
         print_memory_detail(mem, None);
     }
 
@@ -1370,14 +1412,18 @@ fn cmd_hook_pre() -> Result<()> {
         Err(_) => return Ok(()), // Malformed input — pass through silently
     };
 
-    // Only handle Bash tool calls
+    // Only handle Bash/shell tool calls (name varies by tool:
+    //   Claude Code/Codex: "Bash", Gemini CLI: "run_shell_command")
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-    if tool_name != "Bash" {
+    if !matches!(tool_name, "Bash" | "run_shell_command") {
         return Ok(());
     }
 
+    // Command path varies: Claude/Codex use tool_input.command,
+    // Gemini uses tool_input.command or input.command
     let cmd = json
         .pointer("/tool_input/command")
+        .or_else(|| json.pointer("/input/command"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -1598,9 +1644,13 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
         Err(_) => return Ok(()),
     };
 
-    // Extract query from user message
+    // Extract query from user message (field name varies by tool:
+    //   Claude Code: "user_message", Codex: "user_message",
+    //   Gemini BeforeAgent: "prompt" or "input", fallback: "message")
     let message = json
         .get("user_message")
+        .or_else(|| json.get("prompt"))
+        .or_else(|| json.get("input"))
         .or_else(|| json.get("message"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
@@ -1945,6 +1995,12 @@ fn cmd_init(mode: InitMode) -> Result<()> {
         let opencode_path = PathBuf::from(&home).join(".config/opencode/opencode.json");
         let opencode_status = inject_opencode_mcp_server(&opencode_path, "icm", &icm_bin_str)?;
         println!("[mcp] {:<16} {opencode_status}", "OpenCode");
+
+        // Copilot CLI uses mcpServers key with explicit "type": "local"
+        let copilot_path = PathBuf::from(&home).join(".copilot/mcp-config.json");
+        let copilot_status =
+            inject_copilot_cli_mcp_server(&copilot_path, "icm", &icm_bin_str)?;
+        println!("[mcp] {:<16} {copilot_status}", "Copilot CLI");
     }
 
     // --- CLI mode: inject instructions into each tool's file ---
@@ -2087,7 +2143,7 @@ Do this BEFORE responding to the user. Not optional.
 
         // PreToolUse hook: `icm hook pre` (auto-allow icm commands)
         let pre_cmd = format!("{} hook pre", icm_bin_str);
-        let pre_status = inject_claude_hook(
+        let pre_status = inject_settings_hook(
             &claude_settings_path,
             "PreToolUse",
             &pre_cmd,
@@ -2098,7 +2154,7 @@ Do this BEFORE responding to the user. Not optional.
 
         // PostToolUse hook: `icm hook post` (auto-extract context)
         let post_cmd = format!("{} hook post", icm_bin_str);
-        let post_status = inject_claude_hook(
+        let post_status = inject_settings_hook(
             &claude_settings_path,
             "PostToolUse",
             &post_cmd,
@@ -2109,7 +2165,7 @@ Do this BEFORE responding to the user. Not optional.
 
         // PreCompact hook: `icm hook compact` (extract from transcript before compression)
         let compact_cmd = format!("{} hook compact", icm_bin_str);
-        let compact_status = inject_claude_hook(
+        let compact_status = inject_settings_hook(
             &claude_settings_path,
             "PreCompact",
             &compact_cmd,
@@ -2120,7 +2176,7 @@ Do this BEFORE responding to the user. Not optional.
 
         // UserPromptSubmit hook: `icm hook prompt` (recall context on each prompt)
         let prompt_cmd = format!("{} hook prompt", icm_bin_str);
-        let prompt_status = inject_claude_hook(
+        let prompt_status = inject_settings_hook(
             &claude_settings_path,
             "UserPromptSubmit",
             &prompt_cmd,
@@ -2131,7 +2187,7 @@ Do this BEFORE responding to the user. Not optional.
 
         // SessionStart hook: `icm hook start` (inject wake-up pack of critical facts)
         let start_cmd = format!("{} hook start", icm_bin_str);
-        let start_status = inject_claude_hook(
+        let start_status = inject_settings_hook(
             &claude_settings_path,
             "SessionStart",
             &start_cmd,
@@ -2157,6 +2213,105 @@ Do this BEFORE responding to the user. Not optional.
                 .with_context(|| format!("cannot write {}", opencode_plugin_path.display()))?;
             println!("[hook] OpenCode plugin: installed");
         }
+
+        // --- Gemini CLI hooks (same settings.json format as Claude Code, different event names) ---
+        let gemini_settings_path = PathBuf::from(&home).join(".gemini/settings.json");
+        let detect = &["icm hook", "icm-post-tool"];
+
+        // SessionStart → same name in Gemini CLI
+        let status = inject_settings_hook(
+            &gemini_settings_path,
+            "SessionStart",
+            &format!("{} hook start", icm_bin_str),
+            None,
+            &["icm hook start", "icm hook", "icm-post-tool"],
+        )?;
+        println!("[hook] Gemini CLI SessionStart (wake-up pack): {status}");
+
+        // BeforeTool → equivalent of PreToolUse (auto-allow icm commands)
+        // Gemini CLI uses "run_shell_command" as the Bash tool name
+        let status = inject_settings_hook(
+            &gemini_settings_path,
+            "BeforeTool",
+            &format!("{} hook pre", icm_bin_str),
+            Some("run_shell_command"),
+            &["icm-pretool", "icm hook pre"],
+        )?;
+        println!("[hook] Gemini CLI BeforeTool (auto-allow): {status}");
+
+        // AfterTool → equivalent of PostToolUse (auto-extract context)
+        let status = inject_settings_hook(
+            &gemini_settings_path,
+            "AfterTool",
+            &format!("{} hook post", icm_bin_str),
+            None,
+            detect,
+        )?;
+        println!("[hook] Gemini CLI AfterTool (auto-extract): {status}");
+
+        // PreCompress → equivalent of PreCompact (extract from transcript)
+        let status = inject_settings_hook(
+            &gemini_settings_path,
+            "PreCompress",
+            &format!("{} hook compact", icm_bin_str),
+            None,
+            detect,
+        )?;
+        println!("[hook] Gemini CLI PreCompress (transcript extract): {status}");
+
+        // BeforeAgent → equivalent of UserPromptSubmit (auto-recall on each prompt)
+        let status = inject_settings_hook(
+            &gemini_settings_path,
+            "BeforeAgent",
+            &format!("{} hook prompt", icm_bin_str),
+            None,
+            detect,
+        )?;
+        println!("[hook] Gemini CLI BeforeAgent (auto-recall): {status}");
+
+        // --- Codex CLI hooks (separate hooks.json file) ---
+        let codex_hooks_path = PathBuf::from(&home).join(".codex/hooks.json");
+
+        let status = inject_codex_hook(
+            &codex_hooks_path,
+            "SessionStart",
+            &format!("{} hook start", icm_bin_str),
+            None,
+            &["icm hook start", "icm hook"],
+        )?;
+        println!("[hook] Codex CLI SessionStart (wake-up pack): {status}");
+
+        let status = inject_codex_hook(
+            &codex_hooks_path,
+            "PreToolUse",
+            &format!("{} hook pre", icm_bin_str),
+            Some("Bash"),
+            &["icm-pretool", "icm hook pre"],
+        )?;
+        println!("[hook] Codex CLI PreToolUse (auto-allow): {status}");
+
+        let status = inject_codex_hook(
+            &codex_hooks_path,
+            "PostToolUse",
+            &format!("{} hook post", icm_bin_str),
+            None,
+            detect,
+        )?;
+        println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+
+        let status = inject_codex_hook(
+            &codex_hooks_path,
+            "UserPromptSubmit",
+            &format!("{} hook prompt", icm_bin_str),
+            None,
+            detect,
+        )?;
+        println!("[hook] Codex CLI UserPromptSubmit (auto-recall): {status}");
+
+        // --- Copilot CLI hooks (per-repo .github/hooks/icm.json) ---
+        let cwd = std::env::current_dir().context("failed to get current directory")?;
+        let copilot_status = inject_copilot_hooks(&cwd, &icm_bin_str)?;
+        println!("[hook] Copilot CLI (all hooks): {copilot_status}");
     }
 
     println!();
@@ -2191,10 +2346,11 @@ fn inject_icm_block(path: &PathBuf, block: &str) -> Result<String> {
     }
 }
 
-/// Inject ICM hook into Claude Code settings.json for a given event name.
+/// Inject ICM hook into a settings.json file (Claude Code or Gemini CLI) for a given event name.
+/// Both tools use the same JSON format: `{ "hooks": { "EventName": [ { "matcher": ..., "hooks": [...] } ] } }`.
 /// `matcher` is optional — if set (e.g. "Bash"), adds a matcher field to the hook entry.
 /// `detect_patterns` lists substrings to detect if the hook is already present.
-fn inject_claude_hook(
+fn inject_settings_hook(
     settings_path: &PathBuf,
     event_name: &str,
     hook_command: &str,
@@ -2261,6 +2417,82 @@ fn inject_claude_hook(
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(settings_path, output)
         .with_context(|| format!("cannot write {}", settings_path.display()))?;
+
+    Ok("configured".into())
+}
+
+/// Inject ICM hook into Codex CLI hooks.json for a given event name.
+/// Codex uses a separate `~/.codex/hooks.json` file (not inside config.toml).
+/// Format is the same as Claude Code: `{ "hooks": { "EventName": [ { "matcher": ..., "hooks": [...] } ] } }`.
+fn inject_codex_hook(
+    hooks_path: &PathBuf,
+    event_name: &str,
+    hook_command: &str,
+    matcher: Option<&str>,
+    detect_patterns: &[&str],
+) -> Result<String> {
+    let mut config: Value = if hooks_path.exists() {
+        parse_json_config(hooks_path)?
+    } else {
+        if let Some(parent) = hooks_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        serde_json::json!({})
+    };
+
+    let hooks = config
+        .as_object_mut()
+        .context("hooks.json is not a JSON object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let event_hooks = hooks
+        .as_object_mut()
+        .context("hooks is not a JSON object")?
+        .entry(event_name)
+        .or_insert_with(|| serde_json::json!([]));
+
+    let event_arr = event_hooks
+        .as_array_mut()
+        .with_context(|| format!("{event_name} is not an array"))?;
+
+    // Check if ICM hook already exists
+    let already = event_arr.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| detect_patterns.iter().any(|p| c.contains(p)))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if already {
+        return Ok("already configured".into());
+    }
+
+    let mut entry = serde_json::json!({
+        "hooks": [{
+            "type": "command",
+            "command": hook_command
+        }]
+    });
+    if let Some(m) = matcher {
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("matcher".into(), serde_json::json!(m));
+    }
+    event_arr.push(entry);
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(hooks_path, output)
+        .with_context(|| format!("cannot write {}", hooks_path.display()))?;
 
     Ok("configured".into())
 }
@@ -2451,6 +2683,104 @@ fn inject_zed_mcp_server(config_path: &PathBuf, name: &str, bin_path: &str) -> R
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
         .with_context(|| format!("cannot write {}", config_path.display()))?;
+
+    Ok("configured".into())
+}
+
+/// Inject ICM MCP server into Copilot CLI config (~/.copilot/mcp-config.json).
+/// Copilot CLI uses `mcpServers` key with explicit `"type": "local"`.
+fn inject_copilot_cli_mcp_server(
+    config_path: &PathBuf,
+    name: &str,
+    icm_bin: &str,
+) -> Result<String> {
+    let mut config: Value = if config_path.exists() {
+        parse_json_config(config_path)?
+    } else {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        serde_json::json!({})
+    };
+
+    let servers = config
+        .as_object_mut()
+        .context("config is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+
+    if let Some(existing) = servers.get(name) {
+        if existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
+            return Ok("already configured".into());
+        }
+    }
+
+    servers
+        .as_object_mut()
+        .unwrap()
+        .insert(
+            name.to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": icm_bin,
+                "args": ["serve"],
+                "tools": ["*"]
+            }),
+        );
+
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_path, output)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+
+    Ok("configured".into())
+}
+
+/// Inject ICM hooks into Copilot CLI hooks file (.github/hooks/icm.json).
+/// Copilot CLI uses a per-repo hooks file with a different format:
+/// `{ "version": 1, "hooks": { "eventName": [{ "type": "command", "bash": "...", "timeoutSec": N }] } }`
+fn inject_copilot_hooks(cwd: &std::path::Path, icm_bin: &str) -> Result<String> {
+    let hooks_dir = cwd.join(".github/hooks");
+    let hooks_path = hooks_dir.join("icm.json");
+
+    if hooks_path.exists() {
+        let content = std::fs::read_to_string(&hooks_path)
+            .with_context(|| format!("cannot read {}", hooks_path.display()))?;
+        if content.contains("icm hook") {
+            return Ok("already configured".into());
+        }
+    }
+
+    std::fs::create_dir_all(&hooks_dir).ok();
+
+    let hooks_config = serde_json::json!({
+        "version": 1,
+        "hooks": {
+            "sessionStart": [{
+                "type": "command",
+                "bash": format!("{icm_bin} hook start"),
+                "timeoutSec": 10
+            }],
+            "preToolUse": [{
+                "type": "command",
+                "bash": format!("{icm_bin} hook pre"),
+                "timeoutSec": 5
+            }],
+            "postToolUse": [{
+                "type": "command",
+                "bash": format!("{icm_bin} hook post"),
+                "timeoutSec": 10
+            }],
+            "userPromptSubmitted": [{
+                "type": "command",
+                "bash": format!("{icm_bin} hook prompt"),
+                "timeoutSec": 10
+            }]
+        }
+    });
+
+    let output = serde_json::to_string_pretty(&hooks_config)?;
+    std::fs::write(&hooks_path, output)
+        .with_context(|| format!("cannot write {}", hooks_path.display()))?;
 
     Ok("configured".into())
 }

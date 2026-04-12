@@ -2007,6 +2007,11 @@ fn cmd_init(mode: InitMode) -> Result<()> {
         let copilot_path = PathBuf::from(&home).join(".copilot/mcp-config.json");
         let copilot_status = inject_copilot_cli_mcp_server(&copilot_path, "icm", &icm_bin_str)?;
         println!("[mcp] {:<16} {copilot_status}", "Copilot CLI");
+
+        // Continue.dev uses YAML config with mcpServers key
+        let continue_path = PathBuf::from(&home).join(".continue/config.yaml");
+        let continue_status = inject_continue_mcp_server(&continue_path, "icm", &icm_bin_str)?;
+        println!("[mcp] {:<16} {continue_status}", "Continue.dev");
     }
 
     // --- CLI mode: inject instructions into each tool's file ---
@@ -2054,6 +2059,7 @@ icm topics                                # list all topics\n\
             ("Gemini", PathBuf::from(&home).join(".gemini/GEMINI.md")),
             ("Copilot", cwd.join(".github/copilot-instructions.md")),
             ("Windsurf", cwd.join(".windsurfrules")),
+            ("Aider", cwd.join(".aider.conventions.md")),
         ];
 
         for (tool_name, path) in &instruction_files {
@@ -2734,6 +2740,46 @@ fn inject_copilot_cli_mcp_server(
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
         .with_context(|| format!("cannot write {}", config_path.display()))?;
+
+    Ok("configured".into())
+}
+
+/// Inject ICM MCP server into Continue.dev config (~/.continue/config.yaml).
+/// Continue.dev uses YAML with a top-level `mcpServers` list.
+fn inject_continue_mcp_server(config_path: &PathBuf, name: &str, icm_bin: &str) -> Result<String> {
+    if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        if content.contains(icm_bin) || content.contains(&format!("name: {name}")) {
+            return Ok("already configured".into());
+        }
+        // Append MCP server entry to existing config
+        let entry = format!(
+            "\nmcpServers:\n  - name: {name}\n    command: {icm_bin}\n    args:\n      - serve\n"
+        );
+        let new_content = if content.contains("mcpServers:") {
+            // Insert under existing mcpServers key
+            content.replace(
+                "mcpServers:",
+                &format!(
+                    "mcpServers:\n  - name: {name}\n    command: {icm_bin}\n    args:\n      - serve"
+                ),
+            )
+        } else {
+            format!("{}\n{}", content.trim_end(), entry)
+        };
+        std::fs::write(config_path, new_content)
+            .with_context(|| format!("cannot write {}", config_path.display()))?;
+    } else {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let content = format!(
+            "mcpServers:\n  - name: {name}\n    command: {icm_bin}\n    args:\n      - serve\n"
+        );
+        std::fs::write(config_path, content)
+            .with_context(|| format!("cannot write {}", config_path.display()))?;
+    }
 
     Ok("configured".into())
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.22](https://github.com/rtk-ai/icm/compare/icm-v0.10.21...icm-v0.10.22) (2026-04-12)
+
+
+### Features
+
+* **security:** add SHA256 checksum verification + icm upgrade --apply ([#103](https://github.com/rtk-ai/icm/issues/103)) ([3aa18b1](https://github.com/rtk-ai/icm/commit/3aa18b12c78ce63d16d411df9d2751365742e38d))
+
 ## [0.10.21](https://github.com/rtk-ai/icm/compare/icm-v0.10.20...icm-v0.10.21) (2026-04-12)
 
 

@@ -52,3 +52,11 @@ libc = "0.2"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
+
+# Web dashboard
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+rust-embed = "8"
+mime_guess = "2"
+getrandom = "0.2"

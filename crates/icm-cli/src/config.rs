@@ -21,6 +21,7 @@ pub struct Config {
     pub recall: RecallConfig,
     pub wakeup: WakeUpConfig,
     pub mcp: McpConfig,
+    pub web: WebConfig,
     pub cloud: CloudConfig,
 }
 
@@ -116,6 +117,31 @@ pub struct McpConfig {
     pub compact: bool,
     /// Custom system instructions appended to MCP server info.
     pub instructions: Option<String>,
+}
+
+/// Web dashboard settings.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Bind host for the web server.
+    pub host: String,
+    /// Bind port for the web server.
+    pub port: u16,
+    /// Basic auth username.
+    pub username: String,
+    /// Basic auth password. Empty = auto-generate or use ICM_WEB_PASSWORD env.
+    pub password: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 8420,
+            username: "admin".into(),
+            password: String::new(),
+        }
+    }
 }
 
 /// RTK Cloud sync settings.

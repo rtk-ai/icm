@@ -150,7 +150,7 @@ impl fmt::Display for MemorySource {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StoreStats {
     pub total_memories: usize,
     pub total_topics: usize,
@@ -172,7 +172,7 @@ pub struct PatternCluster {
     pub count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TopicHealth {
     pub topic: String,
     pub entry_count: usize,

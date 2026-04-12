@@ -46,6 +46,9 @@ directories = "6"
 # HTTP (cloud sync)
 ureq = "2"
 rpassword = "5"
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
 
 # Platform
 libc = "0.2"

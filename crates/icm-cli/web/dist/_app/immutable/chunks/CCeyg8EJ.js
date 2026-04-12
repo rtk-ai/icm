@@ -1,0 +1,1 @@
+import{a as l}from"./CYphsYiT.js";import{i as e}from"./wqRimN2r.js";function u(s,c,r,f,p,i){var a=s.__className;if(e||a!==r||a===void 0){var t=l(r);(!e||t!==s.getAttribute("class"))&&(t==null?s.removeAttribute("class"):s.className=t),s.__className=r}return i}export{u as s};

@@ -37,6 +37,7 @@ pub struct AppState {
     store: Arc<Mutex<SqliteStore>>,
     username: String,
     password: String,
+    session_token: Arc<Mutex<String>>,
     config_toml: String,
 }
 
@@ -106,64 +107,63 @@ fn credentials_path() -> Option<std::path::PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Basic Auth middleware
+// Session auth middleware (cookie-based)
 // ---------------------------------------------------------------------------
+
+/// Generate a random session token (32 hex chars).
+fn generate_session_token() -> String {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).ok();
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+const SESSION_COOKIE: &str = "icm_session";
 
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    // /_health is public (no auth)
-    if req.uri().path() == "/_health" {
+    let path = req.uri().path();
+
+    // Public routes — no auth required
+    if path == "/_health" || path == "/api/login" || path == "/login" {
         return next.run(req).await;
     }
 
-    let authorized = req
+    // Check session cookie
+    let has_valid_session = req
         .headers()
-        .get(header::AUTHORIZATION)
+        .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic "))
-        .and_then(|b64| {
-            let decoded = base64_decode(b64)?;
-            let s = String::from_utf8(decoded).ok()?;
-            let (user, pass) = s.split_once(':')?;
-            Some(user == state.username && pass == state.password)
+        .map(|cookies| {
+            cookies.split(';').any(|c| {
+                let c = c.trim();
+                if let Some(val) = c.strip_prefix("icm_session=") {
+                    val == *state.session_token.lock().unwrap()
+                } else {
+                    false
+                }
+            })
         })
         .unwrap_or(false);
 
-    if authorized {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"icm\"")],
-            "Unauthorized",
-        )
-            .into_response()
+    if has_valid_session {
+        return next.run(req).await;
     }
-}
 
-/// Simple base64 decode (avoid pulling in a full crate).
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u32 = 0;
-    for &b in input.as_bytes() {
-        if b == b'=' {
-            break;
-        }
-        let val = TABLE.iter().position(|&c| c == b)? as u32;
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
+    // Not authenticated — serve SPA for page routes (login page handles it client-side),
+    // return 401 JSON for API routes
+    if path.starts_with("/api/") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
     }
-    Some(out)
+
+    // For non-API routes, serve the SPA (it will show the login page)
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +196,9 @@ fn api_router() -> Router<AppState> {
         // Settings
         .route("/api/whoami", get(api_whoami))
         .route("/api/config", get(api_config))
+        // Auth
+        .route("/api/login", post(api_login))
+        .route("/api/logout", post(api_logout))
         // Public health check (no auth, no SPA conflict)
         .route("/_health", get(api_health_check))
 }
@@ -223,6 +226,7 @@ pub async fn run_web_server(
         store: Arc::new(Mutex::new(store)),
         username,
         password,
+        session_token: Arc::new(Mutex::new(String::new())),
         config_toml,
     };
 
@@ -641,4 +645,44 @@ async fn api_config(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "config_toml": state.config_toml,
     }))
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn api_login(
+    State(state): State<AppState>,
+    Json(body): Json<LoginRequest>,
+) -> impl IntoResponse {
+    if body.username == state.username && body.password == state.password {
+        let token = generate_session_token();
+        *state.session_token.lock().unwrap() = token.clone();
+        let cookie =
+            format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400");
+        (
+            StatusCode::OK,
+            [(header::SET_COOKIE, cookie)],
+            Json(serde_json::json!({"ok": true, "username": state.username})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"ok": false, "error": "Invalid credentials"})),
+        )
+            .into_response()
+    }
+}
+
+async fn api_logout(State(state): State<AppState>) -> impl IntoResponse {
+    *state.session_token.lock().unwrap() = String::new();
+    let cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0");
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({"ok": true})),
+    )
 }

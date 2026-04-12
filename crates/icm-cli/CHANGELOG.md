@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.19](https://github.com/rtk-ai/icm/compare/icm-v0.10.18...icm-v0.10.19) (2026-04-12)
+
+
+### Features
+
+* add Continue.dev MCP + Aider CLI support ([#95](https://github.com/rtk-ai/icm/issues/95)) ([1087917](https://github.com/rtk-ai/icm/commit/10879172c4a390143f9ca0d03a213124471e31f5))
+
 ## [0.10.18](https://github.com/rtk-ai/icm/compare/icm-v0.10.17...icm-v0.10.18) (2026-04-12)
 
 

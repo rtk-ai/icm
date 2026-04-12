@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.21](https://github.com/rtk-ai/icm/compare/icm-v0.10.20...icm-v0.10.21) (2026-04-12)
+
+
+### Bug Fixes
+
+* persist hook counter in SQLite instead of /tmp file ([#101](https://github.com/rtk-ai/icm/issues/101)) ([a256a85](https://github.com/rtk-ai/icm/commit/a256a85e49bcdb0bebe2d325110bb9f58b9d9790))
+* **zed:** use correct settings format ([#88](https://github.com/rtk-ai/icm/issues/88)) ([0dd366d](https://github.com/rtk-ai/icm/commit/0dd366d7834acebe662593c4640bbb0ccc8aaa5c))
+
 ## [0.10.20](https://github.com/rtk-ai/icm/compare/icm-v0.10.19...icm-v0.10.20) (2026-04-12)
 
 

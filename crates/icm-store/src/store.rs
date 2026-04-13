@@ -1981,13 +1981,17 @@ impl TranscriptStore for SqliteStore {
              JOIN sessions s ON s.id = m.session_id
              WHERE messages_fts MATCH ?1",
         );
+        // Param numbering: ?1 = query (always). Session if present is ?2.
+        // Project is ?2 if no session, else ?3.
         if session_id.is_some() {
-            sql.push_str(" AND m.session_id = ?");
-            sql.push_str(if project.is_some() { "2" } else { "2" });
+            sql.push_str(" AND m.session_id = ?2");
         }
         if project.is_some() {
-            sql.push_str(" AND s.project = ?");
-            sql.push_str(if session_id.is_some() { "3" } else { "2" });
+            if session_id.is_some() {
+                sql.push_str(" AND s.project = ?3");
+            } else {
+                sql.push_str(" AND s.project = ?2");
+            }
         }
         sql.push_str(" ORDER BY score ASC LIMIT ?");
         sql.push_str(match (session_id.is_some(), project.is_some()) {

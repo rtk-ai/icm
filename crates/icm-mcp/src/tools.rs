@@ -533,6 +533,111 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "properties": {}
             }
         }),
+        // --- Transcript tools (verbatim session replay) ---
+        json!({
+            "name": "icm_transcript_start_session",
+            "description": "Create a new transcript session for verbatim message capture. Returns the session_id used by subsequent icm_transcript_record calls. Use once per conversation or debugging session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Agent identifier (e.g. 'claude-code', 'cursor', 'gemini-cli'). Default: 'mcp'."
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project name (optional; usually cwd basename or repo slug)"
+                    },
+                    "metadata": {
+                        "type": "string",
+                        "description": "Arbitrary JSON metadata (optional)"
+                    }
+                }
+            }
+        }),
+        json!({
+            "name": "icm_transcript_record",
+            "description": "Append a verbatim message to a transcript session. Stores the raw content with no summarization. Use once per user turn, assistant reply, or tool call for full replay fidelity.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session id from icm_transcript_start_session"
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ["user", "assistant", "system", "tool"],
+                        "description": "Message role"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Raw message content (stored verbatim)"
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Tool name if role=tool (optional)"
+                    },
+                    "tokens": {
+                        "type": "integer",
+                        "description": "Token count for billing / stats (optional)"
+                    },
+                    "metadata": {
+                        "type": "string",
+                        "description": "Arbitrary JSON metadata (optional)"
+                    }
+                },
+                "required": ["session_id", "role", "content"]
+            }
+        }),
+        json!({
+            "name": "icm_transcript_search",
+            "description": "Full-text search across recorded transcript messages (FTS5 BM25). Supports boolean operators, phrase matches, and prefix queries. Use to recall exact quotes or debug past decisions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "FTS5 query: 'postgres OR mysql', '\"exact phrase\"', 'auth*'"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Restrict to one session (optional)"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Restrict to one project (optional)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 50
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "icm_transcript_show",
+            "description": "Replay the full message thread of a transcript session, chronologically. Returns up to `limit` messages with role, content, tool name, timestamp.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "limit": { "type": "integer", "default": 200, "minimum": 1, "maximum": 2000 }
+                },
+                "required": ["session_id"]
+            }
+        }),
+        json!({
+            "name": "icm_transcript_stats",
+            "description": "Global transcript statistics: session count, message count, total bytes, breakdown by role and agent, top sessions by message count.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
         json!({
             "name": "icm_wake_up",
             "description": "Build a compact critical-facts pack for LLM system-prompt injection. Selects critical/high memories (and preferences) optionally scoped by project, ranks by importance × recency × weight, and truncates to a token budget. Use at session start to hydrate an agent with the most load-bearing context.",
@@ -626,9 +731,118 @@ pub fn call_tool(
         "icm_feedback_record" => tool_feedback_record(store, args, compact),
         "icm_feedback_search" => tool_feedback_search(store, args),
         "icm_feedback_stats" => tool_feedback_stats(store),
+        // Transcript tools
+        "icm_transcript_start_session" => tool_transcript_start_session(store, args),
+        "icm_transcript_record" => tool_transcript_record(store, args),
+        "icm_transcript_search" => tool_transcript_search(store, args),
+        "icm_transcript_show" => tool_transcript_show(store, args),
+        "icm_transcript_stats" => tool_transcript_stats(store),
         // Wake-up tool
         "icm_wake_up" => tool_wake_up(store, args),
         _ => ToolResult::error(format!("unknown tool: {name}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript tool handlers
+// ---------------------------------------------------------------------------
+
+fn tool_transcript_start_session(store: &SqliteStore, args: &Value) -> ToolResult {
+    use icm_core::TranscriptStore;
+    let agent = args.get("agent").and_then(|v| v.as_str()).unwrap_or("mcp");
+    let project = args.get("project").and_then(|v| v.as_str());
+    let metadata = args.get("metadata").and_then(|v| v.as_str());
+    match store.create_session(agent, project, metadata) {
+        Ok(id) => ToolResult::text(format!("{{\"session_id\":\"{id}\"}}")),
+        Err(e) => ToolResult::error(format!("start_session failed: {e}")),
+    }
+}
+
+fn tool_transcript_record(store: &SqliteStore, args: &Value) -> ToolResult {
+    use icm_core::{Role, TranscriptStore};
+    let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return ToolResult::error("session_id is required".into()),
+    };
+    let role_str = match args.get("role").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return ToolResult::error("role is required".into()),
+    };
+    let role = match Role::parse(role_str) {
+        Some(r) => r,
+        None => {
+            return ToolResult::error(format!(
+                "invalid role '{role_str}'; must be user|assistant|system|tool"
+            ))
+        }
+    };
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return ToolResult::error("content is required".into()),
+    };
+    let tool_name = args.get("tool_name").and_then(|v| v.as_str());
+    let tokens = args.get("tokens").and_then(|v| v.as_i64());
+    let metadata = args.get("metadata").and_then(|v| v.as_str());
+    match store.record_message(session_id, role, content, tool_name, tokens, metadata) {
+        Ok(id) => ToolResult::text(format!("{{\"message_id\":\"{id}\"}}")),
+        Err(e) => ToolResult::error(format!("record failed: {e}")),
+    }
+}
+
+fn tool_transcript_search(store: &SqliteStore, args: &Value) -> ToolResult {
+    use icm_core::TranscriptStore;
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return ToolResult::error("query is required".into()),
+    };
+    let session_id = args.get("session_id").and_then(|v| v.as_str());
+    let project = args.get("project").and_then(|v| v.as_str());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .min(50) as usize;
+    match store.search_transcripts(query, session_id, project, limit) {
+        Ok(hits) => {
+            let json = serde_json::to_string(&hits)
+                .unwrap_or_else(|_| "[]".into());
+            ToolResult::text(json)
+        }
+        Err(e) => ToolResult::error(format!("search failed: {e}")),
+    }
+}
+
+fn tool_transcript_show(store: &SqliteStore, args: &Value) -> ToolResult {
+    use icm_core::TranscriptStore;
+    let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return ToolResult::error("session_id is required".into()),
+    };
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200)
+        .min(2000) as usize;
+    let sess = match store.get_session(session_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return ToolResult::error(format!("session {session_id} not found")),
+        Err(e) => return ToolResult::error(format!("get_session failed: {e}")),
+    };
+    let msgs = match store.list_session_messages(session_id, limit, 0) {
+        Ok(m) => m,
+        Err(e) => return ToolResult::error(format!("list_messages failed: {e}")),
+    };
+    let body = json!({ "session": sess, "messages": msgs });
+    ToolResult::text(body.to_string())
+}
+
+fn tool_transcript_stats(store: &SqliteStore) -> ToolResult {
+    use icm_core::TranscriptStore;
+    match store.transcript_stats() {
+        Ok(s) => ToolResult::text(
+            serde_json::to_string(&s).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(e) => ToolResult::error(format!("stats failed: {e}")),
     }
 }
 

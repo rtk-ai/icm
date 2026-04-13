@@ -989,7 +989,12 @@ fn main() -> Result<()> {
                 agent,
                 project,
                 metadata,
-            } => cmd_transcript_start_session(&store, &agent, project.as_deref(), metadata.as_deref()),
+            } => cmd_transcript_start_session(
+                &store,
+                &agent,
+                project.as_deref(),
+                metadata.as_deref(),
+            ),
             TranscriptCommands::Record {
                 session,
                 role,
@@ -1628,7 +1633,11 @@ fn cmd_transcript_search(
     }
     for hit in hits {
         let preview: String = hit.message.content.chars().take(280).collect();
-        let suffix = if hit.message.content.chars().count() > 280 { "…" } else { "" };
+        let suffix = if hit.message.content.chars().count() > 280 {
+            "…"
+        } else {
+            ""
+        };
         let proj = hit.session.project.as_deref().unwrap_or("-");
         println!("--- {} ---", hit.message.id);
         println!(
@@ -1741,7 +1750,11 @@ fn cmd_transcript_stats(store: &SqliteStore) -> Result<()> {
     if !s.by_agent.is_empty() {
         println!("\nBy agent:");
         for (agent, count) in &s.by_agent {
-            let label = if agent.is_empty() { "(unset)" } else { agent.as_str() };
+            let label = if agent.is_empty() {
+                "(unset)"
+            } else {
+                agent.as_str()
+            };
             println!("  {label}: {count}");
         }
     }

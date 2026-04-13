@@ -1951,7 +1951,10 @@ impl TranscriptStore for SqliteStore {
             )
             .map_err(db_err)?;
         let rows: Vec<Message> = stmt
-            .query_map(params![session_id, limit as i64, offset as i64], row_to_message)
+            .query_map(
+                params![session_id, limit as i64, offset as i64],
+                row_to_message,
+            )
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
@@ -4620,7 +4623,9 @@ mod tests {
     #[test]
     fn test_transcript_search_fts5_boolean_and_phrase() {
         let store = test_store();
-        let sid = store.create_session("cli", Some("db-debate"), None).unwrap();
+        let sid = store
+            .create_session("cli", Some("db-debate"), None)
+            .unwrap();
         store
             .record_message(
                 &sid,
@@ -4672,7 +4677,9 @@ mod tests {
             .unwrap();
 
         // Global search returns both
-        let all = store.search_transcripts("postgres", None, None, 10).unwrap();
+        let all = store
+            .search_transcripts("postgres", None, None, 10)
+            .unwrap();
         assert_eq!(all.len(), 2);
 
         // Session filter
@@ -4701,14 +4708,7 @@ mod tests {
             .record_message(&s, Role::Assistant, "a", None, None, None)
             .unwrap();
         store
-            .record_message(
-                &s,
-                Role::Tool,
-                "{}",
-                Some("Bash"),
-                Some(10),
-                None,
-            )
+            .record_message(&s, Role::Tool, "{}", Some("Bash"), Some(10), None)
             .unwrap();
 
         let stats = store.transcript_stats().unwrap();
@@ -4727,14 +4727,7 @@ mod tests {
         let s = store.create_session("cli", None, None).unwrap();
         for i in 0..5 {
             store
-                .record_message(
-                    &s,
-                    Role::User,
-                    &format!("msg {i}"),
-                    None,
-                    None,
-                    None,
-                )
+                .record_message(&s, Role::User, &format!("msg {i}"), None, None, None)
                 .unwrap();
         }
 
@@ -4768,14 +4761,7 @@ mod tests {
         let ids: Vec<_> = (0..3)
             .map(|i| {
                 store
-                    .record_message(
-                        &s,
-                        Role::User,
-                        &format!("{i}"),
-                        None,
-                        None,
-                        None,
-                    )
+                    .record_message(&s, Role::User, &format!("{i}"), None, None, None)
                     .unwrap()
             })
             .collect();

@@ -804,8 +804,7 @@ fn tool_transcript_search(store: &SqliteStore, args: &Value) -> ToolResult {
         .min(50) as usize;
     match store.search_transcripts(query, session_id, project, limit) {
         Ok(hits) => {
-            let json = serde_json::to_string(&hits)
-                .unwrap_or_else(|_| "[]".into());
+            let json = serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into());
             ToolResult::text(json)
         }
         Err(e) => ToolResult::error(format!("search failed: {e}")),
@@ -839,9 +838,7 @@ fn tool_transcript_show(store: &SqliteStore, args: &Value) -> ToolResult {
 fn tool_transcript_stats(store: &SqliteStore) -> ToolResult {
     use icm_core::TranscriptStore;
     match store.transcript_stats() {
-        Ok(s) => ToolResult::text(
-            serde_json::to_string(&s).unwrap_or_else(|_| "{}".into()),
-        ),
+        Ok(s) => ToolResult::text(serde_json::to_string(&s).unwrap_or_else(|_| "{}".into())),
         Err(e) => ToolResult::error(format!("stats failed: {e}")),
     }
 }

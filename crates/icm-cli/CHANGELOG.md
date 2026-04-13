@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.24](https://github.com/rtk-ai/icm/compare/icm-v0.10.23...icm-v0.10.24) (2026-04-13)
+
+
+### Features
+
+* verbatim transcripts — sessions + messages (refs [#107](https://github.com/rtk-ai/icm/issues/107)) ([#108](https://github.com/rtk-ai/icm/issues/108)) ([85cad66](https://github.com/rtk-ai/icm/commit/85cad663a36d05c23a71f8180a1fee85d038119b))
+
 ## [0.10.23](https://github.com/rtk-ai/icm/compare/icm-v0.10.22...icm-v0.10.23) (2026-04-12)
 
 

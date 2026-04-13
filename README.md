@@ -227,7 +227,38 @@ icm memoir export -m "system-architecture" -f json     # Structured JSON with al
 icm memoir export -m "system-architecture" -f dot | dot -Tsvg > graph.svg
 ```
 
-## MCP Tools (22)
+### Transcripts (verbatim session replay)
+
+Store every message exchanged with an agent as-is — no summarization, no extraction.
+Search later with FTS5 (BM25 + boolean + phrase + prefix). Useful for session replay,
+post-mortem review, compliance audit, training data. Complementary to curated memories.
+
+```bash
+# 1. Start a session
+SID=$(icm transcript start-session --agent claude-code --project myapp)
+
+# 2. Record every turn verbatim
+icm transcript record -s "$SID" -r user      -c "Pourquoi on avait choisi Postgres ?"
+icm transcript record -s "$SID" -r assistant -c "JSONB natif, BRIN pour les logs, auto-vacuum tuné."
+icm transcript record -s "$SID" -r tool      -c '{"cmd":"psql -c ..."}' -t Bash --tokens 42
+
+# 3. Replay, search, inspect
+icm transcript list-sessions --project myapp
+icm transcript show "$SID" --limit 200
+icm transcript search "postgres JSONB"                    # BM25 ranked
+icm transcript search '"auto-vacuum"'                     # phrase match
+icm transcript search "postgres OR mysql" --session "$SID" # boolean, scoped
+icm transcript stats
+
+# 4. Delete a session (cascade deletes its messages)
+icm transcript forget "$SID"
+```
+
+Rust + SQLite + FTS5 — 0 Python, 0 ChromaDB, 0 external service. Writes are ~10× faster than
+ChromaDB-based verbatim stores; the whole transcript lives in the same SQLite file as your
+memories and memoirs.
+
+## MCP Tools (27)
 
 ### Memory tools
 
@@ -265,6 +296,16 @@ icm memoir export -m "system-architecture" -f dot | dot -Tsvg > graph.svg
 | `icm_feedback_record` | Record a correction when an AI prediction was wrong |
 | `icm_feedback_search` | Search past corrections to inform future predictions |
 | `icm_feedback_stats` | Feedback statistics: total count, breakdown by topic, most applied |
+
+### Transcript tools (verbatim session replay)
+
+| Tool | Description |
+|------|-------------|
+| `icm_transcript_start_session` | Create a session for verbatim message capture; returns `session_id` |
+| `icm_transcript_record` | Append a raw message (role, content, optional tool + tokens + metadata) |
+| `icm_transcript_search` | FTS5 search across messages (BM25, boolean, phrase, prefix) |
+| `icm_transcript_show` | Replay full message thread of a session, chronologically |
+| `icm_transcript_stats` | Sessions, messages, bytes, breakdown by role/agent/top-sessions |
 
 ### Relation types
 

@@ -144,6 +144,12 @@ enum Commands {
         command: FeedbackCommands,
     },
 
+    /// Transcript subcommands — verbatim sessions + messages (session replay)
+    Transcript {
+        #[command(subcommand)]
+        command: TranscriptCommands,
+    },
+
     /// Detect recurring patterns in a topic and optionally create memoir concepts
     ExtractPatterns {
         /// Topic to analyze
@@ -663,6 +669,99 @@ enum FeedbackCommands {
     Stats,
 }
 
+#[derive(Subcommand)]
+enum TranscriptCommands {
+    /// Create a new session and print its id
+    StartSession {
+        /// Agent identifier (e.g. "claude-code", "cursor")
+        #[arg(short, long, default_value = "cli")]
+        agent: String,
+
+        /// Project name (optional, usually cwd basename)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Arbitrary metadata as JSON
+        #[arg(short, long)]
+        metadata: Option<String>,
+    },
+
+    /// Record a single message into a session
+    Record {
+        /// Session id (from `icm transcript start-session`)
+        #[arg(short, long)]
+        session: String,
+
+        /// Role: user, assistant, system, or tool
+        #[arg(short, long)]
+        role: String,
+
+        /// Raw message content
+        #[arg(short, long)]
+        content: String,
+
+        /// Tool name if role=tool (optional)
+        #[arg(short, long)]
+        tool: Option<String>,
+
+        /// Token count (optional)
+        #[arg(long)]
+        tokens: Option<i64>,
+
+        /// Arbitrary metadata as JSON
+        #[arg(short, long)]
+        metadata: Option<String>,
+    },
+
+    /// Full-text search across transcript messages (BM25)
+    Search {
+        /// Query (FTS5 syntax supported: "postgres OR mysql", "auth*", "\"exact phrase\"")
+        query: String,
+
+        /// Only within this session
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// Only within this project
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Max results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// List all sessions, newest first
+    ListSessions {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Max results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Replay the full message thread of a session, chronologically
+    Show {
+        /// Session id
+        session: String,
+
+        /// Max messages to show
+        #[arg(short, long, default_value = "200")]
+        limit: usize,
+    },
+
+    /// Show global transcript statistics (sessions, messages, bytes, top sessions)
+    Stats,
+
+    /// Delete a session and all its messages
+    Forget {
+        /// Session id
+        session: String,
+    },
+}
+
 #[derive(Clone, ValueEnum)]
 enum CliImportance {
     Critical,
@@ -884,6 +983,54 @@ fn main() -> Result<()> {
                 limit,
             } => cmd_feedback_search(&store, &query, topic.as_deref(), limit),
             FeedbackCommands::Stats => cmd_feedback_stats(&store),
+        },
+        Commands::Transcript { command } => match command {
+            TranscriptCommands::StartSession {
+                agent,
+                project,
+                metadata,
+            } => cmd_transcript_start_session(
+                &store,
+                &agent,
+                project.as_deref(),
+                metadata.as_deref(),
+            ),
+            TranscriptCommands::Record {
+                session,
+                role,
+                content,
+                tool,
+                tokens,
+                metadata,
+            } => cmd_transcript_record(
+                &store,
+                &session,
+                &role,
+                &content,
+                tool.as_deref(),
+                tokens,
+                metadata.as_deref(),
+            ),
+            TranscriptCommands::Search {
+                query,
+                session,
+                project,
+                limit,
+            } => cmd_transcript_search(
+                &store,
+                &query,
+                session.as_deref(),
+                project.as_deref(),
+                limit,
+            ),
+            TranscriptCommands::ListSessions { project, limit } => {
+                cmd_transcript_list_sessions(&store, project.as_deref(), limit)
+            }
+            TranscriptCommands::Show { session, limit } => {
+                cmd_transcript_show(&store, &session, limit)
+            }
+            TranscriptCommands::Stats => cmd_transcript_stats(&store),
+            TranscriptCommands::Forget { session } => cmd_transcript_forget(&store, &session),
         },
         Commands::ExtractPatterns {
             topic,
@@ -1435,6 +1582,196 @@ fn cmd_feedback_stats(store: &SqliteStore) -> Result<()> {
             println!("  {id}: {count} times");
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Transcript commands — verbatim sessions + messages
+// ---------------------------------------------------------------------------
+
+fn cmd_transcript_start_session(
+    store: &SqliteStore,
+    agent: &str,
+    project: Option<&str>,
+    metadata: Option<&str>,
+) -> Result<()> {
+    use icm_core::TranscriptStore;
+    let id = store.create_session(agent, project, metadata)?;
+    println!("{id}");
+    Ok(())
+}
+
+fn cmd_transcript_record(
+    store: &SqliteStore,
+    session: &str,
+    role: &str,
+    content: &str,
+    tool: Option<&str>,
+    tokens: Option<i64>,
+    metadata: Option<&str>,
+) -> Result<()> {
+    use icm_core::{Role, TranscriptStore};
+    let parsed_role = Role::parse(role)
+        .ok_or_else(|| anyhow::anyhow!("role must be user|assistant|system|tool, got '{role}'"))?;
+    let id = store.record_message(session, parsed_role, content, tool, tokens, metadata)?;
+    println!("{id}");
+    Ok(())
+}
+
+fn cmd_transcript_search(
+    store: &SqliteStore,
+    query: &str,
+    session: Option<&str>,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    use icm_core::TranscriptStore;
+    let hits = store.search_transcripts(query, session, project, limit)?;
+    if hits.is_empty() {
+        println!("No matches.");
+        return Ok(());
+    }
+    for hit in hits {
+        let preview: String = hit.message.content.chars().take(280).collect();
+        let suffix = if hit.message.content.chars().count() > 280 {
+            "…"
+        } else {
+            ""
+        };
+        let proj = hit.session.project.as_deref().unwrap_or("-");
+        println!("--- {} ---", hit.message.id);
+        println!(
+            "  session:  {} ({}, project={}, agent={})",
+            hit.session.id, hit.message.role, proj, hit.session.agent
+        );
+        println!("  ts:       {}", hit.message.ts.format("%Y-%m-%d %H:%M:%S"));
+        println!("  score:    {:.3}", hit.score);
+        if let Some(t) = &hit.message.tool_name {
+            println!("  tool:     {t}");
+        }
+        println!("  content:  {preview}{suffix}");
+        println!();
+    }
+    Ok(())
+}
+
+fn cmd_transcript_list_sessions(
+    store: &SqliteStore,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    use icm_core::TranscriptStore;
+    let sessions = store.list_sessions(project, limit)?;
+    if sessions.is_empty() {
+        println!("No sessions.");
+        return Ok(());
+    }
+    println!(
+        "{:<28} {:<14} {:<18} {:<20} {:<20}",
+        "ID", "AGENT", "PROJECT", "STARTED", "UPDATED"
+    );
+    println!("{}", "-".repeat(102));
+    for s in sessions {
+        let proj = s.project.as_deref().unwrap_or("-");
+        let short_id = if s.id.len() > 26 { &s.id[..26] } else { &s.id };
+        println!(
+            "{:<28} {:<14} {:<18} {:<20} {:<20}",
+            short_id,
+            truncate(&s.agent, 14),
+            truncate(proj, 18),
+            s.started_at.format("%Y-%m-%d %H:%M:%S"),
+            s.updated_at.format("%Y-%m-%d %H:%M:%S"),
+        );
+    }
+    Ok(())
+}
+
+fn cmd_transcript_show(store: &SqliteStore, session: &str, limit: usize) -> Result<()> {
+    use icm_core::TranscriptStore;
+    let meta = store.get_session(session)?;
+    let meta = match meta {
+        Some(s) => s,
+        None => {
+            println!("Session not found: {session}");
+            return Ok(());
+        }
+    };
+    println!("=== Session {} ===", meta.id);
+    println!(
+        "agent={} project={} started={} updated={}",
+        meta.agent,
+        meta.project.as_deref().unwrap_or("-"),
+        meta.started_at.format("%Y-%m-%d %H:%M:%S"),
+        meta.updated_at.format("%Y-%m-%d %H:%M:%S"),
+    );
+    println!();
+
+    let messages = store.list_session_messages(session, limit, 0)?;
+    for m in messages {
+        let ts = m.ts.format("%H:%M:%S");
+        let tool = m
+            .tool_name
+            .as_ref()
+            .map(|t| format!(" [{t}]"))
+            .unwrap_or_default();
+        let tokens = m.tokens.map(|t| format!(" ({t}t)")).unwrap_or_default();
+        println!("[{ts}] {}{tool}{tokens}", m.role);
+        for line in m.content.lines() {
+            println!("    {line}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn cmd_transcript_stats(store: &SqliteStore) -> Result<()> {
+    use icm_core::TranscriptStore;
+    let s = store.transcript_stats()?;
+    println!("Sessions:      {}", s.total_sessions);
+    println!("Messages:      {}", s.total_messages);
+    println!(
+        "Bytes:         {} ({:.1} KB)",
+        s.total_bytes,
+        s.total_bytes as f64 / 1024.0
+    );
+    if let (Some(o), Some(n)) = (&s.oldest, &s.newest) {
+        println!(
+            "Range:         {} -> {}",
+            o.format("%Y-%m-%d %H:%M"),
+            n.format("%Y-%m-%d %H:%M")
+        );
+    }
+    if !s.by_role.is_empty() {
+        println!("\nBy role:");
+        for (role, count) in &s.by_role {
+            println!("  {role}: {count}");
+        }
+    }
+    if !s.by_agent.is_empty() {
+        println!("\nBy agent:");
+        for (agent, count) in &s.by_agent {
+            let label = if agent.is_empty() {
+                "(unset)"
+            } else {
+                agent.as_str()
+            };
+            println!("  {label}: {count}");
+        }
+    }
+    if !s.top_sessions.is_empty() {
+        println!("\nTop sessions:");
+        for (sid, count) in &s.top_sessions {
+            let short = if sid.len() > 26 { &sid[..26] } else { sid };
+            println!("  {short}  {count} msg");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_transcript_forget(store: &SqliteStore, session: &str) -> Result<()> {
+    use icm_core::TranscriptStore;
+    store.forget_session(session)?;
+    println!("Deleted session {session}");
     Ok(())
 }
 

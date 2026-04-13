@@ -10,6 +10,8 @@ pub mod memoir;
 pub mod memoir_store;
 pub mod memory;
 pub mod store;
+pub mod transcript;
+pub mod transcript_store;
 pub mod wake_up;
 
 /// Default embedding vector dimensions (used when no embedder is configured).
@@ -28,6 +30,8 @@ pub use memory::{
     Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
 };
 pub use store::MemoryStore;
+pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
+pub use transcript_store::TranscriptStore;
 pub use wake_up::{
     build_wake_up, build_wake_up_from_memories, WakeUpFormat, WakeUpOptions, EMPTY_PACK_HEADER,
 };

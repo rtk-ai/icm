@@ -240,6 +240,72 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         .map_err(db_err)?;
     }
 
+    // Transcripts (verbatim sessions + messages)
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            agent TEXT NOT NULL DEFAULT '',
+            project TEXT,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+        CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_name TEXT,
+            tokens INTEGER,
+            ts TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+        CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
+        ",
+    )
+    .map_err(db_err)?;
+
+    // FTS5 over messages.content (+ role/tool_name so 'role:tool' style filters work)
+    if !fts_table_exists(conn, "messages_fts")? {
+        conn.execute_batch(
+            "
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                id UNINDEXED,
+                session_id UNINDEXED,
+                role,
+                content,
+                tool_name,
+                content='messages',
+                content_rowid='rowid'
+            );
+
+            CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, id, session_id, role, content, tool_name)
+                VALUES (new.rowid, new.id, new.session_id, new.role, new.content, COALESCE(new.tool_name, ''));
+            END;
+
+            CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, id, session_id, role, content, tool_name)
+                VALUES('delete', old.rowid, old.id, old.session_id, old.role, old.content, COALESCE(old.tool_name, ''));
+            END;
+
+            CREATE TRIGGER messages_au AFTER UPDATE OF role, content, tool_name ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, id, session_id, role, content, tool_name)
+                VALUES('delete', old.rowid, old.id, old.session_id, old.role, old.content, COALESCE(old.tool_name, ''));
+                INSERT INTO messages_fts(rowid, id, session_id, role, content, tool_name)
+                VALUES (new.rowid, new.id, new.session_id, new.role, new.content, COALESCE(new.tool_name, ''));
+            END;
+            ",
+        )
+        .map_err(db_err)?;
+    }
+
     // Migration: add updated_at column if missing (existing DBs pre-0.3.1)
     let has_updated_at: bool = conn
         .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='updated_at'")

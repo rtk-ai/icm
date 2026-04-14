@@ -2002,10 +2002,28 @@ fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
+/// Truncate `s` to at most `max_bytes` bytes, cutting at the nearest preceding
+/// UTF-8 char boundary. Result length is always `<= max_bytes`. Never panics —
+/// bare `&s[..max_bytes]` does when the offset lands inside a multi-byte char
+/// (Cyrillic=2B, CJK=3B, emoji=4B). See issue #110.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk backwards from max_bytes until we land on a char boundary.
+    // `is_char_boundary(0)` is always true, so this terminates.
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
 /// Reads JSON from stdin with `user_message`, recalls relevant memories,
 /// and prints context to stdout (Claude Code appends it as system-reminder).
 fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
+
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -2044,12 +2062,10 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
         format!("{project} {message}")
     };
 
-    // Truncate query to first 200 chars for search
-    let query = if query.len() > 200 {
-        &query[..200]
-    } else {
-        &query
-    };
+    // Truncate query to at most 200 bytes at a safe UTF-8 char boundary.
+    // See issue #110 — bare `&query[..200]` panics when the cut lands inside
+    // a multi-byte UTF-8 char (Cyrillic=2B, CJK=3B, emoji=4B).
+    let query = truncate_at_char_boundary(&query, 200);
 
     let ctx = extract::recall_context(store, query, 5)?;
     if !ctx.is_empty() {
@@ -5281,9 +5297,74 @@ fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
 }
 
 #[cfg(test)]
+mod truncate_tests {
+    use super::truncate_at_char_boundary;
+
+    #[test]
+    fn ascii_short_is_unchanged() {
+        assert_eq!(truncate_at_char_boundary("hello", 200), "hello");
+    }
+
+    #[test]
+    fn ascii_long_is_cut_at_exact_byte() {
+        let s = "a".repeat(300);
+        let out = truncate_at_char_boundary(&s, 200);
+        assert_eq!(out.len(), 200);
+    }
+
+    /// Regression: issue #110. Cyrillic chars are 2 bytes each in UTF-8.
+    /// Byte 200 lands inside a 2-byte sequence for text shorter than 100 chars
+    /// after some leading ASCII — bare `&s[..200]` panics.
+    #[test]
+    fn cyrillic_never_panics_and_cuts_at_char_boundary() {
+        // 120 chars × 2 bytes = 240 bytes; 200 bytes = mid-char if not fixed.
+        let s = "\u{043F}".repeat(120); // Cyrillic 'п'
+        assert_eq!(s.len(), 240);
+        let out = truncate_at_char_boundary(&s, 200);
+        // Must not panic, and must be a valid UTF-8 prefix.
+        assert!(out.len() <= 200);
+        // 200 / 2 bytes-per-char = 100 chars, and the last char must fit.
+        assert!(out.len() % 2 == 0, "boundary landed mid-char");
+        // Round-trip: chars reconstructed from `out` must all be Cyrillic 'п'.
+        assert!(out.chars().all(|c| c == '\u{043F}'));
+    }
+
+    /// Emoji are 4 bytes each. With a prompt of mixed ASCII + emoji, the
+    /// cut at 200 bytes will often land inside an emoji.
+    #[test]
+    fn emoji_never_panics_and_cuts_at_char_boundary() {
+        let s = "\u{1F600}".repeat(60); // 60 × 4 = 240 bytes
+        let out = truncate_at_char_boundary(&s, 201);
+        assert!(out.len() <= 201);
+        assert_eq!(out.len() % 4, 0, "boundary landed mid-emoji");
+        assert!(out.chars().all(|c| c == '\u{1F600}'));
+    }
+
+    /// Mixed ASCII prefix + Cyrillic body — the common case for prompts
+    /// like "project_name посмотри в апстрим...".
+    #[test]
+    fn mixed_ascii_cyrillic_never_panics() {
+        let s = format!("rtk {}", "\u{0430}".repeat(200)); // "rtk " + 200 × Cyrillic 'а'
+        let out = truncate_at_char_boundary(&s, 200);
+        assert!(out.len() <= 200);
+        // The tail after "rtk " must be whole Cyrillic chars.
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    /// Cut size smaller than the first char: must not panic; returns empty.
+    #[test]
+    fn cut_smaller_than_first_char_returns_empty() {
+        let s = "\u{1F600}rest"; // first char is 4 bytes
+        let out = truncate_at_char_boundary(s, 2);
+        assert_eq!(out, "");
+    }
+}
+
+#[cfg(test)]
 mod hook_start_tests {
     use super::*;
     use icm_core::Importance;
+
 
     fn seed_store() -> SqliteStore {
         let store = SqliteStore::in_memory().unwrap();

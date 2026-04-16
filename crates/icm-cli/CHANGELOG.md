@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.25](https://github.com/rtk-ai/icm/compare/icm-v0.10.24...icm-v0.10.25) (2026-04-16)
+
+
+### Bug Fixes
+
+* **cli:** apply truncate_at_char_boundary to remaining byte-slicing sites ([#113](https://github.com/rtk-ai/icm/issues/113)) ([17ba38c](https://github.com/rtk-ai/icm/commit/17ba38cd1b640794b357b0b28aab563690003ef1))
+* **hook-prompt:** don't panic on multi-byte UTF-8 query truncation ([#111](https://github.com/rtk-ai/icm/issues/111)) ([16b9631](https://github.com/rtk-ai/icm/commit/16b963127f1be87f482eb0a609507a6dd010e17f)), closes [#110](https://github.com/rtk-ai/icm/issues/110)
+
 ## [0.10.24](https://github.com/rtk-ai/icm/compare/icm-v0.10.23...icm-v0.10.24) (2026-04-13)
 
 

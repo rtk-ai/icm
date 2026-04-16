@@ -19,6 +19,7 @@ use icm_core::{FeedbackStore, MemoirStore, MemoryStore};
 use icm_store::SqliteStore;
 
 use crate::config::WebConfig;
+use crate::truncate_at_char_boundary;
 
 // ---------------------------------------------------------------------------
 // Embedded SPA assets (compiled SvelteKit output)
@@ -446,7 +447,7 @@ async fn api_topic_consolidate(
         .collect::<Vec<_>>()
         .join(" | ");
     let truncated = if summary.len() > 500 {
-        format!("{}...", &summary[..500])
+        format!("{}...", truncate_at_char_boundary(&summary, 500))
     } else {
         summary
     };

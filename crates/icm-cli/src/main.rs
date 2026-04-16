@@ -2006,7 +2006,7 @@ fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
 /// UTF-8 char boundary. Result length is always `<= max_bytes`. Never panics —
 /// bare `&s[..max_bytes]` does when the offset lands inside a multi-byte char
 /// (Cyrillic=2B, CJK=3B, emoji=4B). See issue #110.
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
@@ -2023,7 +2023,6 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 /// Reads JSON from stdin with `user_message`, recalls relevant memories,
 /// and prints context to stdout (Claude Code appends it as system-reminder).
 fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
-
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -3992,7 +3991,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         let total_expected = all_scores_wo[0][i].1;
 
         let q_short = if q.prompt.len() > 38 {
-            format!("{}...", &q.prompt[..35])
+            format!("{}...", truncate_at_char_boundary(&q.prompt, 35))
         } else {
             q.prompt.to_string()
         };
@@ -5364,7 +5363,6 @@ mod truncate_tests {
 mod hook_start_tests {
     use super::*;
     use icm_core::Importance;
-
 
     fn seed_store() -> SqliteStore {
         let store = SqliteStore::in_memory().unwrap();

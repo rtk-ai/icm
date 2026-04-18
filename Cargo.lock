@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.23"
+version = "0.10.25"
 dependencies = [
  "anyhow",
  "axum",

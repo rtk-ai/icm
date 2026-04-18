@@ -168,10 +168,12 @@ jobs:
 
       - name: Get version
         id: version
+        # inputs.tag is set for both workflow_call and workflow_dispatch.
+        # github.event_name in a reusable workflow reflects the PARENT's event
+        # (e.g. 'push' when release-please.yml calls us), so we cannot branch
+        # on it to detect workflow_call — check inputs.tag first instead.
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "workflow_call" ]; then
+          if [ -n "${{ inputs.tag }}" ]; then
             echo "version=${{ inputs.tag }}" >> $GITHUB_OUTPUT
           elif [ "${{ github.event_name }}" = "release" ]; then
             echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
@@ -188,7 +190,9 @@ jobs:
           sha256sum * > checksums.txt
 
       - name: Upload Release Assets
-        if: github.event_name == 'release' || github.event_name == 'workflow_call'
+        # Runs for release (direct event), workflow_call (inputs.tag set),
+        # and falls through for workflow_dispatch (handled by Create Release).
+        if: steps.version.outputs.version != '' && github.event_name != 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}

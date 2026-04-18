@@ -1394,8 +1394,8 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
 
     match sort {
         SortField::Weight => memories.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap()),
-        SortField::Created => memories.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
-        SortField::Accessed => memories.sort_by(|a, b| b.last_accessed.cmp(&a.last_accessed)),
+        SortField::Created => memories.sort_by_key(|b| std::cmp::Reverse(b.created_at)),
+        SortField::Accessed => memories.sort_by_key(|b| std::cmp::Reverse(b.last_accessed)),
     }
 
     if memories.is_empty() {

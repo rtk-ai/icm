@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.26](https://github.com/rtk-ai/icm/compare/icm-v0.10.25...icm-v0.10.26) (2026-04-18)
+
+
+### Features
+
+* **init:** add --force flag and doctor command for hook hygiene ([#116](https://github.com/rtk-ai/icm/issues/116)) ([2c769f9](https://github.com/rtk-ai/icm/commit/2c769f94958e30ba8a211e73b6c7e361cf3ad901))
+
 ## [0.10.25](https://github.com/rtk-ai/icm/compare/icm-v0.10.24...icm-v0.10.25) (2026-04-16)
 
 

@@ -1519,7 +1519,7 @@ impl MemoirStore for SqliteStore {
             }
         }
         let mut label_counts: Vec<(String, usize)> = label_map.into_iter().collect();
-        label_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        label_counts.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         Ok(MemoirStats {
             total_concepts,
@@ -2490,7 +2490,7 @@ impl SqliteStore {
         }
 
         // Sort by cluster size descending
-        result.sort_by(|a, b| b.count.cmp(&a.count));
+        result.sort_by_key(|b| std::cmp::Reverse(b.count));
 
         Ok(result)
     }

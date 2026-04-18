@@ -1,5 +1,10 @@
 //! Interactive TUI dashboard for ICM metrics and memory browsing.
 
+// Rust 1.95 promoted collapsible_if and collapsible_match to hard errors
+// under -D warnings. Collapsing the affected sites here would require Rust
+// 2024 let-chains, but this crate is on edition 2021 — suppress instead.
+#![allow(clippy::collapsible_if, clippy::collapsible_match)]
+
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -428,11 +433,9 @@ fn run_loop(
                         _ => {}
                     },
                     // Enter on topics tab -> switch to memories
-                    KeyCode::Enter => {
-                        if app.tab == TAB_TOPICS {
-                            app.load_topic_memories(store);
-                            app.tab = TAB_MEMORIES;
-                        }
+                    KeyCode::Enter if app.tab == TAB_TOPICS => {
+                        app.load_topic_memories(store);
+                        app.tab = TAB_MEMORIES;
                     }
                     // Search
                     KeyCode::Char('/') => {
@@ -725,7 +728,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
 
     // Top topics by count
     let mut sorted_topics = app.topics.clone();
-    sorted_topics.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted_topics.sort_by_key(|b| std::cmp::Reverse(b.1));
     sorted_topics.truncate(8);
 
     let topic_rows: Vec<Row> = sorted_topics

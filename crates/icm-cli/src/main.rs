@@ -226,7 +226,16 @@ enum Commands {
         /// Integration mode: mcp, cli, skill, or all (default: mcp)
         #[arg(short, long, default_value = "mcp")]
         mode: InitMode,
+
+        /// Overwrite existing hook entries that point at a stale icm binary path
+        /// (e.g. a deleted target/release/icm). Without --force, existing entries
+        /// are left untouched, even if their binary path no longer exists.
+        #[arg(short, long)]
+        force: bool,
     },
+
+    /// Diagnose ICM integration: check hook binary paths in Claude Code settings
+    Doctor,
 
     /// Run performance benchmark on in-memory store
     Bench {
@@ -1109,7 +1118,8 @@ fn main() -> Result<()> {
                 cmd_memoir_distill(&store, &from_topic, &into)
             }
         },
-        Commands::Init { mode } => cmd_init(mode),
+        Commands::Init { mode, force } => cmd_init(mode, force),
+        Commands::Doctor => cmd_doctor(),
         Commands::Extract {
             project,
             text,
@@ -1384,8 +1394,8 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
 
     match sort {
         SortField::Weight => memories.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap()),
-        SortField::Created => memories.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
-        SortField::Accessed => memories.sort_by(|a, b| b.last_accessed.cmp(&a.last_accessed)),
+        SortField::Created => memories.sort_by_key(|b| std::cmp::Reverse(b.created_at)),
+        SortField::Accessed => memories.sort_by_key(|b| std::cmp::Reverse(b.last_accessed)),
     }
 
     if memories.is_empty() {
@@ -2273,7 +2283,7 @@ fn cmd_extract_patterns(
     Ok(())
 }
 
-fn cmd_init(mode: InitMode) -> Result<()> {
+fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = icm_bin.to_string_lossy().to_string();
     let home = std::env::var("HOME").context("HOME not set")?;
@@ -2540,6 +2550,7 @@ Do this BEFORE responding to the user. Not optional.
             &pre_cmd,
             Some("Bash"),
             &["icm-pretool", "icm hook pre"],
+            force,
         )?;
         println!("[hook] Claude Code PreToolUse (auto-allow): {pre_status}");
 
@@ -2551,6 +2562,7 @@ Do this BEFORE responding to the user. Not optional.
             &post_cmd,
             None,
             &["icm hook", "icm-post-tool"],
+            force,
         )?;
         println!("[hook] Claude Code PostToolUse (auto-extract): {post_status}");
 
@@ -2562,6 +2574,7 @@ Do this BEFORE responding to the user. Not optional.
             &compact_cmd,
             None,
             &["icm hook", "icm-post-tool"],
+            force,
         )?;
         println!("[hook] Claude Code PreCompact (transcript extract): {compact_status}");
 
@@ -2573,6 +2586,7 @@ Do this BEFORE responding to the user. Not optional.
             &prompt_cmd,
             None,
             &["icm hook", "icm-post-tool"],
+            force,
         )?;
         println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
 
@@ -2584,6 +2598,7 @@ Do this BEFORE responding to the user. Not optional.
             &start_cmd,
             None,
             &["icm hook start", "icm hook", "icm-post-tool"],
+            force,
         )?;
         println!("[hook] Claude Code SessionStart (wake-up pack): {start_status}");
 
@@ -2616,6 +2631,7 @@ Do this BEFORE responding to the user. Not optional.
             &format!("{} hook start", icm_bin_str),
             None,
             &["icm hook start", "icm hook", "icm-post-tool"],
+            force,
         )?;
         println!("[hook] Gemini CLI SessionStart (wake-up pack): {status}");
 
@@ -2627,6 +2643,7 @@ Do this BEFORE responding to the user. Not optional.
             &format!("{} hook pre", icm_bin_str),
             Some("run_shell_command"),
             &["icm-pretool", "icm hook pre"],
+            force,
         )?;
         println!("[hook] Gemini CLI BeforeTool (auto-allow): {status}");
 
@@ -2637,6 +2654,7 @@ Do this BEFORE responding to the user. Not optional.
             &format!("{} hook post", icm_bin_str),
             None,
             detect,
+            force,
         )?;
         println!("[hook] Gemini CLI AfterTool (auto-extract): {status}");
 
@@ -2647,6 +2665,7 @@ Do this BEFORE responding to the user. Not optional.
             &format!("{} hook compact", icm_bin_str),
             None,
             detect,
+            force,
         )?;
         println!("[hook] Gemini CLI PreCompress (transcript extract): {status}");
 
@@ -2657,6 +2676,7 @@ Do this BEFORE responding to the user. Not optional.
             &format!("{} hook prompt", icm_bin_str),
             None,
             detect,
+            force,
         )?;
         println!("[hook] Gemini CLI BeforeAgent (auto-recall): {status}");
 
@@ -2737,16 +2757,114 @@ fn inject_icm_block(path: &PathBuf, block: &str) -> Result<String> {
     }
 }
 
+fn cmd_doctor() -> Result<()> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let current_bin = std::env::current_exe().ok();
+
+    let targets: Vec<(&str, PathBuf, &[&str])> = vec![
+        (
+            "Claude Code",
+            PathBuf::from(&home).join(".claude/settings.json"),
+            &[
+                "PreToolUse",
+                "PostToolUse",
+                "PreCompact",
+                "UserPromptSubmit",
+                "SessionStart",
+            ],
+        ),
+        (
+            "Gemini CLI",
+            PathBuf::from(&home).join(".gemini/settings.json"),
+            &[
+                "SessionStart",
+                "BeforeTool",
+                "AfterTool",
+                "PreCompress",
+                "BeforeAgent",
+            ],
+        ),
+    ];
+
+    let mut broken = 0usize;
+    let mut checked = 0usize;
+
+    for (label, path, events) in &targets {
+        if !path.exists() {
+            println!("[{label}] {} (no settings file, skipped)", path.display());
+            continue;
+        }
+        let config: Value = match parse_json_config(path) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("[{label}] {}: parse error ({e})", path.display());
+                broken += 1;
+                continue;
+            }
+        };
+        let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
+            println!("[{label}] no hooks block configured");
+            continue;
+        };
+        for event in *events {
+            let Some(arr) = hooks.get(*event).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for entry in arr {
+                let Some(hooks_arr) = entry.get("hooks").and_then(|h| h.as_array()) else {
+                    continue;
+                };
+                for h in hooks_arr {
+                    let Some(cmd) = h.get("command").and_then(|c| c.as_str()) else {
+                        continue;
+                    };
+                    if !cmd.contains("icm hook") && !cmd.contains("icm-post-tool") {
+                        continue;
+                    }
+                    checked += 1;
+                    let bin_path = cmd.split_whitespace().next().unwrap_or("");
+                    let exists = std::path::Path::new(bin_path).exists();
+                    if exists {
+                        println!("[{label}] {event:<17} ✓  {bin_path}");
+                    } else {
+                        println!("[{label}] {event:<17} ✗  {bin_path}  (missing)");
+                        broken += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!();
+    if checked == 0 {
+        println!("No ICM hooks found. Run `icm init --mode hook` to install them.");
+    } else if broken == 0 {
+        println!("All {checked} ICM hook entries are healthy.");
+    } else {
+        println!("{broken} of {checked} ICM hook entries point at a missing binary.");
+        if let Some(bin) = current_bin {
+            println!("To fix: icm init --mode hook --force");
+            println!("       (will rewrite stale entries to {})", bin.display());
+        } else {
+            println!("To fix: icm init --mode hook --force");
+        }
+    }
+
+    Ok(())
+}
+
 /// Inject ICM hook into a settings.json file (Claude Code or Gemini CLI) for a given event name.
 /// Both tools use the same JSON format: `{ "hooks": { "EventName": [ { "matcher": ..., "hooks": [...] } ] } }`.
 /// `matcher` is optional — if set (e.g. "Bash"), adds a matcher field to the hook entry.
 /// `detect_patterns` lists substrings to detect if the hook is already present.
+/// `force` rewrites stale entries (matching `detect_patterns` but with a different command) in-place.
 fn inject_settings_hook(
     settings_path: &PathBuf,
     event_name: &str,
     hook_command: &str,
     matcher: Option<&str>,
     detect_patterns: &[&str],
+    force: bool,
 ) -> Result<String> {
     let mut config: Value = if settings_path.exists() {
         parse_json_config(settings_path)?
@@ -2770,27 +2888,52 @@ fn inject_settings_hook(
         .as_array_mut()
         .with_context(|| format!("{event_name} is not an array"))?;
 
-    // Check if ICM hook already exists
-    let already = event_arr.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|c| detect_patterns.iter().any(|p| c.contains(p)))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
-    });
+    // Walk existing entries: classify each matching command as either
+    // already-correct or stale (different binary path). With --force we
+    // rewrite stale ones in-place; without --force we leave them.
+    let mut updated = 0usize;
+    let mut already_correct = false;
+    let mut stale_present = false;
 
-    if already {
+    for entry in event_arr.iter_mut() {
+        let Some(hooks_arr) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            continue;
+        };
+        for h in hooks_arr.iter_mut() {
+            let Some(current) = h.get("command").and_then(|c| c.as_str()) else {
+                continue;
+            };
+            if !detect_patterns.iter().any(|p| current.contains(p)) {
+                continue;
+            }
+            if current == hook_command {
+                already_correct = true;
+            } else if force {
+                h["command"] = serde_json::json!(hook_command);
+                updated += 1;
+            } else {
+                stale_present = true;
+            }
+        }
+    }
+
+    if updated > 0 {
+        let output = serde_json::to_string_pretty(&config)?;
+        std::fs::write(settings_path, output)
+            .with_context(|| format!("cannot write {}", settings_path.display()))?;
+        let plural = if updated == 1 { "entry" } else { "entries" };
+        return Ok(format!("updated ({updated} stale {plural})"));
+    }
+
+    if already_correct {
         return Ok("already configured".into());
     }
 
-    // Add ICM hook entry
+    if stale_present {
+        return Ok("already configured (stale path; use --force to update)".into());
+    }
+
+    // No matching entry — add a fresh one.
     let mut entry = serde_json::json!({
         "hooks": [{
             "type": "command",
@@ -3991,7 +4134,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         let total_expected = all_scores_wo[0][i].1;
 
         let q_short = if q.prompt.len() > 38 {
-            format!("{}...", truncate_at_char_boundary(&q.prompt, 35))
+            format!("{}...", truncate_at_char_boundary(q.prompt, 35))
         } else {
             q.prompt.to_string()
         };
@@ -5323,7 +5466,7 @@ mod truncate_tests {
         // Must not panic, and must be a valid UTF-8 prefix.
         assert!(out.len() <= 200);
         // 200 / 2 bytes-per-char = 100 chars, and the last char must fit.
-        assert!(out.len() % 2 == 0, "boundary landed mid-char");
+        assert!(out.len().is_multiple_of(2), "boundary landed mid-char");
         // Round-trip: chars reconstructed from `out` must all be Cyrillic 'п'.
         assert!(out.chars().all(|c| c == '\u{043F}'));
     }
@@ -5526,5 +5669,222 @@ mod hook_start_tests {
         // call does not panic and returns a valid, non-empty pack.
         assert!(!pack.is_empty());
         assert!(pack.starts_with("# ICM Wake-up"));
+    }
+}
+
+#[cfg(test)]
+mod inject_settings_hook_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn read(path: &PathBuf) -> Value {
+        let raw = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn extract_command(config: &Value, event: &str, idx: usize) -> String {
+        config["hooks"][event][idx]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn writes_new_hook_when_settings_file_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        let status = inject_settings_hook(
+            &path,
+            "SessionStart",
+            "/opt/homebrew/bin/icm hook start",
+            None,
+            &["icm hook start", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(status, "configured");
+        assert!(path.exists());
+        let cfg = read(&path);
+        assert_eq!(
+            extract_command(&cfg, "SessionStart", 0),
+            "/opt/homebrew/bin/icm hook start"
+        );
+    }
+
+    #[test]
+    fn skips_when_already_configured_with_same_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        // First call installs the hook.
+        inject_settings_hook(
+            &path,
+            "SessionStart",
+            "/opt/homebrew/bin/icm hook start",
+            None,
+            &["icm hook start", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        // Second identical call must be a no-op.
+        let status = inject_settings_hook(
+            &path,
+            "SessionStart",
+            "/opt/homebrew/bin/icm hook start",
+            None,
+            &["icm hook start", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(status, "already configured");
+        let cfg = read(&path);
+        assert_eq!(cfg["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reports_stale_path_without_force() {
+        // This is the exact bug the user hit: a previously-configured hook
+        // pointing at a stale binary path is left untouched, but flagged.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        // Pre-seed with a stale entry as if a previous `cargo run` left it.
+        inject_settings_hook(
+            &path,
+            "SessionStart",
+            "/Users/x/dev/icm/target/release/icm hook start",
+            None,
+            &["icm hook start", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        // New install with a different path but force=false must NOT overwrite.
+        let status = inject_settings_hook(
+            &path,
+            "SessionStart",
+            "/opt/homebrew/bin/icm hook start",
+            None,
+            &["icm hook start", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            status.contains("stale path"),
+            "expected stale-path notice, got: {status}"
+        );
+        let cfg = read(&path);
+        // The stale entry is preserved as-is.
+        assert_eq!(
+            extract_command(&cfg, "SessionStart", 0),
+            "/Users/x/dev/icm/target/release/icm hook start"
+        );
+    }
+
+    #[test]
+    fn force_rewrites_stale_path_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        inject_settings_hook(
+            &path,
+            "SessionStart",
+            "/Users/x/dev/icm/target/release/icm hook start",
+            None,
+            &["icm hook start", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        let status = inject_settings_hook(
+            &path,
+            "SessionStart",
+            "/opt/homebrew/bin/icm hook start",
+            None,
+            &["icm hook start", "icm hook"],
+            true,
+        )
+        .unwrap();
+
+        assert!(status.starts_with("updated"), "got: {status}");
+        let cfg = read(&path);
+        assert_eq!(
+            extract_command(&cfg, "SessionStart", 0),
+            "/opt/homebrew/bin/icm hook start"
+        );
+        // Still exactly one entry — force updates in-place, doesn't append.
+        assert_eq!(cfg["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn force_does_not_touch_unrelated_third_party_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                { "type": "command", "command": "/usr/local/bin/some-other-tool" }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let status = inject_settings_hook(
+            &path,
+            "SessionStart",
+            "/opt/homebrew/bin/icm hook start",
+            None,
+            &["icm hook start", "icm hook"],
+            true,
+        )
+        .unwrap();
+
+        // No icm hook to overwrite → should append a new entry.
+        assert_eq!(status, "configured");
+        let cfg = read(&path);
+        let arr = cfg["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(
+            arr[0]["hooks"][0]["command"].as_str().unwrap(),
+            "/usr/local/bin/some-other-tool"
+        );
+        assert_eq!(
+            arr[1]["hooks"][0]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm hook start"
+        );
+    }
+
+    #[test]
+    fn matcher_is_attached_when_provided() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        inject_settings_hook(
+            &path,
+            "PreToolUse",
+            "/opt/homebrew/bin/icm hook pre",
+            Some("Bash"),
+            &["icm hook pre", "icm-pretool"],
+            false,
+        )
+        .unwrap();
+
+        let cfg = read(&path);
+        assert_eq!(
+            cfg["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap(),
+            "Bash"
+        );
     }
 }

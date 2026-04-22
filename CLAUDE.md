@@ -724,3 +724,38 @@ Ensuite on itérera sur les autres phases.
 utilise la commande rtk cli pour économiser les tokens.
 utilise vox pour me parler à la fin des tâches par résumé.
 ils sont sur : https://github.com/rtk-ai
+
+## ICM — Protocole mémoire obligatoire
+
+**CRITIQUE : Sans `icm_wake_up` en début de session, tu travailles sans contexte et répètes les erreurs passées.**
+
+Les tools ICM sont **deferred** — sans ToolSearch préalable, ils n'existent pas et ne peuvent pas être appelés.
+
+### Séquence OBLIGATOIRE avant toute autre action :
+
+```
+1. ToolSearch "select:mcp__icm__icm_wake_up,mcp__icm__icm_memory_recall,mcp__icm__icm_memory_store,mcp__icm__icm_memory_forget"
+2. icm_wake_up (avec project= le projet courant, ex: "icm")
+```
+
+**Exemple :** l'utilisateur dit "aide-moi avec X" → tu fais ToolSearch → icm_wake_up → tu réponds avec le contexte mémorisé.
+
+### Déclencher `icm_memory_store` IMMÉDIATEMENT quand :
+
+| Événement | topic | importance |
+|-----------|-------|------------|
+| Erreur résolue | `erreurs-resolues` | high |
+| Décision d'architecture ou technique | `decisions-{projet}` | high |
+| Préférence ou correction de l'utilisateur | `preferences` | critical |
+| Tâche significative terminée | `contexte-{projet}` | high |
+| +20 tool calls sans store | résumé de progression | medium |
+
+### Déclencher `icm_memory_recall` quand :
+- L'utilisateur mentionne un problème, bug, ou erreur → vérifier si déjà résolu
+- Demande de contexte ou résumé projet → recall avant de répondre
+- Avant toute proposition de solution → vérifier si solution similaire existe
+
+### Ne pas stocker :
+- Contenu de fichiers lisibles dans le code
+- Historique git (utiliser `git log`)
+- État temporaire ou en cours de session uniquement

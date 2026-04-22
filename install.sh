@@ -122,7 +122,13 @@ main() {
     install
     verify
     echo ""
-    info "Installation complete! Run '${BINARY_NAME} --help' to get started."
+    info "Installation complete!"
+    echo ""
+    echo "  Next steps:"
+    echo "    1. icm init            # configure your AI tools (MCP)"
+    echo "    2. icm init --mode hook  # install Claude Code hooks"
+    echo "    3. Restart your AI tool to activate"
+    echo ""
 }
 
 main

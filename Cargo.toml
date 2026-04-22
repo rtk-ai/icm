@@ -5,6 +5,7 @@ members = [
     "crates/icm-store",
     "crates/icm-mcp",
     "crates/icm-cli",
+    "crates/icm-install",
 ]
 
 [profile.release]
@@ -44,7 +45,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "6"
 
 # HTTP (cloud sync)
-ureq = "2"
+ureq = { version = "2", features = ["json"] }
 rpassword = "5"
 sha2 = "0.10"
 flate2 = "1"

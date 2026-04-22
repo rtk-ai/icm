@@ -2369,6 +2369,10 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         ];
 
         for (name, config_path, key) in &tools {
+            if !force && !detect_tool(name, &home, &vscode_data) {
+                println!("[mcp] {name:<16} skipped (not detected)");
+                continue;
+            }
             let status = inject_mcp_server(config_path, "icm", &icm_server_entry, key)?;
             println!("[mcp] {name:<16} {status}");
         }
@@ -2379,28 +2383,48 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         } else {
             PathBuf::from(&home).join(".config/zed/settings.json")
         };
-        let zed_status = inject_zed_mcp_server(&zed_path, "icm", &icm_bin_str)?;
-        println!("[mcp] {:<16} {zed_status}", "Zed");
+        if !force && !detect_tool("Zed", &home, &vscode_data) {
+            println!("[mcp] {:<16} skipped (not detected)", "Zed");
+        } else {
+            let zed_status = inject_zed_mcp_server(&zed_path, "icm", &icm_bin_str)?;
+            println!("[mcp] {:<16} {zed_status}", "Zed");
+        }
 
         // Codex CLI uses TOML format
         let codex_path = PathBuf::from(&home).join(".codex/config.toml");
-        let codex_status = inject_codex_mcp_server(&codex_path, "icm", &icm_bin_str)?;
-        println!("[mcp] {:<16} {codex_status}", "Codex CLI");
+        if !force && !detect_tool("Codex CLI", &home, &vscode_data) {
+            println!("[mcp] {:<16} skipped (not detected)", "Codex CLI");
+        } else {
+            let codex_status = inject_codex_mcp_server(&codex_path, "icm", &icm_bin_str)?;
+            println!("[mcp] {:<16} {codex_status}", "Codex CLI");
+        }
 
         // OpenCode uses different JSON structure (command is array, key is "mcp")
         let opencode_path = PathBuf::from(&home).join(".config/opencode/opencode.json");
-        let opencode_status = inject_opencode_mcp_server(&opencode_path, "icm", &icm_bin_str)?;
-        println!("[mcp] {:<16} {opencode_status}", "OpenCode");
+        if !force && !detect_tool("OpenCode", &home, &vscode_data) {
+            println!("[mcp] {:<16} skipped (not detected)", "OpenCode");
+        } else {
+            let opencode_status = inject_opencode_mcp_server(&opencode_path, "icm", &icm_bin_str)?;
+            println!("[mcp] {:<16} {opencode_status}", "OpenCode");
+        }
 
         // Copilot CLI uses mcpServers key with explicit "type": "local"
         let copilot_path = PathBuf::from(&home).join(".copilot/mcp-config.json");
-        let copilot_status = inject_copilot_cli_mcp_server(&copilot_path, "icm", &icm_bin_str)?;
-        println!("[mcp] {:<16} {copilot_status}", "Copilot CLI");
+        if !force && !detect_tool("Copilot CLI", &home, &vscode_data) {
+            println!("[mcp] {:<16} skipped (not detected)", "Copilot CLI");
+        } else {
+            let copilot_status = inject_copilot_cli_mcp_server(&copilot_path, "icm", &icm_bin_str)?;
+            println!("[mcp] {:<16} {copilot_status}", "Copilot CLI");
+        }
 
         // Continue.dev uses YAML config with mcpServers key
         let continue_path = PathBuf::from(&home).join(".continue/config.yaml");
-        let continue_status = inject_continue_mcp_server(&continue_path, "icm", &icm_bin_str)?;
-        println!("[mcp] {:<16} {continue_status}", "Continue.dev");
+        if !force && !detect_tool("Continue.dev", &home, &vscode_data) {
+            println!("[mcp] {:<16} skipped (not detected)", "Continue.dev");
+        } else {
+            let continue_status = inject_continue_mcp_server(&continue_path, "icm", &icm_bin_str)?;
+            println!("[mcp] {:<16} {continue_status}", "Continue.dev");
+        }
     }
 
     // --- CLI mode: inject instructions into each tool's file ---
@@ -2730,6 +2754,12 @@ Do this BEFORE responding to the user. Not optional.
     println!("  db:     {}", default_db_path().display());
     println!();
     println!("Restart your AI tool to activate.");
+
+    if !do_hook {
+        println!();
+        println!("Tip: run `icm init --mode hook` to also install Claude Code hooks");
+        println!("     for automatic memory extraction and context recall.");
+    }
 
     Ok(())
 }
@@ -3126,6 +3156,75 @@ fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
     let strict: Value = serde_json::from_str(&lenient.to_string())
         .with_context(|| format!("JSON conversion error in {}", config_path.display()))?;
     Ok(strict)
+}
+
+/// Returns true if `name` resolves to an executable file somewhere in $PATH.
+fn binary_in_path(name: &str) -> bool {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .any(|dir| std::path::Path::new(dir).join(name).is_file())
+}
+
+/// Heuristic: is this AI tool installed on the current machine?
+///
+/// Binary presence is checked first (most reliable). Directory checks are only
+/// used for tools without a CLI binary (e.g. Claude Desktop, VS Code extensions).
+/// Note: directory checks can yield false positives if a previous `icm init --force`
+/// already created the config path — use `--force` to bypass detection entirely.
+fn detect_tool(name: &str, home: &str, vscode_data: &PathBuf) -> bool {
+    let h = std::path::Path::new(home);
+    let vscode_present =
+        || binary_in_path("code") || binary_in_path("code-insiders") || vscode_data.exists();
+    match name {
+        "Claude Code" => binary_in_path("claude"),
+        "Claude Desktop" => {
+            // macOS-only app — always false on Linux/Windows
+            cfg!(target_os = "macos")
+                && (std::path::Path::new("/Applications/Claude.app").exists()
+                    || h.join("Library/Application Support/Claude").exists())
+        }
+        "Cursor" => binary_in_path("cursor"),
+        "Windsurf" => binary_in_path("windsurf"),
+        "VS Code" => vscode_present(),
+        "Gemini" => binary_in_path("gemini"),
+        "Amp" => binary_in_path("amp"),
+        "Amazon Q" => binary_in_path("q"),
+        // VS Code extensions: require VS Code AND the extension's globalStorage dir
+        // (globalStorage dirs are only created by VS Code when an extension is installed)
+        "Cline" => {
+            vscode_present()
+                && vscode_data
+                    .join("globalStorage/saoudrizwan.claude-dev")
+                    .exists()
+        }
+        "Roo Code" => {
+            vscode_present()
+                && vscode_data
+                    .join("globalStorage/rooveterinaryinc.roo-cline")
+                    .exists()
+        }
+        "Kilo Code" => {
+            vscode_present()
+                && vscode_data
+                    .join("globalStorage/kilocode.kilo-code")
+                    .exists()
+        }
+        "Zed" => binary_in_path("zed"),
+        "Codex CLI" => binary_in_path("codex"),
+        "OpenCode" => binary_in_path("opencode"),
+        // Copilot CLI is a `gh` extension — require the gh binary
+        "Copilot CLI" => binary_in_path("gh"),
+        // Continue.dev is a VS Code/JetBrains extension — check its globalStorage dir
+        // (icm writes to ~/.continue/config.yaml, not globalStorage, so this is reliable)
+        "Continue.dev" => {
+            vscode_present()
+                && vscode_data
+                    .join("globalStorage/continue.continue")
+                    .exists()
+        }
+        _ => true,
+    }
 }
 
 /// Inject ICM MCP server into a JSON config file. Returns a status string.

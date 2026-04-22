@@ -3218,10 +3218,7 @@ fn detect_tool(name: &str, home: &str, vscode_data: &PathBuf) -> bool {
         // Continue.dev is a VS Code/JetBrains extension — check its globalStorage dir
         // (icm writes to ~/.continue/config.yaml, not globalStorage, so this is reliable)
         "Continue.dev" => {
-            vscode_present()
-                && vscode_data
-                    .join("globalStorage/continue.continue")
-                    .exists()
+            vscode_present() && vscode_data.join("globalStorage/continue.continue").exists()
         }
         _ => true,
     }

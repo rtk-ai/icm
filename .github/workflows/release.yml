@@ -62,19 +62,24 @@ jobs:
 
       - name: Build (cross aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} -p icm-cli --features vendored-openssl
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p icm-cli --features vendored-openssl
+          cargo build --release --target ${{ matrix.target }} -p icm-install
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Build
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} -p icm-cli
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p icm-cli
+          cargo build --release --target ${{ matrix.target }} -p icm-install
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
           tar -czvf ../../../icm-${{ matrix.target }}.${{ matrix.archive }} icm
+          tar -czvf ../../../icm-install-${{ matrix.target }}.${{ matrix.archive }} icm-install
           cd ../../..
 
       - name: Package (Windows)
@@ -82,12 +87,15 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/icm.exe" -DestinationPath "icm-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/icm-install.exe" -DestinationPath "icm-install-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: icm-${{ matrix.target }}
-          path: icm-${{ matrix.target }}.${{ matrix.archive }}
+          path: |
+            icm-${{ matrix.target }}.${{ matrix.archive }}
+            icm-install-${{ matrix.target }}.${{ matrix.archive }}
 
   build-deb:
     name: Build .deb

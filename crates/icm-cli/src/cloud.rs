@@ -448,6 +448,7 @@ pub fn pull_memories(
                 access_count: cm.access_count,
                 related_ids: cm.related_ids,
                 embedding: None,
+                context: None,
                 created_at: cm
                     .created_at
                     .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())

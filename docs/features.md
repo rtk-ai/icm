@@ -592,8 +592,8 @@ icm init [-m <mode>]
 | `mcp` | Configure le serveur MCP | Auto-detecte et configure 14 outils IA |
 | `cli` | Injecte dans CLAUDE.md | Ajoute les instructions `icm store`/`icm recall` |
 | `skill` | Installe les slash commands | `/recall`, `/remember` pour Claude Code, `.mdc` pour Cursor, etc. |
-| `hook` | Installe le hook PostToolUse | Extraction automatique apres chaque outil |
-| `all` | Tout ci-dessus | Configure MCP + CLI + Skills + Hook |
+| `hook` | Installe la suite de hooks | Wake-up pack, rappel de contexte et extraction de faits durables |
+| `all` | Tout ci-dessus | Configure MCP + CLI + Skills + Hooks |
 
 **14 outils supportes (mode MCP) :**
 

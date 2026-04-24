@@ -4,7 +4,8 @@ use serde_json::{json, Value};
 use icm_core::{
     add_backrefs, auto_link_memory, build_wake_up, keyword_matches, topic_matches, AutoLinkOptions,
     Concept, ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
+    MemoryContext, MemoryKind, MemoryStore, Relation, WakeUpFormat, WakeUpOptions,
+    MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -32,6 +33,156 @@ fn parse_keywords(args: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_memory_context(args: &Value) -> Result<Option<MemoryContext>, ToolResult> {
+    let Some(context) = args.get("context") else {
+        return Ok(None);
+    };
+
+    serde_json::from_value(context.clone())
+        .map(Some)
+        .map_err(|e| ToolResult::error(format!("invalid context payload: {e}")))
+}
+
+#[derive(Clone, Copy)]
+struct RecallContext<'a> {
+    project: Option<&'a str>,
+    platform: Option<&'a str>,
+    command: Option<&'a str>,
+    file_path: Option<&'a str>,
+    symbol: Option<&'a str>,
+    error_fingerprint: Option<&'a str>,
+}
+
+impl RecallContext<'_> {
+    fn has_filters(self) -> bool {
+        self.project.is_some()
+            || self.platform.is_some()
+            || self.command.is_some()
+            || self.file_path.is_some()
+            || self.symbol.is_some()
+            || self.error_fingerprint.is_some()
+    }
+}
+
+fn recall_context_from_args(args: &Value) -> RecallContext<'_> {
+    RecallContext {
+        project: get_str(args, "project"),
+        platform: get_str(args, "platform"),
+        command: get_str(args, "command"),
+        file_path: get_str(args, "file_path"),
+        symbol: get_str(args, "symbol"),
+        error_fingerprint: get_str(args, "error_fingerprint"),
+    }
+}
+
+fn recall_candidate_limit(limit: usize, context: RecallContext<'_>) -> usize {
+    if context.has_filters() {
+        (limit.max(10)).saturating_mul(5).min(100)
+    } else {
+        limit
+    }
+}
+
+fn contextual_boost(memory: &Memory, context: RecallContext<'_>) -> f32 {
+    let Some(meta) = memory.context.as_ref() else {
+        return 0.0;
+    };
+
+    let mut boost = 0.0;
+    if context.project == meta.project.as_deref() {
+        boost += 3.0;
+    }
+    if context.platform == meta.platform.as_deref() {
+        boost += 2.0;
+    }
+    if context.command == meta.command.as_deref() {
+        boost += 4.0;
+    }
+    if context.file_path == meta.file_path.as_deref() {
+        boost += 1.5;
+    }
+    if context.symbol == meta.symbol.as_deref() {
+        boost += 1.5;
+    }
+    if context.error_fingerprint == meta.error_fingerprint.as_deref() {
+        boost += 4.0;
+    }
+    boost += match meta.kind {
+        MemoryKind::WorkingCommand | MemoryKind::ResolvedError | MemoryKind::Decision => 0.25,
+        _ => 0.0,
+    };
+
+    boost
+}
+
+fn rerank_contextual_results(
+    mut results: Vec<(Memory, f32)>,
+    context: RecallContext<'_>,
+    limit: usize,
+) -> Vec<(Memory, f32)> {
+    if context.has_filters() {
+        for (memory, score) in &mut results {
+            *score += contextual_boost(memory, context);
+        }
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    results.truncate(limit);
+    results
+}
+
+fn same_operational_fact(existing: &Memory, incoming: &Memory) -> bool {
+    match (&existing.context, &incoming.context) {
+        (Some(a), Some(b)) => {
+            a.kind == b.kind
+                && a.project == b.project
+                && a.platform == b.platform
+                && a.error_fingerprint.is_some()
+                && a.error_fingerprint == b.error_fingerprint
+        }
+        _ => false,
+    }
+}
+
+fn build_updated_memory(
+    existing: &Memory,
+    content: &str,
+    args: &Value,
+    importance: icm_core::Importance,
+    embedding: Option<Vec<f32>>,
+    context: Option<MemoryContext>,
+) -> Memory {
+    Memory {
+        id: existing.id.clone(),
+        created_at: existing.created_at,
+        last_accessed: existing.last_accessed,
+        access_count: existing.access_count,
+        weight: 1.0,
+        topic: existing.topic.clone(),
+        summary: content.to_string(),
+        raw_excerpt: get_str(args, "raw_excerpt")
+            .map(|r| r.into())
+            .or_else(|| existing.raw_excerpt.clone()),
+        keywords: {
+            let kw = parse_keywords(args);
+            if kw.is_empty() {
+                existing.keywords.clone()
+            } else {
+                kw
+            }
+        },
+        embedding,
+        importance,
+        source: existing.source.clone(),
+        related_ids: existing.related_ids.clone(),
+        updated_at: Utc::now(),
+        context: context.or_else(|| existing.context.clone()),
+        scope: existing.scope,
+    }
 }
 
 /// Try to auto-consolidate a topic if it exceeds the threshold.
@@ -82,6 +233,23 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     "raw_excerpt": {
                         "type": "string",
                         "description": "Optional verbatim (code, exact error message, etc.)"
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Optional structured operational context for coding-agent recall",
+                        "properties": {
+                            "project": { "type": "string" },
+                            "repo_root": { "type": "string" },
+                            "platform": { "type": "string" },
+                            "command": { "type": "string" },
+                            "file_path": { "type": "string" },
+                            "symbol": { "type": "string" },
+                            "error_fingerprint": { "type": "string" },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["decision", "resolved_error", "working_command", "constraint", "preference", "progress", "note"]
+                            }
+                        }
                     }
                 },
                 "required": ["topic", "content"]
@@ -111,6 +279,30 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     "keyword": {
                         "type": "string",
                         "description": "Filter results by keyword (exact match on memory keywords)"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Optional project/repo filter used for contextual ranking"
+                    },
+                    "platform": {
+                        "type": "string",
+                        "description": "Optional platform filter such as windows, linux, macos"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Optional command filter used for contextual ranking"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional file path filter used for contextual ranking"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Optional symbol filter used for contextual ranking"
+                    },
+                    "error_fingerprint": {
+                        "type": "string",
+                        "description": "Optional normalized error fingerprint used for contextual ranking"
                     }
                 },
                 "required": ["query"]
@@ -936,6 +1128,10 @@ fn tool_store(
         .unwrap_or(icm_core::Importance::Medium);
 
     let mut memory = Memory::new(topic.into(), content.into(), importance);
+    memory.context = match parse_memory_context(args) {
+        Ok(context) => context,
+        Err(err) => return err,
+    };
 
     let kw = parse_keywords(args);
     if !kw.is_empty() {
@@ -944,6 +1140,26 @@ fn tool_store(
 
     if let Some(raw) = get_str(args, "raw_excerpt") {
         memory.raw_excerpt = Some(raw.into());
+    }
+
+    if let Ok(existing_in_topic) = store.get_by_topic(topic) {
+        if let Some(existing) = existing_in_topic
+            .iter()
+            .find(|existing| same_operational_fact(existing, &memory))
+        {
+            let updated = build_updated_memory(existing, content, args, importance, None, memory.context.clone());
+            if let Err(e) = store.update(&updated) {
+                return ToolResult::error(format!("failed to update: {e}"));
+            }
+            return if compact {
+                ToolResult::text(format!("ok:{}", updated.id))
+            } else {
+                ToolResult::text(format!(
+                    "Updated existing memory (same operational fact): {}",
+                    updated.id
+                ))
+            };
+        }
     }
 
     // Auto-embed if embedder is available
@@ -970,32 +1186,14 @@ fn tool_store(
             if let Some((existing, score)) = similar.first() {
                 if *score > DEDUP_SIMILARITY_THRESHOLD && existing.topic == topic {
                     // Very similar content in same topic — update instead of duplicate
-                    let updated = Memory {
-                        id: existing.id.clone(),
-                        created_at: existing.created_at,
-                        last_accessed: existing.last_accessed,
-                        access_count: existing.access_count,
-                        weight: 1.0, // Reset weight on update
-                        topic: existing.topic.clone(),
-                        summary: content.to_string(),
-                        raw_excerpt: get_str(args, "raw_excerpt")
-                            .map(|r| r.into())
-                            .or_else(|| existing.raw_excerpt.clone()),
-                        keywords: {
-                            let kw = parse_keywords(args);
-                            if kw.is_empty() {
-                                existing.keywords.clone()
-                            } else {
-                                kw
-                            }
-                        },
-                        embedding: Some(query_emb.clone()),
+                    let updated = build_updated_memory(
+                        existing,
+                        content,
+                        args,
                         importance,
-                        source: existing.source.clone(),
-                        related_ids: existing.related_ids.clone(),
-                        updated_at: Utc::now(),
-                        scope: existing.scope,
-                    };
+                        Some(query_emb.clone()),
+                        memory.context.clone(),
+                    );
                     if let Err(e) = store.update(&updated) {
                         return ToolResult::error(format!("failed to update: {e}"));
                     }
@@ -1130,13 +1328,15 @@ fn tool_recall(
         None => return ToolResult::error("missing required field: query".into()),
     };
     let limit = get_i64(args, "limit", 5).clamp(1, 100) as usize;
+    let recall_context = recall_context_from_args(args);
+    let candidate_limit = recall_candidate_limit(limit, recall_context);
     let topic = get_str(args, "topic");
     let keyword = get_str(args, "keyword");
 
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
         if let Ok(query_emb) = emb.embed(query) {
-            if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
+            if let Ok(results) = store.search_hybrid(query, &query_emb, candidate_limit) {
                 let mut scored_results = results;
                 if let Some(t) = topic {
                     scored_results.retain(|(m, _)| topic_matches(&m.topic, t));
@@ -1144,6 +1344,7 @@ fn tool_recall(
                 if let Some(kw) = keyword {
                     scored_results.retain(|(m, _)| keyword_matches(&m.keywords, kw));
                 }
+                let scored_results = rerank_contextual_results(scored_results, recall_context, limit);
 
                 // Graph-aware expansion: follow `related_ids` one hop from
                 // each primary hit and fold neighbors into the result set.
@@ -1168,14 +1369,14 @@ fn tool_recall(
     }
 
     // Fallback: FTS then keywords
-    let mut results = match store.search_fts(query, limit) {
+    let mut results = match store.search_fts(query, candidate_limit) {
         Ok(r) => r,
         Err(e) => return ToolResult::error(format!("search error: {e}")),
     };
 
     if results.is_empty() {
         let keywords: Vec<&str> = query.split_whitespace().collect();
-        results = match store.search_by_keywords(&keywords, limit) {
+        results = match store.search_by_keywords(&keywords, candidate_limit) {
             Ok(r) => r,
             Err(e) => return ToolResult::error(format!("search error: {e}")),
         };
@@ -1188,13 +1389,15 @@ fn tool_recall(
         results.retain(|m| keyword_matches(&m.keywords, kw));
     }
 
-    // Convert to scored format with a sentinel score of 1.0 (FTS fallback
-    // doesn't expose a real similarity score, but we still want the graph
-    // expansion to score neighbors relative to their primary parent).
-    let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, 1.0)).collect();
-
     // Graph-aware expansion also applies in the fallback path so that
     // keyword-only deployments benefit from auto-linked memories.
+    let total = results.len() as f32;
+    let scored: Vec<(Memory, f32)> = results
+        .into_iter()
+        .enumerate()
+        .map(|(index, memory)| (memory, total - index as f32))
+        .collect();
+    let scored = rerank_contextual_results(scored, recall_context, limit);
     let max_neighbors = (limit / 3).max(1);
     let expanded = store
         .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
@@ -2380,6 +2583,145 @@ mod tests {
     }
 
     #[test]
+    fn test_store_accepts_memory_context() {
+        let store = test_store();
+        let store_result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "context-icm",
+                "content": "Windows build uses cargo from the user profile",
+                "context": {
+                    "project": "icm",
+                    "repo_root": "D:/Projects/WORK/other/icm",
+                    "platform": "windows",
+                    "command": "cargo build --release -p icm-cli --features web",
+                    "file_path": "crates/icm-cli/src/main.rs",
+                    "symbol": "Commands::Init",
+                    "kind": "working_command"
+                }
+            }),
+            false,
+        );
+        assert!(!store_result.is_error);
+
+        let memories = store.get_by_topic("context-icm").unwrap();
+        assert_eq!(memories.len(), 1);
+        let context = memories[0].context.as_ref().unwrap();
+        assert_eq!(context.project.as_deref(), Some("icm"));
+        assert_eq!(context.platform.as_deref(), Some("windows"));
+        assert_eq!(
+            context.command.as_deref(),
+            Some("cargo build --release -p icm-cli --features web")
+        );
+    }
+
+    #[test]
+    fn test_store_dedups_same_error_fingerprint() {
+        let store = test_store();
+
+        let first = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "errors-resolved",
+                "content": "PowerShell alias icm points to Invoke-Command",
+                "importance": "high",
+                "context": {
+                    "project": "icm",
+                    "platform": "windows",
+                    "kind": "resolved_error",
+                    "error_fingerprint": "powershell-alias-icm"
+                }
+            }),
+            false,
+        );
+        let second = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "errors-resolved",
+                "content": "Fixed icm alias conflict in PowerShell profile",
+                "importance": "high",
+                "context": {
+                    "project": "icm",
+                    "platform": "windows",
+                    "kind": "resolved_error",
+                    "error_fingerprint": "powershell-alias-icm"
+                }
+            }),
+            false,
+        );
+
+        assert!(!first.is_error && !second.is_error);
+        let items = store.get_by_topic("errors-resolved").unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].summary.contains("Fixed icm alias conflict"));
+    }
+
+    #[test]
+    fn test_recall_prefers_matching_platform_and_command() {
+        let store = test_store();
+
+        let mut linux = Memory::new(
+            "context-icm".into(),
+            "Build succeeds with cargo build --release on Linux".into(),
+            icm_core::Importance::High,
+        );
+        linux.weight = 3.0;
+        linux.context = Some(MemoryContext {
+            project: Some("icm".into()),
+            repo_root: None,
+            platform: Some("linux".into()),
+            command: Some("cargo build --release".into()),
+            file_path: None,
+            symbol: None,
+            error_fingerprint: None,
+            kind: MemoryKind::WorkingCommand,
+        });
+        store.store(linux).unwrap();
+
+        let mut windows = Memory::new(
+            "context-icm".into(),
+            "Build succeeds with cargo build --release -p icm-cli --features web on Windows".into(),
+            icm_core::Importance::High,
+        );
+        windows.weight = 1.0;
+        windows.context = Some(MemoryContext {
+            project: Some("icm".into()),
+            repo_root: None,
+            platform: Some("windows".into()),
+            command: Some("cargo build --release -p icm-cli --features web".into()),
+            file_path: None,
+            symbol: None,
+            error_fingerprint: None,
+            kind: MemoryKind::WorkingCommand,
+        });
+        store.store(windows).unwrap();
+
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({
+                "query": "build release",
+                "project": "icm",
+                "platform": "windows",
+                "command": "cargo build --release -p icm-cli --features web",
+                "limit": 1
+            }),
+            false,
+        );
+
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("features web"));
+        assert!(!result.content[0].text.contains("on Linux"));
+    }
+
+    #[test]
     fn test_compact_store_output() {
         let store = test_store();
         let result = call_tool(
@@ -3201,6 +3543,50 @@ description = "A test project"
         );
         assert!(text.contains("## Identity"));
         assert!(text.contains("## Critical decisions"));
+    }
+
+    #[test]
+    fn test_wake_up_includes_working_commands_and_known_traps() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "context-icm",
+                "content": "Use cargo from C:/Users/times/.cargo/bin on Windows",
+                "importance": "high",
+                "context": {
+                    "project": "icm",
+                    "platform": "windows",
+                    "kind": "working_command",
+                    "command": "C:/Users/times/.cargo/bin/cargo.exe build --release -p icm-cli --features web"
+                }
+            }),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({
+                "topic": "errors-resolved",
+                "content": "PowerShell alias icm shadows the binary",
+                "importance": "high",
+                "context": {
+                    "project": "icm",
+                    "platform": "windows",
+                    "kind": "resolved_error",
+                    "error_fingerprint": "powershell-alias-icm"
+                }
+            }),
+            false,
+        );
+
+        let result = call_tool(&store, None, "icm_wake_up", &json!({"project": "icm"}), false);
+        let text = &result.content[0].text;
+        assert!(text.contains("Working commands"), "missing working command section: {text}");
+        assert!(text.contains("Known traps"), "missing known trap section: {text}");
     }
 
     #[test]

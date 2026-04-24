@@ -105,7 +105,7 @@ fn run() -> Result<()> {
     println!();
     println!("  Next steps:");
     println!("    1. icm init            # configure your AI tools (MCP)");
-    println!("    2. icm init --mode hook  # install Claude Code hooks");
+    println!("    2. icm init --mode hook  # install wake-up, recall, and extraction hooks");
     println!("    3. Restart your AI tool to activate");
     println!();
 

@@ -269,7 +269,7 @@ icm embed --topic "decisions" # Only one topic
 ```bash
 icm init                  # Auto-detect and configure MCP for all found tools
 icm init --mode skill     # Install slash commands and rules
-icm init --mode hook      # Install Claude Code PostToolUse hook for auto-extraction
+icm init --mode hook      # Install wake-up, recall, and extraction hooks
 icm init --mode cli       # Show manual CLI setup instructions
 ```
 
@@ -567,11 +567,14 @@ icm init --mode skill
 ```
 Installe `/recall` et `/remember` dans `~/.claude/commands/`.
 
-**Hook PostToolUse (optionnel) :**
+**Suite de hooks (optionnel) :**
 ```bash
 icm init --mode hook
 ```
-Installe un hook qui extrait automatiquement le contexte apres chaque appel d'outil (git commit, edit, etc.).
+Installe la suite de hooks Claude Code : `SessionStart` pour charger un wake-up pack operationnel,
+`UserPromptSubmit` pour rappeler le contexte pertinent du projet, `PostToolUse` pour extraire des
+faits durables (erreurs resolues, commandes qui marchent, contraintes d'environnement), `PreCompact`
+pour sauver ces faits avant compression, et `PreToolUse` pour auto-authoriser `icm`.
 
 **Mode compact recommande :** Claude Code beneficie du mode compact pour economiser des tokens. Activez dans `~/.config/icm/config.toml` :
 ```toml

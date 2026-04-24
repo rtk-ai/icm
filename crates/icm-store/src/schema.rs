@@ -61,6 +61,7 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             importance TEXT NOT NULL,
             source_type TEXT NOT NULL,
             source_data TEXT, -- JSON
+            context_data TEXT, -- JSON
 
             related_ids TEXT -- JSON array
         );
@@ -328,6 +329,17 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
 
     if !has_embedding {
         conn.execute_batch("ALTER TABLE memories ADD COLUMN embedding BLOB")
+            .map_err(db_err)?;
+    }
+
+    // Migration: add context_data column if missing (existing DBs)
+    let has_context_data: bool = conn
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='context_data'")
+        .and_then(|mut s| s.query_row([], |row| row.get(0)))
+        .map_err(db_err)?;
+
+    if !has_context_data {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN context_data TEXT")
             .map_err(db_err)?;
     }
 

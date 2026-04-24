@@ -24,6 +24,9 @@ pub struct Memory {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<MemoryContext>,
+
     /// Cloud scope: user (local default), project, or org.
     #[serde(default)]
     pub scope: Scope,
@@ -52,9 +55,36 @@ impl Memory {
             source: MemorySource::Manual,
             related_ids: Vec::new(),
             embedding: None,
+            context: None,
             scope: Scope::User,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryContext {
+    pub project: Option<String>,
+    pub repo_root: Option<String>,
+    pub platform: Option<String>,
+    pub command: Option<String>,
+    pub file_path: Option<String>,
+    pub symbol: Option<String>,
+    pub error_fingerprint: Option<String>,
+    #[serde(default)]
+    pub kind: MemoryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    Decision,
+    ResolvedError,
+    WorkingCommand,
+    Constraint,
+    Preference,
+    Progress,
+    #[default]
+    Note,
 }
 
 /// Memory scope for cloud sync.

@@ -53,9 +53,6 @@ ICM le da a tu agente de IA una memoria real — no una herramienta de notas, no
 # Homebrew (macOS / Linux)
 brew tap rtk-ai/tap && brew install icm
 
-# Instalación rápida
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
-
 # Desde el código fuente
 cargo install --path crates/icm-cli
 ```

@@ -12,9 +12,6 @@ ICM gives your AI coding agent a persistent memory that survives across sessions
 # Homebrew
 brew tap rtk-ai/tap && brew install icm
 
-# Quick install
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
-
 # From source
 cargo install --path crates/icm-cli
 ```
@@ -332,7 +329,6 @@ brew tap rtk-ai/tap && brew install icm
 Ou, sans Homebrew :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
 ```
 
 ### Minute 2 : Configurer

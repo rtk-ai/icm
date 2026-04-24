@@ -53,9 +53,6 @@ ICM geeft uw AI-agent een echt geheugen — geen notitietool, geen contextbeheer
 # Homebrew (macOS / Linux)
 brew tap rtk-ai/tap && brew install icm
 
-# Snelle installatie
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
-
 # Vanuit broncode
 cargo install --path crates/icm-cli
 ```

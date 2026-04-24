@@ -53,9 +53,6 @@ ICM даёт вашему ИИ-агенту настоящую память — 
 # Homebrew (macOS / Linux)
 brew tap rtk-ai/tap && brew install icm
 
-# Быстрая установка
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
-
 # Из исходного кода
 cargo install --path crates/icm-cli
 ```

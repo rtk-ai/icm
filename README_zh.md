@@ -53,9 +53,6 @@ ICM 为您的 AI 智能体提供真正的记忆——不是笔记工具，不是
 # Homebrew（macOS / Linux）
 brew tap rtk-ai/tap && brew install icm
 
-# 快速安装
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
-
 # 从源码编译
 cargo install --path crates/icm-cli
 ```

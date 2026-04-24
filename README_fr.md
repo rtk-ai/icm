@@ -54,7 +54,6 @@ ICM donne à votre agent IA une vraie mémoire — pas un outil de prise de note
 brew tap rtk-ai/tap && brew install icm
 
 # Installation rapide
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
 
 # Depuis les sources
 cargo install --path crates/icm-cli

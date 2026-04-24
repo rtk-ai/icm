@@ -53,9 +53,6 @@
 # Homebrew (macOS / Linux)
 brew tap rtk-ai/tap && brew install icm
 
-# تثبيت سريع
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
-
 # من المصدر
 cargo install --path crates/icm-cli
 ```

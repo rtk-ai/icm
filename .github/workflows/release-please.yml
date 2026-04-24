@@ -7,8 +7,6 @@ on:
     paths:
       - 'crates/**'
       - 'plugins/**'
-      - 'install.sh'
-      - 'install.ps1'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/release*.yml'

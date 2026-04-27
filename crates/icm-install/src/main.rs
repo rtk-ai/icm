@@ -7,7 +7,7 @@
 //!   --version latest
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -113,7 +113,7 @@ fn run() -> Result<()> {
     let in_path = std::env::var("PATH")
         .unwrap_or_default()
         .split(':')
-        .any(|p| install_dir.as_os_str() == p);
+        .any(|p| install_dir.as_path() == Path::new(p));
     if !in_path {
         eprintln!(
             "warning: {} is not in your PATH. Add it with:",

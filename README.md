@@ -53,12 +53,17 @@ ICM gives your AI agent a real memory — not a note-taking tool, not a context 
 # Homebrew (macOS / Linux)
 brew tap rtk-ai/tap && brew install icm
 
-# Quick install
+# Quick install (macOS / Linux) — verifies SHA256 against the release checksums
 curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
+
+# Quick install (Windows PowerShell)
+irm https://raw.githubusercontent.com/rtk-ai/icm/main/install.ps1 | iex
 
 # From source
 cargo install --path crates/icm-cli
 ```
+
+Re-run the install command to upgrade to the latest release. To pin a version, pass `--version icm-vX.Y.Z` (sh: `sh -s -- --version …`).
 
 ## Setup
 

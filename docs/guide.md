@@ -12,12 +12,17 @@ ICM gives your AI coding agent a persistent memory that survives across sessions
 # Homebrew
 brew tap rtk-ai/tap && brew install icm
 
-# Quick install
+# Quick install (macOS / Linux) — verifies SHA256 against the release checksums
 curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
+
+# Quick install (Windows PowerShell)
+irm https://raw.githubusercontent.com/rtk-ai/icm/main/install.ps1 | iex
 
 # From source
 cargo install --path crates/icm-cli
 ```
+
+Re-running the install command upgrades an existing installation in place.
 
 ### 2. Setup
 

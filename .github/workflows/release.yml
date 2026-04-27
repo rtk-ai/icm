@@ -249,11 +249,16 @@ jobs:
 
       - name: Parse checksums
         id: sha
+        # checksums.txt now contains both "icm-<target>.tar.gz" and
+        # "icm-install-<target>.tar.gz" entries. A bare grep on the target
+        # matched both rows and produced two SHAs separated by a newline,
+        # which broke $GITHUB_OUTPUT (Invalid format). Match field 2 exactly.
         run: |
-          echo "arm=$(grep aarch64-apple-darwin checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
-          echo "intel=$(grep x86_64-apple-darwin checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
-          echo "linux=$(grep x86_64-unknown-linux-gnu checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
-          echo "linux_arm=$(grep aarch64-unknown-linux-gnu checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+          sha_for() { awk -v f="$1" '$2 == f {print $1; exit}' checksums.txt; }
+          echo "arm=$(sha_for icm-aarch64-apple-darwin.tar.gz)" >> $GITHUB_OUTPUT
+          echo "intel=$(sha_for icm-x86_64-apple-darwin.tar.gz)" >> $GITHUB_OUTPUT
+          echo "linux=$(sha_for icm-x86_64-unknown-linux-gnu.tar.gz)" >> $GITHUB_OUTPUT
+          echo "linux_arm=$(sha_for icm-aarch64-unknown-linux-gnu.tar.gz)" >> $GITHUB_OUTPUT
 
       - name: Update formula
         run: |

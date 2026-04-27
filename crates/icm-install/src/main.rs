@@ -113,7 +113,7 @@ fn run() -> Result<()> {
     let in_path = std::env::var("PATH")
         .unwrap_or_default()
         .split(':')
-        .any(|p| install_dir == p);
+        .any(|p| install_dir.as_os_str() == p);
     if !in_path {
         eprintln!(
             "warning: {} is not in your PATH. Add it with:",

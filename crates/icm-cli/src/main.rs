@@ -12,7 +12,7 @@ mod upgrade;
 #[cfg(feature = "web")]
 mod web;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -3172,7 +3172,7 @@ fn binary_in_path(name: &str) -> bool {
 /// used for tools without a CLI binary (e.g. Claude Desktop, VS Code extensions).
 /// Note: directory checks can yield false positives if a previous `icm init --force`
 /// already created the config path — use `--force` to bypass detection entirely.
-fn detect_tool(name: &str, home: &str, vscode_data: &PathBuf) -> bool {
+fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
     let h = std::path::Path::new(home);
     let vscode_present =
         || binary_in_path("code") || binary_in_path("code-insiders") || vscode_data.exists();

@@ -223,7 +223,7 @@ enum Commands {
 
     /// Configure ICM integration for Claude Code / Claude Desktop
     Init {
-        /// Integration mode: mcp, cli, skill, or all (default: mcp)
+        /// Integration mode: mcp, cli, skill, hook, or all (default: mcp)
         #[arg(short, long, default_value = "mcp")]
         mode: InitMode,
 

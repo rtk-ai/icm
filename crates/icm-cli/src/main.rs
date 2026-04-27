@@ -12,7 +12,7 @@ mod upgrade;
 #[cfg(feature = "web")]
 mod web;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -223,7 +223,7 @@ enum Commands {
 
     /// Configure ICM integration for Claude Code / Claude Desktop
     Init {
-        /// Integration mode: mcp, cli, skill, or all (default: mcp)
+        /// Integration mode: mcp, cli, skill, hook, or all (default: mcp)
         #[arg(short, long, default_value = "mcp")]
         mode: InitMode,
 
@@ -2765,7 +2765,7 @@ Do this BEFORE responding to the user. Not optional.
 }
 
 /// Inject ICM instruction block into a markdown file (CLAUDE.md, AGENTS.md, GEMINI.md, etc.)
-fn inject_icm_block(path: &PathBuf, block: &str) -> Result<String> {
+fn inject_icm_block(path: &Path, block: &str) -> Result<String> {
     if path.exists() {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
@@ -3062,7 +3062,7 @@ fn inject_codex_hook(
 }
 
 /// Install a skill/rule file if it doesn't exist yet.
-fn install_skill(dir: &PathBuf, filename: &str, content: &str, label: &str) -> Result<()> {
+fn install_skill(dir: &Path, filename: &str, content: &str, label: &str) -> Result<()> {
     std::fs::create_dir_all(dir).ok();
     let path = dir.join(filename);
     if path.exists() {
@@ -3172,7 +3172,7 @@ fn binary_in_path(name: &str) -> bool {
 /// used for tools without a CLI binary (e.g. Claude Desktop, VS Code extensions).
 /// Note: directory checks can yield false positives if a previous `icm init --force`
 /// already created the config path — use `--force` to bypass detection entirely.
-fn detect_tool(name: &str, home: &str, vscode_data: &PathBuf) -> bool {
+fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
     let h = std::path::Path::new(home);
     let vscode_present =
         || binary_in_path("code") || binary_in_path("code-insiders") || vscode_data.exists();
@@ -3284,7 +3284,7 @@ fn inject_mcp_server(
 }
 
 /// Inject ICM MCP server into Zed settings.json (uses `context_servers` with nested `command` object).
-fn inject_zed_mcp_server(config_path: &PathBuf, name: &str, bin_path: &str) -> Result<String> {
+fn inject_zed_mcp_server(config_path: &Path, name: &str, bin_path: &str) -> Result<String> {
     let mut config: Value = if config_path.exists() {
         parse_json_config(config_path)?
     } else {
@@ -3369,7 +3369,7 @@ fn inject_copilot_cli_mcp_server(
 
 /// Inject ICM MCP server into Continue.dev config (~/.continue/config.yaml).
 /// Continue.dev uses YAML with a top-level `mcpServers` list.
-fn inject_continue_mcp_server(config_path: &PathBuf, name: &str, icm_bin: &str) -> Result<String> {
+fn inject_continue_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Result<String> {
     if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("cannot read {}", config_path.display()))?;
@@ -3458,7 +3458,7 @@ fn inject_copilot_hooks(cwd: &std::path::Path, icm_bin: &str) -> Result<String> 
 }
 
 /// Inject ICM MCP server into Codex CLI TOML config. Returns a status string.
-fn inject_codex_mcp_server(config_path: &PathBuf, name: &str, icm_bin: &str) -> Result<String> {
+fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Result<String> {
     let mut config: toml::Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("cannot read {}", config_path.display()))?;
@@ -3507,7 +3507,7 @@ fn inject_codex_mcp_server(config_path: &PathBuf, name: &str, icm_bin: &str) -> 
 }
 
 /// Inject ICM MCP server into OpenCode config (uses "mcp" key, command is array).
-fn inject_opencode_mcp_server(config_path: &PathBuf, name: &str, icm_bin: &str) -> Result<String> {
+fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Result<String> {
     let mut config: Value = if config_path.exists() {
         parse_json_config(config_path)?
     } else {
@@ -5773,7 +5773,7 @@ mod inject_settings_hook_tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn read(path: &PathBuf) -> Value {
+    fn read(path: &Path) -> Value {
         let raw = std::fs::read_to_string(path).unwrap();
         serde_json::from_str(&raw).unwrap()
     }

@@ -7,7 +7,7 @@
 //!   --version latest
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -79,7 +79,7 @@ fn run() -> Result<()> {
     if expected != actual {
         bail!("SHA256 mismatch — aborting\n  expected: {expected}\n  got:      {actual}");
     }
-    info(&format!("SHA256 OK"));
+    info("SHA256 OK");
 
     info("Extracting...");
     let binary = extract(&archive_bytes, ext == "zip")?;
@@ -113,7 +113,7 @@ fn run() -> Result<()> {
     let in_path = std::env::var("PATH")
         .unwrap_or_default()
         .split(':')
-        .any(|p| PathBuf::from(p) == install_dir);
+        .any(|p| install_dir.as_path() == Path::new(p));
     if !in_path {
         eprintln!(
             "warning: {} is not in your PATH. Add it with:",

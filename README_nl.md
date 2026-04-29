@@ -336,6 +336,59 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 Zie [config/default.toml](config/default.toml) voor alle opties.
 
+## Multi-project & multi-agent
+
+ICM is gebouwd voor het geval waarin één gebruiker samenwerkt met meerdere agents in meerdere projecten. Herinneringen moeten relevant blijven: een beslissing uit project A mag nooit doorlekken naar project B, en een `dev`-agent mag niet worden gehydrateerd met wat een `mentor`-agent heeft opgeslagen.
+
+### Projectisolatie
+
+ICM bakent herinneringen af via een **naamgevingsconventie voor topics**, niet via een aparte kolom. De conventie:
+
+```
+{kind}-{project}              # e.g. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
+preferences                   # global, always included
+identity                      # global, always included
+```
+
+`icm_wake_up { project: "icm" }` doet **segmentbewuste** matching: `"icm"` matcht `decisions-icm`, `errors-icm-core`, `contexte-icm` — maar nooit `icmp-notes` (geen valse positieven). Topics worden gesplitst op `-`, `.`, `_`, `/`, `:`. De topics voor preferences en identity zijn bewust projectoverstijgend — richtlijnen op gebruikersniveau worden nooit weggefilterd.
+
+De `UserPromptSubmit`-hook (`icm hook prompt`) en de `SessionStart`-hook (`icm hook start`) leiden het project beide af uit het `cwd`-veld in de hook-JSON (`basename` van de werkmap). Draai elk project vanuit zijn eigen map en de isolatie is automatisch.
+
+### Goede herinneringen schrijven
+
+`icm_memory_store` vereist dat de agent zelf `topic` en `content` kiest — er is geen automatische classifier. Best practice:
+
+| Veld | Richtlijn |
+|------|-----------|
+| `topic` | `{kind}-{project}`. Soorten: `decisions`, `errors-resolved`, `contexte`, `preferences`. |
+| `content` | Eén feit per opslag. Dichte Engelse samenvatting — `topic + content` is de tekst die wordt geëmbed. |
+| `raw_excerpt` | Uitsluitend verbatim (code, exacte foutmelding, command-uitvoer). |
+| `keywords` | 3–5 termen om BM25-retrieval te boosten. |
+| `importance` | `critical` voor nooit vergeten, `high` voor projectbeslissingen, `medium` als standaard, `low` voor vluchtige zaken. |
+
+ICM regelt de rest: **dedup bij 85% overeenkomst**, **automatische links** tussen semantisch verwante herinneringen, **automatische consolidatie** boven 10 entries per topic, en **decay** gewogen op aantal toegangen. Eén feit per call werkt beter dan gebatchte dumps — de retriever rangschikt afzonderlijk opgeslagen feiten hoger.
+
+### Multi-agent rollen
+
+ICM heeft nog geen eersteklas `role`-kolom. Op dit moment worden rollen geëmuleerd via topic-suffixen plus een eigen werkmap per agent:
+
+```
+decisions-icm-dev             # dev agent: code patterns, library choices, refactors
+decisions-icm-architect       # architect: design, workflows, subtask decomposition
+decisions-icm-mentor          # mentor / BA: business goals, non-technical context
+```
+
+Elke agent draait in zijn eigen werkmap (`~/projects/icm-dev/`, `~/projects/icm-architect/`, ...) zodat `icm hook prompt` en `icm hook start` een ander projectsegment afleiden uit `cwd` en alleen de bijpassende herinneringen ophalen. Preferences blijven globaal — de identiteit van de gebruiker draagt over alle rollen heen.
+
+Binnen één agent kun je ook handmatig de recall versmallen:
+
+```jsonc
+// icm_memory_recall
+{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
+```
+
+Een eersteklas `role`-veld (met native filtering in wake-up en recall) staat op de roadmap. Tot die tijd is de topic-suffix-conventie het ondersteunde patroon.
+
 ## Automatische extractie
 
 ICM extraheert herinneringen automatisch via drie lagen:

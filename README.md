@@ -392,6 +392,59 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 See [config/default.toml](config/default.toml) for all options.
 
+## Multi-project & multi-agent
+
+ICM is built for the case where one user collaborates with many agents across many projects. Memories must stay relevant: a decision from project A should never leak into project B, and a `dev` agent should not be hydrated with what a `mentor` agent stored.
+
+### Project isolation
+
+ICM scopes memories by **topic naming convention**, not by a separate column. The convention:
+
+```
+{kind}-{project}              # e.g. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
+preferences                   # global, always included
+identity                      # global, always included
+```
+
+`icm_wake_up { project: "icm" }` does **segment-aware** matching: `"icm"` matches `decisions-icm`, `errors-icm-core`, `contexte-icm` — but never `icmp-notes` (no false positives). Topics are split on `-`, `.`, `_`, `/`, `:`. Preference and identity topics are cross-project by design — user-level guidance is never stripped.
+
+The `UserPromptSubmit` hook (`icm hook prompt`) and the `SessionStart` hook (`icm hook start`) both derive the project from the `cwd` field in the hook JSON (`basename` of the working directory). Run each project from its own directory and isolation is automatic.
+
+### Writing good memories
+
+`icm_memory_store` requires the agent to choose `topic` and `content` — there is no auto-classifier. Best practice:
+
+| Field | Guidance |
+|------|----------|
+| `topic` | `{kind}-{project}`. Kinds: `decisions`, `errors-resolved`, `contexte`, `preferences`. |
+| `content` | One fact per store. Dense English summary — `topic + content` is the embedding text. |
+| `raw_excerpt` | Verbatim only (code, exact error message, command output). |
+| `keywords` | 3–5 terms to boost BM25 retrieval. |
+| `importance` | `critical` for never-forget, `high` for project decisions, `medium` default, `low` for ephemeral. |
+
+ICM handles the rest: **dedup at 85% similarity**, **auto-link** between semantically close memories, **auto-consolidation** above 10 entries per topic, and **decay** weighted by access count. One fact per call beats batched dumps — the retriever ranks individually-stored facts higher.
+
+### Multi-agent roles
+
+ICM does not yet have a first-class `role` column. Today, roles are emulated by topic suffixes plus per-agent working directories:
+
+```
+decisions-icm-dev             # dev agent: code patterns, library choices, refactors
+decisions-icm-architect       # architect: design, workflows, subtask decomposition
+decisions-icm-mentor          # mentor / BA: business goals, non-technical context
+```
+
+Each agent runs in its own working directory (`~/projects/icm-dev/`, `~/projects/icm-architect/`, ...) so that `icm hook prompt` and `icm hook start` derive a different project segment from `cwd` and only recall the matching memories. Preferences remain global — user identity carries across all roles.
+
+Within a single agent, you can also narrow recall manually:
+
+```jsonc
+// icm_memory_recall
+{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
+```
+
+A first-class `role` field (with native filtering in wake-up and recall) is on the roadmap. Until then, the topic-suffix convention is the supported pattern.
+
 ## Auto-extraction
 
 ICM extracts memories automatically via three layers:

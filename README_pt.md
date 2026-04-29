@@ -336,6 +336,59 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 Consulte [config/default.toml](config/default.toml) para todas as opções.
 
+## Multi-projeto e multi-agente
+
+O ICM foi desenhado para o caso em que um utilizador colabora com vários agentes em vários projetos. As memórias devem manter-se relevantes: uma decisão do projeto A nunca deve infiltrar-se no projeto B, e um agente `dev` não deve ser hidratado com aquilo que um agente `mentor` armazenou.
+
+### Isolamento de projetos
+
+O ICM delimita as memórias por **convenção de nomes de tópicos**, e não por uma coluna separada. A convenção:
+
+```
+{kind}-{project}              # e.g. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
+preferences                   # global, always included
+identity                      # global, always included
+```
+
+`icm_wake_up { project: "icm" }` faz correspondência **consciente de segmentos**: `"icm"` corresponde a `decisions-icm`, `errors-icm-core`, `contexte-icm` — mas nunca a `icmp-notes` (sem falsos positivos). Os tópicos são separados por `-`, `.`, `_`, `/`, `:`. Os tópicos de preferências e identidade são, por desenho, transversais a todos os projetos — as orientações ao nível do utilizador nunca são removidas.
+
+Tanto o hook `UserPromptSubmit` (`icm hook prompt`) como o hook `SessionStart` (`icm hook start`) derivam o projeto a partir do campo `cwd` no JSON do hook (`basename` do diretório de trabalho). Execute cada projeto a partir do seu próprio diretório e o isolamento é automático.
+
+### Como escrever boas memórias
+
+`icm_memory_store` exige que o agente escolha `topic` e `content` — não existe um classificador automático. Boas práticas:
+
+| Campo | Orientação |
+|------|----------|
+| `topic` | `{kind}-{project}`. Tipos: `decisions`, `errors-resolved`, `contexte`, `preferences`. |
+| `content` | Um facto por chamada. Resumo denso em inglês — `topic + content` é o texto do embedding. |
+| `raw_excerpt` | Apenas verbatim (código, mensagem de erro exata, output de comando). |
+| `keywords` | 3 a 5 termos para reforçar a recuperação por BM25. |
+| `importance` | `critical` para nunca esquecer, `high` para decisões de projeto, `medium` por omissão, `low` para efémero. |
+
+O ICM trata do resto: **deduplicação a 85% de similaridade**, **ligação automática** entre memórias semanticamente próximas, **consolidação automática** acima de 10 entradas por tópico, e **decay** ponderado pelo número de acessos. Um facto por chamada é melhor do que despejos em lote — o retriever classifica mais alto os factos armazenados individualmente.
+
+### Papéis multi-agente
+
+O ICM ainda não tem uma coluna `role` de primeira classe. Atualmente, os papéis são emulados através de sufixos de tópicos combinados com diretórios de trabalho por agente:
+
+```
+decisions-icm-dev             # dev agent: code patterns, library choices, refactors
+decisions-icm-architect       # architect: design, workflows, subtask decomposition
+decisions-icm-mentor          # mentor / BA: business goals, non-technical context
+```
+
+Cada agente é executado no seu próprio diretório de trabalho (`~/projects/icm-dev/`, `~/projects/icm-architect/`, ...) para que `icm hook prompt` e `icm hook start` derivem um segmento de projeto diferente a partir de `cwd` e recuperem apenas as memórias correspondentes. As preferências mantêm-se globais — a identidade do utilizador é transversal a todos os papéis.
+
+Dentro de um único agente, também pode restringir manualmente a recuperação:
+
+```jsonc
+// icm_memory_recall
+{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
+```
+
+Um campo `role` de primeira classe (com filtragem nativa em wake-up e recall) está no roadmap. Até lá, a convenção de sufixos de tópicos é o padrão suportado.
+
 ## Extração automática
 
 O ICM extrai memórias automaticamente através de três camadas:

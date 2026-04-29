@@ -124,7 +124,8 @@ const ICM_INSTRUCTIONS: &str = "\
 Use ICM (Infinite Context Memory) proactively to maintain long-term memory across sessions.\n\
 \n\
 RECALL (icm_memory_recall): At the start of a task, search for relevant past context — decisions, \
-resolved errors, user preferences. Search only what is relevant, do not dump everything.\n\
+resolved errors, working commands, environment constraints, and user preferences. Search only what \
+is relevant, do not dump everything.\n\
 \n\
 STORE (icm_memory_store): You MUST store when ANY of these triggers occur:\n\
 1. Error resolved → topic: \"errors-resolved\", importance: high\n\
@@ -137,7 +138,10 @@ Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
 Do NOT store: trivial details, information already in CLAUDE.md, ephemeral state.\n\
 \n\
-Importance levels: critical (never forgotten), high (slow decay), medium (normal), low (fast decay).";
+Importance levels: critical (never forgotten), high (slow decay), medium (normal), low (fast decay).\n\
+\n\
+Prefer durable operational facts that help future sessions succeed: resolved errors, working \
+commands, project decisions, and environment constraints.";
 
 fn handle_tools_list(id: Value, has_embedder: bool) -> JsonRpcResponse {
     JsonRpcResponse::ok(id, tools::tool_definitions(has_embedder))
@@ -180,7 +184,7 @@ fn handle_tools_call(
     if *calls_since_store >= STORE_NUDGE_THRESHOLD && tool_name != "icm_memory_store" {
         result.append_hint(&format!(
             "\n[ICM: {} tool calls since last store. \
-             Consider saving important context with icm_memory_store before it is lost.]",
+             Consider saving durable facts with icm_memory_store: resolved errors, working commands, decisions, or environment constraints.]",
             calls_since_store
         ));
     }

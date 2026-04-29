@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::error::IcmResult;
-use crate::memory::{Importance, Memory};
+use crate::memory::{Importance, Memory, MemoryKind};
 use crate::store::MemoryStore;
 
 /// Output format for the wake-up pack.
@@ -48,6 +48,8 @@ impl Default for WakeUpOptions<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Category {
     Identity,
+    WorkingCommands,
+    KnownTraps,
     Decision,
     Constraint,
     Error,
@@ -60,6 +62,8 @@ impl Category {
     fn label(self) -> &'static str {
         match self {
             Self::Identity => "Identity & preferences",
+            Self::WorkingCommands => "Working commands",
+            Self::KnownTraps => "Known traps",
             Self::Decision => "Critical decisions",
             Self::Constraint => "Active constraints",
             Self::Error => "Recent errors resolved",
@@ -68,9 +72,11 @@ impl Category {
         }
     }
 
-    fn all_ordered() -> [Category; 6] {
+    fn all_ordered() -> [Category; 8] {
         [
             Self::Identity,
+            Self::WorkingCommands,
+            Self::KnownTraps,
             Self::Decision,
             Self::Constraint,
             Self::Error,
@@ -112,7 +118,7 @@ pub fn build_wake_up_from_memories(memories: Vec<Memory>, opts: &WakeUpOptions<'
             // when the option is set (they may be medium-importance).
             matches!(m.importance, Importance::Critical | Importance::High) || is_pref
         })
-        .filter(|m| project_matches(&m.topic, opts.project))
+        .filter(|m| memory_matches_project(m, opts.project))
         .map(|m| {
             let score = compute_score(&m, now);
             let category = categorize(&m);
@@ -191,6 +197,21 @@ pub fn project_matches(topic: &str, project: Option<&str>) -> bool {
     proj_segs.iter().all(|ps| topic_segs.contains(ps))
 }
 
+fn memory_matches_project(memory: &Memory, project: Option<&str>) -> bool {
+    if project_matches(&memory.topic, project) {
+        return true;
+    }
+
+    let Some(meta) = memory.context.as_ref() else {
+        return false;
+    };
+
+    match project {
+        Some(project) if !project.is_empty() => meta.project.as_deref() == Some(project),
+        _ => true,
+    }
+}
+
 fn compute_score(m: &Memory, now: DateTime<Utc>) -> f32 {
     let importance_weight = match m.importance {
         Importance::Critical => 10.0,
@@ -205,10 +226,28 @@ fn compute_score(m: &Memory, now: DateTime<Utc>) -> f32 {
     // Recency factor: 1.0 at day 0, ~0.5 at day 30, ~0.25 at day 90.
     let recency = 1.0 / (1.0 + days / 30.0);
     let stored_weight = m.weight.max(0.01);
-    importance_weight * recency * stored_weight
+    let kind_boost = match m.context.as_ref().map(|meta| meta.kind) {
+        Some(MemoryKind::WorkingCommand) => 1.4,
+        Some(MemoryKind::ResolvedError) => 1.25,
+        Some(MemoryKind::Decision) => 1.2,
+        _ => 1.0,
+    };
+    importance_weight * recency * stored_weight * kind_boost
 }
 
 fn categorize(m: &Memory) -> Category {
+    if let Some(meta) = m.context.as_ref() {
+        match meta.kind {
+            MemoryKind::Preference => return Category::Identity,
+            MemoryKind::WorkingCommand => return Category::WorkingCommands,
+            MemoryKind::ResolvedError => return Category::KnownTraps,
+            MemoryKind::Decision => return Category::Decision,
+            MemoryKind::Constraint => return Category::Constraint,
+            MemoryKind::Progress => return Category::Milestone,
+            MemoryKind::Note => {}
+        }
+    }
+
     let t = m.topic.to_lowercase();
     let s = m.summary.to_lowercase();
 

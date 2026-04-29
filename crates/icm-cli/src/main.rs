@@ -21,8 +21,8 @@ use serde_json::Value;
 
 use icm_core::{
     build_wake_up, keyword_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore,
-    Importance, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
-    WakeUpOptions, MSG_NO_MEMORIES,
+    Importance, Label, Memoir, MemoirStore, Memory, MemoryContext, MemoryKind, MemoryStore,
+    Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -86,6 +86,30 @@ enum Commands {
         /// Filter results by keyword
         #[arg(short = 'k', long)]
         keyword: Option<String>,
+
+        /// Optional project/repo filter used for contextual ranking
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Optional platform filter such as windows, linux, macos
+        #[arg(long)]
+        platform: Option<String>,
+
+        /// Optional command filter used for contextual ranking
+        #[arg(long)]
+        command: Option<String>,
+
+        /// Optional file path filter used for contextual ranking
+        #[arg(long)]
+        file_path: Option<String>,
+
+        /// Optional symbol filter used for contextual ranking
+        #[arg(long)]
+        symbol: Option<String>,
+
+        /// Optional normalized error fingerprint used for contextual ranking
+        #[arg(long)]
+        error_fingerprint: Option<String>,
     },
 
     /// List memories
@@ -432,7 +456,7 @@ enum Commands {
 enum HookCommands {
     /// PreToolUse hook: auto-allow `icm` CLI commands (no permission prompt)
     Pre,
-    /// PostToolUse hook: auto-extract context every N tool calls
+    /// PostToolUse hook: extract durable operational facts every N tool calls
     Post {
         /// Extract every N tool calls (default from config, fallback: 10)
         #[arg(long, default_value = "15")]
@@ -442,7 +466,7 @@ enum HookCommands {
     Compact,
     /// UserPromptSubmit hook: inject recalled context at the start of each prompt
     Prompt,
-    /// SessionStart hook: inject a wake-up pack of critical facts into the session
+    /// SessionStart hook: inject an operational wake-up pack into the session
     Start {
         /// Approximate token budget for the wake-up pack (0 = use config value)
         #[arg(long, default_value = "0")]
@@ -861,7 +885,7 @@ enum InitMode {
     Cli,
     /// Claude Code slash commands /recall and /remember
     Skill,
-    /// Claude Code PostToolUse hook (auto-extract context)
+    /// Hook suite for wake-up, recall, extraction, and compaction
     Hook,
     /// All integration modes
     All,
@@ -889,6 +913,24 @@ fn init_embedder(_model: &str) -> Option<()> {
 }
 
 fn main() -> Result<()> {
+    #[cfg(all(target_os = "windows", debug_assertions))]
+    {
+        return std::thread::Builder::new()
+            .name("icm-main".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_main)
+            .context("failed to spawn icm main thread")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("icm main thread panicked"))?;
+    }
+
+    #[cfg(not(all(target_os = "windows", debug_assertions)))]
+    {
+        run_main()
+    }
+}
+
+fn run_main() -> Result<()> {
     // Reset SIGPIPE to default so piped commands (e.g. `icm export | head`)
     // don't panic on broken pipe.
     #[cfg(unix)]
@@ -950,6 +992,12 @@ fn main() -> Result<()> {
             topic,
             limit,
             keyword,
+            project,
+            platform,
+            command,
+            file_path,
+            symbol,
+            error_fingerprint,
         } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -962,6 +1010,12 @@ fn main() -> Result<()> {
                 topic.as_deref(),
                 limit,
                 keyword.as_deref(),
+                project.as_deref(),
+                platform.as_deref(),
+                command.as_deref(),
+                file_path.as_deref(),
+                symbol.as_deref(),
+                error_fingerprint.as_deref(),
             )
         }
         Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
@@ -1256,6 +1310,7 @@ fn cmd_store(
     raw: Option<String>,
 ) -> Result<()> {
     let mut memory = Memory::new(topic.clone(), content.clone(), importance);
+    memory.context = Some(build_auto_context(None, None));
     if let Some(kw) = keywords {
         memory.keywords = kw.split(',').map(|s| s.trim().to_string()).collect();
     }
@@ -1309,16 +1364,32 @@ fn cmd_recall(
     topic: Option<&str>,
     limit: usize,
     keyword: Option<&str>,
+    project: Option<&str>,
+    platform: Option<&str>,
+    command: Option<&str>,
+    file_path: Option<&str>,
+    symbol: Option<&str>,
+    error_fingerprint: Option<&str>,
 ) -> Result<()> {
     // Auto-decay if >24h since last decay
     if let Err(e) = store.maybe_auto_decay() {
         tracing::warn!(error = %e, "auto-decay failed during recall");
     }
 
+    let recall_context = CliRecallContext {
+        project,
+        platform,
+        command,
+        file_path,
+        symbol,
+        error_fingerprint,
+    };
+    let candidate_limit = cli_recall_candidate_limit(limit, recall_context);
+
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
         if let Ok(query_emb) = emb.embed(query) {
-            if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
+            if let Ok(results) = store.search_hybrid(query, &query_emb, candidate_limit) {
                 let mut scored = results;
                 if let Some(t) = topic {
                     scored.retain(|(m, _)| topic_matches(&m.topic, t));
@@ -1326,6 +1397,7 @@ fn cmd_recall(
                 if let Some(kw) = keyword {
                     scored.retain(|(m, _)| keyword_matches(&m.keywords, kw));
                 }
+                let scored = cli_rerank_contextual_results(scored, recall_context, limit);
 
                 // Graph-aware expansion: follow related_ids one hop and
                 // fold neighbors into results (discounted 0.5× score).
@@ -1350,11 +1422,11 @@ fn cmd_recall(
     }
 
     // Fallback: FTS then keywords
-    let mut results = store.search_fts(query, limit)?;
+    let mut results = store.search_fts(query, candidate_limit)?;
 
     if results.is_empty() {
         let keywords: Vec<&str> = query.split_whitespace().collect();
-        results = store.search_by_keywords(&keywords, limit)?;
+        results = store.search_by_keywords(&keywords, candidate_limit)?;
     }
 
     if let Some(t) = topic {
@@ -1365,7 +1437,13 @@ fn cmd_recall(
     }
 
     // Graph-aware expansion also runs in the keyword-only fallback path.
-    let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, 1.0)).collect();
+    let total = results.len() as f32;
+    let scored: Vec<(Memory, f32)> = results
+        .into_iter()
+        .enumerate()
+        .map(|(index, memory)| (memory, total - index as f32))
+        .collect();
+    let scored = cli_rerank_contextual_results(scored, recall_context, limit);
     let max_neighbors = (limit / 3).max(1);
     let expanded = store
         .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
@@ -1383,6 +1461,99 @@ fn cmd_recall(
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CliRecallContext<'a> {
+    project: Option<&'a str>,
+    platform: Option<&'a str>,
+    command: Option<&'a str>,
+    file_path: Option<&'a str>,
+    symbol: Option<&'a str>,
+    error_fingerprint: Option<&'a str>,
+}
+
+impl CliRecallContext<'_> {
+    fn has_filters(self) -> bool {
+        self.project.is_some()
+            || self.platform.is_some()
+            || self.command.is_some()
+            || self.file_path.is_some()
+            || self.symbol.is_some()
+            || self.error_fingerprint.is_some()
+    }
+}
+
+fn cli_recall_candidate_limit(limit: usize, context: CliRecallContext<'_>) -> usize {
+    if context.has_filters() {
+        (limit.max(10)).saturating_mul(5).min(100)
+    } else {
+        limit
+    }
+}
+
+fn cli_contextual_boost(memory: &Memory, context: CliRecallContext<'_>) -> f32 {
+    let Some(meta) = memory.context.as_ref() else {
+        return 0.0;
+    };
+
+    let mut boost = 0.0;
+    if context.project == meta.project.as_deref() {
+        boost += 3.0;
+    }
+    if context.platform == meta.platform.as_deref() {
+        boost += 2.0;
+    }
+    if context.command == meta.command.as_deref() {
+        boost += 4.0;
+    }
+    if context.file_path == meta.file_path.as_deref() {
+        boost += 1.5;
+    }
+    if context.symbol == meta.symbol.as_deref() {
+        boost += 1.5;
+    }
+    if context.error_fingerprint == meta.error_fingerprint.as_deref() {
+        boost += 4.0;
+    }
+    boost += match meta.kind {
+        MemoryKind::WorkingCommand | MemoryKind::ResolvedError | MemoryKind::Decision => 0.25,
+        _ => 0.0,
+    };
+    boost
+}
+
+fn cli_rerank_contextual_results(
+    mut results: Vec<(Memory, f32)>,
+    context: CliRecallContext<'_>,
+    limit: usize,
+) -> Vec<(Memory, f32)> {
+    if context.has_filters() {
+        for (memory, score) in &mut results {
+            *score += cli_contextual_boost(memory, context);
+        }
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    results.truncate(limit);
+    results
+}
+
+fn build_auto_context(command: Option<&str>, file_path: Option<&str>) -> MemoryContext {
+    MemoryContext {
+        project: Some(detect_project()),
+        repo_root: std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string()),
+        platform: Some(std::env::consts::OS.to_string()),
+        command: command.map(str::to_string),
+        file_path: file_path.map(str::to_string),
+        symbol: None,
+        error_fingerprint: None,
+        kind: MemoryKind::Note,
+    }
 }
 
 fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField) -> Result<()> {
@@ -1859,7 +2030,7 @@ fn is_icm_command(cmd: &str) -> bool {
     false
 }
 
-/// PostToolUse hook: auto-extract context every N tool calls.
+/// PostToolUse hook: extract durable operational facts every N tool calls.
 /// Reads JSON from stdin. Runs extraction asynchronously.
 fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> Result<()> {
     use std::io::Read;
@@ -2457,39 +2628,41 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     if do_cli {
         let cwd = std::env::current_dir().context("failed to get current directory")?;
 
-        let icm_block = "\
-<!-- icm:start -->\n\
-## Persistent memory (ICM) — MANDATORY\n\
-\n\
-This project uses [ICM](https://github.com/rtk-ai/icm) for persistent memory across sessions.\n\
-You MUST use it actively. Not optional.\n\
-\n\
-### Recall (before starting work)\n\
-```bash\n\
-icm recall \"query\"                        # search memories\n\
-icm recall \"query\" -t \"topic-name\"        # filter by topic\n\
-icm recall-context \"query\" --limit 5      # formatted for prompt injection\n\
-```\n\
-\n\
-### Store — MANDATORY triggers\n\
-You MUST call `icm store` when ANY of the following happens:\n\
-1. **Error resolved** → `icm store -t errors-resolved -c \"description\" -i high -k \"keyword1,keyword2\"`\n\
-2. **Architecture/design decision** → `icm store -t decisions-{project} -c \"description\" -i high`\n\
-3. **User preference discovered** → `icm store -t preferences -c \"description\" -i critical`\n\
-4. **Significant task completed** → `icm store -t context-{project} -c \"summary of work done\" -i high`\n\
-5. **Conversation exceeds ~20 tool calls without a store** → store a progress summary\n\
-\n\
-Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
-\n\
-Do NOT store: trivial details, info already in CLAUDE.md, ephemeral state (build logs, git status).\n\
-\n\
-### Other commands\n\
-```bash\n\
-icm update <id> -c \"updated content\"     # edit memory in-place\n\
-icm health                                # topic hygiene audit\n\
-icm topics                                # list all topics\n\
-```\n\
-<!-- icm:end -->";
+        let icm_block = r#"<!-- icm:start -->
+    ## Persistent memory (ICM) — MANDATORY
+
+    This project uses [ICM](https://github.com/rtk-ai/icm) for persistent memory across sessions.
+    You MUST use it actively. Not optional.
+
+    ### Recall (before starting work)
+    ```bash
+    icm recall "query"                        # search memories
+    icm recall "query" -t "topic-name"        # filter by topic
+    icm recall-context "query" --limit 5      # formatted for prompt injection
+    ```
+
+    Prioritize durable operational facts: resolved errors, working commands, environment constraints,
+    project decisions, and user preferences.
+
+    ### Store — MANDATORY triggers
+    You MUST call `icm store` when ANY of the following happens:
+    1. **Error resolved** → `icm store -t errors-resolved -c "description" -i high -k "keyword1,keyword2"`
+    2. **Architecture/design decision** → `icm store -t decisions-{project} -c "description" -i high`
+    3. **User preference discovered** → `icm store -t preferences -c "description" -i critical`
+    4. **Significant task completed** → `icm store -t context-{project} -c "summary of work done" -i high`
+    5. **Conversation exceeds ~20 tool calls without a store** → store a progress summary
+
+    Do this BEFORE responding to the user. Not after. Not later. Immediately.
+
+    Do NOT store: trivial details, info already in CLAUDE.md, ephemeral state (build logs, git status).
+
+    ### Other commands
+    ```bash
+    icm update <id> -c "updated content"     # edit memory in-place
+    icm health                                # topic hygiene audit
+    icm topics                                # list all topics
+    ```
+    <!-- icm:end -->"#;
 
         // Each AI tool uses its own instruction file
         let instruction_files: Vec<(&str, PathBuf)> = vec![
@@ -2557,6 +2730,9 @@ This project uses ICM (Infinite Context Memory) for persistent memory. Usage is 
 icm recall \"query\"
 ```
 
+Prioritize durable operational facts: resolved errors, working commands,
+environment constraints, project decisions, and user preferences.
+
 **Store** — you MUST store when any of these happens:
 1. Error resolved → `icm store -t errors-resolved -c \"description\" -i high`
 2. Architecture decision → `icm store -t decisions-{project} -c \"description\" -i high`
@@ -2588,7 +2764,7 @@ Do this BEFORE responding to the user. Not optional.
         )?;
     }
 
-    // --- Hook mode: install Claude Code hooks (full Rust, no shell scripts) ---
+    // --- Hook mode: install multi-tool hooks (full Rust, no shell scripts) ---
     if do_hook {
         let claude_settings_path = claude_dir.join("settings.json");
 
@@ -2604,7 +2780,7 @@ Do this BEFORE responding to the user. Not optional.
         )?;
         println!("[hook] Claude Code PreToolUse (auto-allow): {pre_status}");
 
-        // PostToolUse hook: `icm hook post` (auto-extract context)
+        // PostToolUse hook: `icm hook post` (extract durable operational facts)
         let post_cmd = format!("{} hook post", icm_bin_str);
         let post_status = inject_settings_hook(
             &claude_settings_path,
@@ -2614,9 +2790,11 @@ Do this BEFORE responding to the user. Not optional.
             &["icm hook", "icm-post-tool"],
             force,
         )?;
-        println!("[hook] Claude Code PostToolUse (auto-extract): {post_status}");
+        println!(
+            "[hook] Claude Code PostToolUse (durable fact extraction): {post_status}"
+        );
 
-        // PreCompact hook: `icm hook compact` (extract from transcript before compression)
+        // PreCompact hook: `icm hook compact` (extract durable facts before compression)
         let compact_cmd = format!("{} hook compact", icm_bin_str);
         let compact_status = inject_settings_hook(
             &claude_settings_path,
@@ -2626,9 +2804,11 @@ Do this BEFORE responding to the user. Not optional.
             &["icm hook", "icm-post-tool"],
             force,
         )?;
-        println!("[hook] Claude Code PreCompact (transcript extract): {compact_status}");
+        println!(
+            "[hook] Claude Code PreCompact (transcript fact extraction): {compact_status}"
+        );
 
-        // UserPromptSubmit hook: `icm hook prompt` (recall context on each prompt)
+        // UserPromptSubmit hook: `icm hook prompt` (recall matching context on each prompt)
         let prompt_cmd = format!("{} hook prompt", icm_bin_str);
         let prompt_status = inject_settings_hook(
             &claude_settings_path,
@@ -2638,9 +2818,11 @@ Do this BEFORE responding to the user. Not optional.
             &["icm hook", "icm-post-tool"],
             force,
         )?;
-        println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
+        println!(
+            "[hook] Claude Code UserPromptSubmit (project-aware recall): {prompt_status}"
+        );
 
-        // SessionStart hook: `icm hook start` (inject wake-up pack of critical facts)
+        // SessionStart hook: `icm hook start` (inject operational wake-up pack)
         let start_cmd = format!("{} hook start", icm_bin_str);
         let start_status = inject_settings_hook(
             &claude_settings_path,
@@ -2650,7 +2832,9 @@ Do this BEFORE responding to the user. Not optional.
             &["icm hook start", "icm hook", "icm-post-tool"],
             force,
         )?;
-        println!("[hook] Claude Code SessionStart (wake-up pack): {start_status}");
+        println!(
+            "[hook] Claude Code SessionStart (operational wake-up): {start_status}"
+        );
 
         // SessionEnd hook: `icm hook end` (extract from transcript before /exit, /clear, etc.)
         // Catches the path PreCompact misses — compaction does not fire on /clear.
@@ -2696,7 +2880,7 @@ Do this BEFORE responding to the user. Not optional.
             &["icm hook start", "icm hook", "icm-post-tool"],
             force,
         )?;
-        println!("[hook] Gemini CLI SessionStart (wake-up pack): {status}");
+        println!("[hook] Gemini CLI SessionStart (operational wake-up): {status}");
 
         // BeforeTool → equivalent of PreToolUse (auto-allow icm commands)
         // Gemini CLI uses "run_shell_command" as the Bash tool name
@@ -2710,7 +2894,7 @@ Do this BEFORE responding to the user. Not optional.
         )?;
         println!("[hook] Gemini CLI BeforeTool (auto-allow): {status}");
 
-        // AfterTool → equivalent of PostToolUse (auto-extract context)
+        // AfterTool → equivalent of PostToolUse (extract durable operational facts)
         let status = inject_settings_hook(
             &gemini_settings_path,
             "AfterTool",
@@ -2719,7 +2903,7 @@ Do this BEFORE responding to the user. Not optional.
             detect,
             force,
         )?;
-        println!("[hook] Gemini CLI AfterTool (auto-extract): {status}");
+        println!("[hook] Gemini CLI AfterTool (durable fact extraction): {status}");
 
         // PreCompress → equivalent of PreCompact (extract from transcript)
         let status = inject_settings_hook(
@@ -2730,9 +2914,9 @@ Do this BEFORE responding to the user. Not optional.
             detect,
             force,
         )?;
-        println!("[hook] Gemini CLI PreCompress (transcript extract): {status}");
+        println!("[hook] Gemini CLI PreCompress (transcript fact extraction): {status}");
 
-        // BeforeAgent → equivalent of UserPromptSubmit (auto-recall on each prompt)
+        // BeforeAgent → equivalent of UserPromptSubmit (project-aware recall on each prompt)
         let status = inject_settings_hook(
             &gemini_settings_path,
             "BeforeAgent",
@@ -2741,7 +2925,7 @@ Do this BEFORE responding to the user. Not optional.
             detect,
             force,
         )?;
-        println!("[hook] Gemini CLI BeforeAgent (auto-recall): {status}");
+        println!("[hook] Gemini CLI BeforeAgent (project-aware recall): {status}");
 
         // --- Codex CLI hooks (separate hooks.json file) ---
         let codex_hooks_path = codex_dir.join("hooks.json");
@@ -2753,7 +2937,7 @@ Do this BEFORE responding to the user. Not optional.
             None,
             &["icm hook start", "icm hook"],
         )?;
-        println!("[hook] Codex CLI SessionStart (wake-up pack): {status}");
+        println!("[hook] Codex CLI SessionStart (operational wake-up): {status}");
 
         let status = inject_codex_hook(
             &codex_hooks_path,
@@ -2771,7 +2955,7 @@ Do this BEFORE responding to the user. Not optional.
             None,
             detect,
         )?;
-        println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+        println!("[hook] Codex CLI PostToolUse (durable fact extraction): {status}");
 
         let status = inject_codex_hook(
             &codex_hooks_path,
@@ -2780,7 +2964,7 @@ Do this BEFORE responding to the user. Not optional.
             None,
             detect,
         )?;
-        println!("[hook] Codex CLI UserPromptSubmit (auto-recall): {status}");
+        println!("[hook] Codex CLI UserPromptSubmit (project-aware recall): {status}");
 
         // --- Copilot CLI hooks (user-global ~/.copilot/settings.json) ---
         let copilot_status = inject_copilot_hooks(&copilot_dir, &icm_bin_str)?;
@@ -2795,8 +2979,8 @@ Do this BEFORE responding to the user. Not optional.
 
     if !do_hook {
         println!();
-        println!("Tip: run `icm init --mode hook` to also install Claude Code hooks");
-        println!("     for automatic memory extraction and context recall.");
+        println!("Tip: run `icm init --mode hook` to also install wake-up, recall,");
+        println!("     and durable-fact extraction hooks for supported tools.");
     }
 
     Ok(())
@@ -2905,7 +3089,9 @@ fn cmd_doctor() -> Result<()> {
 
     println!();
     if checked == 0 {
-        println!("No ICM hooks found. Run `icm init --mode hook` to install them.");
+        println!(
+            "No ICM hooks found. Run `icm init --mode hook` to install wake-up, recall, and extraction hooks."
+        );
     } else if broken == 0 {
         println!("All {checked} ICM hook entries are healthy.");
     } else {
@@ -5847,6 +6033,21 @@ mod hook_start_tests {
         // call does not panic and returns a valid, non-empty pack.
         assert!(!pack.is_empty());
         assert!(pack.starts_with("# ICM Wake-up"));
+    }
+}
+
+#[cfg(test)]
+mod auto_context_tests {
+    use super::*;
+
+    #[test]
+    fn build_auto_context_sets_platform_and_command() {
+        let context = build_auto_context(Some("cargo test -p icm-cli"), None);
+        assert_eq!(context.platform.as_deref(), Some(std::env::consts::OS));
+        assert_eq!(context.command.as_deref(), Some("cargo test -p icm-cli"));
+        assert!(context.project.is_some());
+        assert!(context.repo_root.is_some());
+        assert_eq!(context.kind, MemoryKind::Note);
     }
 }
 

@@ -12,7 +12,7 @@ icm init --mode all
 icm init --mode mcp      # MCP server configs (default)
 icm init --mode cli      # Inject instructions into CLAUDE.md, AGENTS.md, etc.
 icm init --mode skill    # Slash commands & rules
-icm init --mode hook     # Claude Code hooks + OpenCode plugin
+icm init --mode hook     # Multi-tool hooks + OpenCode plugin
 ```
 
 ## Supported Tools
@@ -35,10 +35,14 @@ icm init --mode all
 
 | Hook | Event | What it does |
 |------|-------|-------------|
+| `icm hook start` | SessionStart | Inject an operational wake-up pack with project decisions, working commands, and known traps |
 | `icm hook pre` | PreToolUse | Auto-allow `icm` commands |
-| `icm hook post` | PostToolUse | Extract facts every 15 calls |
-| `icm hook compact` | PreCompact | Extract before context compression |
-| `icm hook prompt` | UserPromptSubmit | Inject recalled context |
+| `icm hook post` | PostToolUse | Extract durable operational facts from tool output every 15 calls |
+| `icm hook compact` | PreCompact | Extract durable facts from transcript before context compression |
+| `icm hook prompt` | UserPromptSubmit | Inject project-matching recalled context |
+
+`icm init --mode hook` also configures the same operational hook flow for Gemini CLI, Codex CLI,
+and Copilot CLI, and installs the OpenCode plugin.
 
 **Skills:** `/recall`, `/remember` slash commands.
 
@@ -85,6 +89,7 @@ icm init --mode cli     # Injects instructions into .windsurfrules
 ```bash
 icm init --mode mcp     # MCP server for VS Code
 icm init --mode cli     # Injects instructions into .github/copilot-instructions.md
+icm init --mode hook    # Installs repo-scoped Copilot CLI hooks in .github/hooks/icm.json
 ```
 
 **MCP Config:** `~/Library/Application Support/Code/User/mcp.json` → `servers.icm`
@@ -146,6 +151,7 @@ icm init --mode mcp
 ```bash
 icm init --mode mcp     # TOML config
 icm init --mode cli     # Injects into AGENTS.md
+icm init --mode hook    # Installs SessionStart, PreToolUse, PostToolUse, UserPromptSubmit hooks
 ```
 
 **Config:** `~/.codex/config.toml`
@@ -165,6 +171,7 @@ args = ["serve"]
 ```bash
 icm init --mode mcp
 icm init --mode cli     # Injects into ~/.gemini/GEMINI.md
+icm init --mode hook    # Installs SessionStart, BeforeTool, AfterTool, PreCompress, BeforeAgent hooks
 ```
 
 **Config:** `~/.gemini/settings.json` → `mcpServers.icm`
@@ -177,18 +184,18 @@ icm init --mode cli     # Injects into ~/.gemini/GEMINI.md
 
 ```bash
 icm init --mode mcp     # MCP server config
-icm init --mode hook    # Installs JS plugin with hooks
+icm init --mode hook    # Installs JS plugin with operational hooks
 ```
 
 **MCP Config:** `~/.config/opencode/opencode.json` → `mcp.icm`
 
-**Plugin:** `~/.config/opencode/plugins/icm.js`
+**Plugin:** `~/.config/opencode/plugins/icm.ts`
 
 | Event | What it does |
 |-------|-------------|
-| `tool.execute.after` | Extract facts from tool output |
-| `experimental.session.compacting` | Extract before context compression |
-| `session.created` | Recall context at session start |
+| `tool.execute.after` | Extract durable facts from tool output |
+| `experimental.session.compacting` | Extract durable facts before context compression |
+| `session.created` | Recall context and build a wake-up pack at session start |
 
 ---
 
@@ -234,7 +241,7 @@ icm init --mode mcp
 | `mcp` | Configures MCP server in each tool's config | All 14 tools |
 | `cli` | Injects ICM instructions into instruction files | Claude Code, Codex, Gemini, Copilot, Windsurf |
 | `skill` | Creates slash commands and rule files | Claude Code, Cursor, Roo Code, Amp |
-| `hook` | Installs hooks/plugins for automatic extraction | Claude Code (4 hooks), OpenCode (JS plugin) |
+| `hook` | Installs hooks/plugins for wake-up, recall, and durable-fact extraction | Claude Code, Gemini CLI, Codex CLI, Copilot CLI, OpenCode |
 
 ## Manual Setup
 

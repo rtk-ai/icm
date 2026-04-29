@@ -8,8 +8,8 @@ use zerocopy::IntoBytes;
 
 use icm_core::{
     Concept, ConceptLink, Feedback, FeedbackStats, FeedbackStore, IcmError, IcmResult, Importance,
-    Label, Memoir, MemoirStats, MemoirStore, Memory, MemorySource, MemoryStore, Message,
-    PatternCluster, Relation, Role, Session, StoreStats, TopicHealth, TranscriptHit,
+    Label, Memoir, MemoirStats, MemoirStore, Memory, MemoryContext, MemorySource, MemoryStore,
+    Message, PatternCluster, Relation, Role, Session, StoreStats, TopicHealth, TranscriptHit,
     TranscriptStats, TranscriptStore,
 };
 
@@ -155,6 +155,10 @@ fn parse_source(source_type_str: &str, source_data_str: Option<String>) -> Memor
     }
 }
 
+fn parse_context(context_data_str: Option<String>) -> Option<MemoryContext> {
+    context_data_str.and_then(|d| serde_json::from_str(&d).ok())
+}
+
 fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
     embedding.as_bytes().to_vec()
 }
@@ -175,7 +179,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     // Column order: id(0), created_at(1), updated_at(2), last_accessed(3),
     //   access_count(4), weight(5), topic(6), summary(7), raw_excerpt(8),
     //   keywords(9), importance(10), source_type(11), source_data(12),
-    //   related_ids(13), embedding(14)
+    //   context_data(13), related_ids(14), embedding(15)
     let keywords_json: String = row.get::<_, Option<String>>(9)?.unwrap_or_default();
     let keywords: Vec<String> = serde_json::from_str(&keywords_json).unwrap_or_default();
 
@@ -186,11 +190,13 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     let source_data_str: Option<String> = row.get(12)?;
     let source = parse_source(&source_type_str, source_data_str);
 
-    let related_json: String = row.get::<_, Option<String>>(13)?.unwrap_or_default();
+    let context = parse_context(row.get(13)?);
+
+    let related_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_default();
     let related_ids: Vec<String> = serde_json::from_str(&related_json).unwrap_or_default();
 
     let embedding: Option<Vec<f32>> = row
-        .get::<_, Option<Vec<u8>>>(14)?
+        .get::<_, Option<Vec<u8>>>(15)?
         .map(|b| blob_to_embedding(&b));
 
     let created_at_str: String = row.get(1)?;
@@ -218,13 +224,14 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         source,
         related_ids,
         embedding,
+        context,
         scope: icm_core::Scope::User, // default for existing local memories
     })
 }
 
 const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_count, weight, \
                            topic, summary, raw_excerpt, keywords, \
-                           importance, source_type, source_data, related_ids, embedding";
+                           importance, source_type, source_data, context_data, related_ids, embedding";
 
 /// Sanitize a query string for FTS5 MATCH.
 ///
@@ -284,6 +291,7 @@ impl SqliteStore {
     fn store_inner(&self, memory: &Memory) -> IcmResult<String> {
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_json = serde_json::to_string(&memory.related_ids)?;
+        let context_json = serde_json::to_string(&memory.context)?;
         let st = source_type(&memory.source);
         let sd = source_data(&memory.source);
         let emb_blob = memory.embedding.as_deref().map(embedding_to_blob);
@@ -292,8 +300,8 @@ impl SqliteStore {
             .execute(
                 "INSERT INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
                  topic, summary, raw_excerpt, keywords,
-                 importance, source_type, source_data, related_ids, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 importance, source_type, source_data, context_data, related_ids, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     memory.id,
                     memory.created_at.to_rfc3339(),
@@ -308,6 +316,7 @@ impl SqliteStore {
                     memory.importance.to_string(),
                     st,
                     sd,
+                    context_json,
                     related_json,
                     emb_blob,
                 ],
@@ -363,6 +372,7 @@ impl MemoryStore for SqliteStore {
     fn update(&self, memory: &Memory) -> IcmResult<()> {
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_json = serde_json::to_string(&memory.related_ids)?;
+        let context_json = serde_json::to_string(&memory.context)?;
         let st = source_type(&memory.source);
         let sd = source_data(&memory.source);
         let emb_blob = memory.embedding.as_deref().map(embedding_to_blob);
@@ -373,8 +383,8 @@ impl MemoryStore for SqliteStore {
                 "UPDATE memories SET
                  updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
                  topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
-                 importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
-                 embedding = ?14
+                 importance = ?10, source_type = ?11, source_data = ?12, context_data = ?13,
+                 related_ids = ?14, embedding = ?15
                  WHERE id = ?1",
                 params![
                     memory.id,
@@ -389,6 +399,7 @@ impl MemoryStore for SqliteStore {
                     memory.importance.to_string(),
                     st,
                     sd,
+                    context_json,
                     related_json,
                     emb_blob,
                 ],
@@ -2561,7 +2572,7 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icm_core::Importance;
+    use icm_core::{Importance, MemoryContext, MemoryKind};
 
     fn test_store() -> SqliteStore {
         SqliteStore::in_memory().unwrap()
@@ -2591,6 +2602,35 @@ mod tests {
         let retrieved = store.get(&id).unwrap().unwrap();
         assert_eq!(retrieved.summary, "hello world");
         assert_eq!(retrieved.topic, "test");
+    }
+
+    #[test]
+    fn test_memory_context_round_trip() {
+        let store = test_store();
+        let mut mem = make_memory("context-icm", "Windows build uses cargo from user profile");
+        let id = mem.id.clone();
+        mem.context = Some(MemoryContext {
+            project: Some("icm".into()),
+            repo_root: Some("D:/Projects/WORK/other/icm".into()),
+            platform: Some("windows".into()),
+            command: Some("cargo build --release -p icm-cli --features web".into()),
+            file_path: Some("crates/icm-cli/src/main.rs".into()),
+            symbol: Some("Commands::Init".into()),
+            error_fingerprint: None,
+            kind: MemoryKind::WorkingCommand,
+        });
+
+        store.store(mem).unwrap();
+
+        let retrieved = store.get(&id).unwrap().unwrap();
+        let context = retrieved.context.unwrap();
+        assert_eq!(context.project.as_deref(), Some("icm"));
+        assert_eq!(context.platform.as_deref(), Some("windows"));
+        assert_eq!(
+            context.command.as_deref(),
+            Some("cargo build --release -p icm-cli --features web")
+        );
+        assert_eq!(context.kind, MemoryKind::WorkingCommand);
     }
 
     #[test]

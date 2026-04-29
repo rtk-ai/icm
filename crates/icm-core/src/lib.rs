@@ -27,7 +27,8 @@ pub use feedback_store::FeedbackStore;
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
 pub use memoir_store::MemoirStore;
 pub use memory::{
-    Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
+    Importance, Memory, MemoryContext, MemoryKind, MemorySource, PatternCluster, Scope,
+    StoreStats, TopicHealth,
 };
 pub use store::MemoryStore;
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};

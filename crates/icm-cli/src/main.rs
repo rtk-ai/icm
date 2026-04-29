@@ -873,7 +873,10 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("memories.db"))
 }
 
-fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<SqliteStore> {
+fn open_store(
+    db: Option<PathBuf>,
+    embedding_dims: usize,
+) -> Result<(SqliteStore, icm_store::MigrationStatus)> {
     let path = db.unwrap_or_else(default_db_path);
     SqliteStore::with_dims(&path, embedding_dims).context("failed to open database")
 }
@@ -921,7 +924,7 @@ fn main() -> Result<()> {
         })
         .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
-    let store = open_store(cli.db, embedding_dims)?;
+    let (store, _migration) = open_store(cli.db, embedding_dims)?;
 
     match cli.command {
         Commands::Store {
@@ -4135,10 +4138,12 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         });
         std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let _ = SqliteStore::new(&icm_db)?;
+            let (_, _) = SqliteStore::new(&icm_db)?;
         }
 
         // === WITHOUT ICM ===
+
+
         eprintln!("=== WITHOUT ICM ===");
         let s1_prompt = format!(
             "{}{}",
@@ -4179,7 +4184,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         eprintln!(" done ({:.1}s)", s1_icm.duration_ms as f64 / 1000.0);
 
         {
-            let store = SqliteStore::new(&icm_db)?;
+            let (store, _) = SqliteStore::new(&icm_db)?;
             let ext1 =
                 extract::extract_and_store(&store, bench_knowledge::SOURCE_DOCUMENT, "meridian")?;
             let ext2 = extract::extract_and_store(&store, &s1_icm.response, "meridian")?;
@@ -4197,7 +4202,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         let mut scores_with: Vec<(usize, usize, f64)> = Vec::new();
         let mut responses_with: Vec<String> = Vec::new();
         for (i, q) in questions.iter().enumerate() {
-            let store = SqliteStore::new(&icm_db)?;
+            let (store, _) = SqliteStore::new(&icm_db)?;
             let ctx = extract::recall_context(&store, q.prompt, None, 15)?;
             if verbose && !ctx.is_empty() {
                 eprintln!("  [verbose] Context injected for Q{}:", i + 1);
@@ -4220,7 +4225,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
                         eprintln!("    Response: {}", truncate_words(&result.response, 200));
                     }
                     {
-                        let store = SqliteStore::new(&icm_db)?;
+                        let (store, _) = SqliteStore::new(&icm_db)?;
                         let _ = extract::extract_and_store(&store, &result.response, "meridian");
                     }
                     scores_with.push(score);
@@ -4415,13 +4420,13 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
         });
         std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let _ = SqliteStore::new(&icm_db)?;
+            let (_, _) = SqliteStore::new(&icm_db)?;
         }
 
         let mut results_with: Vec<SessionResult> = Vec::new();
         for (i, prompt) in prompts.iter().enumerate() {
             let effective_prompt = if i > 0 {
-                let store = SqliteStore::new(&icm_db)?;
+                let (store, _) = SqliteStore::new(&icm_db)?;
                 let ctx = extract::recall_context(&store, prompt, None, 15)?;
                 if verbose && !ctx.is_empty() {
                     eprintln!("  [verbose] Context injected for session {}:", i + 1);
@@ -4443,7 +4448,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
                 Ok(result) => {
                     eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
                     {
-                        let store = SqliteStore::new(&icm_db)?;
+                        let (store, _) = SqliteStore::new(&icm_db)?;
                         let extracted =
                             extract::extract_and_store(&store, &result.response, "mathlib")?;
                         if extracted > 0 {

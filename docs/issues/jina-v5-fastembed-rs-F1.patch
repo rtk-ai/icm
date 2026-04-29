@@ -1,0 +1,137 @@
+From 57fc1ade67af596f51f42586459da06ba2510162 Mon Sep 17 00:00:00 2001
+From: METAeuPHORIC <drivedonai3@gmail.com>
+Date: Wed, 29 Apr 2026 14:38:44 +0000
+Subject: [PATCH] feat: register jina-embeddings-v5-text-nano-retrieval
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds Jina AI's v5-text-nano retrieval embedder as a built-in
+EmbeddingModel variant.
+
+Model: jinaai/jina-embeddings-v5-text-nano-retrieval
+- 239M params, EuroBERT-style encoder
+- Output dim: 768 (full); Matryoshka-truncatable to {32, 64, 128, 256, 512, 768}
+- 8K-token context window
+- Pooling: mean over last_hidden_state with attention-mask masking
+- License: CC BY-NC 4.0 (non-commercial)
+
+Implements the registration-only path: enum variant, ModelInfo entry
+in init_models_map(), and pooling registration in
+get_default_pooling_method(). Inference uses the existing
+TextEmbedding ONNX runner; no architecture changes required.
+
+The retrieval variant supports asymmetric prompts via instruction
+prefixes ("retrieval.query: " / "retrieval.passage: ") in
+production but this PR does not yet wire that into a typed API —
+users may prepend prefixes manually. A follow-up could lift PR #236's
+embed_query() / with_query_prefix() builders, but that is out of
+scope here.
+
+Snapshot test value in tests/text-embeddings.rs is intentionally
+omitted; the existing _ => panic!() arm signals that the variant
+needs an expected-sum entry. CI has ORT_LIB_LOCATION set and can
+capture this on a follow-up commit, or a maintainer with the
+necessary toolchain can fill it in.
+
+Refs upstream feedback request: jina v5 was tested against fastembed
+in PR #236 (closed) and downstream in icm (rtk-ai/icm).
+---
+ src/models/text_embedding.rs | 19 +++++++++++++++++++
+ src/text_embedding/impl.rs   |  1 +
+ 2 files changed, 20 insertions(+)
+
+diff --git a/src/models/text_embedding.rs b/src/models/text_embedding.rs
+index 6807b08..e66950e 100644
+--- a/src/models/text_embedding.rs
++++ b/src/models/text_embedding.rs
+@@ -67,20 +67,28 @@ pub enum EmbeddingModel {
+     /// Alibaba-NLP/gte-large-en-v1.5
+     GTELargeENV15,
+     /// Quantized Alibaba-NLP/gte-large-en-v1.5
+     GTELargeENV15Q,
+     /// Qdrant/clip-ViT-B-32-text
+     ClipVitB32,
+     /// jinaai/jina-embeddings-v2-base-code
+     JinaEmbeddingsV2BaseCode,
+     /// jinaai/jina-embeddings-v2-base-en
+     JinaEmbeddingsV2BaseEN,
++    /// jinaai/jina-embeddings-v5-text-nano-retrieval
++    ///
++    /// License: CC BY-NC 4.0 (non-commercial). Commercial use requires a
++    /// commercial license from Jina AI. The retrieval variant supports
++    /// asymmetric prompts via instruction prefixes
++    /// (`retrieval.query: ` / `retrieval.passage: `) and Matryoshka
++    /// truncation in {32, 64, 128, 256, 512, 768}.
++    JinaEmbeddingsV5TextNano,
+     /// onnx-community/embeddinggemma-300m-ONNX
+     EmbeddingGemma300M,
+     /// snowflake/snowflake-arctic-embed-xs
+     SnowflakeArcticEmbedXS,
+     /// Quantized snowflake/snowflake-arctic-embed-xs
+     SnowflakeArcticEmbedXSQ,
+     /// snowflake/snowflake-arctic-embed-s
+     SnowflakeArcticEmbedS,
+     /// Quantized snowflake/snowflake-arctic-embed-s
+     SnowflakeArcticEmbedSQ,
+@@ -402,20 +410,31 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
+         },
+         ModelInfo {
+             model: EmbeddingModel::JinaEmbeddingsV2BaseEN,
+             dim: 768,
+             description: String::from("Jina embeddings v2 base English"),
+             model_code: String::from("jinaai/jina-embeddings-v2-base-en"),
+             model_file: String::from("model.onnx"),
+             additional_files: Vec::new(),
+             output_key: None,
+         },
++        ModelInfo {
++            model: EmbeddingModel::JinaEmbeddingsV5TextNano,
++            dim: 768,
++            description: String::from(
++                "Jina embeddings v5 text nano retrieval (CC BY-NC 4.0, non-commercial)",
++            ),
++            model_code: String::from("jinaai/jina-embeddings-v5-text-nano-retrieval"),
++            model_file: String::from("onnx/model.onnx"),
++            additional_files: Vec::new(),
++            output_key: None,
++        },
+         ModelInfo {
+             model: EmbeddingModel::EmbeddingGemma300M,
+             dim: 768,
+             description: String::from("EmbeddingGemma is a 300M parameter from Google"),
+             model_code: String::from("onnx-community/embeddinggemma-300m-ONNX"),
+             model_file: String::from("onnx/model.onnx"),
+             additional_files: vec!["onnx/model.onnx_data".to_string()],
+             output_key: Some(crate::OutputKey::ByName("sentence_embedding")),
+         },
+         ModelInfo {
+diff --git a/src/text_embedding/impl.rs b/src/text_embedding/impl.rs
+index 37b846d..fd48994 100644
+--- a/src/text_embedding/impl.rs
++++ b/src/text_embedding/impl.rs
+@@ -241,20 +241,21 @@ impl TextEmbedding {
+ 
+             EmbeddingModel::GTEBaseENV15 => Some(Pooling::Cls),
+             EmbeddingModel::GTEBaseENV15Q => Some(Pooling::Cls),
+             EmbeddingModel::GTELargeENV15 => Some(Pooling::Cls),
+             EmbeddingModel::GTELargeENV15Q => Some(Pooling::Cls),
+ 
+             EmbeddingModel::ClipVitB32 => Some(Pooling::Mean),
+ 
+             EmbeddingModel::JinaEmbeddingsV2BaseCode => Some(Pooling::Mean),
+             EmbeddingModel::JinaEmbeddingsV2BaseEN => Some(Pooling::Mean),
++            EmbeddingModel::JinaEmbeddingsV5TextNano => Some(Pooling::Mean),
+ 
+             EmbeddingModel::EmbeddingGemma300M => Some(Pooling::Mean),
+ 
+             EmbeddingModel::SnowflakeArcticEmbedXS => Some(Pooling::Cls),
+             EmbeddingModel::SnowflakeArcticEmbedXSQ => Some(Pooling::Cls),
+             EmbeddingModel::SnowflakeArcticEmbedS => Some(Pooling::Cls),
+             EmbeddingModel::SnowflakeArcticEmbedSQ => Some(Pooling::Cls),
+             EmbeddingModel::SnowflakeArcticEmbedM => Some(Pooling::Cls),
+             EmbeddingModel::SnowflakeArcticEmbedMQ => Some(Pooling::Cls),
+             EmbeddingModel::SnowflakeArcticEmbedMLong => Some(Pooling::Cls),
+-- 
+2.54.0
+

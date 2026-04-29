@@ -130,11 +130,13 @@ Update `README.md` with "Embedder backends" section. Add license warning comment
 
 ---
 
-## Track 2 — upstream qdrant/fastembed
+## Track 2 — upstream Anush008/fastembed-rs
 
-### F-1 — Register `jina-embeddings-v5-text-nano-retrieval` as built-in fastembed model
+Note: the actual Rust crate `fastembed` consumed by ICM is published from `Anush008/fastembed-rs`, not `qdrant/fastembed` (which is the Python upstream). PRs target the Rust repo. Issue qdrant/fastembed#607 was filed against the Python upstream; the Rust port has no equivalent issue at the time of writing.
 
-**Parent:** qdrant/fastembed#607
+### F-1 — Register `jina-embeddings-v5-text-nano-retrieval` as built-in fastembed model [PATCH READY: docs/issues/jina-v5-fastembed-rs-F1.patch]
+
+**Parent:** qdrant/fastembed#607 (Python upstream)
 
 **What to build:**
 Add `EmbeddingModel::JinaEmbeddingsV5TextNano` to fastembed's enum in `src/models/text_embedding.rs`. Add `ModelInfo` entry in `init_models_map()` with HF path `jinaai/jina-embeddings-v5-text-nano-retrieval`, dim = 768, max tokens = 8192, license = "CC BY-NC 4.0". Add pooling mode entry. Add snapshot test.
@@ -164,21 +166,27 @@ EmbeddingModel::JinaEmbeddingsV5TextNano => [a, b, c, d],  // run test to captur
 ```
 
 **Acceptance criteria:**
-- [ ] Enum variant + ModelInfo + pooling + snapshot test following fastembed patterns
-- [ ] `TextEmbedding::try_new(InitOptions::new(EmbeddingModel::JinaEmbeddingsV5TextNano))` constructs and produces non-zero 768-dim vec for "hello world"
-- [ ] License note ("CC BY-NC 4.0; non-commercial") in docs
-- [ ] PR references qdrant/fastembed#607
+- [x] Enum variant added with rustdoc covering license + Matryoshka dim list
+- [x] `ModelInfo` entry registered in `init_models_map()` (dim=768, model_file=`onnx/model.onnx`)
+- [x] Pooling registered as `Pooling::Mean` in `get_default_pooling_method()`
+- [x] `cargo build` clean against Anush008/fastembed-rs main (verified 2026-04-29)
+- [ ] Snapshot test entry in `tests/text-embeddings.rs` — DEFERRED. The catch-all `_ => panic!()` arm signals to CI / maintainer that real expected sums must be captured by running the test once with `ORT_LIB_LOCATION` set. Snapshot capture requires ~50MB ONNX Runtime + ~250MB model download; out of scope for the registration-only patch.
+- [ ] PR opened against Anush008/fastembed-rs (HITL — user decides when to fork+push the prepared patch at `docs/issues/jina-v5-fastembed-rs-F1.patch`)
 
-**Blocked by:** None (independent; file in fastembed-rs fork)
+**Apply via:** `git -C <fastembed-rs-fork> am < docs/issues/jina-v5-fastembed-rs-F1.patch`
+
+**Blocked by:** None (patch applies cleanly to Anush008/fastembed-rs main)
 **User stories covered:** US-8
 
 ---
 
-### F-2 — Register `jina-embeddings-v5-text-small-retrieval`
+### F-2 — Register `jina-embeddings-v5-text-small-retrieval` [BLOCKED upstream]
 
 **Parent:** F-1
 
-**What to build:**
+**Status update (2026-04-29):** v5-text-small is Qwen3-decoder-based with mean-pool head. Anush008/fastembed-rs main does NOT support decoder-style ONNX exports (no `Pooling::LastToken`, no `position_ids` injection, no KV-cache injection). Closed PR #236 (`feat: decoder/quantized model support`) attempted this work but was rejected. F-2 cannot be a registration-only patch like F-1; it requires the architectural prerequisites of #236 to land first. Current path: ICM uses its own ort+tokenizers integration in `icm-core` (already DONE in S-2), which is sufficient for the local-only consumer use case. Track upstream re-attempt separately.
+
+**What to build (when unblocked):**
 Same pattern as F-1 but for small (Qwen3-based). Coordinate with fastembed maintainers on whether a new `ModelArchitecture::Qwen3Pooled` variant is needed. If yes, that is a separate commit before F-2.
 
 **Acceptance criteria:**

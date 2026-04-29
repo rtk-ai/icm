@@ -28,6 +28,8 @@ use icm_core::{
 };
 use icm_store::SqliteStore;
 
+use crate::config::EmbedderBackend;
+
 #[derive(Parser)]
 #[command(
     name = "icm",
@@ -1423,6 +1425,10 @@ fn cmd_recall(
                     return Ok(());
                 }
 
+                if !emb.model_name().is_empty() {
+                    println!("model: {}", emb.model_name());
+                    println!();
+                }
                 let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
                 let _ = store.batch_update_access(&ids);
                 for (mem, score) in &expanded {
@@ -3667,6 +3673,33 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
     Ok("configured".into())
 }
 
+/// Returns `(display_name, spdx_license)` for the given embedder backend.
+/// This is the single source of truth used by both `cmd_config` output and tests.
+fn backend_info(backend: &EmbedderBackend) -> (&'static str, &'static str) {
+    match backend {
+        EmbedderBackend::Fastembed => ("fastembed", "Apache-2.0"),
+        EmbedderBackend::JinaV5Nano => ("jina-v5-nano", "CC-BY-NC-4.0, non-commercial"),
+        EmbedderBackend::JinaV5Small => ("jina-v5-small", "CC-BY-NC-4.0, non-commercial"),
+    }
+}
+
+/// Formats the `[embeddings]` config section into a `String`.
+/// Extracted so that tests can assert on the real rendered output.
+fn format_embeddings_section(cfg: &config::EmbeddingsConfig) -> String {
+    let (backend_name, license) = backend_info(&cfg.backend);
+    let mut out = String::new();
+    out.push_str("[embeddings]\n");
+    out.push_str(&format!("  backend = {backend_name}\n"));
+    out.push_str(&format!("  license = {license}\n"));
+    if !cfg.model.is_empty() && cfg.backend == EmbedderBackend::Fastembed {
+        out.push_str(&format!("  model = {}\n", cfg.model));
+    }
+    if let Some(dim) = cfg.truncate_dim {
+        out.push_str(&format!("  truncate_dim = {dim}\n"));
+    }
+    out
+}
+
 fn cmd_config() -> Result<()> {
     let cfg = config::load_config()?;
     println!("Config: {}", config::show_config_path());
@@ -3685,8 +3718,7 @@ fn cmd_config() -> Result<()> {
     println!("  decay_rate = {}", cfg.memory.decay_rate);
     println!("  prune_threshold = {}", cfg.memory.prune_threshold);
     println!();
-    println!("[embeddings]");
-    println!("  model = {}", cfg.embeddings.model);
+    print!("{}", format_embeddings_section(&cfg.embeddings));
     println!();
     println!("[extraction]");
     println!("  enabled = {}", cfg.extraction.enabled);
@@ -6107,6 +6139,111 @@ mod inject_settings_hook_tests {
         assert_eq!(
             cfg["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap(),
             "Bash"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_show_tests {
+    use crate::config::{EmbedderBackend, EmbeddingsConfig};
+    use crate::{backend_info, format_embeddings_section};
+
+    /// The rendered output for jina-v5-nano must contain the exact backend name
+    /// and license string that `cmd_config` prints. This catches display regressions
+    /// because it exercises the real `format_embeddings_section` formatter.
+    #[test]
+    fn jina_v5_nano_section_contains_backend_and_license() {
+        let mut cfg = EmbeddingsConfig::default();
+        cfg.backend = EmbedderBackend::JinaV5Nano;
+
+        let rendered = format_embeddings_section(&cfg);
+
+        assert!(
+            rendered.contains("backend = jina-v5-nano"),
+            "expected 'backend = jina-v5-nano' in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("license = CC-BY-NC-4.0, non-commercial"),
+            "expected 'license = CC-BY-NC-4.0, non-commercial' in:\n{rendered}"
+        );
+        // model line must be suppressed for non-fastembed backends
+        assert!(
+            !rendered.contains("model ="),
+            "model line should be omitted for jina backends, got:\n{rendered}"
+        );
+    }
+
+    /// jina-v5-small mirrors nano — separate test so renaming one variant doesn't
+    /// mask a broken mapping for the other.
+    #[test]
+    fn jina_v5_small_section_contains_backend_and_license() {
+        let mut cfg = EmbeddingsConfig::default();
+        cfg.backend = EmbedderBackend::JinaV5Small;
+
+        let rendered = format_embeddings_section(&cfg);
+
+        assert!(
+            rendered.contains("backend = jina-v5-small"),
+            "expected 'backend = jina-v5-small' in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("license = CC-BY-NC-4.0, non-commercial"),
+            "expected 'license = CC-BY-NC-4.0, non-commercial' in:\n{rendered}"
+        );
+    }
+
+    /// fastembed must show Apache-2.0 and the model line (no truncate_dim by default).
+    #[test]
+    fn fastembed_section_shows_apache_license_and_model() {
+        let cfg = EmbeddingsConfig::default(); // backend = Fastembed
+
+        let rendered = format_embeddings_section(&cfg);
+
+        assert!(
+            rendered.contains("backend = fastembed"),
+            "expected 'backend = fastembed' in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("license = Apache-2.0"),
+            "expected 'license = Apache-2.0' in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("model ="),
+            "fastembed section should include model line, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("truncate_dim"),
+            "truncate_dim should be absent when None, got:\n{rendered}"
+        );
+    }
+
+    /// truncate_dim appears in the rendered output when set.
+    #[test]
+    fn truncate_dim_appears_when_set() {
+        let mut cfg = EmbeddingsConfig::default();
+        cfg.backend = EmbedderBackend::JinaV5Nano;
+        cfg.truncate_dim = Some(512);
+
+        let rendered = format_embeddings_section(&cfg);
+
+        assert!(
+            rendered.contains("truncate_dim = 512"),
+            "expected 'truncate_dim = 512' in:\n{rendered}"
+        );
+    }
+
+    /// `backend_info` is the single source of truth — verify it returns the exact
+    /// strings the spec mandates so any future rename is caught here first.
+    #[test]
+    fn backend_info_returns_canonical_strings() {
+        assert_eq!(backend_info(&EmbedderBackend::Fastembed), ("fastembed", "Apache-2.0"));
+        assert_eq!(
+            backend_info(&EmbedderBackend::JinaV5Nano),
+            ("jina-v5-nano", "CC-BY-NC-4.0, non-commercial")
+        );
+        assert_eq!(
+            backend_info(&EmbedderBackend::JinaV5Small),
+            ("jina-v5-small", "CC-BY-NC-4.0, non-commercial")
         );
     }
 }

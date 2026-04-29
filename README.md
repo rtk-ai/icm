@@ -392,6 +392,36 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 See [config/default.toml](config/default.toml) for all options.
 
+## Embedder backends
+
+ICM supports three local ONNX embedding backends — no external API required.
+
+| Backend | Dims | License | Notes |
+|---------|------|---------|-------|
+| `fastembed` (default) | 384 / 768 / 1024 (model-dependent) | Apache-2.0 | multilingual-e5-base and others via fastembed |
+| `jina-v5-nano` | 32, 64, 128, 256, 512, 768 (default: 768) | CC BY-NC 4.0 | jinaai/jina-embeddings-v5-text-nano-retrieval |
+| `jina-v5-small` | 32, 64, 128, 256, 512, 768, 1024 (default: 1024) | CC BY-NC 4.0 | jinaai/jina-embeddings-v5-text-small-retrieval (Qwen3-based) |
+
+> **IMPORTANT — Non-commercial restriction:** Jina v5 model weights are licensed under
+> [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). **Use in commercial products
+> requires a commercial Jina AI license.** See https://jina.ai/contact-sales for details.
+> The default `fastembed` backend (Apache-2.0) has no such restriction.
+
+Weights download automatically to `~/.cache/huggingface/` on first run. No account or API key needed.
+
+```toml
+# config.toml
+[embeddings]
+backend = "jina-v5-nano"
+truncate_dim = 512  # optional Matryoshka dim (omit to use model default)
+```
+
+Matryoshka truncation lets you trade accuracy for speed and storage. Valid dims per backend:
+
+- `jina-v5-nano`: 32, 64, 128, 256, 512, 768 (default: 768)
+- `jina-v5-small`: 32, 64, 128, 256, 512, 768, 1024 (default: 1024)
+- `fastembed`: no truncation; dim is fixed by the chosen model
+
 ## Auto-extraction
 
 ICM extracts memories automatically via three layers:

@@ -2311,6 +2311,13 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     let icm_bin_str = icm_bin.to_string_lossy().to_string();
     let home = std::env::var("HOME").context("HOME not set")?;
 
+    // Per-CLI config directories, with env var overrides honored.
+    // Each tool documents its own override; we mirror that.
+    let claude_dir = cli_config_dir("CLAUDE_CONFIG_DIR", ".claude", &home);
+    let gemini_dir = cli_config_dir("GEMINI_CONFIG_DIR", ".gemini", &home);
+    let codex_dir = cli_config_dir("CODEX_HOME", ".codex", &home);
+    let copilot_dir = cli_config_dir("COPILOT_HOME", ".copilot", &home);
+
     let do_mcp = matches!(mode, InitMode::Mcp | InitMode::All);
     let do_cli = matches!(mode, InitMode::Cli | InitMode::All);
     let do_skill = matches!(mode, InitMode::Skill | InitMode::All);
@@ -2355,11 +2362,7 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
                 "mcpServers",
             ),
             ("VS Code", vscode_data.join("mcp.json"), "servers"),
-            (
-                "Gemini",
-                PathBuf::from(&home).join(".gemini/settings.json"),
-                "mcpServers",
-            ),
+            ("Gemini", gemini_dir.join("settings.json"), "mcpServers"),
             // --- Terminal tools ---
             (
                 "Amp",
@@ -2414,7 +2417,7 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         }
 
         // Codex CLI uses TOML format
-        let codex_path = PathBuf::from(&home).join(".codex/config.toml");
+        let codex_path = codex_dir.join("config.toml");
         if !force && !detect_tool("Codex CLI", &home, &vscode_data) {
             println!("[mcp] {:<16} skipped (not detected)", "Codex CLI");
         } else {
@@ -2432,7 +2435,7 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         }
 
         // Copilot CLI uses mcpServers key with explicit "type": "local"
-        let copilot_path = PathBuf::from(&home).join(".copilot/mcp-config.json");
+        let copilot_path = copilot_dir.join("mcp-config.json");
         if !force && !detect_tool("Copilot CLI", &home, &vscode_data) {
             println!("[mcp] {:<16} skipped (not detected)", "Copilot CLI");
         } else {
@@ -2492,7 +2495,7 @@ icm topics                                # list all topics\n\
         let instruction_files: Vec<(&str, PathBuf)> = vec![
             ("Claude Code", cwd.join("CLAUDE.md")),
             ("Codex", cwd.join("AGENTS.md")),
-            ("Gemini", PathBuf::from(&home).join(".gemini/GEMINI.md")),
+            ("Gemini", gemini_dir.join("GEMINI.md")),
             ("Copilot", cwd.join(".github/copilot-instructions.md")),
             ("Windsurf", cwd.join(".windsurfrules")),
             ("Aider", cwd.join(".aider.conventions.md")),
@@ -2523,8 +2526,8 @@ icm store -t \"note\" -c \"$ARGUMENTS\"
 ```
 ";
 
-        // Claude Code: ~/.claude/commands/
-        let claude_skills_dir = PathBuf::from(&home).join(".claude/commands");
+        // Claude Code: ~/.claude/commands/ (or $CLAUDE_CONFIG_DIR/commands/)
+        let claude_skills_dir = claude_dir.join("commands");
         install_skill(
             &claude_skills_dir,
             "recall.md",
@@ -2587,7 +2590,7 @@ Do this BEFORE responding to the user. Not optional.
 
     // --- Hook mode: install Claude Code hooks (full Rust, no shell scripts) ---
     if do_hook {
-        let claude_settings_path = PathBuf::from(&home).join(".claude/settings.json");
+        let claude_settings_path = claude_dir.join("settings.json");
 
         // PreToolUse hook: `icm hook pre` (auto-allow icm commands)
         let pre_cmd = format!("{} hook pre", icm_bin_str);
@@ -2681,7 +2684,7 @@ Do this BEFORE responding to the user. Not optional.
         }
 
         // --- Gemini CLI hooks (same settings.json format as Claude Code, different event names) ---
-        let gemini_settings_path = PathBuf::from(&home).join(".gemini/settings.json");
+        let gemini_settings_path = gemini_dir.join("settings.json");
         let detect = &["icm hook", "icm-post-tool"];
 
         // SessionStart → same name in Gemini CLI
@@ -2741,7 +2744,7 @@ Do this BEFORE responding to the user. Not optional.
         println!("[hook] Gemini CLI BeforeAgent (auto-recall): {status}");
 
         // --- Codex CLI hooks (separate hooks.json file) ---
-        let codex_hooks_path = PathBuf::from(&home).join(".codex/hooks.json");
+        let codex_hooks_path = codex_dir.join("hooks.json");
 
         let status = inject_codex_hook(
             &codex_hooks_path,
@@ -2779,9 +2782,8 @@ Do this BEFORE responding to the user. Not optional.
         )?;
         println!("[hook] Codex CLI UserPromptSubmit (auto-recall): {status}");
 
-        // --- Copilot CLI hooks (per-repo .github/hooks/icm.json) ---
-        let cwd = std::env::current_dir().context("failed to get current directory")?;
-        let copilot_status = inject_copilot_hooks(&cwd, &icm_bin_str)?;
+        // --- Copilot CLI hooks (user-global ~/.copilot/settings.json) ---
+        let copilot_status = inject_copilot_hooks(&copilot_dir, &icm_bin_str)?;
         println!("[hook] Copilot CLI (all hooks): {copilot_status}");
     }
 
@@ -3208,6 +3210,17 @@ fn binary_in_path(name: &str) -> bool {
 /// used for tools without a CLI binary (e.g. Claude Desktop, VS Code extensions).
 /// Note: directory checks can yield false positives if a previous `icm init --force`
 /// already created the config path — use `--force` to bypass detection entirely.
+/// Resolve the config directory for a CLI tool, respecting an env var override.
+/// Falls back to `$HOME/{default_subdir}` if the env var is unset or empty.
+/// Mirrors how each tool documents its own override (CLAUDE_CONFIG_DIR,
+/// GEMINI_CONFIG_DIR, CODEX_HOME, COPILOT_HOME).
+fn cli_config_dir(env_var: &str, default_subdir: &str, home: &str) -> PathBuf {
+    match std::env::var(env_var) {
+        Ok(custom) if !custom.is_empty() => PathBuf::from(custom),
+        _ => PathBuf::from(home).join(default_subdir),
+    }
+}
+
 fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
     let h = std::path::Path::new(home);
     let vscode_present =
@@ -3443,52 +3456,81 @@ fn inject_continue_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
     Ok("configured".into())
 }
 
-/// Inject ICM hooks into Copilot CLI hooks file (.github/hooks/icm.json).
-/// Copilot CLI uses a per-repo hooks file with a different format:
-/// `{ "version": 1, "hooks": { "eventName": [{ "type": "command", "bash": "...", "timeoutSec": N }] } }`
-fn inject_copilot_hooks(cwd: &std::path::Path, icm_bin: &str) -> Result<String> {
-    let hooks_dir = cwd.join(".github/hooks");
-    let hooks_path = hooks_dir.join("icm.json");
+/// Inject ICM hooks into Copilot CLI user settings (~/.copilot/settings.json).
+/// Copilot accepts inline hooks in its user settings file under the `hooks` key:
+/// `{ "hooks": { "eventName": [{ "type": "command", "bash": "...", "timeoutSec": N }] } }`.
+/// Path resolution honors $COPILOT_HOME via the caller (see `cli_config_dir`).
+fn inject_copilot_hooks(copilot_dir: &std::path::Path, icm_bin: &str) -> Result<String> {
+    let settings_path = copilot_dir.join("settings.json");
 
-    if hooks_path.exists() {
-        let content = std::fs::read_to_string(&hooks_path)
-            .with_context(|| format!("cannot read {}", hooks_path.display()))?;
-        if content.contains("icm hook") {
-            return Ok("already configured".into());
+    let mut config: Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path)
+            .with_context(|| format!("cannot read {}", settings_path.display()))?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("invalid JSON in {}", settings_path.display()))?
         }
+    } else {
+        serde_json::json!({})
+    };
+
+    let root = config
+        .as_object_mut()
+        .context("settings.json is not a JSON object")?;
+
+    let hooks_value = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks = hooks_value
+        .as_object_mut()
+        .context("hooks is not a JSON object")?;
+
+    // Idempotent: if any existing hook command already references `icm hook`,
+    // treat as already configured and don't append duplicates.
+    let already = hooks.values().any(|arr| {
+        arr.as_array()
+            .map(|a| {
+                a.iter().any(|h| {
+                    h.get("bash")
+                        .and_then(|b| b.as_str())
+                        .map(|s| s.contains("icm hook"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+    if already {
+        return Ok("already configured".into());
     }
 
-    std::fs::create_dir_all(&hooks_dir).ok();
+    let events = [
+        ("sessionStart", "start", 10),
+        ("preToolUse", "pre", 5),
+        ("postToolUse", "post", 10),
+        ("userPromptSubmitted", "prompt", 10),
+    ];
+    for (event, sub, timeout) in events {
+        let entry = serde_json::json!({
+            "type": "command",
+            "bash": format!("{icm_bin} hook {sub}"),
+            "timeoutSec": timeout
+        });
+        hooks
+            .entry(event.to_string())
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .with_context(|| format!("hooks.{event} is not an array"))?
+            .push(entry);
+    }
 
-    let hooks_config = serde_json::json!({
-        "version": 1,
-        "hooks": {
-            "sessionStart": [{
-                "type": "command",
-                "bash": format!("{icm_bin} hook start"),
-                "timeoutSec": 10
-            }],
-            "preToolUse": [{
-                "type": "command",
-                "bash": format!("{icm_bin} hook pre"),
-                "timeoutSec": 5
-            }],
-            "postToolUse": [{
-                "type": "command",
-                "bash": format!("{icm_bin} hook post"),
-                "timeoutSec": 10
-            }],
-            "userPromptSubmitted": [{
-                "type": "command",
-                "bash": format!("{icm_bin} hook prompt"),
-                "timeoutSec": 10
-            }]
-        }
-    });
-
-    let output = serde_json::to_string_pretty(&hooks_config)?;
-    std::fs::write(&hooks_path, output)
-        .with_context(|| format!("cannot write {}", hooks_path.display()))?;
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&settings_path, output)
+        .with_context(|| format!("cannot write {}", settings_path.display()))?;
 
     Ok("configured".into())
 }
@@ -6022,5 +6064,123 @@ mod inject_settings_hook_tests {
             cfg["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap(),
             "Bash"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_config_dir_tests {
+    use super::*;
+
+    #[test]
+    fn falls_back_to_home_when_env_unset() {
+        // Use a uniquely-named env var so we don't race with a real one.
+        let var = "ICM_TEST_FAKE_ENV_VAR_THAT_DOES_NOT_EXIST";
+        std::env::remove_var(var);
+        let dir = cli_config_dir(var, ".faketool", "/home/u");
+        assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
+    }
+
+    #[test]
+    fn uses_env_var_when_set() {
+        let var = "ICM_TEST_CLI_CONFIG_DIR_OVERRIDE";
+        std::env::set_var(var, "/tmp/custom-cli-home");
+        let dir = cli_config_dir(var, ".faketool", "/home/u");
+        std::env::remove_var(var);
+        assert_eq!(dir, PathBuf::from("/tmp/custom-cli-home"));
+    }
+
+    #[test]
+    fn empty_env_var_falls_back_to_home() {
+        // An accidentally-empty `export FOO=` should not produce a useless empty path.
+        let var = "ICM_TEST_CLI_CONFIG_DIR_EMPTY";
+        std::env::set_var(var, "");
+        let dir = cli_config_dir(var, ".faketool", "/home/u");
+        std::env::remove_var(var);
+        assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
+    }
+}
+
+#[cfg(test)]
+mod inject_copilot_hooks_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn read(path: &Path) -> Value {
+        let raw = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn writes_settings_json_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let copilot_dir = tmp.path();
+
+        let status = inject_copilot_hooks(copilot_dir, "/usr/local/bin/icm").unwrap();
+        assert_eq!(status, "configured");
+
+        let cfg = read(&copilot_dir.join("settings.json"));
+        let hooks = cfg["hooks"].as_object().unwrap();
+        for event in [
+            "sessionStart",
+            "preToolUse",
+            "postToolUse",
+            "userPromptSubmitted",
+        ] {
+            let arr = hooks[event].as_array().expect("event should be an array");
+            assert_eq!(arr.len(), 1, "event {event} should have one entry");
+            let bash = arr[0]["bash"].as_str().unwrap();
+            assert!(bash.starts_with("/usr/local/bin/icm hook "), "got: {bash}");
+        }
+    }
+
+    #[test]
+    fn idempotent_when_icm_already_present() {
+        let tmp = TempDir::new().unwrap();
+        let copilot_dir = tmp.path();
+
+        inject_copilot_hooks(copilot_dir, "/usr/local/bin/icm").unwrap();
+        let status = inject_copilot_hooks(copilot_dir, "/usr/local/bin/icm").unwrap();
+        assert_eq!(status, "already configured");
+
+        // No duplication.
+        let cfg = read(&copilot_dir.join("settings.json"));
+        let arr = cfg["hooks"]["sessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[test]
+    fn preserves_unrelated_settings_and_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let copilot_dir = tmp.path();
+        let settings_path = copilot_dir.join("settings.json");
+
+        // Pre-seed with unrelated user settings AND a third-party hook.
+        std::fs::write(
+            &settings_path,
+            r#"{
+                "theme": "dark",
+                "hooks": {
+                    "sessionStart": [
+                        { "type": "command", "bash": "/usr/local/bin/some-other-tool", "timeoutSec": 5 }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let status = inject_copilot_hooks(copilot_dir, "/usr/local/bin/icm").unwrap();
+        assert_eq!(status, "configured");
+
+        let cfg = read(&settings_path);
+        // Unrelated settings preserved.
+        assert_eq!(cfg["theme"].as_str().unwrap(), "dark");
+        // Existing third-party hook preserved + ours appended.
+        let arr = cfg["hooks"]["sessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(
+            arr[0]["bash"].as_str().unwrap(),
+            "/usr/local/bin/some-other-tool"
+        );
+        assert!(arr[1]["bash"].as_str().unwrap().contains("icm hook start"));
     }
 }

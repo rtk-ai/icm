@@ -448,6 +448,8 @@ enum HookCommands {
         #[arg(long, default_value = "0")]
         max_tokens: usize,
     },
+    /// SessionEnd hook: extract memories from transcript before the session closes
+    End,
 }
 
 #[derive(Subcommand)]
@@ -1225,6 +1227,7 @@ fn main() -> Result<()> {
                 };
                 cmd_hook_start(&store, tokens)
             }
+            HookCommands::End => cmd_hook_end(&store),
         },
         #[cfg(feature = "tui")]
         Commands::Dashboard => {
@@ -1912,9 +1915,28 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> 
 }
 
 /// PreCompact hook (Layer 1): extract memories from transcript before context compression.
+fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
+    extract_from_hook_transcript(store, "pre-compact")
+}
+
+/// SessionEnd hook (Layer 1b): extract memories from transcript before the
+/// session terminates. Catches the `/exit`, `/clear`, and tool-quit paths
+/// that PreCompact misses (compaction does not fire on `/clear`).
+///
+/// Same transcript-parsing logic as PreCompact — the only difference is the
+/// log prefix. SqliteStore handles its own dedup so a session that triggers
+/// both PreCompact and SessionEnd back-to-back will not double-store facts.
+fn cmd_hook_end(store: &SqliteStore) -> Result<()> {
+    extract_from_hook_transcript(store, "session-end")
+}
+
+/// Read JSON from stdin, locate the transcript file, parse the last 100
+/// assistant messages, and extract facts. Used by both PreCompact and
+/// SessionEnd hooks. `source` is purely a log-prefix tag.
+///
 /// Reads JSON from stdin with `transcript_path`, reads the JSONL transcript,
 /// and extracts facts from assistant messages.
-fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
+fn extract_from_hook_transcript(store: &SqliteStore, source: &str) -> Result<()> {
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -2005,7 +2027,7 @@ fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
         .unwrap_or_else(|| "project".to_string());
 
     match extract::extract_and_store_with_opts(store, text, &project, true) {
-        Ok(n) if n > 0 => eprintln!("[icm] pre-compact: extracted {n} facts from transcript"),
+        Ok(n) if n > 0 => eprintln!("[icm] {source}: extracted {n} facts from transcript"),
         _ => {}
     }
 
@@ -2626,6 +2648,19 @@ Do this BEFORE responding to the user. Not optional.
             force,
         )?;
         println!("[hook] Claude Code SessionStart (wake-up pack): {start_status}");
+
+        // SessionEnd hook: `icm hook end` (extract from transcript before /exit, /clear, etc.)
+        // Catches the path PreCompact misses — compaction does not fire on /clear.
+        let end_cmd = format!("{} hook end", icm_bin_str);
+        let end_status = inject_settings_hook(
+            &claude_settings_path,
+            "SessionEnd",
+            &end_cmd,
+            None,
+            &["icm hook end", "icm hook", "icm-post-tool"],
+            force,
+        )?;
+        println!("[hook] Claude Code SessionEnd (transcript extract): {end_status}");
 
         // OpenCode plugin: install TS plugin using native @opencode-ai/plugin SDK
         let opencode_plugins_dir = PathBuf::from(&home).join(".config/opencode/plugins");

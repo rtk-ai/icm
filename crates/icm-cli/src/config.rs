@@ -182,12 +182,18 @@ impl Default for MemoryConfig {
 
 impl Default for ExtractionConfig {
     fn default() -> Self {
+        // Auto-extraction is OFF by default. The naive rule-based extractor
+        // produces low-quality fragments (truncated URLs, isolated markdown
+        // bullets, sentence pieces) that pollute the store and get replayed
+        // verbatim by UserPromptSubmit recall. Manual `icm store` calls are
+        // the source of truth — opt in with `[extraction] enabled = true`
+        // if you accept the noise.
         Self {
-            enabled: true,
+            enabled: false,
             min_score: 2.0,
             max_facts: 20,
-            extract_every: 3,
-            store_raw: true,
+            extract_every: 15,
+            store_raw: false,
         }
     }
 }
@@ -259,7 +265,9 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert!(config.extraction.enabled);
+        // Auto-extraction is opt-in; manual stores are the default source.
+        assert!(!config.extraction.enabled);
+        assert!(!config.extraction.store_raw);
         assert_eq!(config.memory.decay_rate, 0.95);
         assert_eq!(config.recall.limit, 15);
         assert!(config.mcp.compact);
@@ -273,8 +281,8 @@ decay_rate = 0.90
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.memory.decay_rate, 0.90);
-        // Other fields should be defaults
-        assert!(config.extraction.enabled);
+        // Other fields should be defaults — auto-extraction off by default.
+        assert!(!config.extraction.enabled);
     }
 
     #[test]

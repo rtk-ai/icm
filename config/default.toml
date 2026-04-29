@@ -35,8 +35,13 @@ prune_threshold = 0.1
 model = "intfloat/multilingual-e5-base"
 
 [extraction]
-# Layer 0: rule-based fact extraction (zero LLM cost)
-enabled = true
+# Layer 0: rule-based fact extraction (zero LLM cost).
+# OFF by default — the naive rule-based extractor produces low-quality
+# fragments (truncated URLs, isolated markdown bullets, sentence pieces).
+# Manual `icm store` calls are the source of truth. Set to `true` only if
+# you accept the noise; planned future work: replace with LLM-based async
+# extraction.
+enabled = false
 
 # Minimum keyword score to keep a fact
 min_score = 3.0

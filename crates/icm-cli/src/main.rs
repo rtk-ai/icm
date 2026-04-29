@@ -1210,6 +1210,11 @@ fn main() -> Result<()> {
         Commands::Hook { command } => match command {
             HookCommands::Pre => cmd_hook_pre(),
             HookCommands::Post { every } => {
+                // Auto-extraction is opt-in. Without it, this hook is a no-op
+                // (the bash counter file is no longer touched either).
+                if !cfg.extraction.enabled {
+                    return Ok(());
+                }
                 let extract_every = if every != 15 {
                     every // CLI flag overrides config
                 } else {
@@ -1217,7 +1222,12 @@ fn main() -> Result<()> {
                 };
                 cmd_hook_post(&store, extract_every, cfg.extraction.store_raw)
             }
-            HookCommands::Compact => cmd_hook_compact(&store),
+            HookCommands::Compact => {
+                if !cfg.extraction.enabled {
+                    return Ok(());
+                }
+                cmd_hook_compact(&store)
+            }
             HookCommands::Prompt => cmd_hook_prompt(&store),
             HookCommands::Start { max_tokens } => {
                 let tokens = if max_tokens > 0 {
@@ -1227,7 +1237,12 @@ fn main() -> Result<()> {
                 };
                 cmd_hook_start(&store, tokens)
             }
-            HookCommands::End => cmd_hook_end(&store),
+            HookCommands::End => {
+                if !cfg.extraction.enabled {
+                    return Ok(());
+                }
+                cmd_hook_end(&store)
+            }
         },
         #[cfg(feature = "tui")]
         Commands::Dashboard => {

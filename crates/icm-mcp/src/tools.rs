@@ -2,9 +2,10 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
-    add_backrefs, auto_link_memory, build_wake_up, keyword_matches, topic_matches, AutoLinkOptions,
-    Concept, ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
+    add_backrefs, auto_link_memory, build_wake_up, is_preference_topic, keyword_matches,
+    project_matches, topic_matches, AutoLinkOptions, Concept, ConceptLink, Embedder, Feedback,
+    FeedbackStore, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
+    WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -111,6 +112,10 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     "keyword": {
                         "type": "string",
                         "description": "Filter results by keyword (exact match on memory keywords)"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project filter (segment-aware). Defaults to the server's cwd directory name. Pass an empty string to disable the filter and search across all projects."
                     }
                 },
                 "required": ["query"]
@@ -1133,11 +1138,33 @@ fn tool_recall(
     let topic = get_str(args, "topic");
     let keyword = get_str(args, "keyword");
 
+    // Project filter: same hard segment-aware filter applied to the CLI
+    // `recall_context` path (extract.rs) so MCP-side recall can't leak
+    // memories from other projects. Caller can override via the explicit
+    // `project` arg (empty string disables the filter); otherwise we
+    // derive it from the server's cwd.
+    let project_arg = get_str(args, "project");
+    let cwd_project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
+    let project: Option<String> = match project_arg {
+        Some("") => None,
+        Some(p) => Some(p.to_string()),
+        None => cwd_project,
+    };
+    let project_filter = |m: &Memory| -> bool {
+        match project.as_deref() {
+            None => true,
+            Some(p) => is_preference_topic(&m.topic) || project_matches(&m.topic, Some(p)),
+        }
+    };
+
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
         if let Ok(query_emb) = emb.embed(query) {
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored_results = results;
+                scored_results.retain(|(m, _)| project_filter(m));
                 if let Some(t) = topic {
                     scored_results.retain(|(m, _)| topic_matches(&m.topic, t));
                 }
@@ -1181,6 +1208,7 @@ fn tool_recall(
         };
     }
 
+    results.retain(|m| project_filter(m));
     if let Some(t) = topic {
         results.retain(|m| topic_matches(&m.topic, t));
     }
@@ -2372,7 +2400,7 @@ mod tests {
             &store,
             None,
             "icm_memory_recall",
-            &json!({"query": "Rust SQLite"}),
+            &json!({"query": "Rust SQLite", "project": ""}),
             false,
         );
         assert!(!recall_result.is_error);
@@ -2407,7 +2435,7 @@ mod tests {
             &store,
             None,
             "icm_memory_recall",
-            &json!({"query": "Rust memory"}),
+            &json!({"query": "Rust memory", "project": ""}),
             true,
         );
         assert!(!result.is_error);
@@ -2519,7 +2547,7 @@ mod tests {
             &store,
             None,
             "icm_memory_recall",
-            &json!({"query": "script alert"}),
+            &json!({"query": "script alert", "project": ""}),
             false,
         );
         assert!(recall.content[0].text.contains("<script>"));
@@ -2603,11 +2631,13 @@ mod tests {
                 false,
             );
         }
+        // `project: ""` disables the cwd-based project filter so the test
+        // is deterministic regardless of where `cargo test` runs from.
         let result = call_tool(
             &store,
             None,
             "icm_memory_recall",
-            &json!({"query": "data", "topic": "beta"}),
+            &json!({"query": "data", "topic": "beta", "project": ""}),
             false,
         );
         assert!(!result.is_error);
@@ -2776,7 +2806,7 @@ mod tests {
             &store,
             None,
             "icm_memory_recall",
-            &json!({"query": "legit"}),
+            &json!({"query": "legit", "project": ""}),
             false,
         );
         assert!(!recall.is_error);
@@ -3368,7 +3398,7 @@ description = "A test project"
             &store,
             None,
             "icm_memory_recall",
-            &json!({"query": "SQLite FTS5 indexing", "limit": 5}),
+            &json!({"query": "SQLite FTS5 indexing", "limit": 5, "project": ""}),
             false,
         );
         assert!(
@@ -3381,6 +3411,110 @@ description = "A test project"
         assert!(
             text.contains("BM25 ranking"),
             "graph-expanded neighbor should appear: {text}"
+        );
+    }
+
+    #[test]
+    fn test_recall_filters_by_project_via_arg() {
+        // Two memories in distinct project topics. Recall with `project`
+        // arg pointing at one project must NOT surface the other's memory.
+        let store = test_store();
+        let a = Memory::new(
+            "context-projecta".into(),
+            "Project A: chose Postgres for transactional store".into(),
+            icm_core::Importance::High,
+        );
+        let b = Memory::new(
+            "context-projectb".into(),
+            "Project B: chose Mongo for document store".into(),
+            icm_core::Importance::High,
+        );
+        store.store(a).unwrap();
+        store.store(b).unwrap();
+
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "store", "project": "projecta", "limit": 10}),
+            false,
+        );
+        assert!(!res.is_error);
+        let text = &res.content[0].text;
+        assert!(
+            text.contains("Postgres"),
+            "expected projecta memory to surface: {text}"
+        );
+        assert!(
+            !text.contains("Mongo"),
+            "projectb memory leaked through filter: {text}"
+        );
+    }
+
+    #[test]
+    fn test_recall_empty_project_arg_disables_filter() {
+        // Pass `project=""` to explicitly opt out of segment-aware filtering
+        // and search across all projects.
+        let store = test_store();
+        let a = Memory::new(
+            "context-alpha".into(),
+            "Alpha decision: rust workspace layout".into(),
+            icm_core::Importance::Medium,
+        );
+        let b = Memory::new(
+            "context-bravo".into(),
+            "Bravo decision: rust workspace layout".into(),
+            icm_core::Importance::Medium,
+        );
+        store.store(a).unwrap();
+        store.store(b).unwrap();
+
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "rust workspace", "project": "", "limit": 10}),
+            false,
+        );
+        assert!(!res.is_error);
+        let text = &res.content[0].text;
+        assert!(text.contains("Alpha"), "Alpha missing: {text}");
+        assert!(text.contains("Bravo"), "Bravo missing: {text}");
+    }
+
+    #[test]
+    fn test_recall_preferences_bypass_project_filter() {
+        // Preferences are user-wide and must surface regardless of project.
+        let store = test_store();
+        let pref = Memory::new(
+            "preferences".into(),
+            "User prefers tabs over spaces in JS".into(),
+            icm_core::Importance::Critical,
+        );
+        let other = Memory::new(
+            "context-otherproject".into(),
+            "Project X: tabs over spaces in JS".into(),
+            icm_core::Importance::Medium,
+        );
+        store.store(pref).unwrap();
+        store.store(other).unwrap();
+
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "tabs spaces", "project": "myproject", "limit": 10}),
+            false,
+        );
+        assert!(!res.is_error);
+        let text = &res.content[0].text;
+        assert!(
+            text.contains("User prefers"),
+            "preference memory should leak through project filter: {text}"
+        );
+        assert!(
+            !text.contains("Project X"),
+            "non-preference memory from a different project leaked: {text}"
         );
     }
 

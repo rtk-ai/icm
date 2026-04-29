@@ -41,15 +41,15 @@ pub fn load_credentials() -> Option<Credentials> {
     //    rtk-pro uses dirs::config_dir() which is:
     //    - macOS: ~/Library/Application Support/rtk/
     //    - Linux: ~/.config/rtk/
+    // Resolve home cross-platform — Windows uses %USERPROFILE%, not $HOME.
+    let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
     let rtk_paths = [
         // macOS: ~/Library/Application Support/rtk/credentials.json
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(&h).join("Library/Application Support/rtk/credentials.json")),
+        home.as_ref()
+            .map(|h| h.join("Library/Application Support/rtk/credentials.json")),
         // Linux: ~/.config/rtk/credentials.json
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(&h).join(".config/rtk/credentials.json")),
+        home.as_ref()
+            .map(|h| h.join(".config/rtk/credentials.json")),
     ];
     for path in rtk_paths.into_iter().flatten() {
         if let Some(creds) = load_credentials_from_path(path) {

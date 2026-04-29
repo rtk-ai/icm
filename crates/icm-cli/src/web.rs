@@ -96,7 +96,20 @@ pub fn resolve_password(cfg: &WebConfig) -> Result<String> {
         }
     }
 
-    eprintln!("[icm web] Generated admin password: {generated}");
+    // Don't print the password to stderr — it would land in CI logs, shell
+    // history, and `script(1)` recordings. Point the user at the 0600 file
+    // instead. If credentials_path() failed (no project dir), surface a
+    // single fallback line so the user still knows where to retrieve it.
+    match cred_path {
+        Some(path) => eprintln!(
+            "[icm web] Generated admin password (saved to {}). Run `cat {}` to read it.",
+            path.display(),
+            path.display()
+        ),
+        None => eprintln!(
+            "[icm web] Generated admin password — set ICM_WEB_PASSWORD or [web] password in config to control it."
+        ),
+    }
     Ok(generated)
 }
 

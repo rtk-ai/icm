@@ -173,7 +173,8 @@ pub fn parse_chatgpt(content: &str) -> Result<(Vec<Exchange>, String)> {
                 Some((ct, msg))
             })
             .collect();
-        nodes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        // Guard against NaN create_time (would otherwise panic the import).
+        nodes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         for (_, msg) in &nodes {
             let role_str = msg

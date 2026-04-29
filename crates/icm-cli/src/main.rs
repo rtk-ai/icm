@@ -1396,7 +1396,13 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
     };
 
     match sort {
-        SortField::Weight => memories.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap()),
+        SortField::Weight => memories.sort_by(|a, b| {
+            // NaN should never appear in stored weights, but guard anyway —
+            // a single NaN would otherwise panic the whole `icm list` flow.
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
         SortField::Created => memories.sort_by_key(|b| std::cmp::Reverse(b.created_at)),
         SortField::Accessed => memories.sort_by_key(|b| std::cmp::Reverse(b.last_accessed)),
     }
@@ -2309,7 +2315,7 @@ fn cmd_extract_patterns(
 fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = icm_bin.to_string_lossy().to_string();
-    let home = std::env::var("HOME").context("HOME not set")?;
+    let home = home_dir_str()?;
 
     // Per-CLI config directories, with env var overrides honored.
     // Each tool documents its own override; we mirror that.
@@ -2826,7 +2832,7 @@ fn inject_icm_block(path: &Path, block: &str) -> Result<String> {
 }
 
 fn cmd_doctor() -> Result<()> {
-    let home = std::env::var("HOME").context("HOME not set")?;
+    let home = home_dir_str()?;
     let current_bin = std::env::current_exe().ok();
 
     let targets: Vec<(&str, PathBuf, &[&str])> = vec![
@@ -3210,6 +3216,28 @@ fn binary_in_path(name: &str) -> bool {
 /// used for tools without a CLI binary (e.g. Claude Desktop, VS Code extensions).
 /// Note: directory checks can yield false positives if a previous `icm init --force`
 /// already created the config path — use `--force` to bypass detection entirely.
+/// Resolve the user's home directory in a cross-platform way.
+///
+/// Unix uses `$HOME`, Windows uses `%USERPROFILE%`. We delegate to the
+/// `directories` crate so a single call site works everywhere instead of
+/// the previous Unix-only `env::var("HOME")` which silently broke `icm
+/// init` and `icm doctor` on Windows.
+pub(crate) fn home_dir_str() -> Result<String> {
+    if let Some(dirs) = directories::UserDirs::new() {
+        return Ok(dirs.home_dir().to_string_lossy().to_string());
+    }
+    // Fallback path: respect explicit env vars if `directories` failed to
+    // resolve (very unusual — typically only happens in stripped-down
+    // sandboxes without standard env vars).
+    if let Ok(h) = std::env::var("HOME") {
+        return Ok(h);
+    }
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        return Ok(h);
+    }
+    bail!("cannot determine user home directory (HOME / USERPROFILE not set)")
+}
+
 /// Resolve the config directory for a CLI tool, respecting an env var override.
 /// Falls back to `$HOME/{default_subdir}` if the env var is unset or empty.
 /// Mirrors how each tool documents its own override (CLAUDE_CONFIG_DIR,

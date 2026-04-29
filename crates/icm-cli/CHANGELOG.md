@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.32](https://github.com/rtk-ai/icm/compare/icm-v0.10.31...icm-v0.10.32) (2026-04-29)
+
+
+### Bug Fixes
+
+* audit batch 1 — security, panics, and cross-platform paths ([#141](https://github.com/rtk-ai/icm/issues/141)) ([181c6dd](https://github.com/rtk-ai/icm/commit/181c6dd4b051b48165ef1eae4132710da576013b))
+
 ## [0.10.31](https://github.com/rtk-ai/icm/compare/icm-v0.10.30...icm-v0.10.31) (2026-04-29)
 
 

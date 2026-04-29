@@ -24,6 +24,18 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # Embeddings (optional)
 fastembed = "4"
 
+# Jina v5 embedder. These are workspace version pins only; each
+# consumer crate must mark them `optional = true` and gate them behind
+# the `jina-v5` feature. Default builds must NOT pull these crates.
+#
+# `ort` defaults pull `download-binaries` which fetches the ONNX Runtime
+# at build time. We disable defaults and load the system runtime via
+# `load-dynamic`; `ndarray` is required for `try_extract_tensor`.
+hf-hub = "0.4"
+ort = { version = "2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
+tokenizers = "0.21"
+ndarray = "0.16"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

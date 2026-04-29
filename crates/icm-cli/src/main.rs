@@ -6,6 +6,8 @@ mod extract;
 mod import;
 #[cfg(test)]
 mod learn_tests;
+#[cfg(test)]
+mod migration_tests;
 #[cfg(feature = "tui")]
 mod tui;
 mod upgrade;
@@ -26,6 +28,8 @@ use icm_core::{
 };
 use icm_store::SqliteStore;
 
+use crate::config::EmbedderBackend;
+
 #[derive(Parser)]
 #[command(
     name = "icm",
@@ -40,6 +44,10 @@ struct Cli {
     /// Disable embeddings (skip model download, use keyword search only)
     #[arg(long, global = true)]
     no_embeddings: bool,
+
+    /// Skip automatic re-embedding when the embedder model changes.
+    #[arg(long, global = true, default_value_t = false)]
+    no_auto_reembed: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -873,19 +881,76 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("memories.db"))
 }
 
-fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<SqliteStore> {
+fn open_store(
+    db: Option<PathBuf>,
+    embedding_dims: usize,
+) -> Result<(SqliteStore, icm_store::MigrationStatus)> {
     let path = db.unwrap_or_else(default_db_path);
     SqliteStore::with_dims(&path, embedding_dims).context("failed to open database")
 }
 
-#[cfg(feature = "embeddings")]
-fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
-    Some(icm_core::FastEmbedder::with_model(model))
+#[cfg(any(feature = "embeddings", feature = "jina-v5"))]
+fn init_embedder(
+    cfg: &config::EmbeddingsConfig,
+) -> Result<Option<Box<dyn icm_core::Embedder>>> {
+    use config::EmbedderBackend;
+    match cfg.backend {
+        #[cfg(feature = "embeddings")]
+        EmbedderBackend::Fastembed => Ok(Some(Box::new(icm_core::FastEmbedder::with_model(
+            &cfg.model,
+        )))),
+        #[cfg(not(feature = "embeddings"))]
+        EmbedderBackend::Fastembed => Err(anyhow::anyhow!(
+            "config requests backend `fastembed` but this binary was built \
+             without the `embeddings` feature. Rebuild with \
+             `--features embeddings` or set `embeddings.backend = \"jina-v5-nano\"`."
+        )),
+        #[cfg(feature = "jina-v5")]
+        EmbedderBackend::JinaV5Nano => {
+            let emb = icm_core::JinaV5NanoEmbedder::new(cfg.truncate_dim)
+                .map_err(|e| anyhow::anyhow!("jina-v5-nano init: {e}"))?;
+            Ok(Some(Box::new(emb)))
+        }
+        #[cfg(not(feature = "jina-v5"))]
+        EmbedderBackend::JinaV5Nano => Err(anyhow::anyhow!(
+            "config requests backend `jina-v5-nano` but this binary was built \
+             without the `jina-v5` feature. Rebuild with `--features jina-v5` \
+             or set `embeddings.backend = \"fastembed\"`."
+        )),
+        #[cfg(feature = "jina-v5")]
+        EmbedderBackend::JinaV5Small => {
+            let emb = icm_core::JinaV5SmallEmbedder::new(cfg.truncate_dim)
+                .map_err(|e| anyhow::anyhow!("jina-v5-small init: {e}"))?;
+            Ok(Some(Box::new(emb)))
+        }
+        #[cfg(not(feature = "jina-v5"))]
+        EmbedderBackend::JinaV5Small => Err(anyhow::anyhow!(
+            "config requests backend `jina-v5-small` but this binary was built \
+             without the `jina-v5` feature. Rebuild with `--features jina-v5` \
+             or set `embeddings.backend = \"fastembed\"`."
+        )),
+    }
 }
 
-#[cfg(not(feature = "embeddings"))]
-fn init_embedder(_model: &str) -> Option<()> {
-    None
+#[cfg(not(any(feature = "embeddings", feature = "jina-v5")))]
+fn init_embedder(
+    cfg: &config::EmbeddingsConfig,
+) -> Result<Option<Box<dyn icm_core::Embedder>>> {
+    use config::EmbedderBackend;
+    match cfg.backend {
+        EmbedderBackend::Fastembed => Err(anyhow::anyhow!(
+            "config requests backend `fastembed` but this binary was built \
+             without the `embeddings` feature."
+        )),
+        EmbedderBackend::JinaV5Nano => Err(anyhow::anyhow!(
+            "config requests backend `jina-v5-nano` but this binary was built \
+             without the `jina-v5` feature."
+        )),
+        EmbedderBackend::JinaV5Small => Err(anyhow::anyhow!(
+            "config requests backend `jina-v5-small` but this binary was built \
+             without the `jina-v5` feature."
+        )),
+    }
 }
 
 fn main() -> Result<()> {
@@ -907,21 +972,54 @@ fn main() -> Result<()> {
     let cfg = config::load_config()?;
     let embeddings_enabled =
         cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
-    #[allow(unused_variables)]
-    let embedder = if embeddings_enabled {
-        init_embedder(&cfg.embeddings.model)
+    let embedder: Option<Box<dyn icm_core::Embedder>> = if embeddings_enabled {
+        init_embedder(&cfg.embeddings)?
     } else {
         None
     };
     let embedding_dims = embedder
         .as_ref()
-        .map(|e| {
-            use icm_core::Embedder;
-            e.dimensions()
-        })
+        .map(|e| e.dimensions())
         .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
-    let store = open_store(cli.db, embedding_dims)?;
+    let (store, migration_status) = open_store(cli.db, embedding_dims)?;
+    if migration_status.dim_changed {
+        eprintln!(
+            "Embedding dim changed ({} -> {}): {} memories cleared.",
+            migration_status.old_dim,
+            migration_status.new_dim,
+            migration_status.affected_rows
+        );
+        // The MCP server (Commands::Serve) always auto-reembeds; the
+        // --no-auto-reembed flag only applies to interactive CLI invocations.
+        let is_serve = matches!(&cli.command, Commands::Serve { .. });
+        if cli.no_auto_reembed && !is_serve {
+            eprintln!(
+                "Skipping auto re-embed (--no-auto-reembed). \
+                 Run `icm embed --all` manually."
+            );
+        } else {
+            #[cfg(any(feature = "embeddings", feature = "jina-v5"))]
+            if let Some(emb) = embedder.as_deref() {
+                eprintln!(
+                    "Auto re-embedding {} memories \
+                     (use --no-auto-reembed to skip)...",
+                    migration_status.affected_rows
+                );
+                cmd_embed(&store, emb, None, false, 32)?;
+            } else {
+                eprintln!(
+                    "No embedder active — run `icm embed --all` \
+                     after enabling embeddings."
+                );
+            }
+            #[cfg(not(any(feature = "embeddings", feature = "jina-v5")))]
+            eprintln!(
+                "No embedder active — run `icm embed --all` \
+                 after enabling embeddings."
+            );
+        }
+    }
 
     match cli.command {
         Commands::Store {
@@ -931,10 +1029,7 @@ fn main() -> Result<()> {
             keywords,
             raw,
         } => {
-            #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            #[cfg(not(feature = "embeddings"))]
-            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let emb_ref = embedder.as_deref();
             cmd_store(
                 &store,
                 emb_ref,
@@ -951,10 +1046,7 @@ fn main() -> Result<()> {
             limit,
             keyword,
         } => {
-            #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            #[cfg(not(feature = "embeddings"))]
-            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let emb_ref = embedder.as_deref();
             cmd_recall(
                 &store,
                 emb_ref,
@@ -972,10 +1064,7 @@ fn main() -> Result<()> {
             importance,
             keywords,
         } => {
-            #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            #[cfg(not(feature = "embeddings"))]
-            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let emb_ref = embedder.as_deref();
             cmd_update(&store, emb_ref, &id, content, importance, keywords)
         }
         Commands::Health { topic } => cmd_health(&store, topic.as_deref()),
@@ -1063,7 +1152,7 @@ fn main() -> Result<()> {
         } => {
             #[cfg(feature = "embeddings")]
             {
-                let emb = match embedder.as_ref() {
+                let emb = match embedder.as_deref() {
                     Some(e) => e,
                     None => bail!("embeddings not available — check your configuration"),
                 };
@@ -1157,7 +1246,7 @@ fn main() -> Result<()> {
             importance,
             keywords,
         } => {
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref();
             cmd_save_project(&store, emb_ref, &content, importance.into(), keywords)
         }
         Commands::Learn { dir, name } => {
@@ -1199,10 +1288,7 @@ fn main() -> Result<()> {
                     password,
                 );
             }
-            #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            #[cfg(not(feature = "embeddings"))]
-            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let emb_ref = embedder.as_deref();
             // --compact flag overrides, otherwise use config (default: true)
             let use_compact = compact || cfg.mcp.compact;
             icm_mcp::run_server(&store, emb_ref, use_compact)
@@ -1317,7 +1403,7 @@ fn cmd_recall(
 
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
-        if let Ok(query_emb) = emb.embed(query) {
+        if let Ok(query_emb) = emb.embed_query(query) {
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored = results;
                 if let Some(t) = topic {
@@ -1339,6 +1425,10 @@ fn cmd_recall(
                     return Ok(());
                 }
 
+                if !emb.model_name().is_empty() {
+                    println!("model: {}", emb.model_name());
+                    println!();
+                }
                 let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
                 let _ = store.batch_update_access(&ids);
                 for (mem, score) in &expanded {
@@ -3583,6 +3673,33 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
     Ok("configured".into())
 }
 
+/// Returns `(display_name, spdx_license)` for the given embedder backend.
+/// This is the single source of truth used by both `cmd_config` output and tests.
+fn backend_info(backend: &EmbedderBackend) -> (&'static str, &'static str) {
+    match backend {
+        EmbedderBackend::Fastembed => ("fastembed", "Apache-2.0"),
+        EmbedderBackend::JinaV5Nano => ("jina-v5-nano", "CC-BY-NC-4.0, non-commercial"),
+        EmbedderBackend::JinaV5Small => ("jina-v5-small", "CC-BY-NC-4.0, non-commercial"),
+    }
+}
+
+/// Formats the `[embeddings]` config section into a `String`.
+/// Extracted so that tests can assert on the real rendered output.
+fn format_embeddings_section(cfg: &config::EmbeddingsConfig) -> String {
+    let (backend_name, license) = backend_info(&cfg.backend);
+    let mut out = String::new();
+    out.push_str("[embeddings]\n");
+    out.push_str(&format!("  backend = {backend_name}\n"));
+    out.push_str(&format!("  license = {license}\n"));
+    if !cfg.model.is_empty() && cfg.backend == EmbedderBackend::Fastembed {
+        out.push_str(&format!("  model = {}\n", cfg.model));
+    }
+    if let Some(dim) = cfg.truncate_dim {
+        out.push_str(&format!("  truncate_dim = {dim}\n"));
+    }
+    out
+}
+
 fn cmd_config() -> Result<()> {
     let cfg = config::load_config()?;
     println!("Config: {}", config::show_config_path());
@@ -3601,8 +3718,7 @@ fn cmd_config() -> Result<()> {
     println!("  decay_rate = {}", cfg.memory.decay_rate);
     println!("  prune_threshold = {}", cfg.memory.prune_threshold);
     println!();
-    println!("[embeddings]");
-    println!("  model = {}", cfg.embeddings.model);
+    print!("{}", format_embeddings_section(&cfg.embeddings));
     println!();
     println!("[extraction]");
     println!("  enabled = {}", cfg.extraction.enabled);
@@ -3837,7 +3953,7 @@ fn cmd_save_project(
     )
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "jina-v5"))]
 fn cmd_embed(
     store: &SqliteStore,
     embedder: &dyn icm_core::Embedder,
@@ -4135,10 +4251,12 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         });
         std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let _ = SqliteStore::new(&icm_db)?;
+            let (_, _) = SqliteStore::new(&icm_db)?;
         }
 
         // === WITHOUT ICM ===
+
+
         eprintln!("=== WITHOUT ICM ===");
         let s1_prompt = format!(
             "{}{}",
@@ -4179,7 +4297,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         eprintln!(" done ({:.1}s)", s1_icm.duration_ms as f64 / 1000.0);
 
         {
-            let store = SqliteStore::new(&icm_db)?;
+            let (store, _) = SqliteStore::new(&icm_db)?;
             let ext1 =
                 extract::extract_and_store(&store, bench_knowledge::SOURCE_DOCUMENT, "meridian")?;
             let ext2 = extract::extract_and_store(&store, &s1_icm.response, "meridian")?;
@@ -4197,7 +4315,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         let mut scores_with: Vec<(usize, usize, f64)> = Vec::new();
         let mut responses_with: Vec<String> = Vec::new();
         for (i, q) in questions.iter().enumerate() {
-            let store = SqliteStore::new(&icm_db)?;
+            let (store, _) = SqliteStore::new(&icm_db)?;
             let ctx = extract::recall_context(&store, q.prompt, None, 15)?;
             if verbose && !ctx.is_empty() {
                 eprintln!("  [verbose] Context injected for Q{}:", i + 1);
@@ -4220,7 +4338,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
                         eprintln!("    Response: {}", truncate_words(&result.response, 200));
                     }
                     {
-                        let store = SqliteStore::new(&icm_db)?;
+                        let (store, _) = SqliteStore::new(&icm_db)?;
                         let _ = extract::extract_and_store(&store, &result.response, "meridian");
                     }
                     scores_with.push(score);
@@ -4415,13 +4533,13 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
         });
         std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let _ = SqliteStore::new(&icm_db)?;
+            let (_, _) = SqliteStore::new(&icm_db)?;
         }
 
         let mut results_with: Vec<SessionResult> = Vec::new();
         for (i, prompt) in prompts.iter().enumerate() {
             let effective_prompt = if i > 0 {
-                let store = SqliteStore::new(&icm_db)?;
+                let (store, _) = SqliteStore::new(&icm_db)?;
                 let ctx = extract::recall_context(&store, prompt, None, 15)?;
                 if verbose && !ctx.is_empty() {
                     eprintln!("  [verbose] Context injected for session {}:", i + 1);
@@ -4443,7 +4561,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
                 Ok(result) => {
                     eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
                     {
-                        let store = SqliteStore::new(&icm_db)?;
+                        let (store, _) = SqliteStore::new(&icm_db)?;
                         let extracted =
                             extract::extract_and_store(&store, &result.response, "mathlib")?;
                         if extracted > 0 {
@@ -6021,6 +6139,111 @@ mod inject_settings_hook_tests {
         assert_eq!(
             cfg["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap(),
             "Bash"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_show_tests {
+    use crate::config::{EmbedderBackend, EmbeddingsConfig};
+    use crate::{backend_info, format_embeddings_section};
+
+    /// The rendered output for jina-v5-nano must contain the exact backend name
+    /// and license string that `cmd_config` prints. This catches display regressions
+    /// because it exercises the real `format_embeddings_section` formatter.
+    #[test]
+    fn jina_v5_nano_section_contains_backend_and_license() {
+        let mut cfg = EmbeddingsConfig::default();
+        cfg.backend = EmbedderBackend::JinaV5Nano;
+
+        let rendered = format_embeddings_section(&cfg);
+
+        assert!(
+            rendered.contains("backend = jina-v5-nano"),
+            "expected 'backend = jina-v5-nano' in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("license = CC-BY-NC-4.0, non-commercial"),
+            "expected 'license = CC-BY-NC-4.0, non-commercial' in:\n{rendered}"
+        );
+        // model line must be suppressed for non-fastembed backends
+        assert!(
+            !rendered.contains("model ="),
+            "model line should be omitted for jina backends, got:\n{rendered}"
+        );
+    }
+
+    /// jina-v5-small mirrors nano — separate test so renaming one variant doesn't
+    /// mask a broken mapping for the other.
+    #[test]
+    fn jina_v5_small_section_contains_backend_and_license() {
+        let mut cfg = EmbeddingsConfig::default();
+        cfg.backend = EmbedderBackend::JinaV5Small;
+
+        let rendered = format_embeddings_section(&cfg);
+
+        assert!(
+            rendered.contains("backend = jina-v5-small"),
+            "expected 'backend = jina-v5-small' in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("license = CC-BY-NC-4.0, non-commercial"),
+            "expected 'license = CC-BY-NC-4.0, non-commercial' in:\n{rendered}"
+        );
+    }
+
+    /// fastembed must show Apache-2.0 and the model line (no truncate_dim by default).
+    #[test]
+    fn fastembed_section_shows_apache_license_and_model() {
+        let cfg = EmbeddingsConfig::default(); // backend = Fastembed
+
+        let rendered = format_embeddings_section(&cfg);
+
+        assert!(
+            rendered.contains("backend = fastembed"),
+            "expected 'backend = fastembed' in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("license = Apache-2.0"),
+            "expected 'license = Apache-2.0' in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("model ="),
+            "fastembed section should include model line, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("truncate_dim"),
+            "truncate_dim should be absent when None, got:\n{rendered}"
+        );
+    }
+
+    /// truncate_dim appears in the rendered output when set.
+    #[test]
+    fn truncate_dim_appears_when_set() {
+        let mut cfg = EmbeddingsConfig::default();
+        cfg.backend = EmbedderBackend::JinaV5Nano;
+        cfg.truncate_dim = Some(512);
+
+        let rendered = format_embeddings_section(&cfg);
+
+        assert!(
+            rendered.contains("truncate_dim = 512"),
+            "expected 'truncate_dim = 512' in:\n{rendered}"
+        );
+    }
+
+    /// `backend_info` is the single source of truth — verify it returns the exact
+    /// strings the spec mandates so any future rename is caught here first.
+    #[test]
+    fn backend_info_returns_canonical_strings() {
+        assert_eq!(backend_info(&EmbedderBackend::Fastembed), ("fastembed", "Apache-2.0"));
+        assert_eq!(
+            backend_info(&EmbedderBackend::JinaV5Nano),
+            ("jina-v5-nano", "CC-BY-NC-4.0, non-commercial")
+        );
+        assert_eq!(
+            backend_info(&EmbedderBackend::JinaV5Small),
+            ("jina-v5-small", "CC-BY-NC-4.0, non-commercial")
         );
     }
 }

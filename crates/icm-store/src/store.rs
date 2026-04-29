@@ -14,6 +14,7 @@ use icm_core::{
 };
 
 use crate::schema::{init_db, init_db_with_dims};
+use crate::MigrationStatus;
 
 /// Convert rusqlite::Error to IcmError::Database
 pub(crate) fn db_err(e: rusqlite::Error) -> IcmError {
@@ -43,12 +44,14 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    pub fn new(path: &Path) -> IcmResult<Self> {
+    pub fn new(path: &Path) -> IcmResult<(Self, MigrationStatus)> {
         Self::with_dims(path, icm_core::DEFAULT_EMBEDDING_DIMS)
     }
 
     /// Open or create a store with a specific embedding dimension.
-    pub fn with_dims(path: &Path, embedding_dims: usize) -> IcmResult<Self> {
+    /// Returns the store and a [`MigrationStatus`] indicating whether a
+    /// dim-change migration was performed (embeddings NULLed, vec table recreated).
+    pub fn with_dims(path: &Path, embedding_dims: usize) -> IcmResult<(Self, MigrationStatus)> {
         ensure_sqlite_vec();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -60,8 +63,8 @@ impl SqliteStore {
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
         )
         .map_err(db_err)?;
-        init_db_with_dims(&conn, embedding_dims)?;
-        Ok(Self { conn })
+        let migration = init_db_with_dims(&conn, embedding_dims)?;
+        Ok((Self { conn }, migration))
     }
 
     /// Apply decay if more than 24 hours since last decay.

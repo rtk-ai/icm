@@ -24,7 +24,15 @@ prune_threshold = 0.1
 # Set to false to disable embeddings entirely (no model download, keyword search only)
 # enabled = false
 
-# Embedding model (fastembed model_code). Default: multilingual-e5-small (384d, 100+ languages)
+# Embedder backend: "fastembed" (default, Apache-2.0) | "jina-v5-nano" | "jina-v5-small"
+#
+# Jina v5 backends: CC BY-NC 4.0 (non-commercial). For commercial use, acquire a
+# commercial license from Jina AI before deploying. Weights download to
+# ~/.cache/huggingface/ on first run.
+#
+# backend = "jina-v5-nano"
+
+# Embedding model (fastembed model_code). Default: multilingual-e5-base (768d, 100+ languages)
 # Other options:
 #   "BAAI/bge-small-en-v1.5"              — 384d, English-only (fastest)
 #   "Xenova/bge-small-en-v1.5"            — 384d, quantized English-only
@@ -33,6 +41,11 @@ prune_threshold = 0.1
 #   "Xenova/all-MiniLM-L12-v2"            — 384d, English
 #   "jinaai/jina-embeddings-v2-base-code" — 768d, code-optimized
 model = "intfloat/multilingual-e5-base"
+
+# Matryoshka truncation (jina-v5 backends only). Valid dims:
+#   jina-v5-nano:  32, 64, 128, 256, 512, 768 (default: 768)
+#   jina-v5-small: 32, 64, 128, 256, 512, 768, 1024 (default: 1024)
+# truncate_dim = 512
 
 [extraction]
 # Layer 0: rule-based fact extraction (zero LLM cost)

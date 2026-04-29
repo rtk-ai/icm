@@ -9,7 +9,7 @@ mod tests {
     fn test_store() -> (TempDir, SqliteStore) {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let db_path = tmp.path().join("test.db");
-        let store = SqliteStore::with_dims(&db_path, 384).expect("failed to create store");
+        let (store, _) = SqliteStore::with_dims(&db_path, 384).expect("failed to create store");
         (tmp, store)
     }
 

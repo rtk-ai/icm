@@ -15,6 +15,7 @@ path = "src/main.rs"
 [features]
 default = ["embeddings", "tui"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
+jina-v5 = ["icm-core/jina-v5"]
 tui = ["dep:ratatui", "dep:crossterm"]
 web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess", "dep:getrandom"]
 vendored-openssl = ["openssl/vendored"]

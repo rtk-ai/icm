@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use icm_core::{IcmError, IcmResult};
 
 use crate::store::db_err;
+use crate::MigrationStatus;
 
 /// Check if a FTS virtual table exists in sqlite_master.
 fn fts_table_exists(conn: &Connection, name: &str) -> Result<bool, IcmError> {
@@ -36,13 +37,15 @@ fn create_vec_table(conn: &Connection, embedding_dims: usize) -> Result<(), IcmE
     Ok(())
 }
 
-/// Initialize the database schema. `embedding_dims` controls the sqlite-vec vector size.
-/// Pass `None` to skip vector table creation (no embeddings feature).
-pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
+/// Initialize the database schema using the default embedding dimensions.
+/// Returns a [`MigrationStatus`] describing whether a dim-change migration ran.
+pub fn init_db(conn: &Connection) -> Result<MigrationStatus, IcmError> {
     init_db_with_dims(conn, icm_core::DEFAULT_EMBEDDING_DIMS)
 }
 
-pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(), IcmError> {
+/// Initialize the database schema. `embedding_dims` controls the sqlite-vec vector size.
+/// Returns a [`MigrationStatus`] describing whether a dim-change migration ran.
+pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<MigrationStatus, IcmError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS memories (
@@ -361,15 +364,22 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             // Model changed — drop vec table and clear embeddings
             conn.execute_batch("DROP TABLE IF EXISTS vec_memories")
                 .map_err(db_err)?;
-            conn.execute("UPDATE memories SET embedding = NULL", [])
+            let affected_rows = conn
+                .execute("UPDATE memories SET embedding = NULL", [])
                 .map_err(db_err)?;
             create_vec_table(conn, embedding_dims)?;
+            return Ok(MigrationStatus {
+                dim_changed: true,
+                old_dim: stored,
+                new_dim: embedding_dims,
+                affected_rows,
+            });
         }
     } else {
         create_vec_table(conn, embedding_dims)?;
     }
 
-    Ok(())
+    Ok(MigrationStatus::default())
 }
 
 /// Migrate existing DBs: replace the broad `memories_au` trigger with one

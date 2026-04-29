@@ -4,6 +4,10 @@ pub mod error;
 #[cfg(feature = "embeddings")]
 pub mod fastembed_embedder;
 pub mod feedback;
+#[cfg(feature = "jina-v5")]
+pub mod jina_v5_nano;
+#[cfg(feature = "jina-v5")]
+mod jina_v5_small;
 pub mod feedback_store;
 pub mod learn;
 pub mod memoir;
@@ -22,6 +26,10 @@ pub use embedder::Embedder;
 pub use error::{IcmError, IcmResult};
 #[cfg(feature = "embeddings")]
 pub use fastembed_embedder::FastEmbedder;
+#[cfg(feature = "jina-v5")]
+pub use jina_v5_nano::{truncate_and_renorm, JinaV5NanoEmbedder};
+#[cfg(feature = "jina-v5")]
+pub use jina_v5_small::JinaV5SmallEmbedder;
 pub use feedback::{Feedback, FeedbackStats};
 pub use feedback_store::FeedbackStore;
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};

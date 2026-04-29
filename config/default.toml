@@ -51,6 +51,19 @@ enabled = true
 # Maximum memories to inject
 limit = 15
 
+[wakeup]
+# SessionStart hook (Layer 1): wake-up pack of critical/high-importance
+# memories injected at session start.
+
+# Token budget for the pack (~4 chars/token). Increase for richer context;
+# decrease if your tool's system prompt is already tight.
+max_tokens = 500
+
+# Include preference / identity memories regardless of project filter so
+# user-wide settings (style, language, conventions) leak through into
+# every project's wake-up.
+include_preferences = true
+
 [mcp]
 # MCP server transport: "stdio"
 transport = "stdio"

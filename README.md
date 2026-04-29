@@ -263,21 +263,30 @@ Rust + SQLite + FTS5 — 0 Python, 0 ChromaDB, 0 external service. Writes are ~1
 ChromaDB-based verbatim stores; the whole transcript lives in the same SQLite file as your
 memories and memoirs.
 
-## MCP Tools (27)
+## MCP Tools (31)
 
 ### Memory tools
 
 | Tool | Description |
 |------|-------------|
 | `icm_memory_store` | Store with auto-dedup (>85% similarity → update instead of duplicate) |
-| `icm_memory_recall` | Search by query, filter by topic and/or keyword |
+| `icm_memory_recall` | Search by query, filter by topic / keyword / project |
 | `icm_memory_update` | Edit a memory in-place (content, importance, keywords) |
 | `icm_memory_forget` | Delete a memory by ID |
+| `icm_memory_forget_topic` | Delete all memories in a given topic |
 | `icm_memory_consolidate` | Merge all memories of a topic into one summary |
+| `icm_memory_extract_patterns` | Detect recurring patterns within a topic and surface them as concepts |
 | `icm_memory_list_topics` | List all topics with counts |
 | `icm_memory_stats` | Global memory statistics |
 | `icm_memory_health` | Per-topic hygiene audit (staleness, consolidation needs) |
 | `icm_memory_embed_all` | Backfill embeddings for vector search |
+
+### Session tools
+
+| Tool | Description |
+|------|-------------|
+| `icm_wake_up` | Build a project-scoped wake-up pack (critical/high memories + preferences) for SessionStart-style context injection |
+| `icm_learn` | Scan a project directory and seed a Memoir knowledge graph from its code/docs |
 
 ### Memoir tools (knowledge graphs)
 

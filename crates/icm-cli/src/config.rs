@@ -46,21 +46,40 @@ pub struct MemoryConfig {
     pub auto_consolidate_threshold: usize,
 }
 
+/// Which embedder backend to use for `EmbeddingsConfig.backend`.
+#[derive(Debug, Deserialize, Default, PartialEq, Eq, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbedderBackend {
+    /// fastembed (default) — multilingual-e5-base etc., Apache-2.0 weights.
+    #[default]
+    Fastembed,
+    /// jina-embeddings-v5-text-nano-retrieval — local ONNX, CC-BY-NC-4.0.
+    JinaV5Nano,
+}
+
 /// Embedding model settings.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct EmbeddingsConfig {
     /// Enable embeddings (set to false to skip model download entirely).
     pub enabled: bool,
-    /// Model identifier (fastembed model_code, e.g. "intfloat/multilingual-e5-small").
+    /// Which embedder backend to use.
+    pub backend: EmbedderBackend,
+    /// Model identifier for the fastembed backend
+    /// (e.g. "intfloat/multilingual-e5-base"). Ignored by other backends.
     pub model: String,
+    /// Matryoshka truncation dimension. `None` = use the model's default
+    /// output dimension. Currently consumed by the jina-v5-nano backend.
+    pub truncate_dim: Option<usize>,
 }
 
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            backend: EmbedderBackend::Fastembed,
             model: "intfloat/multilingual-e5-base".into(),
+            truncate_dim: None,
         }
     }
 }

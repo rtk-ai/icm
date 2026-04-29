@@ -881,14 +881,52 @@ fn open_store(
     SqliteStore::with_dims(&path, embedding_dims).context("failed to open database")
 }
 
-#[cfg(feature = "embeddings")]
-fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
-    Some(icm_core::FastEmbedder::with_model(model))
+#[cfg(any(feature = "embeddings", feature = "jina-v5"))]
+fn init_embedder(
+    cfg: &config::EmbeddingsConfig,
+) -> Result<Option<Box<dyn icm_core::Embedder>>> {
+    use config::EmbedderBackend;
+    match cfg.backend {
+        #[cfg(feature = "embeddings")]
+        EmbedderBackend::Fastembed => Ok(Some(Box::new(icm_core::FastEmbedder::with_model(
+            &cfg.model,
+        )))),
+        #[cfg(not(feature = "embeddings"))]
+        EmbedderBackend::Fastembed => Err(anyhow::anyhow!(
+            "config requests backend `fastembed` but this binary was built \
+             without the `embeddings` feature. Rebuild with \
+             `--features embeddings` or set `embeddings.backend = \"jina-v5-nano\"`."
+        )),
+        #[cfg(feature = "jina-v5")]
+        EmbedderBackend::JinaV5Nano => {
+            let emb = icm_core::JinaV5NanoEmbedder::new(cfg.truncate_dim)
+                .map_err(|e| anyhow::anyhow!("jina-v5-nano init: {e}"))?;
+            Ok(Some(Box::new(emb)))
+        }
+        #[cfg(not(feature = "jina-v5"))]
+        EmbedderBackend::JinaV5Nano => Err(anyhow::anyhow!(
+            "config requests backend `jina-v5-nano` but this binary was built \
+             without the `jina-v5` feature. Rebuild with `--features jina-v5` \
+             or set `embeddings.backend = \"fastembed\"`."
+        )),
+    }
 }
 
-#[cfg(not(feature = "embeddings"))]
-fn init_embedder(_model: &str) -> Option<()> {
-    None
+#[cfg(not(any(feature = "embeddings", feature = "jina-v5")))]
+fn init_embedder(
+    cfg: &config::EmbeddingsConfig,
+) -> Result<Option<Box<dyn icm_core::Embedder>>> {
+    use config::EmbedderBackend;
+    match cfg.backend {
+        EmbedderBackend::Fastembed => Err(anyhow::anyhow!(
+            "config requests backend `fastembed` but this binary was built \
+             without the `embeddings` feature."
+        )),
+        EmbedderBackend::JinaV5Nano => Err(anyhow::anyhow!(
+            "config requests backend `jina-v5-nano` but this binary was built \
+             without the `jina-v5` feature."
+        )),
+    }
 }
 
 fn main() -> Result<()> {
@@ -910,21 +948,26 @@ fn main() -> Result<()> {
     let cfg = config::load_config()?;
     let embeddings_enabled =
         cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
-    #[allow(unused_variables)]
-    let embedder = if embeddings_enabled {
-        init_embedder(&cfg.embeddings.model)
+    let embedder: Option<Box<dyn icm_core::Embedder>> = if embeddings_enabled {
+        init_embedder(&cfg.embeddings)?
     } else {
         None
     };
     let embedding_dims = embedder
         .as_ref()
-        .map(|e| {
-            use icm_core::Embedder;
-            e.dimensions()
-        })
+        .map(|e| e.dimensions())
         .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
-    let (store, _migration) = open_store(cli.db, embedding_dims)?;
+    let (store, migration_status) = open_store(cli.db, embedding_dims)?;
+    if migration_status.dim_changed {
+        eprintln!(
+            "Embedding dim changed ({} -> {}): {} memories need re-embedding. \
+             Run `icm embed --all` to repopulate.",
+            migration_status.old_dim,
+            migration_status.new_dim,
+            migration_status.affected_rows
+        );
+    }
 
     match cli.command {
         Commands::Store {
@@ -934,10 +977,7 @@ fn main() -> Result<()> {
             keywords,
             raw,
         } => {
-            #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            #[cfg(not(feature = "embeddings"))]
-            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let emb_ref = embedder.as_deref();
             cmd_store(
                 &store,
                 emb_ref,
@@ -954,10 +994,7 @@ fn main() -> Result<()> {
             limit,
             keyword,
         } => {
-            #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            #[cfg(not(feature = "embeddings"))]
-            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let emb_ref = embedder.as_deref();
             cmd_recall(
                 &store,
                 emb_ref,
@@ -975,10 +1012,7 @@ fn main() -> Result<()> {
             importance,
             keywords,
         } => {
-            #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            #[cfg(not(feature = "embeddings"))]
-            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let emb_ref = embedder.as_deref();
             cmd_update(&store, emb_ref, &id, content, importance, keywords)
         }
         Commands::Health { topic } => cmd_health(&store, topic.as_deref()),
@@ -1066,7 +1100,7 @@ fn main() -> Result<()> {
         } => {
             #[cfg(feature = "embeddings")]
             {
-                let emb = match embedder.as_ref() {
+                let emb = match embedder.as_deref() {
                     Some(e) => e,
                     None => bail!("embeddings not available — check your configuration"),
                 };
@@ -1160,7 +1194,7 @@ fn main() -> Result<()> {
             importance,
             keywords,
         } => {
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref();
             cmd_save_project(&store, emb_ref, &content, importance.into(), keywords)
         }
         Commands::Learn { dir, name } => {
@@ -1202,10 +1236,7 @@ fn main() -> Result<()> {
                     password,
                 );
             }
-            #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            #[cfg(not(feature = "embeddings"))]
-            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let emb_ref = embedder.as_deref();
             // --compact flag overrides, otherwise use config (default: true)
             let use_compact = compact || cfg.mcp.compact;
             icm_mcp::run_server(&store, emb_ref, use_compact)

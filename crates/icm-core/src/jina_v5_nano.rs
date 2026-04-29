@@ -40,7 +40,7 @@ mod inner {
             let repo = api.model(HF_MODEL_ID.to_string());
 
             eprintln!(
-                "Downloading jina-v5-text-nano-retrieval from HuggingFace (first run only)..."
+                "Loading jina-v5-text-nano-retrieval (downloads on first run, cached thereafter)..."
             );
             let onnx_path = repo
                 .get("onnx/model.onnx")
@@ -181,6 +181,14 @@ mod inner {
         }
     }
 
+    // NOTE: `embed_query` and `embed_document` are intentionally not overridden here.
+    // Jina v5 retrieval models use asymmetric instruction prefixes in production:
+    //   query: "Represent this sentence for searching relevant passages: {text}"
+    //   document: no prefix
+    // This prefix injection is implemented in slice S-4. The symmetric fallback used
+    // here (inherited default: both call `embed`) is functionally correct for
+    // backend infrastructure testing and produces valid (if slightly sub-optimal)
+    // retrieval results without the prefix.
     impl Embedder for JinaV5NanoEmbedder {
         fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
             self.encode_texts(&[text]).map(|mut v| v.remove(0))

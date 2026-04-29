@@ -909,6 +909,18 @@ fn init_embedder(
              without the `jina-v5` feature. Rebuild with `--features jina-v5` \
              or set `embeddings.backend = \"fastembed\"`."
         )),
+        #[cfg(feature = "jina-v5")]
+        EmbedderBackend::JinaV5Small => {
+            let emb = icm_core::JinaV5SmallEmbedder::new(cfg.truncate_dim)
+                .map_err(|e| anyhow::anyhow!("jina-v5-small init: {e}"))?;
+            Ok(Some(Box::new(emb)))
+        }
+        #[cfg(not(feature = "jina-v5"))]
+        EmbedderBackend::JinaV5Small => Err(anyhow::anyhow!(
+            "config requests backend `jina-v5-small` but this binary was built \
+             without the `jina-v5` feature. Rebuild with `--features jina-v5` \
+             or set `embeddings.backend = \"fastembed\"`."
+        )),
     }
 }
 
@@ -924,6 +936,10 @@ fn init_embedder(
         )),
         EmbedderBackend::JinaV5Nano => Err(anyhow::anyhow!(
             "config requests backend `jina-v5-nano` but this binary was built \
+             without the `jina-v5` feature."
+        )),
+        EmbedderBackend::JinaV5Small => Err(anyhow::anyhow!(
+            "config requests backend `jina-v5-small` but this binary was built \
              without the `jina-v5` feature."
         )),
     }

@@ -55,6 +55,8 @@ pub enum EmbedderBackend {
     Fastembed,
     /// jina-embeddings-v5-text-nano-retrieval — local ONNX, CC-BY-NC-4.0.
     JinaV5Nano,
+    /// jina-embeddings-v5-text-small-retrieval (Qwen3-based) — local ONNX, CC-BY-NC-4.0.
+    JinaV5Small,
 }
 
 /// Embedding model settings.
@@ -69,7 +71,7 @@ pub struct EmbeddingsConfig {
     /// (e.g. "intfloat/multilingual-e5-base"). Ignored by other backends.
     pub model: String,
     /// Matryoshka truncation dimension. `None` = use the model's default
-    /// output dimension. Currently consumed by the jina-v5-nano backend.
+    /// output dimension. Consumed by the jina-v5-nano and jina-v5-small backends.
     pub truncate_dim: Option<usize>,
 }
 

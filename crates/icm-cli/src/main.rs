@@ -6,6 +6,8 @@ mod extract;
 mod import;
 #[cfg(test)]
 mod learn_tests;
+#[cfg(test)]
+mod migration_tests;
 #[cfg(feature = "tui")]
 mod tui;
 mod upgrade;
@@ -40,6 +42,10 @@ struct Cli {
     /// Disable embeddings (skip model download, use keyword search only)
     #[arg(long, global = true)]
     no_embeddings: bool,
+
+    /// Skip automatic re-embedding when the embedder model changes.
+    #[arg(long, global = true, default_value_t = false)]
+    no_auto_reembed: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -977,12 +983,40 @@ fn main() -> Result<()> {
     let (store, migration_status) = open_store(cli.db, embedding_dims)?;
     if migration_status.dim_changed {
         eprintln!(
-            "Embedding dim changed ({} -> {}): {} memories need re-embedding. \
-             Run `icm embed --all` to repopulate.",
+            "Embedding dim changed ({} -> {}): {} memories cleared.",
             migration_status.old_dim,
             migration_status.new_dim,
             migration_status.affected_rows
         );
+        // The MCP server (Commands::Serve) always auto-reembeds; the
+        // --no-auto-reembed flag only applies to interactive CLI invocations.
+        let is_serve = matches!(&cli.command, Commands::Serve { .. });
+        if cli.no_auto_reembed && !is_serve {
+            eprintln!(
+                "Skipping auto re-embed (--no-auto-reembed). \
+                 Run `icm embed --all` manually."
+            );
+        } else {
+            #[cfg(any(feature = "embeddings", feature = "jina-v5"))]
+            if let Some(emb) = embedder.as_deref() {
+                eprintln!(
+                    "Auto re-embedding {} memories \
+                     (use --no-auto-reembed to skip)...",
+                    migration_status.affected_rows
+                );
+                cmd_embed(&store, emb, None, false, 32)?;
+            } else {
+                eprintln!(
+                    "No embedder active — run `icm embed --all` \
+                     after enabling embeddings."
+                );
+            }
+            #[cfg(not(any(feature = "embeddings", feature = "jina-v5")))]
+            eprintln!(
+                "No embedder active — run `icm embed --all` \
+                 after enabling embeddings."
+            );
+        }
     }
 
     match cli.command {
@@ -3887,7 +3921,7 @@ fn cmd_save_project(
     )
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "jina-v5"))]
 fn cmd_embed(
     store: &SqliteStore,
     embedder: &dyn icm_core::Embedder,

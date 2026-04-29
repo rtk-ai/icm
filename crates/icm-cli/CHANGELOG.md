@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.29](https://github.com/rtk-ai/icm/compare/icm-v0.10.28...icm-v0.10.29) (2026-04-29)
+
+
+### Bug Fixes
+
+* **cli:** convert remaining &PathBuf params to &Path (clippy::ptr_arg) ([dcf45fb](https://github.com/rtk-ai/icm/commit/dcf45fbbe2ea70475ab25f670e46468cbeebd6a3))
+* **cli:** list 'hook' as a valid --mode value in icm init --help ([9a54782](https://github.com/rtk-ai/icm/commit/9a5478296777e30f2fa91eb6fa68725efec41154))
+* **cli:** list 'hook' as a valid --mode value in icm init --help ([10a7aaf](https://github.com/rtk-ai/icm/commit/10a7aaf8d7e74d7106084f4430bd25514c504b06))
+* **cli:** satisfy clippy::ptr_arg on detect_tool's vscode_data param ([d733e54](https://github.com/rtk-ai/icm/commit/d733e541c3e00c9225fdae19d134e0125a0b3b3e))
+* **hook:** filter recall_context by project to stop cross-project leakage ([#130](https://github.com/rtk-ai/icm/issues/130)) ([3af4e91](https://github.com/rtk-ai/icm/commit/3af4e91986c1c0f90464d2e3f0925abb66776b26))
+
 ## [0.10.26](https://github.com/rtk-ai/icm/compare/icm-v0.10.25...icm-v0.10.26) (2026-04-18)
 
 

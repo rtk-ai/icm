@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use icm_core::{Importance, Memory, MemoryStore};
+use icm_core::{is_preference_topic, project_matches, Importance, Memory, MemoryStore};
 use icm_store::SqliteStore;
 
 /// Extract key facts from text and store them in ICM.
@@ -50,22 +50,59 @@ pub fn extract_and_store_with_opts(
 }
 
 /// Recall relevant memories and format as context preamble for prompt injection.
-pub fn recall_context(store: &SqliteStore, query: &str, limit: usize) -> Result<String> {
-    // Try FTS search with the query
-    let results = store.search_fts(query, limit * 2)?;
+///
+/// When `project` is `Some(name)`, results are restricted to memories whose
+/// topic matches that project (segment-aware match via
+/// [`icm_core::project_matches`]). Preference / identity topics are always
+/// kept so global user guidance is not stripped. When `project` is `None`,
+/// no project filtering is applied (back-compat with non-hook callers).
+///
+/// Issue: previously the hook concatenated the project name into the FTS
+/// query as a soft scoring hint, which let high-FTS-score memories from
+/// other projects bleed into the recalled context. The hard filter here
+/// prevents cross-project leakage.
+pub fn recall_context(
+    store: &SqliteStore,
+    query: &str,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<String> {
+    let project_filter = |m: &Memory| -> bool {
+        match project {
+            None => true,
+            Some("") => true,
+            Some(p) => is_preference_topic(&m.topic) || project_matches(&m.topic, Some(p)),
+        }
+    };
 
-    let relevant: Vec<_> = if results.is_empty() {
-        // Fallback: get all memories sorted by weight
+    // Oversample FTS results so that filtering still leaves enough candidates.
+    let fts_results = store.search_fts(query, limit.saturating_mul(4).max(limit))?;
+    let filtered: Vec<Memory> = fts_results
+        .into_iter()
+        .filter(|m| project_filter(m))
+        .take(limit)
+        .collect();
+
+    let relevant: Vec<_> = if filtered.is_empty() {
+        // Fallback: get all (project-matching) memories sorted by weight.
         let topics = store.list_topics()?;
         let mut all = Vec::new();
         for (topic, _) in &topics {
-            all.extend(store.get_by_topic(topic)?);
+            for mem in store.get_by_topic(topic)? {
+                if project_filter(&mem) {
+                    all.push(mem);
+                }
+            }
         }
-        all.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap());
+        all.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         all.truncate(limit);
         all
     } else {
-        results.into_iter().take(limit).collect()
+        filtered
     };
 
     if relevant.is_empty() {
@@ -938,7 +975,7 @@ mod tests {
     #[test]
     fn test_recall_context_empty_store() {
         let store = SqliteStore::in_memory().unwrap();
-        let ctx = recall_context(&store, "anything", 5).unwrap();
+        let ctx = recall_context(&store, "anything", None, 5).unwrap();
         assert!(ctx.is_empty());
     }
 
@@ -951,9 +988,90 @@ mod tests {
         let stored = extract_and_store(&store, text, "mathlib").unwrap();
         assert!(stored > 0);
 
-        let ctx = recall_context(&store, "parsing algorithm", 5).unwrap();
+        let ctx = recall_context(&store, "parsing algorithm", None, 5).unwrap();
         assert!(!ctx.is_empty());
         assert!(ctx.contains("Pratt") || ctx.contains("parsing") || ctx.contains("algorithm"));
+    }
+
+    #[test]
+    fn test_recall_context_filters_other_projects() {
+        // Two projects' memories share search terms; the project filter must
+        // strip the cross-project hits from FTS results.
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mem_a = Memory::new(
+            "context-projecta".to_string(),
+            "Auth refactor switched to OIDC bearer tokens".to_string(),
+            Importance::High,
+        );
+        let mem_b = Memory::new(
+            "context-projectb".to_string(),
+            "Auth refactor moved to session cookies".to_string(),
+            Importance::High,
+        );
+        store.store(mem_a).unwrap();
+        store.store(mem_b).unwrap();
+
+        let ctx = recall_context(&store, "Auth refactor", Some("projecta"), 5).unwrap();
+        assert!(ctx.contains("OIDC"), "must include projecta memory");
+        assert!(
+            !ctx.contains("session cookies"),
+            "must NOT leak projectb memory: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_keeps_preferences_when_filtering() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let project_mem = Memory::new(
+            "context-myapp".to_string(),
+            "Deployment uses Helm charts".to_string(),
+            Importance::High,
+        );
+        let pref_mem = Memory::new(
+            "preferences".to_string(),
+            "User prefers terse responses".to_string(),
+            Importance::Critical,
+        );
+        store.store(project_mem).unwrap();
+        store.store(pref_mem).unwrap();
+
+        let ctx = recall_context(&store, "deployment", Some("myapp"), 5).unwrap();
+        assert!(ctx.contains("Helm"));
+        // Preferences are global, so they survive project filtering even when
+        // the FTS query is unrelated.
+        let ctx2 = recall_context(&store, "anything random", Some("myapp"), 5).unwrap();
+        assert!(
+            ctx2.contains("terse responses"),
+            "preferences must not be stripped by project filter: {ctx2}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_no_project_keeps_all() {
+        // When no project is specified, behavior matches the pre-filter API:
+        // every matching memory is returned regardless of topic.
+        let store = SqliteStore::in_memory().unwrap();
+
+        store
+            .store(Memory::new(
+                "context-projecta".to_string(),
+                "Token refresh logic".to_string(),
+                Importance::High,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "context-projectb".to_string(),
+                "Token rotation policy".to_string(),
+                Importance::High,
+            ))
+            .unwrap();
+
+        let ctx = recall_context(&store, "Token", None, 5).unwrap();
+        assert!(ctx.contains("refresh"));
+        assert!(ctx.contains("rotation"));
     }
 
     #[test]

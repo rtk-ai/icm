@@ -2057,7 +2057,9 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
         return Ok(());
     }
 
-    // Build query: combine project name + user message
+    // Project name (from hook cwd) is used as a hard filter on recalled
+    // memories — not as a soft hint embedded in the FTS query, which used
+    // to let high-FTS-score memories from other projects bleed in.
     let project = json
         .get("cwd")
         .and_then(|v| v.as_str())
@@ -2065,18 +2067,17 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let query = if project.is_empty() {
-        message.to_string()
-    } else {
-        format!("{project} {message}")
-    };
-
     // Truncate query to at most 200 bytes at a safe UTF-8 char boundary.
     // See issue #110 — bare `&query[..200]` panics when the cut lands inside
     // a multi-byte UTF-8 char (Cyrillic=2B, CJK=3B, emoji=4B).
-    let query = truncate_at_char_boundary(&query, 200);
+    let query = truncate_at_char_boundary(message, 200);
 
-    let ctx = extract::recall_context(store, query, 5)?;
+    let project_filter = if project.is_empty() {
+        None
+    } else {
+        Some(project.as_str())
+    };
+    let ctx = extract::recall_context(store, query, project_filter, 5)?;
     if !ctx.is_empty() {
         print!("{ctx}");
     }
@@ -3674,7 +3675,9 @@ fn cmd_extract(
 }
 
 fn cmd_recall_context(store: &SqliteStore, query: &str, limit: usize) -> Result<()> {
-    let ctx = extract::recall_context(store, query, limit)?;
+    // Explicit `recall-context` CLI invocation: no implicit project filter,
+    // the user passed the query they want.
+    let ctx = extract::recall_context(store, query, None, limit)?;
     if ctx.is_empty() {
         eprintln!("No relevant context found.");
     } else {
@@ -3721,9 +3724,11 @@ fn cmd_recall_project(store: &SqliteStore, limit: usize) -> Result<()> {
     let project = detect_project();
     eprintln!("Project: {project}");
 
-    // Search across project-related topics: context-<project>, decisions-<project>, errors-resolved
+    // Search across project-related topics: context-<project>, decisions-<project>, errors-resolved.
+    // Pass the project name as both the FTS query (so topic-name hits rank)
+    // and as the hard project filter (so cross-project hits are stripped).
     let query = &project;
-    let ctx = extract::recall_context(store, query, limit)?;
+    let ctx = extract::recall_context(store, query, Some(project.as_str()), limit)?;
     if ctx.is_empty() {
         eprintln!("No context found for project '{project}'.");
     } else {
@@ -4158,7 +4163,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         let mut responses_with: Vec<String> = Vec::new();
         for (i, q) in questions.iter().enumerate() {
             let store = SqliteStore::new(&icm_db)?;
-            let ctx = extract::recall_context(&store, q.prompt, 15)?;
+            let ctx = extract::recall_context(&store, q.prompt, None, 15)?;
             if verbose && !ctx.is_empty() {
                 eprintln!("  [verbose] Context injected for Q{}:", i + 1);
                 for line in ctx.lines().take(10) {
@@ -4382,7 +4387,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
         for (i, prompt) in prompts.iter().enumerate() {
             let effective_prompt = if i > 0 {
                 let store = SqliteStore::new(&icm_db)?;
-                let ctx = extract::recall_context(&store, prompt, 15)?;
+                let ctx = extract::recall_context(&store, prompt, None, 15)?;
                 if verbose && !ctx.is_empty() {
                     eprintln!("  [verbose] Context injected for session {}:", i + 1);
                     for line in ctx.lines().take(8) {

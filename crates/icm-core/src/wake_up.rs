@@ -138,7 +138,11 @@ pub fn build_wake_up_from_memories(memories: Vec<Memory>, opts: &WakeUpOptions<'
 }
 
 /// Return true when a topic looks like it holds identity/preference data.
-fn is_preference_topic(topic: &str) -> bool {
+///
+/// Preference topics are global (not scoped to a single project) and are
+/// always included by `project_matches` so user identity / cross-project
+/// guidance is not stripped out by project filtering.
+pub fn is_preference_topic(topic: &str) -> bool {
     let lower = topic.to_lowercase();
     lower == "preferences"
         || lower == "identity"
@@ -156,7 +160,7 @@ fn is_preference_topic(topic: &str) -> bool {
 /// positives like `"icm"` matching `"icmp-notes"` while still allowing
 /// `"icm"` to match `"decisions-icm-core"` (via the `"icm"` segment) and
 /// `"icm-core"` to match `"decisions-icm-core"` (via both segments).
-fn project_matches(topic: &str, project: Option<&str>) -> bool {
+pub fn project_matches(topic: &str, project: Option<&str>) -> bool {
     let Some(proj) = project else {
         return true;
     };

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.30](https://github.com/rtk-ai/icm/compare/icm-v0.10.29...icm-v0.10.30) (2026-04-29)
+
+
+### Features
+
+* **hook:** add SessionEnd handler so /exit and /clear flush memories ([#132](https://github.com/rtk-ai/icm/issues/132)) ([95cd969](https://github.com/rtk-ai/icm/commit/95cd969b2ef5663dab5c8c2fcdc085f8f5c59561))
+
 ## [0.10.29](https://github.com/rtk-ai/icm/compare/icm-v0.10.28...icm-v0.10.29) (2026-04-29)
 
 

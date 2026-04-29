@@ -33,8 +33,8 @@ pub use store::MemoryStore;
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;
 pub use wake_up::{
-    build_wake_up, build_wake_up_from_memories, is_preference_topic, project_matches,
-    WakeUpFormat, WakeUpOptions, EMPTY_PACK_HEADER,
+    build_wake_up, build_wake_up_from_memories, is_preference_topic, project_matches, WakeUpFormat,
+    WakeUpOptions, EMPTY_PACK_HEADER,
 };
 
 pub use learn::{learn_project, LearnResult};

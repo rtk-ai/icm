@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.31](https://github.com/rtk-ai/icm/compare/icm-v0.10.30...icm-v0.10.31) (2026-04-29)
+
+
+### Bug Fixes
+
+* **cli:** honor XXX_HOME env vars and move Copilot hooks to user dir ([#138](https://github.com/rtk-ai/icm/issues/138)) ([0647926](https://github.com/rtk-ai/icm/commit/0647926e5c8969f5cd0c21455bcafe7a6b66070c))
+
 ## [0.10.30](https://github.com/rtk-ai/icm/compare/icm-v0.10.29...icm-v0.10.30) (2026-04-29)
 
 

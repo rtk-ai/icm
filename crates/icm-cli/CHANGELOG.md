@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.42](https://github.com/rtk-ai/icm/compare/icm-v0.10.41...icm-v0.10.42) (2026-04-30)
+
+
+### Bug Fixes
+
+* **audit-batch-13:** chronological transcript assembly + filter post-expand ([#163](https://github.com/rtk-ai/icm/issues/163)) ([cc74a5c](https://github.com/rtk-ai/icm/commit/cc74a5c44603ec11a23191eea1b863b78b0687ca))
+
 ## [0.10.41](https://github.com/rtk-ai/icm/compare/icm-v0.10.40...icm-v0.10.41) (2026-04-30)
 
 

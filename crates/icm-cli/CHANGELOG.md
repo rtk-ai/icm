@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.41](https://github.com/rtk-ai/icm/compare/icm-v0.10.40...icm-v0.10.41) (2026-04-30)
+
+
+### Bug Fixes
+
+* **audit-batch-12:** prune dry-run alignment + transcript code-fence + recall --project ([#161](https://github.com/rtk-ai/icm/issues/161)) ([8918304](https://github.com/rtk-ai/icm/commit/8918304613799f095b9a89f73f77f3749b94d4c8))
+
 ## [0.10.40](https://github.com/rtk-ai/icm/compare/icm-v0.10.39...icm-v0.10.40) (2026-04-30)
 
 

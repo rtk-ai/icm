@@ -201,7 +201,7 @@ icm memoir export -m "system-architecture" -f json     # 모든 메타데이터 
 icm memoir export -m "system-architecture" -f dot | dot -Tsvg > graph.svg
 ```
 
-## MCP 도구 (22개)
+## MCP 도구 (31개)
 
 ### 메모리 도구
 

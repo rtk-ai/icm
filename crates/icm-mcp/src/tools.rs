@@ -37,8 +37,18 @@ fn parse_keywords(args: &Value) -> Vec<String> {
 
 /// Try to auto-consolidate a topic if it exceeds the threshold.
 /// Returns a human-readable message if consolidation happened, or empty string.
-fn try_auto_consolidate(store: &SqliteStore, topic: &str, threshold: usize) -> String {
-    match store.auto_consolidate(topic, threshold) {
+///
+/// Routes through `auto_consolidate_with_embedder` so the consolidated
+/// memory is embedded inline (closes audit M2/AC2: previously the
+/// rolled-up memory had `embedding = None` and was invisible to hybrid
+/// recall until a manual `icm embed` rebuilt it).
+fn try_auto_consolidate(
+    store: &SqliteStore,
+    embedder: Option<&dyn Embedder>,
+    topic: &str,
+    threshold: usize,
+) -> String {
+    match store.auto_consolidate_with_embedder(topic, threshold, embedder) {
         Ok(true) => format!("Auto-consolidated topic '{topic}' (exceeded {threshold} entries)."),
         Ok(false) => String::new(),
         Err(e) => {
@@ -1066,7 +1076,7 @@ fn tool_store(
             if compact {
                 // Try auto-consolidation even in compact mode
                 let consolidation_msg =
-                    try_auto_consolidate(store, topic, AUTO_CONSOLIDATE_THRESHOLD);
+                    try_auto_consolidate(store, embedder, topic, AUTO_CONSOLIDATE_THRESHOLD);
                 if consolidation_msg.is_empty() {
                     ToolResult::text(format!("ok:{id}{link_suffix}"))
                 } else {
@@ -1074,7 +1084,7 @@ fn tool_store(
                 }
             } else {
                 let consolidation_msg =
-                    try_auto_consolidate(store, topic, AUTO_CONSOLIDATE_THRESHOLD);
+                    try_auto_consolidate(store, embedder, topic, AUTO_CONSOLIDATE_THRESHOLD);
                 if consolidation_msg.is_empty() {
                     // Still show a nudge if approaching threshold
                     let hint = if let Ok(count) = store.count_by_topic(topic) {

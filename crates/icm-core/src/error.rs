@@ -16,6 +16,11 @@ pub enum IcmError {
 
     #[error("embedding error: {0}")]
     Embedding(String),
+
+    /// Caller-supplied input violates a domain invariant (e.g. would
+    /// introduce a cycle in the concept graph, empty topic, etc.).
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 pub type IcmResult<T> = Result<T, IcmError>;

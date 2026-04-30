@@ -109,12 +109,42 @@ pub fn recall_context(
         return Ok(String::new());
     }
 
+    // Per-memory and aggregate caps to bound the injection size.
+    // Without these, a single oversized memory (e.g. 50KB summary)
+    // produced a 50KB system-reminder injection on every prompt — a
+    // 12k-token tax for one bad write. Users still see the head of
+    // the summary; the tail is ellipsised. Aggregate cap is applied
+    // after per-memory truncation so the bullet structure stays
+    // readable even when many memories are recalled.
+    const PER_MEMORY_CHAR_CAP: usize = 400;
+    const AGGREGATE_CHAR_CAP: usize = 4_000;
+
     let mut ctx = String::from(
         "Here is context from previous analysis of this project. \
          Use it to answer efficiently without re-reading files.\n\n",
     );
     for mem in &relevant {
-        ctx.push_str(&format!("- {}\n", mem.summary));
+        let summary = if mem.summary.chars().count() > PER_MEMORY_CHAR_CAP {
+            // Truncate at a UTF-8 boundary using char count, then add
+            // an ellipsis. We deliberately don't try to break on word
+            // or sentence boundaries — keeping the head of the text
+            // verbatim is more honest about what's stored.
+            let mut truncated: String = mem.summary.chars().take(PER_MEMORY_CHAR_CAP).collect();
+            truncated.push_str(" […]");
+            truncated
+        } else {
+            mem.summary.clone()
+        };
+        let line = format!("- {summary}\n");
+        if ctx.len() + line.len() > AGGREGATE_CHAR_CAP {
+            // Stop appending bullets — the aggregate cap dominates.
+            // The user gets the most relevant memories first (the
+            // caller already sorted by relevance) and a truncation
+            // marker so they know more was available.
+            ctx.push_str("- (recall context truncated — increase per-memory or aggregate caps)\n");
+            break;
+        }
+        ctx.push_str(&line);
     }
     ctx.push_str("\n---\n\n");
 

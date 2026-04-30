@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.35](https://github.com/rtk-ai/icm/compare/icm-v0.10.34...icm-v0.10.35) (2026-04-30)
+
+
+### Bug Fixes
+
+* **robustness:** audit batch 7 — versions, honorifics, wake-up cap, UTF-8 slice ([#148](https://github.com/rtk-ai/icm/issues/148)) ([edc0d3b](https://github.com/rtk-ai/icm/commit/edc0d3b6404c65759813c0ac7566a1810c8ced9d))
+
 ## [0.10.34](https://github.com/rtk-ai/icm/compare/icm-v0.10.33...icm-v0.10.34) (2026-04-30)
 
 

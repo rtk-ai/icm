@@ -223,8 +223,16 @@ enum Commands {
 
     /// Configure ICM integration for Claude Code / Claude Desktop
     Init {
-        /// Integration mode: mcp, cli, skill, hook, or all (default: mcp)
-        #[arg(short, long, default_value = "mcp")]
+        /// Integration mode (default: standard = cli + skill + hook, no MCP).
+        ///
+        /// - `standard` (default): inject CLAUDE.md instructions, install
+        ///   slash commands, register Claude Code hooks. No MCP server.
+        /// - `cli`: instructions only.
+        /// - `skill`: slash commands only.
+        /// - `hook`: hooks only.
+        /// - `mcp`: MCP server only (opt in if you want the JSON-RPC path).
+        /// - `all`: everything including MCP (legacy `--mode all` behavior).
+        #[arg(short, long, default_value = "standard")]
         mode: InitMode,
 
         /// Overwrite existing hook entries that point at a stale icm binary path
@@ -886,7 +894,14 @@ enum InitMode {
     Skill,
     /// Claude Code PostToolUse hook (auto-extract context)
     Hook,
-    /// All integration modes
+    /// Recommended setup: cli + skill + hook, no MCP. This is the new
+    /// default — bash/CLI integration is faster, more debuggable, and
+    /// doesn't need a long-running MCP server. Opt into MCP with
+    /// `--mode mcp` or `--mode all` if you specifically want it.
+    Standard,
+    /// All integration modes including MCP (cli + skill + hook + mcp).
+    /// Pre-existing users who relied on `--mode all` still get the same
+    /// behavior; the new MCP-free default is `standard`.
     All,
 }
 
@@ -2515,10 +2530,12 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     let codex_dir = cli_config_dir("CODEX_HOME", ".codex", &home);
     let copilot_dir = cli_config_dir("COPILOT_HOME", ".copilot", &home);
 
+    // `standard` enables cli + skill + hook (everything *except* MCP).
+    // `all` keeps the legacy meaning: cli + skill + hook + mcp.
     let do_mcp = matches!(mode, InitMode::Mcp | InitMode::All);
-    let do_cli = matches!(mode, InitMode::Cli | InitMode::All);
-    let do_skill = matches!(mode, InitMode::Skill | InitMode::All);
-    let do_hook = matches!(mode, InitMode::Hook | InitMode::All);
+    let do_cli = matches!(mode, InitMode::Cli | InitMode::All | InitMode::Standard);
+    let do_skill = matches!(mode, InitMode::Skill | InitMode::All | InitMode::Standard);
+    let do_hook = matches!(mode, InitMode::Hook | InitMode::All | InitMode::Standard);
 
     // --- MCP mode: configure MCP servers for all detected tools ---
     if do_mcp {
@@ -3007,6 +3024,13 @@ Do this BEFORE responding to the user. Not optional.
         println!();
         println!("Tip: run `icm init --mode hook` to also install Claude Code hooks");
         println!("     for automatic memory extraction and context recall.");
+    }
+    if !do_mcp {
+        println!();
+        println!("Note: MCP server is NOT installed by default. The `standard`");
+        println!("      mode uses CLI/Bash integration which is faster, more");
+        println!("      debuggable, and doesn't need a long-running MCP server.");
+        println!("      To opt in to MCP, run `icm init --mode mcp` (or `--mode all`).");
     }
 
     Ok(())

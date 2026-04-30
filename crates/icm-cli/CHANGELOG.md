@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.39](https://github.com/rtk-ai/icm/compare/icm-v0.10.38...icm-v0.10.39) (2026-04-30)
+
+
+### Bug Fixes
+
+* **deps:** restore vendored-openssl feature for cross-build pipeline ([#156](https://github.com/rtk-ai/icm/issues/156)) ([6493e87](https://github.com/rtk-ai/icm/commit/6493e8702ad284bd18bc8f5de54b45579e862aaf))
+
 ## [0.10.38](https://github.com/rtk-ai/icm/compare/icm-v0.10.37...icm-v0.10.38) (2026-04-30)
 
 

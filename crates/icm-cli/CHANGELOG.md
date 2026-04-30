@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.34](https://github.com/rtk-ai/icm/compare/icm-v0.10.33...icm-v0.10.34) (2026-04-30)
+
+
+### Bug Fixes
+
+* **security,robustness:** audit batch 6 — PreToolUse chain bypass + 4 robustness gaps ([#146](https://github.com/rtk-ai/icm/issues/146)) ([49c9789](https://github.com/rtk-ai/icm/commit/49c978960ad7f5e878ffc44f74771b35fe20ac84))
+
 ## [0.10.33](https://github.com/rtk-ai/icm/compare/icm-v0.10.32...icm-v0.10.33) (2026-04-30)
 
 

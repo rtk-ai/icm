@@ -1452,10 +1452,26 @@ fn cmd_recall(
 
                 // Graph-aware expansion: follow related_ids one hop and
                 // fold neighbors into results (discounted 0.5× score).
+                //
+                // Audit R13b: `expand_with_neighbors` fetches neighbors
+                // by id without re-applying our project / topic /
+                // keyword filters. Auto-link can connect memories
+                // across topics, so a project-A primary hit can pull
+                // in a project-B neighbor — bypassing the filter the
+                // caller asked for. Re-apply the filters to `expanded`
+                // after expansion so neighbors must still satisfy the
+                // requested scope.
                 let max_neighbors = (limit / 3).max(1);
-                let expanded = store
+                let mut expanded = store
                     .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
                     .unwrap_or(scored);
+                expanded.retain(|(m, _)| project_filter(m));
+                if let Some(t) = topic {
+                    expanded.retain(|(m, _)| topic_matches(&m.topic, t));
+                }
+                if let Some(kw) = keyword {
+                    expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
+                }
 
                 if expanded.is_empty() {
                     println!("{MSG_NO_MEMORIES}");
@@ -1491,9 +1507,17 @@ fn cmd_recall(
     // Graph-aware expansion also runs in the keyword-only fallback path.
     let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, 1.0)).collect();
     let max_neighbors = (limit / 3).max(1);
-    let expanded = store
+    let mut expanded = store
         .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
         .unwrap_or(scored);
+    // Same R13b re-filter on the FTS-fallback path.
+    expanded.retain(|(m, _)| project_filter(m));
+    if let Some(t) = topic {
+        expanded.retain(|(m, _)| topic_matches(&m.topic, t));
+    }
+    if let Some(kw) = keyword {
+        expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
+    }
 
     if expanded.is_empty() {
         println!("{MSG_NO_MEMORIES}");
@@ -2167,13 +2191,32 @@ fn extract_from_hook_transcript(
         Err(_) => return Ok(()), // Can't read transcript — fail silently
     };
 
-    // Extract assistant text from the last 100 JSONL lines.
-    // Supported formats:
-    //   Claude Code: {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
-    //   Codex:       {"type":"response_item","payload":{"role":"developer","content":[{"type":"text","text":"..."}]}}
-    //   Simple:      {"role":"assistant","content":"..."}
+    // Extract assistant text from the last 100 JSONL lines, in
+    // **chronological order**.
+    //
+    // Audit R7b: a previous version iterated `transcript.lines().rev()`
+    // and appended in that order, which scrambled the chronology so a
+    // ```code-fence``` opening in an older message could land AFTER its
+    // closing in the buffer. The splitter then either misses both
+    // markers (parity = 0) or treats the close as an open (parity = 1
+    // with prepend), and the orphaned mid-fence body leaks as prose
+    // (`panic!("...")` lines stored as memories).
+    //
+    // Fix: take the last 100 lines but feed them into the assembler in
+    // chronological order so any ```fence opening properly precedes
+    // its close. The splitter's existing in_code_fence state machine
+    // then correctly skips fenced regions end-to-end.
+    let recent_lines: Vec<&str> = {
+        let mut tail: Vec<&str> = transcript.lines().rev().take(100).collect();
+        tail.reverse();
+        tail
+    };
     let mut assistant_text = String::new();
-    for line in transcript.lines().rev().take(100) {
+    for line in recent_lines.iter().copied() {
+        // Supported formats:
+        //   Claude Code: {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
+        //   Codex:       {"type":"response_item","payload":{"role":"developer","content":[{"type":"text","text":"..."}]}}
+        //   Simple:      {"role":"assistant","content":"..."}
         if let Ok(entry) = serde_json::from_str::<Value>(line) {
             // Find the message object (varies by format)
             let msg = if entry.get("type").and_then(|t| t.as_str()) == Some("assistant") {

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.37](https://github.com/rtk-ai/icm/compare/icm-v0.10.36...icm-v0.10.37) (2026-04-30)
+
+
+### Bug Fixes
+
+* **docs,cli:** audit batch 9 — extract_every help text + 12 README count drifts ([#152](https://github.com/rtk-ai/icm/issues/152)) ([834ddd3](https://github.com/rtk-ai/icm/commit/834ddd3197c7ed259d746eccd485e650fdc0da2e))
+
 ## [0.10.36](https://github.com/rtk-ai/icm/compare/icm-v0.10.35...icm-v0.10.36) (2026-04-30)
 
 

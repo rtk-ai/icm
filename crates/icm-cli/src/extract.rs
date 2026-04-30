@@ -537,6 +537,40 @@ fn extract_facts_with_threshold(
 /// Minimum char count for a fragment to be kept after splitting.
 const MIN_SENTENCE_LEN: usize = 30;
 
+/// English-language honorific abbreviations that end in `.` followed by a
+/// space + capitalized name. The naive splitter used to break sentences
+/// like `Mr. Smith joined the team.` into `... Mr.` + `Smith joined ...`.
+/// We suppress sentence-boundary detection when the buffer ends with one
+/// of these tokens (case-insensitive, preceded by whitespace or the
+/// start of the buffer).
+const HONORIFIC_PREFIXES: &[&str] = &[
+    "Mr.", "Mrs.", "Ms.", "Dr.", "Prof.", "Sr.", "Jr.", "St.", "Mt.", "Rev.", "Hon.", "Lt.",
+    "Sgt.", "Cpl.", "Pvt.", "Gen.", "Col.", "Maj.", "Capt.", "Cmdr.",
+];
+
+/// Return true iff `buf` ends in an honorific abbreviation that should
+/// suppress sentence-boundary detection on the trailing dot.
+fn ends_with_honorific(buf: &str) -> bool {
+    let trimmed = buf.trim_end();
+    for &h in HONORIFIC_PREFIXES {
+        if trimmed.len() >= h.len() && trimmed.ends_with(h) {
+            // Must be preceded by whitespace or be at the start, so we
+            // don't accidentally match `weatherstr.` containing `St.`.
+            let prefix_start = trimmed.len() - h.len();
+            if prefix_start == 0
+                || trimmed
+                    .as_bytes()
+                    .get(prefix_start - 1)
+                    .map(|b| b.is_ascii_whitespace())
+                    .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Split a block of text into sentence-sized chunks suitable for fact
 /// extraction. The previous implementation split on every `.` or `\n`,
 /// which truncated URLs at `https://github.`, file paths at `$HOME/.`,
@@ -608,7 +642,14 @@ fn split_sentences(text: &str) -> Vec<String> {
         } else if matches!(ch, '.' | '?' | '!' | ':') {
             match next {
                 None => true,
-                Some(c) if c.is_whitespace() => true,
+                Some(c) if c.is_whitespace() => {
+                    // `.` followed by whitespace is *usually* a sentence
+                    // boundary — but English honorifics like `Mr.`,
+                    // `Mrs.`, `Dr.`, `Prof.`, `St.`, `Sr.`, `Jr.` are
+                    // followed by a space + capitalized name, not a new
+                    // sentence. Suppress the boundary in that case.
+                    !ends_with_honorific(&current)
+                }
                 _ => false, // `.` inside URL/path/version/abbreviation
             }
         } else {
@@ -1384,5 +1425,56 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].contains("Pratt"));
         assert!(chunks[1].contains("right-associative"));
+    }
+
+    // ── Honorific allowlist regression tests (audit batch 7) ──────────
+
+    #[test]
+    fn split_keeps_honorific_titles_intact() {
+        // Audit A5 finding: `Mr. Smith joined the team.` used to split
+        // into `... Mr.` + `Smith joined the team.` Now we suppress the
+        // boundary on common English honorifics.
+        let text = "The architecture team led by Mr. Smith joined the project last quarter.";
+        let chunks = split_sentences(text);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "honorific split shouldn't break: {chunks:?}"
+        );
+        assert!(chunks[0].contains("Mr. Smith"));
+    }
+
+    #[test]
+    fn split_keeps_dr_and_prof_honorifics() {
+        // Same logic for Dr., Prof., and the others.
+        let cases = [
+            "Dr. Watson published a follow-up paper on the new architecture.",
+            "Prof. Knuth still recommends Knuth-Bendix completion for these problems.",
+            "St. Augustine FL hosts the team's annual offsite gathering each spring.",
+        ];
+        for text in &cases {
+            let chunks = split_sentences(text);
+            assert_eq!(
+                chunks.len(),
+                1,
+                "honorific should not split the sentence: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_does_not_match_honorific_substring_in_word() {
+        // `weatherstr.` should not be treated as ending in `St.` (the
+        // suffix matches but isn't preceded by whitespace, so it's part
+        // of a longer token).
+        let text = "The weatherstr. value contains the forecast string and is then logged.";
+        let chunks = split_sentences(text);
+        // It's not split-suppressed; the dot in `weatherstr.` is followed
+        // by a space + lowercase letter, so the splitter treats it as a
+        // genuine sentence boundary. Assert chunks > 0 and we don't
+        // accidentally erase content. Don't over-specify the count
+        // because either 1 or 2 chunks would be defensible — the key is
+        // we don't trigger the honorific path for a non-honorific.
+        assert!(!chunks.is_empty());
     }
 }

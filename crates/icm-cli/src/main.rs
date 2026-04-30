@@ -2045,9 +2045,20 @@ fn extract_from_hook_transcript(store: &SqliteStore, source: &str) -> Result<()>
         return Ok(());
     }
 
-    // Truncate to last 4000 chars to keep extraction reasonable
+    // Truncate to last 4000 bytes to keep extraction reasonable.
+    //
+    // The original raw byte slice `&assistant_text[len-4000..]` panics
+    // when the cut-point lands inside a multibyte UTF-8 char (Cyrillic
+    // 2B, CJK 3B, emoji 4B). Find the nearest UTF-8 char boundary at or
+    // after `len-4000` instead. Result is at most 4000 bytes long; we
+    // accept losing a few leading bytes to char-align rather than
+    // panicking on multilingual transcripts.
     let text = if assistant_text.len() > 4000 {
-        &assistant_text[assistant_text.len() - 4000..]
+        let mut start = assistant_text.len() - 4000;
+        while start < assistant_text.len() && !assistant_text.is_char_boundary(start) {
+            start += 1;
+        }
+        &assistant_text[start..]
     } else {
         &assistant_text
     };

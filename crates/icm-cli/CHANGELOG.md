@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.38](https://github.com/rtk-ai/icm/compare/icm-v0.10.37...icm-v0.10.38) (2026-04-30)
+
+
+### Bug Fixes
+
+* **deps:** audit batch 10 — drop tokio "full" + remove dead openssl dep ([#154](https://github.com/rtk-ai/icm/issues/154)) ([fbc3aa5](https://github.com/rtk-ai/icm/commit/fbc3aa514d56d2b56ebde133cff973a9f03c9ee8))
+
 ## [0.10.37](https://github.com/rtk-ai/icm/compare/icm-v0.10.36...icm-v0.10.37) (2026-04-30)
 
 

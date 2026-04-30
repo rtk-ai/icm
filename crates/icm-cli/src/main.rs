@@ -434,9 +434,16 @@ enum HookCommands {
     Pre,
     /// PostToolUse hook: auto-extract context every N tool calls
     Post {
-        /// Extract every N tool calls (default from config, fallback: 10)
-        #[arg(long, default_value = "15")]
-        every: usize,
+        /// Override how often to extract (every N tool calls).
+        ///
+        /// When omitted, uses `[extraction] extract_every` from config
+        /// (built-in default: 3). Audit M3/M6 found that the previous
+        /// help text claimed "default 15, fallback 10" while the actual
+        /// config default was 3 — three different numbers across help,
+        /// config example, and code. Made it Option-typed to drop the
+        /// sentinel and document the real default.
+        #[arg(long)]
+        every: Option<usize>,
     },
     /// PreCompact hook: extract memories from transcript before context compression
     Compact,
@@ -1237,11 +1244,8 @@ fn main() -> Result<()> {
         Commands::Hook { command } => match command {
             HookCommands::Pre => cmd_hook_pre(),
             HookCommands::Post { every } => {
-                let extract_every = if every != 15 {
-                    every // CLI flag overrides config
-                } else {
-                    cfg.extraction.extract_every
-                };
+                // CLI flag wins over config; absent flag falls back to config.
+                let extract_every = every.unwrap_or(cfg.extraction.extract_every);
                 #[cfg(feature = "embeddings")]
                 let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
                 #[cfg(not(feature = "embeddings"))]

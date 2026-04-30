@@ -201,7 +201,7 @@ icm memoir export -m "system-architecture" -f json     # 全メタデータ付�
 icm memoir export -m "system-architecture" -f dot | dot -Tsvg > graph.svg
 ```
 
-## MCPツール（22個）
+## MCPツール（31個）
 
 ### メモリツール
 

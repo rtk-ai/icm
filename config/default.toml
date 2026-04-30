@@ -44,6 +44,17 @@ min_score = 3.0
 # Maximum facts per extraction pass
 max_facts = 10
 
+# Extract every N PostToolUse hook fires (i.e. every N tool calls in a
+# Claude Code / Gemini / Codex / Copilot session). Lower = more
+# aggressive (more memories, more noise); higher = quieter. The
+# `--every` CLI flag on `icm hook post` overrides this.
+extract_every = 3
+
+# Store the raw tool output as a low-importance memory when the
+# rule-based extractor produces no facts. Useful as a coarse safety
+# net; set to `false` if you only want signal-rich extractions.
+store_raw = true
+
 [recall]
 # Layer 2: context injection before sessions
 enabled = true

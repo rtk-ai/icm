@@ -201,7 +201,7 @@ icm memoir export -m "architektura-systemu" -f json     # Strukturalny JSON ze w
 icm memoir export -m "architektura-systemu" -f dot | dot -Tsvg > graph.svg
 ```
 
-## Narzędzia MCP (22)
+## Narzędzia MCP (31)
 
 ### Narzędzia pamięci
 

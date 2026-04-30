@@ -240,10 +240,32 @@ fn categorize(m: &Memory) -> Category {
 /// Always includes at least one memory if any candidate exists.
 /// Counts user-visible characters (not bytes) so multibyte summaries aren't
 /// over-penalized.
+///
+/// **Smart truncation**: oversized memories are trimmed to a per-memory
+/// cap (with `[…]` suffix) instead of being included verbatim or
+/// blocking subsequent memories from fitting. Without this, a single
+/// 5KB memory at the front of the candidate list either:
+///   - filled the entire budget and starved the rest (small budgets), or
+///   - was emitted verbatim (large budgets), bloating the wake-up pack.
 fn truncate_by_budget(candidates: Vec<ScoredMemory>, max_chars: usize) -> Vec<ScoredMemory> {
+    // Per-memory cap: a single memory shouldn't consume more than half
+    // the budget. Below 200 chars we keep the cap at 200 so very small
+    // budgets still admit a usable head + ellipsis.
+    let per_memory_cap = (max_chars / 2).max(200);
+
     let mut total = 0usize;
     let mut out = Vec::new();
-    for c in candidates {
+    for mut c in candidates {
+        let summary_chars = c.memory.summary.chars().count();
+        if summary_chars > per_memory_cap {
+            // Truncate at a UTF-8 char boundary. We deliberately don't
+            // try to break on word/sentence boundary — the head of the
+            // summary is what carries signal; the tail is usually
+            // elaboration. Add a `[…]` marker so the user knows.
+            let mut truncated: String = c.memory.summary.chars().take(per_memory_cap).collect();
+            truncated.push_str(" […]");
+            c.memory.summary = truncated;
+        }
         // Account for bullet prefix + newline.
         let line_len = c.memory.summary.chars().count().saturating_add(4);
         if !out.is_empty() && total.saturating_add(line_len) > max_chars {

@@ -1,6 +1,6 @@
 [package]
 name = "icm-store"
-version = "0.10.2"
+version = "0.10.34"
 edition = "2021"
 
 [dependencies]

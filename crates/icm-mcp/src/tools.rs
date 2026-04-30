@@ -921,6 +921,18 @@ fn tool_store(
         None => return ToolResult::error("missing required field: content".into()),
     };
 
+    // Empty-string validation: the inputSchema marks `topic` and
+    // `content` as required, but JSON allows passing `""` which slips
+    // past the structural check. Reject explicitly so callers don't
+    // silently end up with a memory under a blank topic that they
+    // can't meaningfully recall.
+    if topic.trim().is_empty() {
+        return ToolResult::error("topic must not be empty".into());
+    }
+    if content.trim().is_empty() {
+        return ToolResult::error("content must not be empty".into());
+    }
+
     // Input length validation
     if topic.len() > MAX_TOPIC_LEN {
         return ToolResult::error(format!(
@@ -2815,6 +2827,8 @@ mod tests {
 
     #[test]
     fn test_empty_topic_field() {
+        // Audit finding: empty `topic: ""` was accepted as if it were a
+        // valid topic, producing recall-invisible memories. Must reject.
         let store = test_store();
         let result = call_tool(
             &store,
@@ -2823,12 +2837,19 @@ mod tests {
             &json!({"topic": "", "content": "empty topic"}),
             false,
         );
-        // Should either reject or store; must not panic
-        assert!(!result.content.is_empty());
+        assert!(result.is_error, "empty topic should be rejected");
+        assert!(
+            result.content[0].text.contains("topic must not be empty"),
+            "got: {}",
+            result.content[0].text
+        );
     }
 
     #[test]
     fn test_whitespace_only_fields() {
+        // Whitespace-only is the same class of bug as empty: trims to
+        // empty so the user can never recall it back, but the structural
+        // type-check (string-typed) lets it slip through.
         let store = test_store();
         let result = call_tool(
             &store,
@@ -2837,8 +2858,7 @@ mod tests {
             &json!({"topic": "   \t\n  ", "content": "   \n\t  "}),
             false,
         );
-        // Should either reject or store; must not panic
-        assert!(!result.content.is_empty());
+        assert!(result.is_error, "whitespace-only topic should be rejected");
     }
 
     #[test]

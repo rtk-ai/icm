@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.36](https://github.com/rtk-ai/icm/compare/icm-v0.10.35...icm-v0.10.36) (2026-04-30)
+
+
+### Bug Fixes
+
+* **consistency:** audit batch 8 — auto-consolidate paths, embedding, cycles, feedback list ([#150](https://github.com/rtk-ai/icm/issues/150)) ([004458a](https://github.com/rtk-ai/icm/commit/004458a1831e757c630f475f345ddaf6abd5e671))
+
 ## [0.10.35](https://github.com/rtk-ai/icm/compare/icm-v0.10.34...icm-v0.10.35) (2026-04-30)
 
 

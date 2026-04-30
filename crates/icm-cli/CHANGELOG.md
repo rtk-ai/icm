@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.33](https://github.com/rtk-ai/icm/compare/icm-v0.10.32...icm-v0.10.33) (2026-04-30)
+
+
+### Bug Fixes
+
+* **extract:** URL/path/version-aware sentence splitter ([#144](https://github.com/rtk-ai/icm/issues/144)) ([cde26df](https://github.com/rtk-ai/icm/commit/cde26df910adc5a92fe6f22af782e42f42146a8e))
+
 ## [0.10.32](https://github.com/rtk-ai/icm/compare/icm-v0.10.31...icm-v0.10.32) (2026-04-29)
 
 

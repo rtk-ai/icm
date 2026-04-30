@@ -1198,10 +1198,23 @@ fn tool_recall(
                 // each primary hit and fold neighbors into the result set.
                 // Neighbors carry a discounted score so they rank below
                 // direct matches but can displace weak primary results.
+                //
+                // Audit R13b: neighbors are fetched by id without going
+                // through the project / topic / keyword filters above,
+                // so a project-A primary hit can pull in a project-B
+                // neighbor via auto-linked `related_ids`. Re-apply the
+                // filters to `expanded` so the caller's scope is honored.
                 let max_neighbors = (limit / 3).max(1);
-                let expanded = store
+                let mut expanded = store
                     .expand_with_neighbors(&scored_results, max_neighbors, 0.5, limit)
                     .unwrap_or(scored_results);
+                expanded.retain(|(m, _)| project_filter(m));
+                if let Some(t) = topic {
+                    expanded.retain(|(m, _)| topic_matches(&m.topic, t));
+                }
+                if let Some(kw) = keyword {
+                    expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
+                }
 
                 // Batch update access counts (includes expanded neighbors)
                 let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
@@ -1245,10 +1258,18 @@ fn tool_recall(
 
     // Graph-aware expansion also applies in the fallback path so that
     // keyword-only deployments benefit from auto-linked memories.
+    // Same R13b re-filter as the hybrid path.
     let max_neighbors = (limit / 3).max(1);
-    let expanded = store
+    let mut expanded = store
         .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
         .unwrap_or(scored);
+    expanded.retain(|(m, _)| project_filter(m));
+    if let Some(t) = topic {
+        expanded.retain(|(m, _)| topic_matches(&m.topic, t));
+    }
+    if let Some(kw) = keyword {
+        expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
+    }
 
     // Batch update access counts (includes expanded neighbors)
     let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();

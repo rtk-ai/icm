@@ -7,9 +7,9 @@ use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
 use zerocopy::IntoBytes;
 
 use icm_core::{
-    Concept, ConceptLink, Feedback, FeedbackStats, FeedbackStore, IcmError, IcmResult, Importance,
-    Label, Memoir, MemoirStats, MemoirStore, Memory, MemorySource, MemoryStore, Message,
-    PatternCluster, Relation, Role, Session, StoreStats, TopicHealth, TranscriptHit,
+    Concept, ConceptLink, Embedder, Feedback, FeedbackStats, FeedbackStore, IcmError, IcmResult,
+    Importance, Label, Memoir, MemoirStats, MemoirStore, Memory, MemorySource, MemoryStore,
+    Message, PatternCluster, Relation, Role, Session, StoreStats, TopicHealth, TranscriptHit,
     TranscriptStats, TranscriptStore,
 };
 
@@ -1317,6 +1317,28 @@ impl MemoirStore for SqliteStore {
     // --- Graph ---
 
     fn add_link(&self, link: ConceptLink) -> IcmResult<String> {
+        // Reject self-links: A→A is meaningless and produces a 1-step
+        // cycle. Caller usually catches this earlier but the store is
+        // the authoritative invariant gate.
+        if link.source_id == link.target_id {
+            return Err(IcmError::InvalidInput(format!(
+                "self-link rejected: source and target are the same concept ({})",
+                link.source_id
+            )));
+        }
+        // Cycle detection: BFS from `target` following outgoing edges.
+        // If we can reach `source`, the new edge would close a cycle
+        // (source → target → ... → source). Reject before insert.
+        //
+        // The BFS is bounded by the number of links currently in the
+        // memoir, so worst-case it touches every link once. For typical
+        // memoirs (<10k links) this is sub-millisecond.
+        if self.would_create_cycle(&link.source_id, &link.target_id)? {
+            return Err(IcmError::InvalidInput(format!(
+                "concept link rejected: {} → {} would create a cycle in the graph",
+                link.source_id, link.target_id
+            )));
+        }
         self.conn
             .execute(
                 "INSERT INTO concept_links (id, source_id, target_id, relation, weight, created_at)
@@ -2220,12 +2242,75 @@ impl TranscriptStore for SqliteStore {
 // ---------------------------------------------------------------------------
 
 impl SqliteStore {
+    /// Would inserting an edge `source → target` close a cycle in the
+    /// concept graph? BFS from `target` along outgoing edges; if we
+    /// reach `source`, the new edge would form a cycle.
+    ///
+    /// Returns `Ok(false)` for the empty-graph case and bounds the
+    /// search to a depth-limit equal to twice the link count to avoid
+    /// pathological loops on already-corrupt graphs.
+    fn would_create_cycle(&self, source: &str, target: &str) -> IcmResult<bool> {
+        if source == target {
+            return Ok(true);
+        }
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(target.to_string());
+        visited.insert(target.to_string());
+        // Soft cap on traversal — guards against malformed pre-existing
+        // cycles (which shouldn't exist, but the user could have edited
+        // the DB by hand).
+        let cap = 10_000;
+        let mut steps = 0;
+        while let Some(current) = queue.pop_front() {
+            steps += 1;
+            if steps > cap {
+                tracing::warn!(
+                    "would_create_cycle: BFS hit {cap}-step cap while checking {source} → {target}"
+                );
+                break;
+            }
+            for next_link in self.get_links_from(&current)? {
+                if next_link.target_id == source {
+                    return Ok(true);
+                }
+                if visited.insert(next_link.target_id.clone()) {
+                    queue.push_back(next_link.target_id);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Automatically consolidate a topic if it exceeds the threshold.
     ///
     /// Keeps the top 3 summaries (by weight), merges all unique keywords,
     /// and replaces all memories with a single consolidated memory.
     /// Returns `true` if consolidation was performed.
+    ///
+    /// Backwards-compatible no-embedder variant. Prefer
+    /// [`auto_consolidate_with_embedder`] for new code so the
+    /// consolidated memory keeps a fresh embedding instead of being
+    /// silently un-recallable via vector search.
     pub fn auto_consolidate(&self, topic: &str, threshold: usize) -> IcmResult<bool> {
+        self.auto_consolidate_with_embedder(topic, threshold, None)
+    }
+
+    /// Same as [`auto_consolidate`] but also embeds the consolidated
+    /// memory when an embedder is available.
+    ///
+    /// Audit finding M2/AC2: the no-embedder variant produced a
+    /// consolidated memory with `embedding = None`, leaving it
+    /// invisible to hybrid / vector search until a manual `icm embed`
+    /// rebuilt it. With this variant the embedder is invoked inline so
+    /// the consolidated memory is recall-ready as soon as the topic is
+    /// rolled up.
+    pub fn auto_consolidate_with_embedder(
+        &self,
+        topic: &str,
+        threshold: usize,
+        embedder: Option<&dyn Embedder>,
+    ) -> IcmResult<bool> {
         let count = self.count_by_topic(topic)?;
         if count < threshold {
             return Ok(false);
@@ -2271,6 +2356,22 @@ impl SqliteStore {
         consolidated.raw_excerpt =
             Some(format!("auto-consolidated from {original_count} memories"));
         consolidated.weight = 1.0;
+
+        // Embed the consolidated content if an embedder is available so
+        // hybrid recall picks it up immediately. Errors are logged and
+        // swallowed — a partial consolidation (no embedding) is still
+        // better than blocking the whole rollup on an embedder hiccup.
+        if let Some(emb) = embedder {
+            match emb.embed(&consolidated.embed_text()) {
+                Ok(vec) => consolidated.embedding = Some(vec),
+                Err(e) => {
+                    tracing::warn!(
+                        "auto-consolidate: embedding failed for topic '{topic}': {e}; \
+                         consolidated memory will lack vector representation"
+                    );
+                }
+            }
+        }
 
         // Replace all memories in the topic with the consolidated one
         self.consolidate_topic(topic, consolidated)?;
@@ -2956,6 +3057,59 @@ mod tests {
         let link = ConceptLink::new(c_id.clone(), c_id, Relation::RelatedTo);
         let result = store.add_link(link);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transitive_cycle_rejected() {
+        // Audit M11/CYC1: A → B → C → A used to be silently accepted,
+        // corrupting BFS in `get_neighborhood`. Now the third edge
+        // (closing the cycle) is rejected with `InvalidInput`.
+        let store = test_store();
+        let m_id = store.create_memoir(make_memoir("proj")).unwrap();
+        let a = store.add_concept(make_concept(&m_id, "A", "a")).unwrap();
+        let b = store.add_concept(make_concept(&m_id, "B", "b")).unwrap();
+        let c = store.add_concept(make_concept(&m_id, "C", "c")).unwrap();
+
+        // A → B: ok
+        store
+            .add_link(ConceptLink::new(a.clone(), b.clone(), Relation::DependsOn))
+            .unwrap();
+        // B → C: ok
+        store
+            .add_link(ConceptLink::new(b.clone(), c.clone(), Relation::Refines))
+            .unwrap();
+        // C → A: would close the cycle — reject
+        let cycle_attempt = store.add_link(ConceptLink::new(c, a, Relation::RelatedTo));
+        assert!(
+            cycle_attempt.is_err(),
+            "C → A should be rejected as a cycle"
+        );
+        let err_msg = cycle_attempt.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cycle"),
+            "error message should mention cycle: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_dag_links_still_allowed() {
+        // Sanity: rejecting cycles must not break legitimate DAG links.
+        let store = test_store();
+        let m_id = store.create_memoir(make_memoir("proj")).unwrap();
+        let a = store.add_concept(make_concept(&m_id, "A", "a")).unwrap();
+        let b = store.add_concept(make_concept(&m_id, "B", "b")).unwrap();
+        let c = store.add_concept(make_concept(&m_id, "C", "c")).unwrap();
+
+        // A → B, A → C, B → C — three edges in a DAG, all should pass.
+        store
+            .add_link(ConceptLink::new(a.clone(), b.clone(), Relation::DependsOn))
+            .unwrap();
+        store
+            .add_link(ConceptLink::new(a, c.clone(), Relation::DependsOn))
+            .unwrap();
+        store
+            .add_link(ConceptLink::new(b, c, Relation::Refines))
+            .unwrap();
     }
 
     #[test]
@@ -4278,6 +4432,46 @@ mod tests {
         let result = store.auto_consolidate("bulk", 10).unwrap();
         assert!(result);
         assert_eq!(store.count_by_topic("bulk").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_auto_consolidate_with_embedder_attaches_embedding() {
+        // Audit M2/AC2: the embedder-aware variant must produce a
+        // consolidated memory that is recall-ready (embedding != None).
+        struct StubEmbedder;
+        impl icm_core::Embedder for StubEmbedder {
+            fn embed(&self, _text: &str) -> IcmResult<Vec<f32>> {
+                Ok(vec![0.42; icm_core::DEFAULT_EMBEDDING_DIMS])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                Ok(texts
+                    .iter()
+                    .map(|_| vec![0.42; icm_core::DEFAULT_EMBEDDING_DIMS])
+                    .collect())
+            }
+            fn dimensions(&self) -> usize {
+                icm_core::DEFAULT_EMBEDDING_DIMS
+            }
+        }
+        let store = test_store();
+        for i in 0..11 {
+            store
+                .store(make_memory("rolled", &format!("fact {i}")))
+                .unwrap();
+        }
+        let stub = StubEmbedder;
+        let did = store
+            .auto_consolidate_with_embedder("rolled", 10, Some(&stub))
+            .unwrap();
+        assert!(did);
+        let consolidated = store.get_by_topic("rolled").unwrap();
+        assert_eq!(consolidated.len(), 1);
+        let embedding = consolidated[0]
+            .embedding
+            .as_ref()
+            .expect("consolidated memory must have an embedding");
+        assert_eq!(embedding.len(), icm_core::DEFAULT_EMBEDDING_DIMS);
+        assert!((embedding[0] - 0.42).abs() < 1e-6);
     }
 
     #[test]

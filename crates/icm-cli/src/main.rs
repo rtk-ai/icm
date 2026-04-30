@@ -676,6 +676,22 @@ enum FeedbackCommands {
         limit: usize,
     },
 
+    /// List feedback entries (optionally filtered by topic).
+    ///
+    /// Mirror of `Search` without the FTS query — useful for browsing
+    /// all feedback under a single topic (e.g. all corrections to the
+    /// `predictions-deploy` topic) without having to come up with a
+    /// keyword that intersects every entry.
+    List {
+        /// Filter by topic (omit to list across all topics)
+        #[arg(short, long)]
+        topic: Option<String>,
+
+        /// Maximum results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
     /// Show feedback statistics
     Stats,
 }
@@ -938,6 +954,7 @@ fn main() -> Result<()> {
             cmd_store(
                 &store,
                 emb_ref,
+                &cfg.memory,
                 topic,
                 content,
                 importance.into(),
@@ -993,6 +1010,9 @@ fn main() -> Result<()> {
                 topic,
                 limit,
             } => cmd_feedback_search(&store, &query, topic.as_deref(), limit),
+            FeedbackCommands::List { topic, limit } => {
+                cmd_feedback_list(&store, topic.as_deref(), limit)
+            }
             FeedbackCommands::Stats => cmd_feedback_stats(&store),
         },
         Commands::Transcript { command } => match command {
@@ -1158,7 +1178,14 @@ fn main() -> Result<()> {
             keywords,
         } => {
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            cmd_save_project(&store, emb_ref, &content, importance.into(), keywords)
+            cmd_save_project(
+                &store,
+                emb_ref,
+                &cfg.memory,
+                &content,
+                importance.into(),
+                keywords,
+            )
         }
         Commands::Learn { dir, name } => {
             let dir = dir
@@ -1215,9 +1242,25 @@ fn main() -> Result<()> {
                 } else {
                     cfg.extraction.extract_every
                 };
-                cmd_hook_post(&store, extract_every, cfg.extraction.store_raw)
+                #[cfg(feature = "embeddings")]
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                #[cfg(not(feature = "embeddings"))]
+                let emb_ref: Option<&dyn icm_core::Embedder> = None;
+                cmd_hook_post(
+                    &store,
+                    emb_ref,
+                    &cfg.memory,
+                    extract_every,
+                    cfg.extraction.store_raw,
+                )
             }
-            HookCommands::Compact => cmd_hook_compact(&store),
+            HookCommands::Compact => {
+                #[cfg(feature = "embeddings")]
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                #[cfg(not(feature = "embeddings"))]
+                let emb_ref: Option<&dyn icm_core::Embedder> = None;
+                cmd_hook_compact(&store, emb_ref, &cfg.memory)
+            }
             HookCommands::Prompt => cmd_hook_prompt(&store),
             HookCommands::Start { max_tokens } => {
                 let tokens = if max_tokens > 0 {
@@ -1227,7 +1270,13 @@ fn main() -> Result<()> {
                 };
                 cmd_hook_start(&store, tokens)
             }
-            HookCommands::End => cmd_hook_end(&store),
+            HookCommands::End => {
+                #[cfg(feature = "embeddings")]
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                #[cfg(not(feature = "embeddings"))]
+                let emb_ref: Option<&dyn icm_core::Embedder> = None;
+                cmd_hook_end(&store, emb_ref, &cfg.memory)
+            }
         },
         #[cfg(feature = "tui")]
         Commands::Dashboard => {
@@ -1246,9 +1295,39 @@ fn main() -> Result<()> {
 // Memory commands
 // ---------------------------------------------------------------------------
 
+/// If `auto_consolidate_enabled` is set, fire the rollup for the given topic.
+///
+/// Audit finding M2/AC1: only the MCP `tool_store` path used to trigger
+/// consolidation. The CLI `icm store` and the PostToolUse / PreCompact /
+/// SessionEnd hook extractions all bypassed the threshold check, so a
+/// user with `auto_consolidate_enabled = true` would never see a rollup
+/// unless they wrote via MCP. This helper centralises the trigger so
+/// every write path stays consistent. Errors are logged and swallowed
+/// — consolidation is a maintenance op, not on the critical path.
+fn maybe_auto_consolidate(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    topic: &str,
+    cfg: &crate::config::MemoryConfig,
+) {
+    if !cfg.auto_consolidate_enabled {
+        return;
+    }
+    match store.auto_consolidate_with_embedder(topic, cfg.auto_consolidate_threshold, embedder) {
+        Ok(true) => eprintln!(
+            "[icm] auto-consolidated topic '{topic}' (exceeded {} entries)",
+            cfg.auto_consolidate_threshold
+        ),
+        Ok(false) => {} // below threshold — no-op
+        Err(e) => tracing::warn!("auto-consolidate failed for topic '{topic}': {e}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_store(
     store: &SqliteStore,
     embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
     topic: String,
     content: String,
     importance: Importance,
@@ -1299,6 +1378,10 @@ fn cmd_store(
             if linked_ids.len() == 1 { "" } else { "s" }
         );
     }
+
+    // Auto-consolidate the topic if config says so. Closes audit M2/AC1.
+    maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+
     Ok(())
 }
 
@@ -1563,6 +1646,34 @@ fn cmd_feedback_search(
     let results = store.search_feedback(query, topic, limit)?;
     if results.is_empty() {
         println!("No feedback found.");
+        return Ok(());
+    }
+
+    for fb in &results {
+        println!("--- {} [{}] ---", fb.id, fb.topic);
+        println!("  context:   {}", fb.context);
+        println!("  predicted: {}", fb.predicted);
+        println!("  corrected: {}", fb.corrected);
+        if let Some(ref reason) = fb.reason {
+            println!("  reason:    {reason}");
+        }
+        if !fb.source.is_empty() {
+            println!("  source:    {}", fb.source);
+        }
+        if fb.applied_count > 0 {
+            println!("  applied:   {} times", fb.applied_count);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_feedback_list(store: &SqliteStore, topic: Option<&str>, limit: usize) -> Result<()> {
+    let results = store.list_feedback(topic, limit)?;
+    if results.is_empty() {
+        match topic {
+            Some(t) => println!("No feedback found in topic '{t}'."),
+            None => println!("No feedback found."),
+        }
         return Ok(());
     }
 
@@ -1894,7 +2005,13 @@ fn is_icm_command(cmd: &str) -> bool {
 
 /// PostToolUse hook: auto-extract context every N tool calls.
 /// Reads JSON from stdin. Runs extraction asynchronously.
-fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> Result<()> {
+fn cmd_hook_post(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+    extract_every: usize,
+    store_raw: bool,
+) -> Result<()> {
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -1940,7 +2057,14 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> 
 
     // Extract facts and store (with raw text fallback if enabled)
     match extract::extract_and_store_with_opts(store, tool_output, &project, store_raw) {
-        Ok(n) if n > 0 => eprintln!("[icm] auto-extracted {n} facts from tool output"),
+        Ok(n) if n > 0 => {
+            eprintln!("[icm] auto-extracted {n} facts from tool output");
+            // Audit M3: extracted facts all land under context-{project}.
+            // If the user has auto-consolidate enabled, fire it now so the
+            // hook path stops bypassing the rollup.
+            let topic = format!("context-{project}");
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+        }
         _ => {}
     }
 
@@ -1948,8 +2072,12 @@ fn cmd_hook_post(store: &SqliteStore, extract_every: usize, store_raw: bool) -> 
 }
 
 /// PreCompact hook (Layer 1): extract memories from transcript before context compression.
-fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
-    extract_from_hook_transcript(store, "pre-compact")
+fn cmd_hook_compact(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+) -> Result<()> {
+    extract_from_hook_transcript(store, embedder, memory_cfg, "pre-compact")
 }
 
 /// SessionEnd hook (Layer 1b): extract memories from transcript before the
@@ -1959,8 +2087,12 @@ fn cmd_hook_compact(store: &SqliteStore) -> Result<()> {
 /// Same transcript-parsing logic as PreCompact — the only difference is the
 /// log prefix. SqliteStore handles its own dedup so a session that triggers
 /// both PreCompact and SessionEnd back-to-back will not double-store facts.
-fn cmd_hook_end(store: &SqliteStore) -> Result<()> {
-    extract_from_hook_transcript(store, "session-end")
+fn cmd_hook_end(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+) -> Result<()> {
+    extract_from_hook_transcript(store, embedder, memory_cfg, "session-end")
 }
 
 /// Read JSON from stdin, locate the transcript file, parse the last 100
@@ -1969,7 +2101,12 @@ fn cmd_hook_end(store: &SqliteStore) -> Result<()> {
 ///
 /// Reads JSON from stdin with `transcript_path`, reads the JSONL transcript,
 /// and extracts facts from assistant messages.
-fn extract_from_hook_transcript(store: &SqliteStore, source: &str) -> Result<()> {
+fn extract_from_hook_transcript(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+    source: &str,
+) -> Result<()> {
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -2071,7 +2208,14 @@ fn extract_from_hook_transcript(store: &SqliteStore, source: &str) -> Result<()>
         .unwrap_or_else(|| "project".to_string());
 
     match extract::extract_and_store_with_opts(store, text, &project, true) {
-        Ok(n) if n > 0 => eprintln!("[icm] {source}: extracted {n} facts from transcript"),
+        Ok(n) if n > 0 => {
+            eprintln!("[icm] {source}: extracted {n} facts from transcript");
+            // Audit M3/AC1: fire auto-consolidate after the bulk extract
+            // so the PreCompact / SessionEnd path stops bypassing the
+            // rollup configured in `[memory] auto_consolidate_enabled`.
+            let topic = format!("context-{project}");
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+        }
         _ => {}
     }
 
@@ -3943,6 +4087,7 @@ fn cmd_wake_up(
 fn cmd_save_project(
     store: &SqliteStore,
     embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
     content: &str,
     importance: Importance,
     keywords: Option<String>,
@@ -3955,6 +4100,7 @@ fn cmd_save_project(
     cmd_store(
         store,
         embedder,
+        memory_cfg,
         topic,
         content.to_string(),
         importance,

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.40](https://github.com/rtk-ai/icm/compare/icm-v0.10.39...icm-v0.10.40) (2026-04-30)
+
+
+### Features
+
+* **init:** default to CLI-only integration (no MCP) ([#158](https://github.com/rtk-ai/icm/issues/158)) ([fcfbb73](https://github.com/rtk-ai/icm/commit/fcfbb73b72383ea75b0f050c1cb4adea0c02f362))
+
 ## [0.10.39](https://github.com/rtk-ai/icm/compare/icm-v0.10.38...icm-v0.10.39) (2026-04-30)
 
 

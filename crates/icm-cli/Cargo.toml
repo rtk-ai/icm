@@ -1,6 +1,6 @@
 [package]
 name = "icm-cli"
-version = "0.10.39"
+version = "0.10.40"
 edition = "2021"
 description = "Permanent memory for AI agents"
 license = "Apache-2.0"

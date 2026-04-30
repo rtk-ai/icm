@@ -20,9 +20,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    build_wake_up, keyword_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore,
-    Importance, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
-    WakeUpOptions, MSG_NO_MEMORIES,
+    build_wake_up, is_preference_topic, keyword_matches, project_matches, topic_matches, Concept,
+    ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir, MemoirStore, Memory,
+    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -86,6 +86,14 @@ enum Commands {
         /// Filter results by keyword
         #[arg(short = 'k', long)]
         keyword: Option<String>,
+
+        /// Restrict to memories under this project (segment-aware match
+        /// against topic, with `preferences` always passing through).
+        /// Pass `""` to opt out explicitly. When omitted, no project
+        /// filter is applied — symmetric with the MCP `icm_memory_recall`
+        /// tool's `project` arg (audit R13).
+        #[arg(short = 'p', long)]
+        project: Option<String>,
     },
 
     /// List memories
@@ -989,6 +997,7 @@ fn main() -> Result<()> {
             topic,
             limit,
             keyword,
+            project,
         } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -1001,6 +1010,7 @@ fn main() -> Result<()> {
                 topic.as_deref(),
                 limit,
                 keyword.as_deref(),
+                project.as_deref(),
             )
         }
         Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
@@ -1411,17 +1421,28 @@ fn cmd_recall(
     topic: Option<&str>,
     limit: usize,
     keyword: Option<&str>,
+    project: Option<&str>,
 ) -> Result<()> {
     // Auto-decay if >24h since last decay
     if let Err(e) = store.maybe_auto_decay() {
         tracing::warn!(error = %e, "auto-decay failed during recall");
     }
 
+    // Project filter: same segment-aware filter the MCP path uses.
+    // `Some("")` is the explicit opt-out signal. `None` means no filter.
+    let project_filter = |m: &Memory| -> bool {
+        match project {
+            None | Some("") => true,
+            Some(p) => is_preference_topic(&m.topic) || project_matches(&m.topic, Some(p)),
+        }
+    };
+
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
         if let Ok(query_emb) = emb.embed(query) {
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored = results;
+                scored.retain(|(m, _)| project_filter(m));
                 if let Some(t) = topic {
                     scored.retain(|(m, _)| topic_matches(&m.topic, t));
                 }
@@ -1459,6 +1480,7 @@ fn cmd_recall(
         results = store.search_by_keywords(&keywords, limit)?;
     }
 
+    results.retain(project_filter);
     if let Some(t) = topic {
         results.retain(|m| topic_matches(&m.topic, t));
     }
@@ -2209,7 +2231,7 @@ fn extract_from_hook_transcript(
     // after `len-4000` instead. Result is at most 4000 bytes long; we
     // accept losing a few leading bytes to char-align rather than
     // panicking on multilingual transcripts.
-    let text = if assistant_text.len() > 4000 {
+    let truncated: &str = if assistant_text.len() > 4000 {
         let mut start = assistant_text.len() - 4000;
         while start < assistant_text.len() && !assistant_text.is_char_boundary(start) {
             start += 1;
@@ -2217,6 +2239,24 @@ fn extract_from_hook_transcript(
         &assistant_text[start..]
     } else {
         &assistant_text
+    };
+
+    // Audit R7: if the byte truncation cut the transcript mid-fence
+    // (the opening ```lang line lives in the dropped prefix), the
+    // splitter starts in normal-text mode and treats the orphaned code
+    // body as prose — caught the panic line `panic!(...)` from inside
+    // a Rust block leaking into stored memories. Detect by parity: a
+    // balanced fenced region contains an even number of ``` markers
+    // (open + close = 2). An odd count means we cut mid-fence; prepend
+    // a synthetic ``` line so the splitter immediately enters fence
+    // mode and skips through to the close that's still in the buffer.
+    let fence_count = truncated.matches("```").count();
+    let text_owned: String;
+    let text: &str = if fence_count % 2 == 1 {
+        text_owned = format!("```\n{truncated}");
+        &text_owned
+    } else {
+        truncated
     };
 
     let project = json
@@ -2445,11 +2485,19 @@ fn cmd_decay(store: &SqliteStore, factor: f32) -> Result<()> {
 
 fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
     if dry_run {
+        // The dry-run filter MUST mirror what `SqliteStore::prune` actually
+        // does, otherwise `--dry-run` lies. Audit R16 caught this: the
+        // store hard-protects both Critical AND High (see
+        // `crates/icm-store/src/store.rs:700-718`), but the dry-run was
+        // only excluding Critical, over-counting prune victims by ~30%
+        // in mixed-importance topics.
         let topics = store.list_topics()?;
         let mut count = 0;
         for (t, _) in &topics {
             for mem in store.get_by_topic(t)? {
-                if mem.weight < threshold && mem.importance != Importance::Critical {
+                if mem.weight < threshold
+                    && !matches!(mem.importance, Importance::Critical | Importance::High)
+                {
                     count += 1;
                     println!(
                         "  [dry-run] would prune: {} ({}, weight={:.3})",

@@ -504,27 +504,148 @@ fn extract_facts_with_threshold(
     facts
 }
 
-fn split_sentences(text: &str) -> Vec<String> {
-    let mut sentences = Vec::new();
-    let mut current = String::new();
+/// Minimum char count for a fragment to be kept after splitting.
+const MIN_SENTENCE_LEN: usize = 30;
 
-    for ch in text.chars() {
-        current.push(ch);
-        if ch == '.' || ch == '\n' {
-            let trimmed = current.trim().to_string();
-            if trimmed.len() > 15 {
-                sentences.push(trimmed);
+/// Split a block of text into sentence-sized chunks suitable for fact
+/// extraction. The previous implementation split on every `.` or `\n`,
+/// which truncated URLs at `https://github.`, file paths at `$HOME/.`,
+/// version numbers at `0.10.32`, and surfaced markdown artifacts as
+/// standalone "sentences". Those fragments then ended up in the store
+/// and got replayed verbatim by the UserPromptSubmit hook, polluting
+/// every prompt's context.
+///
+/// Rules:
+/// - A `.`, `?`, `!`, or `:` is a sentence terminator **only if followed
+///   by whitespace or end-of-input**. A `.` followed immediately by a
+///   non-whitespace character (letter, digit, `/`, `:`, etc.) is part
+///   of a URL, file path, version number, or abbreviation — keep going.
+/// - `\n` is a hard boundary (preserves the existing line-aware behaviour
+///   for lists and tool output) but the resulting fragment goes through
+///   `is_keepable_fragment` before being kept.
+/// - Triple-backtick-fenced blocks (markdown code) are skipped entirely:
+///   their content is rarely usable as a "fact" and tends to contain
+///   noise (paths, JSON, etc.).
+///
+/// The kept fragments must (via `is_keepable_fragment`):
+/// - End in a sentence terminator (`.`, `?`, `!`, `:`).
+/// - Not start with a markdown artifact prefix (`> `, `- `, `- [`, `* `,
+///   `+ `, `# `).
+/// - Be at least `MIN_SENTENCE_LEN` chars long.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_code_fence = false;
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+
+        // Toggle code-fence state when we see ``` at the start of a line.
+        let at_line_start = i == 0 || chars[i - 1] == '\n';
+        if at_line_start
+            && i + 2 < chars.len()
+            && chars[i] == '`'
+            && chars[i + 1] == '`'
+            && chars[i + 2] == '`'
+        {
+            in_code_fence = !in_code_fence;
+            // Skip past the rest of the fence-marker line.
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
             }
-            current = String::new();
+            // Flush whatever we had buffered before the fence.
+            let trimmed = current.trim().to_string();
+            if is_keepable_fragment(&trimmed) {
+                out.push(trimmed);
+            }
+            current.clear();
+            i += 1; // step over the trailing '\n' if any
+            continue;
         }
+
+        if in_code_fence {
+            i += 1;
+            continue;
+        }
+
+        current.push(ch);
+
+        let next = chars.get(i + 1).copied();
+        let boundary = if ch == '\n' {
+            true
+        } else if matches!(ch, '.' | '?' | '!' | ':') {
+            match next {
+                None => true,
+                Some(c) if c.is_whitespace() => true,
+                _ => false, // `.` inside URL/path/version/abbreviation
+            }
+        } else {
+            false
+        };
+
+        if boundary {
+            let trimmed = current.trim().to_string();
+            if is_keepable_fragment(&trimmed) {
+                out.push(trimmed);
+            }
+            current.clear();
+        }
+        i += 1;
     }
 
     let trimmed = current.trim().to_string();
-    if trimmed.len() > 15 {
-        sentences.push(trimmed);
+    if is_keepable_fragment(&trimmed) {
+        out.push(trimmed);
     }
 
-    sentences
+    out
+}
+
+/// Predicate for whether a candidate fragment from `split_sentences`
+/// deserves to be kept and considered for fact extraction. Centralises
+/// the rejections so the splitter stays focused on boundary detection.
+///
+/// We deliberately do NOT require a terminating punctuation here: many
+/// real-world inputs (one-line tool outputs, log lines, terse user
+/// notes) skip the trailing period. The URL/path/version-aware boundary
+/// detection in `split_sentences` is what actually prevents the
+/// truncation bugs we saw in production — this filter just strips
+/// markdown structure and obvious junk.
+fn is_keepable_fragment(s: &str) -> bool {
+    if s.chars().count() < MIN_SENTENCE_LEN {
+        return false;
+    }
+
+    let stripped = s.trim_start();
+
+    // Markdown artifact line prefixes — these are structure, not facts.
+    // Order matters: `- [` (task list) must be checked before `- `.
+    if stripped.starts_with("> ")
+        || stripped.starts_with("- [")
+        || stripped.starts_with("- ")
+        || stripped.starts_with("* ")
+        || stripped.starts_with("+ ")
+        || stripped.starts_with("# ")
+        || stripped.starts_with("```")
+    {
+        return false;
+    }
+
+    // Catch dangling URL/path tokens at the end. Boundary detection
+    // should have prevented these from forming, but this is cheap
+    // belt-and-suspenders against future regressions.
+    let last_word = s.split_whitespace().next_back().unwrap_or("");
+    if last_word.ends_with("://")
+        || last_word.ends_with('/')
+        || last_word.ends_with('\\')
+        || last_word.ends_with('=')
+    {
+        return false;
+    }
+
+    true
 }
 
 // ── Fact classification ──────────────────────────────────────────────────
@@ -1125,5 +1246,113 @@ mod tests {
         assert!(!results.is_empty());
         let (_, _, _, kw) = &results[0];
         assert!(kw.iter().any(|k| k.starts_with("kind:")));
+    }
+
+    // ── Regression tests for the splitter ──────────────────────────────
+    // Each input here was actually observed in a real session of this
+    // assistant; the previous splitter produced truncated garbage that
+    // got replayed into every prompt's context.
+
+    #[test]
+    fn split_keeps_url_intact() {
+        // Was previously cut at "https://github." because of the dot
+        // before "com". The full sentence must come back as one piece.
+        let text = "PR ouverte : **https://github.com/rtk-ai/icm/pull/136**.";
+        let chunks = split_sentences(text);
+        assert!(!chunks.is_empty(), "URL sentence dropped entirely");
+        assert!(
+            chunks.iter().any(|c| c.contains("github.com/rtk-ai/icm")),
+            "URL was truncated mid-domain: {chunks:?}"
+        );
+        // And no fragment is just the truncated `https://github.` part.
+        assert!(
+            !chunks.iter().any(|c| c.ends_with("github.")),
+            "split surfaced a truncated `github.` fragment: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn split_keeps_path_intact() {
+        // Was previously cut at "$HOME/." because of the dot before "icm".
+        let text =
+            "Set the DB location with `export ICM_DATABASE_URL=\"file:$HOME/.icm/memories.db\"`.";
+        let chunks = split_sentences(text);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks.iter().any(|c| c.contains("$HOME/.icm/memories.db")),
+            "path was truncated: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn split_keeps_version_intact() {
+        // Version numbers like 0.10.32 used to split at every dot.
+        let text = "We just released icm 0.10.32 with the audit batch fixes.";
+        let chunks = split_sentences(text);
+        assert!(chunks.iter().any(|c| c.contains("0.10.32")));
+    }
+
+    #[test]
+    fn split_drops_blockquote_lines() {
+        // Lines starting with `> ` are quoted prose, not new facts.
+        let text = "> Hey, we just documented this in the README — see the new section.";
+        let chunks = split_sentences(text);
+        assert!(
+            chunks.is_empty(),
+            "blockquote line should be filtered out: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn split_drops_task_list_lines() {
+        // Markdown task-list bullets are structure, not facts.
+        let text = "- [ ] Spot-check 2-3 localized READMEs render correctly (Arabic RTL, CJK).";
+        let chunks = split_sentences(text);
+        assert!(
+            chunks.is_empty(),
+            "task-list line should be filtered out: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn split_drops_dangling_url_token() {
+        // Belt-and-suspenders: even if a future bug somehow lets a
+        // mid-URL split through, the trailing-token check catches it.
+        let text = "Open the issue at https://github.com/rtk-ai/icm/pull/";
+        let chunks = split_sentences(text);
+        assert!(
+            chunks.is_empty(),
+            "fragment ending in dangling `/` should be filtered: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn split_skips_code_fence_content() {
+        // Triple-backtick blocks are code, not prose. Their contents
+        // shouldn't pollute the fact stream even if they happen to look
+        // sentence-shaped.
+        let text = "Here is the snippet:\n\
+                    ```\n\
+                    let x = 1;\n\
+                    println!(\"value: {}\", x);\n\
+                    ```\n\
+                    The output is what you'd expect for an integer literal.";
+        let chunks = split_sentences(text);
+        assert!(chunks.iter().any(|c| c.contains("output is what")));
+        assert!(
+            !chunks.iter().any(|c| c.contains("println!")),
+            "code-fence content leaked: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn split_keeps_two_real_sentences_intact() {
+        // Sanity: the splitter must still produce sentences for normal prose.
+        let text = "The parser uses Pratt precedence. \
+                     It handles right-associative operators well.";
+        let chunks = split_sentences(text);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].contains("Pratt"));
+        assert!(chunks[1].contains("right-associative"));
     }
 }

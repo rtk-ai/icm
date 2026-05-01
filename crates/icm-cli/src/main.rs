@@ -6,6 +6,7 @@ mod extract;
 mod import;
 #[cfg(test)]
 mod learn_tests;
+mod recall_format;
 #[cfg(feature = "tui")]
 mod tui;
 mod upgrade;
@@ -94,6 +95,13 @@ enum Commands {
         /// tool's `project` arg (audit R13).
         #[arg(short = 'p', long)]
         project: Option<String>,
+
+        /// Output format. `toon` is compact (header + rows) and is the
+        /// best fit when the stdout gets piped into an LLM context.
+        /// `detail` reproduces the legacy multi-line labelled view for
+        /// human terminal reading. `json` emits a parseable array.
+        #[arg(short = 'f', long, default_value = "toon")]
+        format: recall_format::RecallFormat,
     },
 
     /// List memories
@@ -998,6 +1006,7 @@ fn main() -> Result<()> {
             limit,
             keyword,
             project,
+            format,
         } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -1011,6 +1020,7 @@ fn main() -> Result<()> {
                 limit,
                 keyword.as_deref(),
                 project.as_deref(),
+                format,
             )
         }
         Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
@@ -1414,6 +1424,7 @@ fn cmd_store(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_recall(
     store: &SqliteStore,
     embedder: Option<&dyn icm_core::Embedder>,
@@ -1422,6 +1433,7 @@ fn cmd_recall(
     limit: usize,
     keyword: Option<&str>,
     project: Option<&str>,
+    format: recall_format::RecallFormat,
 ) -> Result<()> {
     // Auto-decay if >24h since last decay
     if let Err(e) = store.maybe_auto_decay() {
@@ -1437,99 +1449,76 @@ fn cmd_recall(
         }
     };
 
-    // Try hybrid search if embedder is available
-    if let Some(emb) = embedder {
-        if let Ok(query_emb) = emb.embed(query) {
-            if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
-                let mut scored = results;
-                scored.retain(|(m, _)| project_filter(m));
-                if let Some(t) = topic {
-                    scored.retain(|(m, _)| topic_matches(&m.topic, t));
-                }
-                if let Some(kw) = keyword {
-                    scored.retain(|(m, _)| keyword_matches(&m.keywords, kw));
-                }
+    // Try hybrid search if embedder is available; fall back to FTS / keywords.
+    let scored: Option<Vec<(Memory, f32)>> = embedder
+        .and_then(|emb| emb.embed(query).ok())
+        .and_then(|query_emb| store.search_hybrid(query, &query_emb, limit).ok());
 
-                // Graph-aware expansion: follow related_ids one hop and
-                // fold neighbors into results (discounted 0.5× score).
-                //
-                // Audit R13b: `expand_with_neighbors` fetches neighbors
-                // by id without re-applying our project / topic /
-                // keyword filters. Auto-link can connect memories
-                // across topics, so a project-A primary hit can pull
-                // in a project-B neighbor — bypassing the filter the
-                // caller asked for. Re-apply the filters to `expanded`
-                // after expansion so neighbors must still satisfy the
-                // requested scope.
-                let max_neighbors = (limit / 3).max(1);
-                let mut expanded = store
-                    .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
-                    .unwrap_or(scored);
-                expanded.retain(|(m, _)| project_filter(m));
-                if let Some(t) = topic {
-                    expanded.retain(|(m, _)| topic_matches(&m.topic, t));
-                }
-                if let Some(kw) = keyword {
-                    expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
-                }
+    let (mut results, has_score): (Vec<(Memory, Option<f32>)>, bool) = match scored {
+        Some(scored) => {
+            let pairs = scored.into_iter().map(|(m, s)| (m, Some(s))).collect();
+            (pairs, true)
+        }
+        None => {
+            let mut fts = store.search_fts(query, limit)?;
+            if fts.is_empty() {
+                let kws: Vec<&str> = query.split_whitespace().collect();
+                fts = store.search_by_keywords(&kws, limit)?;
+            }
+            (fts.into_iter().map(|m| (m, None)).collect(), false)
+        }
+    };
 
-                if expanded.is_empty() {
-                    println!("{MSG_NO_MEMORIES}");
-                    return Ok(());
-                }
-
-                let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
-                let _ = store.batch_update_access(&ids);
-                for (mem, score) in &expanded {
-                    print_memory_detail(mem, Some(*score));
-                }
-                return Ok(());
+    let filter = |pair: &(Memory, Option<f32>)| -> bool {
+        let (m, _) = pair;
+        if !project_filter(m) {
+            return false;
+        }
+        if let Some(t) = topic {
+            if !topic_matches(&m.topic, t) {
+                return false;
             }
         }
-    }
+        if let Some(kw) = keyword {
+            if !keyword_matches(&m.keywords, kw) {
+                return false;
+            }
+        }
+        true
+    };
 
-    // Fallback: FTS then keywords
-    let mut results = store.search_fts(query, limit)?;
+    results.retain(&filter);
 
-    if results.is_empty() {
-        let keywords: Vec<&str> = query.split_whitespace().collect();
-        results = store.search_by_keywords(&keywords, limit)?;
-    }
-
-    results.retain(project_filter);
-    if let Some(t) = topic {
-        results.retain(|m| topic_matches(&m.topic, t));
-    }
-    if let Some(kw) = keyword {
-        results.retain(|m| keyword_matches(&m.keywords, kw));
-    }
-
-    // Graph-aware expansion also runs in the keyword-only fallback path.
-    let scored: Vec<(Memory, f32)> = results.into_iter().map(|m| (m, 1.0)).collect();
+    // Graph-aware expansion: follow related_ids one hop and fold
+    // neighbours back in (discounted ×0.5). Audit R13b: re-apply
+    // project/topic/keyword filters after expansion since auto-link can
+    // pull cross-scope neighbours.
+    let scored_for_expand: Vec<(Memory, f32)> = results
+        .iter()
+        .map(|(m, s)| (m.clone(), s.unwrap_or(1.0)))
+        .collect();
     let max_neighbors = (limit / 3).max(1);
-    let mut expanded = store
-        .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
-        .unwrap_or(scored);
-    // Same R13b re-filter on the FTS-fallback path.
-    expanded.retain(|(m, _)| project_filter(m));
-    if let Some(t) = topic {
-        expanded.retain(|(m, _)| topic_matches(&m.topic, t));
-    }
-    if let Some(kw) = keyword {
-        expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
-    }
+    let expanded = store
+        .expand_with_neighbors(&scored_for_expand, max_neighbors, 0.5, limit)
+        .unwrap_or(scored_for_expand);
 
-    if expanded.is_empty() {
+    let mut final_results: Vec<(Memory, Option<f32>)> = if has_score {
+        expanded.into_iter().map(|(m, s)| (m, Some(s))).collect()
+    } else {
+        expanded.into_iter().map(|(m, _)| (m, None)).collect()
+    };
+    final_results.retain(&filter);
+
+    if final_results.is_empty() {
         println!("{MSG_NO_MEMORIES}");
         return Ok(());
     }
 
-    let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
+    let ids: Vec<&str> = final_results.iter().map(|(m, _)| m.id.as_str()).collect();
     let _ = store.batch_update_access(&ids);
-    for (mem, _) in &expanded {
-        print_memory_detail(mem, None);
-    }
 
+    let rendered = recall_format::render(&final_results, format)?;
+    print!("{rendered}");
     Ok(())
 }
 

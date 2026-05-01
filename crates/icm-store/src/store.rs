@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 use chrono::{DateTime, Utc};
+use lru::LruCache;
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
 use zerocopy::IntoBytes;
 
@@ -38,8 +40,17 @@ fn ensure_sqlite_vec() {
     });
 }
 
+/// In-process LRU cache size for hot memories. Each entry is one
+/// fully-hydrated `Memory` (incl. optional 384×f32 embedding ≈ 1.5KB),
+/// so 256 entries cap RAM at ~400KB worst case. Helps long-running
+/// processes (`icm serve`, TUI) where the same memories are read
+/// repeatedly; zero benefit in one-shot CLI invocations beyond the
+/// single recall flow.
+const MEMORY_CACHE_CAP: usize = 256;
+
 pub struct SqliteStore {
     conn: Connection,
+    cache: Mutex<LruCache<String, Memory>>,
 }
 
 impl SqliteStore {
@@ -61,7 +72,10 @@ impl SqliteStore {
         )
         .map_err(db_err)?;
         init_db_with_dims(&conn, embedding_dims)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            cache: Mutex::new(new_cache()),
+        })
     }
 
     /// Apply decay if more than 24 hours since last decay.
@@ -123,8 +137,47 @@ impl SqliteStore {
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
             .map_err(db_err)?;
         init_db(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            cache: Mutex::new(new_cache()),
+        })
     }
+
+    fn cache_get(&self, id: &str) -> Option<Memory> {
+        self.cache.lock().ok().and_then(|mut c| c.get(id).cloned())
+    }
+
+    fn cache_put(&self, m: &Memory) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.put(m.id.clone(), m.clone());
+        }
+    }
+
+    fn cache_invalidate(&self, id: &str) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.pop(id);
+        }
+    }
+
+    fn cache_invalidate_many(&self, ids: &[&str]) {
+        if let Ok(mut c) = self.cache.lock() {
+            for id in ids {
+                c.pop(*id);
+            }
+        }
+    }
+
+    fn cache_clear(&self) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.clear();
+        }
+    }
+}
+
+fn new_cache() -> LruCache<String, Memory> {
+    let cap = NonZeroUsize::new(MEMORY_CACHE_CAP)
+        .expect("MEMORY_CACHE_CAP must be non-zero — see store.rs");
+    LruCache::new(cap)
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +400,10 @@ impl MemoryStore for SqliteStore {
     }
 
     fn get(&self, id: &str) -> IcmResult<Option<Memory>> {
+        if let Some(m) = self.cache_get(id) {
+            return Ok(Some(m));
+        }
+
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT {SELECT_COLS} FROM memories WHERE id = ?1"))
@@ -357,6 +414,9 @@ impl MemoryStore for SqliteStore {
             .optional()
             .map_err(db_err)?;
 
+        if let Some(ref m) = result {
+            self.cache_put(m);
+        }
         Ok(result)
     }
 
@@ -413,6 +473,7 @@ impl MemoryStore for SqliteStore {
                 .map_err(db_err)?;
         }
 
+        self.cache_invalidate(&memory.id);
         Ok(())
     }
 
@@ -429,6 +490,7 @@ impl MemoryStore for SqliteStore {
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
         }
+        self.cache_invalidate(id);
         Ok(())
     }
 
@@ -645,6 +707,7 @@ impl MemoryStore for SqliteStore {
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
         }
+        self.cache_invalidate(id);
         Ok(())
     }
 
@@ -667,6 +730,7 @@ impl MemoryStore for SqliteStore {
         let refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
         let changed = self.conn.execute(&sql, refs.as_slice()).map_err(db_err)?;
+        self.cache_invalidate_many(ids);
         Ok(changed)
     }
 
@@ -694,6 +758,9 @@ impl MemoryStore for SqliteStore {
             )
             .map_err(db_err)?;
 
+        // Decay touches every non-critical row's weight; can't selectively
+        // invalidate without re-reading rows, so just nuke the cache.
+        self.cache_clear();
         Ok(changed)
     }
 
@@ -714,6 +781,9 @@ impl MemoryStore for SqliteStore {
             )
             .map_err(db_err)?;
 
+        if changed > 0 {
+            self.cache_clear();
+        }
         Ok(changed)
     }
 
@@ -804,6 +874,8 @@ impl MemoryStore for SqliteStore {
         }
 
         self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+        // Bulk delete + re-insert touches arbitrarily many cached entries.
+        self.cache_clear();
         Ok(())
     }
 
@@ -2406,25 +2478,33 @@ impl SqliteStore {
         }
 
         let initial_ids: HashSet<String> = initial.iter().map(|(m, _)| m.id.clone()).collect();
-        let mut neighbors: Vec<(Memory, f32)> = Vec::new();
-        let mut seen_neighbors: HashSet<String> = HashSet::new();
 
-        // Walk initial results in score order (they're already sorted).
-        for (mem, score) in initial {
+        // Phase 1 — collect candidate neighbour ids in score-priority order
+        // up to max_neighbors. We track parent scores here so we can apply
+        // the hop discount once memories come back from the batched fetch.
+        let mut candidates: Vec<(String, f32)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        'outer: for (mem, score) in initial {
             for neighbor_id in &mem.related_ids {
-                if initial_ids.contains(neighbor_id) || seen_neighbors.contains(neighbor_id) {
+                if candidates.len() >= max_neighbors {
+                    break 'outer;
+                }
+                if initial_ids.contains(neighbor_id) || !seen.insert(neighbor_id.clone()) {
                     continue;
                 }
-                if let Some(n) = self.get(neighbor_id)? {
-                    seen_neighbors.insert(n.id.clone());
-                    neighbors.push((n, score * hop_discount));
-                    if neighbors.len() >= max_neighbors {
-                        break;
-                    }
-                }
+                candidates.push((neighbor_id.clone(), *score));
             }
-            if neighbors.len() >= max_neighbors {
-                break;
+        }
+
+        // Phase 2 — single batched SELECT instead of N round-trips.
+        let mut neighbors: Vec<(Memory, f32)> = Vec::new();
+        if !candidates.is_empty() {
+            let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+            let fetched = self.get_many(&ids)?;
+            for (id, parent_score) in candidates {
+                if let Some(m) = fetched.get(&id) {
+                    neighbors.push((m.clone(), parent_score * hop_discount));
+                }
             }
         }
 
@@ -2434,6 +2514,78 @@ impl SqliteStore {
         combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         combined.truncate(max_total);
         Ok(combined)
+    }
+
+    /// Fetch many memories by id in one round-trip, deduplicated by id.
+    ///
+    /// Cache-aware: cached entries are served from memory, misses are
+    /// batched into a single `IN (?,?,…)` query. Missing ids are
+    /// silently dropped — callers expecting a strict mapping should
+    /// diff their input vs the returned map.
+    pub fn get_many(&self, ids: &[&str]) -> IcmResult<HashMap<String, Memory>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Dedup so the IN clause gets at most one slot per id.
+        let mut unique: Vec<&str> = Vec::with_capacity(ids.len());
+        let mut seen: HashSet<&str> = HashSet::new();
+        for id in ids {
+            if seen.insert(*id) {
+                unique.push(*id);
+            }
+        }
+
+        // Phase 1 — pull cache hits aside, leaving only true misses for SQL.
+        let mut out: HashMap<String, Memory> = HashMap::with_capacity(unique.len());
+        let mut misses: Vec<&str> = Vec::with_capacity(unique.len());
+        if let Ok(mut cache) = self.cache.lock() {
+            for id in &unique {
+                if let Some(m) = cache.get(*id) {
+                    out.insert((*id).to_string(), m.clone());
+                } else {
+                    misses.push(*id);
+                }
+            }
+        } else {
+            misses.extend_from_slice(&unique);
+        }
+
+        if misses.is_empty() {
+            return Ok(out);
+        }
+
+        // Phase 2 — single batched SELECT for the misses.
+        let placeholders: Vec<String> = (1..=misses.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM memories WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let params_vec: Vec<&dyn rusqlite::types::ToSql> = misses
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt
+            .query_map(params_vec.as_slice(), row_to_memory)
+            .map_err(db_err)?;
+
+        let mut fetched: Vec<Memory> = Vec::new();
+        for row in rows {
+            fetched.push(row.map_err(db_err)?);
+        }
+
+        if let Ok(mut cache) = self.cache.lock() {
+            for m in &fetched {
+                cache.put(m.id.clone(), m.clone());
+            }
+        }
+        for m in fetched {
+            out.insert(m.id.clone(), m);
+        }
+        Ok(out)
     }
 
     /// Get memories by topic prefix (e.g., "wshm" matches "wshm:owner/repo").
@@ -4709,6 +4861,160 @@ mod tests {
         let initial = vec![(store.get(&id1).unwrap().unwrap(), 0.9)];
         let expanded = store.expand_with_neighbors(&initial, 5, 0.5, 10).unwrap();
         assert_eq!(expanded.len(), 1, "ghost link must be silently skipped");
+    }
+
+    // ── get_many (batched fetch) ─────────────────────────────────────────
+
+    #[test]
+    fn test_get_many_returns_requested_ids() {
+        let store = test_store();
+        let m1 = make_memory("t", "first");
+        let m2 = make_memory("t", "second");
+        let m3 = make_memory("t", "third");
+        let id1 = store.store(m1.clone()).unwrap();
+        let id2 = store.store(m2.clone()).unwrap();
+        store.store(m3).unwrap();
+
+        let got = store.get_many(&[id1.as_str(), id2.as_str()]).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains_key(&id1));
+        assert!(got.contains_key(&id2));
+    }
+
+    #[test]
+    fn test_get_many_empty_input_returns_empty() {
+        let store = test_store();
+        let got = store.get_many(&[]).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn test_get_many_missing_ids_silently_dropped() {
+        let store = test_store();
+        let m1 = make_memory("t", "real");
+        let id1 = store.store(m1).unwrap();
+
+        let got = store.get_many(&[id1.as_str(), "01NONEXISTENT"]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got.contains_key(&id1));
+    }
+
+    #[test]
+    fn test_get_many_dedupes_input() {
+        let store = test_store();
+        let m1 = make_memory("t", "only");
+        let id1 = store.store(m1).unwrap();
+
+        // Same id three times — must not blow up the IN clause.
+        let got = store
+            .get_many(&[id1.as_str(), id1.as_str(), id1.as_str()])
+            .unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    // ── LRU cache invalidation ────────────────────────────────────────────
+
+    #[test]
+    fn test_cache_serves_after_first_get() {
+        let store = test_store();
+        let m = make_memory("t", "original");
+        let id = store.store(m).unwrap();
+
+        // Warm the cache.
+        let first = store.get(&id).unwrap().unwrap();
+        assert_eq!(first.summary, "original");
+
+        // Mutate the row out-of-band so a stale cache hit would show.
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET summary = 'mutated' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        // Cache is unaware of the raw SQL write, so we should still
+        // see "original" — that's the proof the cache is serving reads.
+        let cached = store.get(&id).unwrap().unwrap();
+        assert_eq!(cached.summary, "original", "cache must serve hot reads");
+    }
+
+    #[test]
+    fn test_update_invalidates_cache() {
+        let store = test_store();
+        let m = make_memory("t", "v1");
+        let id = store.store(m).unwrap();
+
+        // Warm cache.
+        let _ = store.get(&id).unwrap();
+
+        // Proper update through the trait flushes the cache entry.
+        let mut updated = store.get(&id).unwrap().unwrap();
+        updated.summary = "v2".into();
+        store.update(&updated).unwrap();
+
+        let after = store.get(&id).unwrap().unwrap();
+        assert_eq!(after.summary, "v2");
+    }
+
+    #[test]
+    fn test_delete_invalidates_cache() {
+        let store = test_store();
+        let m = make_memory("t", "doomed");
+        let id = store.store(m).unwrap();
+
+        // Warm the cache, then delete.
+        let _ = store.get(&id).unwrap();
+        store.delete(&id).unwrap();
+
+        let after = store.get(&id).unwrap();
+        assert!(after.is_none(), "deleted memory must not survive in cache");
+    }
+
+    #[test]
+    fn test_apply_decay_clears_cache() {
+        let store = test_store();
+        let m1 = make_memory("t", "a");
+        let m2 = make_memory("t", "b");
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+
+        // Warm cache for both.
+        let before1 = store.get(&id1).unwrap().unwrap().weight;
+        let _ = store.get(&id2).unwrap();
+
+        store.apply_decay(0.5).unwrap();
+
+        // After decay, cache must have been wiped, so the next read
+        // returns the decayed weight from disk.
+        let after1 = store.get(&id1).unwrap().unwrap().weight;
+        assert!(
+            after1 < before1,
+            "post-decay weight should reflect DB, not stale cache (before={before1}, after={after1})"
+        );
+    }
+
+    #[test]
+    fn test_get_many_uses_cache_for_warm_ids() {
+        let store = test_store();
+        let m = make_memory("t", "warm");
+        let id = store.store(m).unwrap();
+
+        // Warm the cache via single get.
+        let _ = store.get(&id).unwrap();
+
+        // Out-of-band mutate — cached value should still be served by
+        // get_many for this id.
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET summary = 'mutated' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let got = store.get_many(&[id.as_str()]).unwrap();
+        assert_eq!(got.get(&id).unwrap().summary, "warm");
     }
 
     #[test]

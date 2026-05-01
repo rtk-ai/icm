@@ -1,0 +1,44 @@
+name: PR Target Branch Check
+
+on:
+  pull_request_target:
+    types: [opened, edited]
+
+jobs:
+  check-target:
+    runs-on: ubuntu-latest
+    # Only flag PRs targeting main that don't come from develop. develop→main
+    # PRs are the maintainer release path and must not be flagged.
+    if: >-
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref != 'develop'
+    steps:
+      - name: Add wrong-base label and comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: ['wrong-base'],
+            });
+
+            const body = `Thanks for the PR! It looks like this targets \`main\`, but contributor PRs should target the **\`develop\`** branch.
+
+            \`main\` is reserved for stable releases (only \`develop\` → \`main\` PRs cut by maintainers via release-please).
+
+            To fix:
+            1. Click **Edit** at the top right of this PR
+            2. Change the base branch from \`main\` to \`develop\`
+
+            See \`.github/workflows/cd.yml\` for the release flow.`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body,
+            });

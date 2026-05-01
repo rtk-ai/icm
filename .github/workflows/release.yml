@@ -9,11 +9,21 @@ on:
         description: 'Tag to release'
         required: true
         type: string
+      prerelease:
+        description: 'Mark the release as pre-release (skips Homebrew + latest tag)'
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       tag:
         description: 'Tag to release (e.g., v0.0.1)'
         required: true
+      prerelease:
+        description: 'Mark the release as pre-release'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -204,6 +214,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
+          prerelease: ${{ inputs.prerelease == true }}
+          generate_release_notes: ${{ inputs.prerelease == true }}
           files: release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -215,7 +227,7 @@ jobs:
           tag_name: ${{ steps.version.outputs.version }}
           name: icm ${{ steps.version.outputs.version }}
           draft: false
-          prerelease: false
+          prerelease: ${{ inputs.prerelease == true }}
           generate_release_notes: true
           files: release/*
         env:
@@ -224,6 +236,8 @@ jobs:
   homebrew:
     name: Update Homebrew formula
     needs: [release]
+    # Skip the Homebrew tap update for pre-releases; stable channels only.
+    if: ${{ inputs.prerelease != true }}
     runs-on: ubuntu-latest
     steps:
       - name: Get version

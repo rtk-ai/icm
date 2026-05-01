@@ -4019,6 +4019,94 @@ mod tests {
         );
     }
 
+    /// Measure cache-hot vs cache-cold `get()` cost.
+    ///
+    /// Run with `cargo test -p icm-store -- --ignored --nocapture
+    /// bench_cache_hit_vs_miss`. Informational only — no assertion.
+    #[test]
+    #[ignore]
+    fn bench_cache_hit_vs_miss() {
+        let store = test_store();
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..50 {
+            let mem = make_memory("bench", &format!("memory {i}"));
+            ids.push(mem.id.clone());
+            store.store(mem).unwrap();
+        }
+
+        // Cold: clear cache, read each id once. Mix of cache-fill + DB hit.
+        store.cache_clear();
+        let cold = std::time::Instant::now();
+        for id in &ids {
+            store.get(id).unwrap();
+        }
+        let cold_elapsed = cold.elapsed();
+
+        // Warm: cache already populated by the cold pass; 1000 iterations
+        // of the same id set are all cache hits.
+        let warm = std::time::Instant::now();
+        for _ in 0..1000 {
+            for id in &ids {
+                store.get(id).unwrap();
+            }
+        }
+        let warm_elapsed = warm.elapsed();
+        let warm_per_get_ns = warm_elapsed.as_nanos() / (1000 * ids.len() as u128);
+        let cold_per_get_ns = cold_elapsed.as_nanos() / ids.len() as u128;
+
+        eprintln!("=== bench_cache_hit_vs_miss ===");
+        eprintln!("  cold (50 fills,   first read each): {cold_per_get_ns} ns/get");
+        eprintln!("  warm (50000 hits, all cache reads): {warm_per_get_ns} ns/get");
+        if warm_per_get_ns > 0 {
+            eprintln!(
+                "  speedup on hot reads: {:.1}x",
+                cold_per_get_ns as f64 / warm_per_get_ns as f64
+            );
+        }
+    }
+
+    /// Measure batched `get_many` vs per-id `get` round-trips.
+    ///
+    /// Run with `cargo test -p icm-store -- --ignored --nocapture
+    /// bench_get_many_vs_n_plus_one`. Informational only.
+    #[test]
+    #[ignore]
+    fn bench_get_many_vs_n_plus_one() {
+        let store = test_store();
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..50 {
+            let mem = make_memory("bench", &format!("entry {i}"));
+            ids.push(mem.id.clone());
+            store.store(mem).unwrap();
+        }
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+        // Cold batched fetch.
+        store.cache_clear();
+        let t = std::time::Instant::now();
+        let got = store.get_many(&id_refs).unwrap();
+        let batch_elapsed = t.elapsed();
+        assert_eq!(got.len(), 50);
+
+        // Cold N+1 fetch.
+        store.cache_clear();
+        let t = std::time::Instant::now();
+        for id in &id_refs {
+            store.get(id).unwrap();
+        }
+        let n_plus_one_elapsed = t.elapsed();
+
+        eprintln!("=== bench_get_many_vs_n_plus_one (50 ids) ===");
+        eprintln!("  batched get_many: {} µs", batch_elapsed.as_micros());
+        eprintln!("  N+1 individual:   {} µs", n_plus_one_elapsed.as_micros());
+        if batch_elapsed.as_micros() > 0 {
+            eprintln!(
+                "  speedup: {:.1}x",
+                n_plus_one_elapsed.as_micros() as f64 / batch_elapsed.as_micros() as f64
+            );
+        }
+    }
+
     // === Additional performance tests ===
 
     #[test]

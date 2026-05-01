@@ -1,0 +1,146 @@
+name: CD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop, main]
+
+# Pre-release on develop is interruptible (newer commit supersedes the older
+# build); a stable release on main must never be cancelled mid-run, hence the
+# ref-conditional cancel-in-progress.
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # ═══════════════════════════════════════════════
+  # DEVELOP PATH: Pre-release
+  # ═══════════════════════════════════════════════
+
+  pre-release:
+    if: >-
+      github.ref == 'refs/heads/develop'
+      || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute next version from conventional commits
+        id: tag
+        run: |
+          # Latest stable tag follows the release-please format: icm-v0.10.42
+          LATEST_TAG=$(git tag -l 'icm-v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname \
+            | grep -v '-' | head -1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "::error::No stable icm-v* release tag found"
+            exit 1
+          fi
+          LATEST_VERSION="${LATEST_TAG#icm-v}"
+          echo "Latest stable: $LATEST_TAG"
+
+          COMMITS=$(git log "${LATEST_TAG}..HEAD" --format="%s")
+          HAS_BREAKING=$(echo "$COMMITS" | grep -cE '^[a-z]+(\(.+\))?!:' || true)
+          HAS_FEAT=$(echo "$COMMITS"     | grep -cE '^feat(\(.+\))?:'    || true)
+          HAS_FIX=$(echo "$COMMITS"      | grep -cE '^fix(\(.+\))?:'     || true)
+          echo "Commits since $LATEST_TAG: breaking=$HAS_BREAKING feat=$HAS_FEAT fix=$HAS_FIX"
+
+          # release-please-config.json sets bump-minor-pre-major +
+          # bump-patch-for-minor-pre-major, so for major=0:
+          #   breaking -> minor bump
+          #   feat     -> patch bump
+          #   fix      -> patch bump
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_VERSION"
+          if [ "$MAJOR" -eq 0 ]; then
+            if [ "$HAS_BREAKING" -gt 0 ]; then
+              MINOR=$((MINOR + 1)); PATCH=0
+            elif [ "$HAS_FEAT" -gt 0 ] || [ "$HAS_FIX" -gt 0 ]; then
+              PATCH=$((PATCH + 1))
+            else
+              PATCH=$((PATCH + 1))
+            fi
+          else
+            if [ "$HAS_BREAKING" -gt 0 ]; then
+              MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+            elif [ "$HAS_FEAT" -gt 0 ]; then
+              MINOR=$((MINOR + 1)); PATCH=0
+            else
+              PATCH=$((PATCH + 1))
+            fi
+          fi
+
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          TAG="icm-dev-v${VERSION}-rc.${{ github.run_number }}"
+
+          echo "Next version: $VERSION (from $LATEST_VERSION)"
+          echo "Pre-release tag: $TAG"
+
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "::error::Tag ${TAG} already exists"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+  build-prerelease:
+    name: Build pre-release
+    needs: pre-release
+    if: needs.pre-release.outputs.tag != ''
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.pre-release.outputs.tag }}
+      prerelease: true
+    permissions:
+      contents: write
+    secrets: inherit
+
+  # ═══════════════════════════════════════════════
+  # MAIN PATH: Stable release via release-please
+  # ═══════════════════════════════════════════════
+
+  release-please:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs['crates/icm-cli--tag_name'] }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+
+  build-release:
+    name: Build and upload release assets
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+      prerelease: false
+    permissions:
+      contents: write
+    secrets: inherit
+
+  update-latest-tag:
+    name: Update 'latest' tag
+    needs: [release-please, build-release]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update latest tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa latest -m "Latest stable release (${{ needs.release-please.outputs.tag_name }})"
+          git push origin latest --force

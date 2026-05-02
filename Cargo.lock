@@ -1382,6 +1382,7 @@ dependencies = [
  "lru",
  "rusqlite",
  "serde_json",
+ "sha2",
  "sqlite-vec",
  "tempfile",
  "tracing",

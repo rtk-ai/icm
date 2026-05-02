@@ -12,20 +12,34 @@ use icm_store::SqliteStore;
 /// Extract key facts from text and store them in ICM.
 /// Returns the number of facts stored.
 pub fn extract_and_store(store: &SqliteStore, text: &str, project: &str) -> Result<usize> {
-    extract_and_store_with_opts(store, text, project, false)
+    extract_and_store_with_opts(store, text, project, false, Importance::Critical)
 }
 
 /// Extract and store with option to store raw text as fallback.
+///
+/// `max_importance` clamps each extracted fact's auto-assigned importance.
+/// Callers that ingest **untrusted** content (hook handlers reading
+/// transcripts produced by the LLM and any tool it called) should pass
+/// `Importance::Medium` so a malicious assistant message containing
+/// `"DECISION: ..."` (which the rule-based extractor would otherwise
+/// promote to High) cannot inject itself into wake-up packs as a
+/// "critical decision". CLI / bench callers ingesting user-explicit
+/// input pass `Importance::Critical` to disable the cap.
 pub fn extract_and_store_with_opts(
     store: &SqliteStore,
     text: &str,
     project: &str,
     store_raw: bool,
+    max_importance: Importance,
 ) -> Result<usize> {
     let facts = extract_facts(text, project);
     let mut stored = 0;
     for (topic, content, importance) in &facts {
-        let mem = Memory::new(topic.clone(), content.clone(), *importance);
+        let mem = Memory::new(
+            topic.clone(),
+            content.clone(),
+            cap_importance(*importance, max_importance),
+        );
         store.store(mem)?;
         stored += 1;
     }
@@ -47,6 +61,23 @@ pub fn extract_and_store_with_opts(
     }
 
     Ok(stored)
+}
+
+/// Clamp `value` to at most `cap`. `Importance` doesn't derive `Ord` (it
+/// would imply a numeric ranking that's not meaningful in all contexts),
+/// so map locally to a partial order: Critical > High > Medium > Low.
+fn cap_importance(value: Importance, cap: Importance) -> Importance {
+    let rank = |i: Importance| match i {
+        Importance::Critical => 4,
+        Importance::High => 3,
+        Importance::Medium => 2,
+        Importance::Low => 1,
+    };
+    if rank(value) > rank(cap) {
+        cap
+    } else {
+        value
+    }
 }
 
 /// Recall relevant memories and format as context preamble for prompt injection.
@@ -178,6 +209,17 @@ fn extract_facts_with_threshold(
         }
 
         let lower = s.to_lowercase();
+
+        // Reject AI narration / action-announcement sentences before they
+        // hit the scorer. These trigger the existing keyword tables (e.g.
+        // "I'm going to **deploy**" hits the `deployed` bucket) and end up
+        // stored as if they were facts. Cheap prefix check on lowercase.
+        // Researcher audit R03/R01: ~60% of `context-icm` noise on the prod
+        // DB matched these patterns.
+        if NARRATION_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+            continue;
+        }
+
         let mut score = 0.0f32;
         let mut importance = Importance::Medium;
 
@@ -267,7 +309,11 @@ fn extract_facts_with_threshold(
             }
         }
 
-        // Decision / rationale language
+        // Decision / rationale language. R01 audit: closing-decision
+        // language ("OK so we'll...", "let's go with...", "the call is...")
+        // was missing — sentences that *finalize* a debate scored below
+        // threshold and were dropped, even though they're the highest-value
+        // memory in a session. Added here.
         for kw in &[
             "chose",
             "chosen",
@@ -281,6 +327,16 @@ fn extract_facts_with_threshold(
             "proposed",
             "introduced",
             "invented",
+            "ok so we",
+            "ok, so we",
+            "so we'll",
+            "so we will",
+            "let's go with",
+            "going with",
+            "final answer:",
+            "the call is",
+            "settled on",
+            "opted for",
         ] {
             if lower.contains(kw) {
                 score += 2.5;
@@ -536,6 +592,44 @@ fn extract_facts_with_threshold(
 
 /// Minimum char count for a fragment to be kept after splitting.
 const MIN_SENTENCE_LEN: usize = 30;
+
+/// Prefixes that mark a sentence as AI narration / action announcement
+/// rather than a factual statement worth remembering. Case-insensitive
+/// match on the *start* of the trimmed sentence — these are the patterns
+/// LLMs emit while working ("Let me check…", "I'll now read…") that the
+/// keyword scorer otherwise mis-classifies as decisions or actions.
+const NARRATION_PREFIXES: &[&str] = &[
+    "let me ",
+    "let's ",
+    "i will ",
+    "i'll ",
+    "i'm going to ",
+    "i am going to ",
+    "i'm now ",
+    "i am now ",
+    "now i'll ",
+    "now let me ",
+    "next, i'll ",
+    "next i'll ",
+    "first, i'll ",
+    "first i'll ",
+    "first, let me ",
+    "first let me ",
+    "reading the ",
+    "looking at the ",
+    "checking the ",
+    "running the ",
+    "storing this ",
+    "i should ",
+    "i need to check",
+    "i need to look",
+    "i need to read",
+    "i need to verify",
+    "i'll start by ",
+    "i will start by ",
+    "let me start by ",
+    "let me check ",
+];
 
 /// English-language honorific abbreviations that end in `.` followed by a
 /// space + capitalized name. The naive splitter used to break sentences
@@ -1160,7 +1254,8 @@ mod tests {
     fn test_store_raw_fallback() {
         let store = SqliteStore::in_memory().unwrap();
         let text = "Just some random conversation text that has no particular keywords but is still somewhat meaningful context about the ongoing work session";
-        let stored = extract_and_store_with_opts(&store, text, "test", true).unwrap();
+        let stored =
+            extract_and_store_with_opts(&store, text, "test", true, Importance::Critical).unwrap();
         assert_eq!(stored, 1, "should store raw text as fallback");
     }
 

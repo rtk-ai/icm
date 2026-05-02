@@ -72,13 +72,12 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories(topic);
         CREATE INDEX IF NOT EXISTS idx_memories_weight ON memories(weight);
         CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
-        -- Partial unique index: only enforce on rows that have a hash
-        -- (i.e. new rows). Pre-existing dupes with NULL hash are left
-        -- alone — a separate one-shot dedup tool can collapse them later.
-        -- Topic compared case-insensitively to match the in-Rust
-        -- normalization done in summary_hash().
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_topic_hash
-            ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;
+        -- The summary_hash partial unique index is created later, AFTER the
+        -- idempotent ALTER TABLE migration that adds the column on legacy
+        -- DBs (PRs #176 + this hotfix). Creating it here would crash with
+        -- `no such column: summary_hash` on any pre-0.10.43 DB because
+        -- `CREATE TABLE IF NOT EXISTS` is a no-op on existing tables — the
+        -- new column declaration above only takes effect on fresh DBs.
 
         -- Memoir tables
         CREATE TABLE IF NOT EXISTS memoirs (
@@ -452,6 +451,96 @@ mod tests {
         init_db(&conn).unwrap();
         // Second call should be idempotent
         init_db(&conn).unwrap();
+    }
+
+    /// Simulates upgrading a pre-0.10.43 database (no `summary_hash`
+    /// column on the `memories` table) with the new binary. The migration
+    /// must (a) succeed without error, (b) add the missing column, and
+    /// (c) leave the partial unique index in place. Regression test for
+    /// the V8 retest blocker where the index was created in the same
+    /// batch as `CREATE TABLE IF NOT EXISTS`, before the ALTER TABLE
+    /// migration could run, bricking every existing user DB on upgrade.
+    #[test]
+    fn test_migration_from_pre_0_10_43_schema() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Build a legacy schema by hand: CREATE TABLE without summary_hash.
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT '',
+                last_accessed TEXT NOT NULL,
+                access_count INTEGER DEFAULT 0,
+                weight REAL DEFAULT 1.0,
+                topic TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                raw_excerpt TEXT,
+                keywords TEXT,
+                importance TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_data TEXT,
+                related_ids TEXT
+            );",
+        )
+        .unwrap();
+
+        // Seed one row that pre-dates the migration — must survive intact.
+        conn.execute(
+            "INSERT INTO memories (id, created_at, last_accessed, topic, summary, importance, source_type)
+             VALUES ('legacy-1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'legacy', 'old summary', 'medium', 'manual')",
+            [],
+        )
+        .unwrap();
+
+        // Now run the new init — this is what the V8 test reproduced as a
+        // bricking error. Must complete without panic.
+        init_db(&conn).expect("upgrade must succeed on a legacy schema");
+
+        // summary_hash column now exists.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(memories)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "summary_hash"),
+            "summary_hash column must be added by the migration; saw {cols:?}"
+        );
+
+        // Partial unique index now exists.
+        let indices: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_memories_topic_hash'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            indices.len(),
+            1,
+            "idx_memories_topic_hash must exist after migration"
+        );
+
+        // Legacy row still readable, summary_hash is NULL on it.
+        let (legacy_summary, legacy_hash): (String, Option<String>) = conn
+            .query_row(
+                "SELECT summary, summary_hash FROM memories WHERE id = 'legacy-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_summary, "old summary");
+        assert!(
+            legacy_hash.is_none(),
+            "legacy row must keep NULL summary_hash so it doesn't conflict with the partial unique index"
+        );
+
+        // Re-running the migration is idempotent.
+        init_db(&conn).expect("re-running migration must be a no-op");
     }
 
     #[test]

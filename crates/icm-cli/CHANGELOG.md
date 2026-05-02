@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.43](https://github.com/rtk-ai/icm/compare/icm-v0.10.42...icm-v0.10.43) (2026-05-02)
+
+
+### Features
+
+* **cli:** add `icm bench-format` to compare recall payload token costs ([#166](https://github.com/rtk-ai/icm/issues/166)) ([9d44fa8](https://github.com/rtk-ai/icm/commit/9d44fa8dfa1e6b00124776904b01d6dbfa899847))
+* **recall:** TOON default + LRU cache + batched neighbour fetch ([#167](https://github.com/rtk-ai/icm/issues/167)) ([6bd2ca4](https://github.com/rtk-ai/icm/commit/6bd2ca4fe1e4847ab6e011133c726af710e344ee))
+
 ## [0.10.42](https://github.com/rtk-ai/icm/compare/icm-v0.10.41...icm-v0.10.42) (2026-04-30)
 
 

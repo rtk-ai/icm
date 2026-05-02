@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.41"
+version = "0.10.42"
 dependencies = [
  "anyhow",
  "axum",
@@ -1391,6 +1391,7 @@ version = "0.10.34"
 dependencies = [
  "chrono",
  "icm-core",
+ "lru",
  "rusqlite",
  "serde_json",
  "sqlite-vec",

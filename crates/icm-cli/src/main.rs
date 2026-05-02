@@ -1,4 +1,5 @@
 mod bench_data;
+mod bench_format;
 mod bench_knowledge;
 pub mod cloud;
 mod config;
@@ -394,6 +395,28 @@ enum Commands {
         /// Show extracted facts and injected context
         #[arg(short, long)]
         verbose: bool,
+    },
+
+    /// Compare token cost of recall payload formats (JSON / TOML / TOON / compact)
+    ///
+    /// Builds a synthetic recall result, serializes it in each candidate
+    /// format, and reports byte size + estimated tokens. With
+    /// `ANTHROPIC_API_KEY` set, also calls the Anthropic `count_tokens`
+    /// API for true token counts (lets you see the Opus 4.7 tokenizer
+    /// inflation directly).
+    BenchFormat {
+        /// Number of synthetic memories in the fixture
+        #[arg(short, long, default_value = "10")]
+        count: usize,
+
+        /// Model id passed to count_tokens (e.g. claude-opus-4-5,
+        /// claude-sonnet-4-5, claude-opus-4-7)
+        #[arg(short, long, default_value = "claude-sonnet-4-5")]
+        model: String,
+
+        /// Skip the Anthropic API call; report char-based estimates only
+        #[arg(long)]
+        no_api: bool,
     },
 
     /// Show current configuration
@@ -1241,6 +1264,11 @@ fn main() -> Result<()> {
             runs,
             verbose,
         } => cmd_bench_agent(sessions, &model, runs, verbose),
+        Commands::BenchFormat {
+            count,
+            model,
+            no_api,
+        } => bench_format::cmd_bench_format(count, &model, no_api),
         Commands::Cloud { command } => cmd_cloud(command, &store),
         Commands::Serve {
             compact,

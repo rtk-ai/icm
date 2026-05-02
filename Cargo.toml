@@ -5,7 +5,6 @@ members = [
     "crates/icm-store",
     "crates/icm-mcp",
     "crates/icm-cli",
-    "crates/icm-install",
 ]
 
 [profile.release]

@@ -1360,18 +1360,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "icm-install"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "flate2",
- "serde_json",
- "sha2",
- "tar",
- "ureq",
-]
-
-[[package]]
 name = "icm-mcp"
 version = "0.10.34"
 dependencies = [

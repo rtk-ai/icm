@@ -37,9 +37,13 @@ jobs:
       - name: Compute next version from conventional commits
         id: tag
         run: |
-          # Latest stable tag follows the release-please format: icm-v0.10.42
+          # Latest stable tag follows the release-please format: icm-v0.10.42.
+          # The `^icm-v…$` anchor filters out any pre-release suffix
+          # (e.g. icm-v0.10.42-rc.1) without filtering on a bare dash —
+          # the icm- prefix itself contains one, which broke the original
+          # `grep -v '-'` borrowed from rtk-ai/rtk where tags are bare `vX.Y.Z`.
           LATEST_TAG=$(git tag -l 'icm-v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname \
-            | grep -v '-' | head -1)
+            | grep -E '^icm-v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
           if [ -z "$LATEST_TAG" ]; then
             echo "::error::No stable icm-v* release tag found"
             exit 1

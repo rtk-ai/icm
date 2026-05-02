@@ -62,12 +62,23 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             source_type TEXT NOT NULL,
             source_data TEXT, -- JSON
 
-            related_ids TEXT -- JSON array
+            related_ids TEXT, -- JSON array
+            -- SHA-256 over normalize(topic + '\\0' + summary). Used by
+            -- INSERT OR IGNORE dedup. NULL on rows that predate the
+            -- migration (existing duplicates intentionally untouched).
+            summary_hash TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories(topic);
         CREATE INDEX IF NOT EXISTS idx_memories_weight ON memories(weight);
         CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+        -- Partial unique index: only enforce on rows that have a hash
+        -- (i.e. new rows). Pre-existing dupes with NULL hash are left
+        -- alone — a separate one-shot dedup tool can collapse them later.
+        -- Topic compared case-insensitively to match the in-Rust
+        -- normalization done in summary_hash().
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_topic_hash
+            ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;
 
         -- Memoir tables
         CREATE TABLE IF NOT EXISTS memoirs (
@@ -111,6 +122,23 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         CREATE INDEX IF NOT EXISTS idx_concept_links_source ON concept_links(source_id);
         CREATE INDEX IF NOT EXISTS idx_concept_links_target ON concept_links(target_id);
         ",
+    )
+    .map_err(db_err)?;
+
+    // Migration: add `summary_hash` column to existing DBs that predate
+    // the dedup feature. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we
+    // try the ALTER and ignore the "duplicate column name" error.
+    if let Err(e) = conn.execute("ALTER TABLE memories ADD COLUMN summary_hash TEXT", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(db_err(e));
+        }
+    }
+    // Ensure the partial unique index exists even on DBs that ran an old
+    // CREATE TABLE (which had no summary_hash column to index against).
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_topic_hash
+            ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;",
     )
     .map_err(db_err)?;
 

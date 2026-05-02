@@ -6,6 +6,7 @@ use std::sync::{Mutex, Once};
 use chrono::{DateTime, Utc};
 use lru::LruCache;
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
 use icm_core::{
@@ -331,22 +332,49 @@ fn sanitize_fts_query(query: &str) -> String {
 // MemoryStore impl
 // ---------------------------------------------------------------------------
 
+/// SHA-256 over the normalized `(topic, summary)` pair, hex-encoded.
+/// Normalization: trim + lowercase + collapse whitespace runs to single
+/// spaces. Topic and summary are joined by `\0` to prevent boundary
+/// ambiguity (e.g. `"a"|"bc"` vs `"ab"|"c"` would otherwise hash the
+/// same). Used by the dedup `INSERT OR IGNORE` path.
+pub(crate) fn summary_hash(topic: &str, summary: &str) -> String {
+    let topic_n = topic.trim().to_lowercase();
+    let summary_n: String = summary
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+        .to_lowercase();
+    let mut h = Sha256::new();
+    h.update(topic_n.as_bytes());
+    h.update(b"\0");
+    h.update(summary_n.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
 impl SqliteStore {
     /// Insert a memory into the database without transaction management.
     /// Callers are responsible for wrapping this in a transaction.
+    ///
+    /// Dedup contract: an INSERT that collides with an existing memory on
+    /// `(topic, summary_hash)` is silently ignored, and the **existing**
+    /// row's id is returned. The caller's `memory.id` is forgotten in
+    /// that case. This keeps `store(...)` idempotent: writing the same
+    /// fact 100× ends up with one row, not 100.
     fn store_inner(&self, memory: &Memory) -> IcmResult<String> {
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_json = serde_json::to_string(&memory.related_ids)?;
         let st = source_type(&memory.source);
         let sd = source_data(&memory.source);
         let emb_blob = memory.embedding.as_deref().map(embedding_to_blob);
+        let hash = summary_hash(&memory.topic, &memory.summary);
 
-        self.conn
+        let inserted = self
+            .conn
             .execute(
-                "INSERT INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
+                "INSERT OR IGNORE INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
                  topic, summary, raw_excerpt, keywords,
-                 importance, source_type, source_data, related_ids, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 importance, source_type, source_data, related_ids, embedding, summary_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     memory.id,
                     memory.created_at.to_rfc3339(),
@@ -363,11 +391,35 @@ impl SqliteStore {
                     sd,
                     related_json,
                     emb_blob,
+                    hash,
                 ],
             )
             .map_err(db_err)?;
 
-        // Sync to vec_memories for KNN search
+        if inserted == 0 {
+            // Dedup hit: a row with the same (topic, summary_hash) already
+            // exists. Look up its id and return that — preserves the
+            // contract that the returned id always refers to an actual
+            // row in the table.
+            let existing_id: String = self
+                .conn
+                .query_row(
+                    "SELECT id FROM memories
+                     WHERE LOWER(topic) = LOWER(?1) AND summary_hash = ?2",
+                    params![memory.topic, hash],
+                    |row| row.get(0),
+                )
+                .map_err(db_err)?;
+            tracing::debug!(
+                topic = %memory.topic,
+                existing = %existing_id,
+                attempted = %memory.id,
+                "store: dedup'd duplicate memory"
+            );
+            return Ok(existing_id);
+        }
+
+        // Sync to vec_memories for KNN search (only on a fresh insert).
         if let Some(ref blob) = emb_blob {
             self.conn
                 .execute(
@@ -427,6 +479,11 @@ impl MemoryStore for SqliteStore {
         let sd = source_data(&memory.source);
         let emb_blob = memory.embedding.as_deref().map(embedding_to_blob);
 
+        // Recompute summary_hash on update — topic or summary may have
+        // changed, and the partial unique index on (topic, summary_hash)
+        // would otherwise reflect stale state.
+        let hash = summary_hash(&memory.topic, &memory.summary);
+
         let changed = self
             .conn
             .execute(
@@ -434,7 +491,7 @@ impl MemoryStore for SqliteStore {
                  updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
                  topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
                  importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
-                 embedding = ?14
+                 embedding = ?14, summary_hash = ?15
                  WHERE id = ?1",
                 params![
                     memory.id,
@@ -451,6 +508,7 @@ impl MemoryStore for SqliteStore {
                     sd,
                     related_json,
                     emb_blob,
+                    hash,
                 ],
             )
             .map_err(db_err)?;
@@ -5103,6 +5161,44 @@ mod tests {
 
         let got = store.get_many(&[id.as_str()]).unwrap();
         assert_eq!(got.get(&id).unwrap().summary, "warm");
+    }
+
+    // ── content-hash dedup ───────────────────────────────────────────────
+
+    #[test]
+    fn test_dedup_same_topic_summary_collapses() {
+        let store = test_store();
+        let m1 = make_memory("dedup", "Use Turso for cloud sync");
+        let m2 = make_memory("dedup", "Use Turso for cloud sync"); // identical content
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+        // Both calls return the SAME id (the first row's). Second store
+        // is a no-op at the DB level, but the contract still returns an
+        // id pointing at a real row.
+        assert_eq!(id1, id2, "dedup must return the existing row's id");
+        assert_eq!(store.count().unwrap(), 1, "only one row in memories");
+    }
+
+    #[test]
+    fn test_dedup_normalizes_whitespace_and_case() {
+        let store = test_store();
+        let m1 = make_memory("DEDUP", "Use   Turso   for cloud sync");
+        let m2 = make_memory("dedup", "use turso for cloud sync");
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+        assert_eq!(id1, id2);
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_dedup_different_topic_keeps_both() {
+        let store = test_store();
+        let m1 = make_memory("topic-a", "shared body");
+        let m2 = make_memory("topic-b", "shared body");
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+        assert_ne!(id1, id2, "different topic = different row");
+        assert_eq!(store.count().unwrap(), 2);
     }
 
     #[test]

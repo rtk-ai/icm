@@ -2137,8 +2137,16 @@ fn cmd_hook_post(
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "project".to_string());
 
-    // Extract facts and store (with raw text fallback if enabled)
-    match extract::extract_and_store_with_opts(store, tool_output, &project, store_raw) {
+    // Extract facts and store (with raw text fallback if enabled).
+    // Cap auto-extracted importance at Medium: tool output is untrusted
+    // (a malicious tool could emit decision-keyword text to poison wake-up).
+    match extract::extract_and_store_with_opts(
+        store,
+        tool_output,
+        &project,
+        store_raw,
+        icm_core::Importance::Medium,
+    ) {
         Ok(n) if n > 0 => {
             eprintln!("[icm] auto-extracted {n} facts from tool output");
             // Audit M3: extracted facts all land under context-{project}.
@@ -2326,7 +2334,17 @@ fn extract_from_hook_transcript(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
 
-    match extract::extract_and_store_with_opts(store, text, &project, true) {
+    // Hook path is the prompt-injection surface: any assistant message in
+    // the transcript can be crafted to trigger decision/error keywords and
+    // self-promote to High. Clamp to Medium so wake-up never surfaces
+    // hook-extracted content under "Identity & preferences" or as Critical.
+    match extract::extract_and_store_with_opts(
+        store,
+        text,
+        &project,
+        true,
+        icm_core::Importance::Medium,
+    ) {
         Ok(n) if n > 0 => {
             eprintln!("[icm] {source}: extracted {n} facts from transcript");
             // Audit M3/AC1: fire auto-consolidate after the bulk extract
@@ -4109,7 +4127,14 @@ fn cmd_extract(
             }
         }
     } else {
-        let stored = extract::extract_and_store_with_opts(store, &input, project, store_raw)?;
+        // CLI `icm extract` is user-explicit input; no importance cap.
+        let stored = extract::extract_and_store_with_opts(
+            store,
+            &input,
+            project,
+            store_raw,
+            icm_core::Importance::Critical,
+        )?;
         println!("Extracted and stored {stored} facts.");
     }
     Ok(())

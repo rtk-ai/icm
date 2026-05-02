@@ -124,10 +124,14 @@ pub fn build_wake_up_from_memories(memories: Vec<Memory>, opts: &WakeUpOptions<'
         })
         .collect();
 
+    // Ties broken by id (lexicographic / ULID-monotonic) so the wake-up
+    // ordering stays deterministic — required for the prompt-cache prefix
+    // match to survive across runs with equal-scored memories.
     candidates.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.memory.id.cmp(&b.memory.id))
     });
 
     // Token budget: 1 token ≈ 4 characters (rough approximation).
@@ -277,12 +281,6 @@ fn truncate_by_budget(candidates: Vec<ScoredMemory>, max_chars: usize) -> Vec<Sc
     out
 }
 
-/// Approximate token count for a rendered body: `chars / 4`, rounded up.
-/// Uses characters (not bytes) so the displayed count is honest for non-ASCII.
-fn approx_tokens(s: &str) -> usize {
-    s.chars().count().div_ceil(4)
-}
-
 /// Flatten a summary into a single-line safe string: trim surrounding space,
 /// replace newlines with spaces so an embedded heading can't break section
 /// structure in the rendered Markdown.
@@ -326,13 +324,16 @@ fn render(selected: &[ScoredMemory], opts: &WakeUpOptions<'_>) -> String {
         _ => String::from("# ICM Wake-up"),
     };
 
-    // Pre-compute body to get token count, then prepend header with count.
+    // Render body without prepending a token-count header — that count
+    // changes whenever the body length changes, which destroys the
+    // Anthropic prompt-cache prefix match for SessionStart wake-up
+    // injection. Adding/removing one memory used to drop prefix preservation
+    // from 100% to ~4%. The header now stays byte-stable across runs.
     let body = render_body(selected, opts.format);
-    let tok = approx_tokens(&body);
 
     match opts.format {
         WakeUpFormat::Markdown => {
-            out.push_str(&format!("{header} · ~{tok} tok\n\n"));
+            out.push_str(&format!("{header}\n\n"));
             out.push_str(&body);
         }
         WakeUpFormat::Plain => {
@@ -354,11 +355,13 @@ fn render_body(selected: &[ScoredMemory], format: WakeUpFormat) -> String {
             continue;
         }
         // Sort group by original score (already in selected order, re-sort for safety).
+        // id tiebreak: see candidates.sort_by above — same determinism rationale.
         let mut group = group;
         group.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.memory.id.cmp(&b.memory.id))
         });
 
         match format {

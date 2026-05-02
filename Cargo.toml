@@ -44,14 +44,14 @@ clap = { version = "4", features = ["derive"] }
 directories = "6"
 
 # Caching
-lru = "0.12"
+lru = "0.18"
 
 # HTTP (cloud sync)
 ureq = { version = "2", features = ["json"] }
 rpassword = "5"
 sha2 = "0.10"
 flate2 = "1"
-tar = "0.4"
+tar = "0.4.45"
 
 # Platform
 libc = "0.2"

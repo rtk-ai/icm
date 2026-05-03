@@ -20,6 +20,7 @@ pub struct Config {
     pub extraction: ExtractionConfig,
     pub recall: RecallConfig,
     pub wakeup: WakeUpConfig,
+    pub consolidate: ConsolidateConfig,
     pub mcp: McpConfig,
     pub web: WebConfig,
     pub cloud: CloudConfig,
@@ -104,6 +105,42 @@ impl Default for WakeUpConfig {
         Self {
             max_tokens: 500,
             include_preferences: true,
+        }
+    }
+}
+
+/// Consolidation settings (icm consolidate).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ConsolidateConfig {
+    pub summarizer: SummarizerConfig,
+}
+
+/// LLM-backed summarizer settings — applies to both `icm consolidate` and
+/// (later) the wake-up briefing path tracked in issue #165.
+///
+/// `provider = "none"` (default) keeps the existing lexical concat behavior so
+/// the feature is opt-in and the fast/free path stays unchanged.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct SummarizerConfig {
+    /// auto | claude | codex | gemini | ollama | none
+    pub provider: String,
+    /// Empty = provider's cheap default (haiku, gemini-flash, etc.)
+    pub model: String,
+    /// Approximate token cap for the summary.
+    pub max_tokens: usize,
+    /// Per-call timeout in seconds. CLI shellouts can be slow on first run.
+    pub timeout_secs: u64,
+}
+
+impl Default for SummarizerConfig {
+    fn default() -> Self {
+        Self {
+            provider: "none".into(),
+            model: String::new(),
+            max_tokens: 400,
+            timeout_secs: 60,
         }
     }
 }

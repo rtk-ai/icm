@@ -4088,7 +4088,9 @@ fn resolve_consolidate_provider(
     let raw = cli_flag.unwrap_or(cfg.provider.as_str());
     let kind = summarizer::ProviderKind::parse(raw)?;
     Ok(match kind {
-        summarizer::ProviderKind::Auto => summarizer::detect_provider(summarizer::ProviderKind::Claude),
+        summarizer::ProviderKind::Auto => {
+            summarizer::detect_provider(summarizer::ProviderKind::Claude)
+        }
         other => other,
     })
 }
@@ -4117,9 +4119,13 @@ fn cmd_consolidate(
 
     let provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
     let max_tokens = cli_max_tokens.unwrap_or(cfg.max_tokens);
-    let model_owned: Option<String> = cli_model
-        .map(|s| s.to_string())
-        .or_else(|| if cfg.model.is_empty() { None } else { Some(cfg.model.clone()) });
+    let model_owned: Option<String> = cli_model.map(|s| s.to_string()).or_else(|| {
+        if cfg.model.is_empty() {
+            None
+        } else {
+            Some(cfg.model.clone())
+        }
+    });
 
     let merged_summary = if matches!(provider_kind, summarizer::ProviderKind::None) {
         lexical_consolidate(&memories)

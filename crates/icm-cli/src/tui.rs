@@ -561,11 +561,17 @@ fn execute_confirm(app: &mut App, store: &SqliteStore, db_path: Option<&str>) {
                     match crate::summarizer::make_summarizer(resolved) {
                         Ok(provider) => {
                             let prompt = crate::summarizer::build_consolidate_prompt(
-                                &topic, &summaries, cfg.max_tokens,
+                                &topic,
+                                &summaries,
+                                cfg.max_tokens,
                             );
                             let req = crate::summarizer::SummarizeRequest {
                                 prompt: &prompt,
-                                model: if cfg.model.is_empty() { None } else { Some(cfg.model.as_str()) },
+                                model: if cfg.model.is_empty() {
+                                    None
+                                } else {
+                                    Some(cfg.model.as_str())
+                                },
                                 max_tokens: cfg.max_tokens,
                                 timeout: Duration::from_secs(cfg.timeout_secs),
                             };

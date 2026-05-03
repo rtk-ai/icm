@@ -107,8 +107,12 @@ pub fn make_summarizer(kind: ProviderKind) -> Result<Box<dyn Summarizer>> {
         ProviderKind::Codex => Ok(Box::new(CodexCliSummarizer)),
         ProviderKind::Gemini => Ok(Box::new(GeminiCliSummarizer)),
         ProviderKind::Ollama => Ok(Box::new(OllamaSummarizer::default())),
-        ProviderKind::Auto => Err(anyhow!("Auto must be resolved with detect_provider() first")),
-        ProviderKind::None => Err(anyhow!("None means no summarizer; caller should not invoke")),
+        ProviderKind::Auto => Err(anyhow!(
+            "Auto must be resolved with detect_provider() first"
+        )),
+        ProviderKind::None => Err(anyhow!(
+            "None means no summarizer; caller should not invoke"
+        )),
     }
 }
 
@@ -246,7 +250,9 @@ impl Summarizer for OllamaSummarizer {
 
 fn trim_response(s: String) -> String {
     // Strip trailing newlines and common preamble like "Here is a summary:".
-    let t = s.trim().trim_start_matches("Here is the summary:")
+    let t = s
+        .trim()
+        .trim_start_matches("Here is the summary:")
         .trim_start_matches("Summary:")
         .trim();
     t.to_string()
@@ -275,9 +281,15 @@ pub fn build_consolidate_prompt(topic: &str, summaries: &[&str], max_tokens: usi
     p.push_str("- Preserve every distinct fact / decision exactly once.\n");
     p.push_str("- Drop only verbatim or near-verbatim repetition.\n");
     p.push_str("- Preserve identifiers, tags, IDs, error codes, version strings, file paths, ");
-    p.push_str("flag names, and environment variables EXACTLY as written. Do not paraphrase them.\n");
-    p.push_str("- Output PLAIN TEXT ONLY — no preamble, no \"Summary:\" prefix, no markdown headers.\n");
-    p.push_str("- Use \"- \" bullet points when there are 3 or more distinct items, prose otherwise.\n");
+    p.push_str(
+        "flag names, and environment variables EXACTLY as written. Do not paraphrase them.\n",
+    );
+    p.push_str(
+        "- Output PLAIN TEXT ONLY — no preamble, no \"Summary:\" prefix, no markdown headers.\n",
+    );
+    p.push_str(
+        "- Use \"- \" bullet points when there are 3 or more distinct items, prose otherwise.\n",
+    );
     p.push_str("- Stay under ~");
     p.push_str(&max_tokens.to_string());
     p.push_str(" tokens.\n\n");
@@ -324,11 +336,19 @@ mod tests {
     #[test]
     fn detect_falls_back_to_claude_when_nothing_set() {
         // Save and clear any env that might leak from the host.
-        let snapshot: Vec<_> = ["ICM_INVOKER", "CLAUDECODE", "CLAUDE_CLI", "CODEX_HOME",
-            "CODEX_CLI", "GEMINI_CLI", "GOOGLE_CLOUD_PROJECT", "OLLAMA_HOST"]
-            .iter()
-            .map(|k| (*k, std::env::var(k).ok()))
-            .collect();
+        let snapshot: Vec<_> = [
+            "ICM_INVOKER",
+            "CLAUDECODE",
+            "CLAUDE_CLI",
+            "CODEX_HOME",
+            "CODEX_CLI",
+            "GEMINI_CLI",
+            "GOOGLE_CLOUD_PROJECT",
+            "OLLAMA_HOST",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
         for (k, _) in &snapshot {
             std::env::remove_var(k);
         }
@@ -362,7 +382,10 @@ mod tests {
     #[test]
     fn trim_response_strips_preambles() {
         assert_eq!(trim_response("Summary: hello\n".into()), "hello");
-        assert_eq!(trim_response("Here is the summary:\n  world  ".into()), "world");
+        assert_eq!(
+            trim_response("Here is the summary:\n  world  ".into()),
+            "world"
+        );
         assert_eq!(trim_response("clean\n".into()), "clean");
     }
 }

@@ -85,6 +85,9 @@ struct App {
     confirm: Confirm,
     /// Status bar message
     status: Option<StatusMsg>,
+    /// Summarizer config (TOML / CLI override). Honored by the consolidate
+    /// confirm path so TUI behavior stays consistent with the CLI.
+    summarizer_cfg: crate::config::SummarizerConfig,
 }
 
 impl App {
@@ -128,6 +131,7 @@ impl App {
             show_help: false,
             confirm: Confirm::None,
             status: None,
+            summarizer_cfg: crate::config::SummarizerConfig::default(),
         };
 
         app.load_topic_memories(store);
@@ -247,6 +251,12 @@ pub fn run_dashboard(store: &SqliteStore, db_path: Option<&str>) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(store, db_path)?;
+    // Read the summarizer block once at startup so the consolidate action in
+    // the TUI honors the same config as the CLI. Errors are swallowed: the
+    // default (provider = "none") preserves the historical lexical behavior.
+    if let Ok(cfg) = crate::config::load_config() {
+        app.summarizer_cfg = cfg.consolidate.summarizer;
+    }
     let result = run_loop(&mut terminal, &mut app, store, db_path);
 
     disable_raw_mode()?;
@@ -531,8 +541,49 @@ fn execute_confirm(app: &mut App, store: &SqliteStore, db_path: Option<&str>) {
                     return;
                 }
                 let summaries: Vec<&str> = mems.iter().map(|m| m.summary.as_str()).collect();
-                let combined = summaries.join(" | ");
-                let combined = truncate(&combined, 500);
+
+                // Resolve provider: TUI honors the same config block as the CLI.
+                // `provider = "none"` (default) preserves the lexical concat path.
+                let cfg = &app.summarizer_cfg;
+                let kind = crate::summarizer::ProviderKind::parse(&cfg.provider)
+                    .unwrap_or(crate::summarizer::ProviderKind::None);
+                let resolved = match kind {
+                    crate::summarizer::ProviderKind::Auto => {
+                        crate::summarizer::detect_provider(crate::summarizer::ProviderKind::Claude)
+                    }
+                    other => other,
+                };
+
+                let combined = if matches!(resolved, crate::summarizer::ProviderKind::None) {
+                    let s = summaries.join(" | ");
+                    truncate(&s, 500).to_string()
+                } else {
+                    match crate::summarizer::make_summarizer(resolved) {
+                        Ok(provider) => {
+                            let prompt = crate::summarizer::build_consolidate_prompt(
+                                &topic, &summaries, cfg.max_tokens,
+                            );
+                            let req = crate::summarizer::SummarizeRequest {
+                                prompt: &prompt,
+                                model: if cfg.model.is_empty() { None } else { Some(cfg.model.as_str()) },
+                                max_tokens: cfg.max_tokens,
+                                timeout: Duration::from_secs(cfg.timeout_secs),
+                            };
+                            match provider.summarize(&req) {
+                                Ok(out) if !out.trim().is_empty() => out,
+                                _ => {
+                                    let s = summaries.join(" | ");
+                                    truncate(&s, 500).to_string()
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let s = summaries.join(" | ");
+                            truncate(&s, 500).to_string()
+                        }
+                    }
+                };
+
                 let consolidated = icm_core::Memory::new(
                     topic.clone(),
                     format!("[consolidated] {combined}"),

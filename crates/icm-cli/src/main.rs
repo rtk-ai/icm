@@ -8,6 +8,7 @@ mod import;
 #[cfg(test)]
 mod learn_tests;
 mod recall_format;
+mod summarizer;
 #[cfg(feature = "tui")]
 mod tui;
 mod upgrade;
@@ -215,6 +216,22 @@ enum Commands {
         /// Keep original memories after consolidation
         #[arg(long)]
         keep_originals: bool,
+
+        /// Summarizer provider: auto | claude | codex | gemini | ollama | none
+        ///
+        /// Overrides `[consolidate.summarizer] provider` from config.toml.
+        /// `none` keeps the deterministic lexical concat (default behavior).
+        /// `auto` detects the invoking AI tool from environment hints.
+        #[arg(long, value_name = "PROVIDER")]
+        summarizer_provider: Option<String>,
+
+        /// Summarizer model (provider-specific). Empty = provider's cheap default.
+        #[arg(long, value_name = "MODEL")]
+        summarizer_model: Option<String>,
+
+        /// Approximate token budget for the consolidated summary.
+        #[arg(long, value_name = "N")]
+        summarizer_max_tokens: Option<usize>,
     },
 
     /// Generate embeddings for memories that don't have one yet
@@ -1140,7 +1157,18 @@ fn main() -> Result<()> {
         Commands::Consolidate {
             topic,
             keep_originals,
-        } => cmd_consolidate(&store, &topic, keep_originals),
+            summarizer_provider,
+            summarizer_model,
+            summarizer_max_tokens,
+        } => cmd_consolidate(
+            &store,
+            &topic,
+            keep_originals,
+            &cfg.consolidate.summarizer,
+            summarizer_provider.as_deref(),
+            summarizer_model.as_deref(),
+            summarizer_max_tokens,
+        ),
         Commands::Embed {
             topic,
             force,
@@ -4048,14 +4076,84 @@ fn cmd_config() -> Result<()> {
     Ok(())
 }
 
-fn cmd_consolidate(store: &SqliteStore, topic: &str, keep_originals: bool) -> Result<()> {
+/// Resolve which provider to use given (CLI flag → config → default), then
+/// returning either a concrete provider or `None` for the lexical path.
+///
+/// CLI flag wins over config; config wins over the built-in default
+/// (`provider = "none"`, lexical only).
+fn resolve_consolidate_provider(
+    cfg: &config::SummarizerConfig,
+    cli_flag: Option<&str>,
+) -> Result<summarizer::ProviderKind> {
+    let raw = cli_flag.unwrap_or(cfg.provider.as_str());
+    let kind = summarizer::ProviderKind::parse(raw)?;
+    Ok(match kind {
+        summarizer::ProviderKind::Auto => summarizer::detect_provider(summarizer::ProviderKind::Claude),
+        other => other,
+    })
+}
+
+/// Lexical fallback: concat all summaries with " | " — the historical behavior
+/// preserved as a safe baseline when no LLM is configured or available.
+fn lexical_consolidate(memories: &[Memory]) -> String {
+    let summaries: Vec<&str> = memories.iter().map(|m| m.summary.as_str()).collect();
+    summaries.join(" | ")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_consolidate(
+    store: &SqliteStore,
+    topic: &str,
+    keep_originals: bool,
+    cfg: &config::SummarizerConfig,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    cli_max_tokens: Option<usize>,
+) -> Result<()> {
     let memories = store.get_by_topic(topic)?;
     if memories.is_empty() {
         bail!("no memories found in topic: {topic}");
     }
 
-    let summaries: Vec<&str> = memories.iter().map(|m| m.summary.as_str()).collect();
-    let merged_summary = summaries.join(" | ");
+    let provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
+    let max_tokens = cli_max_tokens.unwrap_or(cfg.max_tokens);
+    let model_owned: Option<String> = cli_model
+        .map(|s| s.to_string())
+        .or_else(|| if cfg.model.is_empty() { None } else { Some(cfg.model.clone()) });
+
+    let merged_summary = if matches!(provider_kind, summarizer::ProviderKind::None) {
+        lexical_consolidate(&memories)
+    } else {
+        let provider = summarizer::make_summarizer(provider_kind)?;
+        let summaries: Vec<&str> = memories.iter().map(|m| m.summary.as_str()).collect();
+        let prompt = summarizer::build_consolidate_prompt(topic, &summaries, max_tokens);
+        let req = summarizer::SummarizeRequest {
+            prompt: &prompt,
+            model: model_owned.as_deref(),
+            max_tokens,
+            timeout: std::time::Duration::from_secs(cfg.timeout_secs),
+        };
+        match provider.summarize(&req) {
+            Ok(s) if !s.trim().is_empty() => {
+                eprintln!("[consolidate] used provider: {}", provider.name());
+                s
+            }
+            Ok(_) => {
+                eprintln!(
+                    "[consolidate] provider {} returned empty output; falling back to lexical",
+                    provider.name(),
+                );
+                lexical_consolidate(&memories)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[consolidate] provider {} failed: {e}; falling back to lexical",
+                    provider.name(),
+                );
+                lexical_consolidate(&memories)
+            }
+        }
+    };
 
     let mut all_keywords: Vec<String> = Vec::new();
     for mem in &memories {
@@ -4080,6 +4178,7 @@ fn cmd_consolidate(store: &SqliteStore, topic: &str, keep_originals: bool) -> Re
 
     let mut consolidated = Memory::new(topic.to_string(), merged_summary, best_importance);
     consolidated.keywords = all_keywords;
+    consolidated.related_ids = memories.iter().map(|m| m.id.clone()).collect();
 
     if keep_originals {
         let id = store.store(consolidated)?;

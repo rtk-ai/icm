@@ -37,9 +37,14 @@ use icm_store::SqliteStore;
     about = "Infinite Context Memory - persistent memory for LLMs"
 )]
 struct Cli {
-    /// Path to the SQLite database
-    #[arg(long, global = true)]
-    db: Option<PathBuf>,
+    /// Path to the SQLite database. Audit #185 medium: `clap`'s
+    /// `global = true` lets the same flag appear at both the parent
+    /// and subcommand level (`icm --db A stats --db B`), with the
+    /// last occurrence winning silently. We collect into a `Vec` so
+    /// we can detect that case and reject it with a clear error
+    /// instead of letting the user lose data with the wrong DB.
+    #[arg(long, global = true, action = clap::ArgAction::Append)]
+    db: Vec<PathBuf>,
 
     /// Disable embeddings (skip model download, use keyword search only)
     #[arg(long, global = true)]
@@ -1015,8 +1020,29 @@ fn main() -> Result<()> {
             e.dimensions()
         })
         .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
-    let db_path = cli.db.clone().unwrap_or_else(default_db_path);
-    let store = open_store(cli.db, embedding_dims)?;
+    // Audit #185 medium: reject `--db A ... --db B` (or with `=`)
+    // instead of silently letting the last occurrence win. Clap
+    // alone doesn't catch the parent+subcommand split case (the
+    // `global = true` flag silently overrides across command
+    // levels), so we scan raw argv pre-parse: any flag that starts
+    // with `--db` (whether `--db PATH` or `--db=PATH`) counts as one
+    // occurrence. The user is most likely passing the wrong DB by
+    // accident; saying so is safer than writing to the unintended
+    // path.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        let db_count = argv
+            .iter()
+            .skip(1)
+            .filter(|a| *a == "--db" || a.starts_with("--db="))
+            .count();
+        if db_count > 1 {
+            anyhow::bail!("--db can only be specified once; got {db_count} occurrences");
+        }
+    }
+    let cli_db: Option<PathBuf> = cli.db.into_iter().next();
+    let db_path = cli_db.clone().unwrap_or_else(default_db_path);
+    let store = open_store(cli_db, embedding_dims)?;
 
     match cli.command {
         Commands::Store {

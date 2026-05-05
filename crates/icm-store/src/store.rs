@@ -69,7 +69,7 @@ impl SqliteStore {
         let conn = Connection::open(path)
             .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;",
         )
         .map_err(db_err)?;
         init_db_with_dims(&conn, embedding_dims)?;
@@ -135,7 +135,7 @@ impl SqliteStore {
         ensure_sqlite_vec();
         let conn = Connection::open_in_memory()
             .map_err(|e| IcmError::Database(format!("cannot open in-memory db: {e}")))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
             .map_err(db_err)?;
         init_db(&conn)?;
         Ok(Self {
@@ -5684,12 +5684,18 @@ mod tests {
 
     #[test]
     fn test_busy_timeout_pragma() {
+        // Audit #185 M: 6/20 parallel hook handlers timed out at the
+        // previous 5s busy_timeout. Bumping to 30s covers realistic
+        // burst-write contention (large transcript extraction triggers
+        // many writes on PreCompact/SessionEnd) without hiding genuine
+        // lock issues — anyone holding a write lock for >30s has a
+        // real bug worth surfacing.
         let store = test_store();
         let timeout: i64 = store
             .conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(timeout, 5000);
+        assert_eq!(timeout, 30000);
     }
 
     #[test]

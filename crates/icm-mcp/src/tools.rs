@@ -17,11 +17,16 @@ const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
 /// Similarity score above which a new memory is considered a duplicate of an existing one.
 const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.85;
 
-/// Maximum allowed length for topic names.
+/// Maximum allowed length for topic names. Must stay <= the store
+/// layer's `MAX_TOPIC_BYTES` so the MCP-level rejection happens
+/// *before* the store's lower-level validation does.
 const MAX_TOPIC_LEN: usize = 255;
 
-/// Maximum allowed length for content/summary text.
-const MAX_CONTENT_LEN: usize = 100_000;
+/// Maximum allowed length for content/summary text. Aligned with the
+/// store layer's `MAX_SUMMARY_BYTES` (64 KB). Letting MCP accept
+/// larger inputs only to have the store reject them would be
+/// confusing — fail fast at the API surface.
+const MAX_CONTENT_LEN: usize = 64 * 1024;
 
 /// Parse a JSON keywords array from tool arguments.
 fn parse_keywords(args: &Value) -> Vec<String> {

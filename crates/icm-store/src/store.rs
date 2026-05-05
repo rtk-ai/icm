@@ -332,6 +332,74 @@ fn sanitize_fts_query(query: &str) -> String {
 // MemoryStore impl
 // ---------------------------------------------------------------------------
 
+/// Maximum byte length of a stored summary. Audit finding: a transcript
+/// containing a 1 MB unbroken text block landed as a single memory whose
+/// summary was the full 1 MB blob. Caps the cost of a single bad write
+/// (memory bloat, embedding compute, FTS5 index growth) to a generous
+/// but bounded 64 KB.
+const MAX_SUMMARY_BYTES: usize = 64 * 1024;
+
+/// Maximum byte length of a stored topic. Topics surface in `icm
+/// topics` listings and as the routing key for project filters; a
+/// thousand-byte topic is always a bug, never legitimate user input.
+const MAX_TOPIC_BYTES: usize = 256;
+
+/// Validate and normalize a `Memory` before insertion. Trims topic
+/// whitespace and rejects inputs that we know corrupt or break the
+/// store:
+///
+/// - Empty or whitespace-only `topic` / `summary` — these would surface
+///   as blank rows in `icm topics` / `icm list` and pollute the FTS5
+///   index without conveying information.
+/// - NUL byte (`\0`) in `topic` or `summary` — libsql binds text via a
+///   NUL-terminated C string, so anything past the first `\0` is
+///   silently dropped. Rather than silently truncate, refuse the
+///   write so the caller knows.
+/// - Newline / CR / tab in `topic` — these break the `icm topics`
+///   tabular layout and could enable display-spoofing of topic names
+///   (e.g. a topic that visually overlaps another in TUI/log output).
+///   Allowed in `summary` since it's free-form prose.
+/// - `topic` longer than `MAX_TOPIC_BYTES` or `summary` longer than
+///   `MAX_SUMMARY_BYTES` — see the constant docs for rationale.
+fn validate_and_normalize(mut memory: Memory) -> IcmResult<Memory> {
+    memory.topic = memory.topic.trim().to_string();
+
+    if memory.topic.is_empty() {
+        return Err(IcmError::InvalidInput("topic cannot be empty".into()));
+    }
+    if memory.summary.trim().is_empty() {
+        return Err(IcmError::InvalidInput("summary cannot be empty".into()));
+    }
+    if memory.topic.contains('\0') {
+        return Err(IcmError::InvalidInput(
+            "topic must not contain NUL bytes".into(),
+        ));
+    }
+    if memory.summary.contains('\0') {
+        return Err(IcmError::InvalidInput(
+            "summary must not contain NUL bytes".into(),
+        ));
+    }
+    if memory.topic.contains(['\n', '\r', '\t']) {
+        return Err(IcmError::InvalidInput(
+            "topic must not contain newline / CR / tab characters".into(),
+        ));
+    }
+    if memory.topic.len() > MAX_TOPIC_BYTES {
+        return Err(IcmError::InvalidInput(format!(
+            "topic exceeds {} bytes",
+            MAX_TOPIC_BYTES
+        )));
+    }
+    if memory.summary.len() > MAX_SUMMARY_BYTES {
+        return Err(IcmError::InvalidInput(format!(
+            "summary exceeds {} bytes",
+            MAX_SUMMARY_BYTES
+        )));
+    }
+    Ok(memory)
+}
+
 /// SHA-256 over the normalized `(topic, summary)` pair, hex-encoded.
 /// Normalization: trim + lowercase + collapse whitespace runs to single
 /// spaces. Topic and summary are joined by `\0` to prevent boundary
@@ -435,6 +503,8 @@ impl SqliteStore {
 
 impl MemoryStore for SqliteStore {
     fn store(&self, memory: Memory) -> IcmResult<String> {
+        let memory = validate_and_normalize(memory)?;
+
         self.conn
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
@@ -3727,42 +3797,138 @@ mod tests {
     }
 
     #[test]
-    fn test_null_bytes_in_content() {
+    fn test_null_bytes_in_summary_rejected() {
+        // Audit finding: libsql binds text via NUL-terminated C strings,
+        // so anything past the first `\0` was silently dropped — a
+        // memory written as `"before\0after"` came back as `"before"`.
+        // We now reject the write so callers know their data isn't
+        // round-tripping intact.
         let store = test_store();
         let mem = make_memory("test", "before\0after");
-        store.store(mem.clone()).unwrap();
-        let retrieved = store.get(&mem.id).unwrap().unwrap();
-        assert!(retrieved.summary.contains("before"));
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("NUL")),
+            "expected InvalidInput(NUL...) got {err:?}"
+        );
     }
 
     #[test]
-    fn test_unicode_boundary_content() {
+    fn test_null_bytes_in_topic_rejected() {
+        let store = test_store();
+        let mem = make_memory("topic\0fake", "real summary content");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("NUL")),
+            "expected InvalidInput(NUL...) got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_unicode_topic_with_trailing_null_rejected() {
+        // The previous permissive behaviour stored the topic
+        // `\u{1F600}\u{1F4A9}\u{0000}` and round-tripped only the
+        // pre-NUL prefix. Now we reject so callers don't think they
+        // stored what they passed.
         let store = test_store();
         let unicode_topic = "\u{1F600}\u{1F4A9}\u{0000}";
-        let mem = make_memory(unicode_topic, "emoji topic");
-        store.store(mem.clone()).unwrap();
-        let retrieved = store.get(&mem.id).unwrap().unwrap();
-        assert!(retrieved.topic.starts_with('\u{1F600}'));
+        let mem = make_memory(unicode_topic, "emoji topic content here");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("NUL")),
+            "expected NUL rejection on emoji+NUL topic, got {err:?}"
+        );
     }
 
     #[test]
-    fn test_very_long_summary() {
+    fn test_unicode_emoji_topic_without_null_accepted() {
+        // Sanity: legitimate emoji topics should still work.
+        let store = test_store();
+        let mem = make_memory("\u{1F525}-decisions", "real content here please");
+        let id = store.store(mem.clone()).unwrap();
+        let retrieved = store.get(&id).unwrap().unwrap();
+        assert!(retrieved.topic.starts_with('\u{1F525}'));
+    }
+
+    #[test]
+    fn test_summary_within_cap_accepted() {
+        let store = test_store();
+        let summary = "a".repeat(60_000);
+        let mem = make_memory("test", &summary);
+        store.store(mem.clone()).unwrap();
+        let retrieved = store.get(&mem.id).unwrap().unwrap();
+        assert_eq!(retrieved.summary.len(), 60_000);
+    }
+
+    #[test]
+    fn test_summary_exceeding_cap_rejected() {
+        // Audit finding: a 1 MB single text block landed verbatim as a
+        // single memory's summary, blowing up DB size and embedding
+        // compute. Cap at 64 KB.
         let store = test_store();
         let long_summary = "a".repeat(100_000);
         let mem = make_memory("test", &long_summary);
-        store.store(mem.clone()).unwrap();
-        let retrieved = store.get(&mem.id).unwrap().unwrap();
-        assert_eq!(retrieved.summary.len(), 100_000);
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("summary exceeds")),
+            "expected summary-size rejection got {err:?}"
+        );
     }
 
     #[test]
-    fn test_empty_strings() {
+    fn test_empty_topic_rejected() {
         let store = test_store();
-        let mem = make_memory("", "");
-        store.store(mem.clone()).unwrap();
-        let retrieved = store.get(&mem.id).unwrap().unwrap();
-        assert_eq!(retrieved.topic, "");
-        assert_eq!(retrieved.summary, "");
+        let mem = make_memory("", "real summary content here");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("topic cannot be empty")),
+            "expected empty-topic rejection got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_topic_rejected() {
+        let store = test_store();
+        let mem = make_memory("   \t  ", "real summary content here");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("topic cannot be empty")),
+            "expected empty-after-trim rejection got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_empty_summary_rejected() {
+        let store = test_store();
+        let mem = make_memory("topic", "");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("summary cannot be empty")),
+            "expected empty-summary rejection got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_topic_with_newline_rejected() {
+        let store = test_store();
+        let mem = make_memory("topic\nfake-topic", "real summary content here");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("newline")),
+            "expected newline rejection got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_topic_trailing_whitespace_trimmed_on_store() {
+        // Two topics that visually look identical (`"trail "` vs
+        // `"trail"`) should land in the same bucket. We trim on the
+        // way in.
+        let store = test_store();
+        let id1 = store
+            .store(make_memory("  trail  ", "summary one content"))
+            .unwrap();
+        let mem1 = store.get(&id1).unwrap().unwrap();
+        assert_eq!(mem1.topic, "trail", "topic should be trimmed");
     }
 
     #[test]

@@ -2078,6 +2078,30 @@ fn cmd_hook_pre() -> Result<()> {
     Ok(())
 }
 
+/// Maximum bytes of transcript content read by hook handlers. The
+/// pre-existing `std::fs::read_to_string` had no upper bound; pointing
+/// `transcript_path` at `/dev/zero`, `/dev/urandom`, or a multi-GB
+/// jsonl tail would block the hook indefinitely (or until OOM).
+/// Hook handlers only consume the last 100 lines anyway, so a tight
+/// cap costs nothing. 32 MB leaves comfortable headroom for real
+/// long-running sessions while killing the DoS vector.
+const MAX_TRANSCRIPT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Read a transcript file with a hard byte cap. The pre-existing
+/// `read_to_string` blew up on `/dev/zero` and friends because there
+/// was no upper limit; this wraps `Read::take` so we always stop at
+/// `MAX_TRANSCRIPT_BYTES` and return what we have. Real transcripts
+/// past the cap get their head dropped — acceptable since the
+/// extraction path only uses the trailing 100 lines.
+fn read_transcript_capped(path: &str) -> std::io::Result<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path)?;
+    let mut limited = std::io::BufReader::new(f).take(MAX_TRANSCRIPT_BYTES);
+    let mut s = String::new();
+    limited.read_to_string(&mut s)?;
+    Ok(s)
+}
+
 /// Check if a bash command is **purely** icm invocations.
 ///
 /// Auto-allow is privilege-grade: a `permissionDecision: "allow"`
@@ -2289,7 +2313,7 @@ fn extract_from_hook_transcript(
         None => return Ok(()), // No transcript path — nothing to do
     };
 
-    let transcript = match std::fs::read_to_string(transcript_path) {
+    let transcript = match read_transcript_capped(transcript_path) {
         Ok(t) => t,
         Err(_) => return Ok(()), // Can't read transcript — fail silently
     };

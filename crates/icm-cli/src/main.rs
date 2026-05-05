@@ -1570,7 +1570,20 @@ fn cmd_recall(
     final_results.retain(&filter);
 
     if final_results.is_empty() {
-        println!("{MSG_NO_MEMORIES}");
+        // Audit #185 H8: don't short-circuit with a human-readable
+        // message — that breaks the JSON / TOON contracts. Render
+        // empty results through the chosen formatter; each renderer
+        // already produces a clean empty representation:
+        //   - toon:   "memories[0]{...}:\n"
+        //   - detail: empty string (so we keep the human banner there)
+        //   - json:   "[]"
+        match format {
+            recall_format::RecallFormat::Detail => println!("{MSG_NO_MEMORIES}"),
+            _ => {
+                let rendered = recall_format::render(&final_results, format)?;
+                print!("{rendered}");
+            }
+        }
         return Ok(());
     }
 
@@ -2660,6 +2673,17 @@ fn cmd_stats(store: &SqliteStore) -> Result<()> {
 }
 
 fn cmd_decay(store: &SqliteStore, factor: f32) -> Result<()> {
+    // Audit #185 H9: `apply_decay` multiplies each memory's weight by
+    // `factor`, so values >= 1 *amplify* weight instead of decaying it
+    // — the opposite of the user's intent and an instant footgun.
+    // Reject at the CLI boundary with a clear message rather than
+    // silently corrupting the ranking.
+    if !(factor.is_finite() && (0.0..1.0).contains(&factor)) {
+        return Err(anyhow::anyhow!(
+            "decay factor must be in [0.0, 1.0); got {factor}. \
+             Values >= 1 amplify weights instead of decaying them."
+        ));
+    }
     let affected = store.apply_decay(factor)?;
     println!("Decay applied (factor={factor}) to {affected} memories.");
     Ok(())
@@ -6893,5 +6917,46 @@ mod is_icm_command_tests {
         // for a one-time permission on `icm recall '<>'`.
         assert!(!is_icm_command(r#"icm recall "<>""#));
         assert!(!is_icm_command(r#"icm recall 'a > b'"#));
+    }
+}
+
+#[cfg(test)]
+mod cli_contracts_tests {
+    use super::*;
+    use icm_store::SqliteStore;
+
+    /// Audit #185 H9: `apply_decay` multiplies weight by `factor`,
+    /// so values >= 1 amplify instead of decaying. Reject at the CLI
+    /// boundary so users can't shoot themselves in the foot.
+    #[test]
+    fn cmd_decay_rejects_factor_one_or_greater() {
+        let store = SqliteStore::in_memory().unwrap();
+        for &bad in &[1.0_f32, 1.5, 2.0, 100.0, f32::INFINITY] {
+            let err = cmd_decay(&store, bad).unwrap_err();
+            assert!(
+                err.to_string().contains("decay factor must be in"),
+                "factor={bad} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_decay_rejects_negative_or_nan_factor() {
+        let store = SqliteStore::in_memory().unwrap();
+        for &bad in &[-0.1_f32, -1.0, f32::NAN, f32::NEG_INFINITY] {
+            let err = cmd_decay(&store, bad).unwrap_err();
+            assert!(
+                err.to_string().contains("decay factor must be in"),
+                "factor={bad} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_decay_accepts_valid_factor() {
+        let store = SqliteStore::in_memory().unwrap();
+        for &good in &[0.0_f32, 0.5, 0.95, 0.999_999] {
+            cmd_decay(&store, good).unwrap_or_else(|e| panic!("factor={good} rejected: {e}"));
+        }
     }
 }

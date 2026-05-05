@@ -1,31 +1,94 @@
 //! Rule-based extraction and context injection for auto-extraction layers.
 //!
-//! Layer 0: Extract facts from text using keyword scoring (zero LLM cost).
+//! Layer 0: Extract facts from text using keyword scoring (zero LLM cost,
+//! English-only). When an `Embedder` is supplied, the keyword scorer is
+//! replaced by [`crate::extract_semantic::SemanticScorer`] which works
+//! cross-lingually via the multilingual embedder.
 //! Layer 2: Recall and format context for prompt injection.
 
 use std::collections::HashSet;
 
 use anyhow::Result;
-use icm_core::{is_preference_topic, project_matches, Importance, Memory, MemoryStore};
+use icm_core::{is_preference_topic, project_matches, Embedder, Importance, Memory, MemoryStore};
 use icm_store::SqliteStore;
+
+use crate::extract_semantic::{AnchorKind, SemanticScorer};
+
+/// `(topic, content, importance, anchor_kind)` — internal shape for
+/// the unified scoring pipeline. Kind is `None` for facts produced by
+/// the keyword scorer (legacy English path).
+type ScoredFact = (String, String, Importance, Option<AnchorKind>);
 
 /// Extract key facts from text and store them in ICM.
 /// Returns the number of facts stored.
 pub fn extract_and_store(store: &SqliteStore, text: &str, project: &str) -> Result<usize> {
-    extract_and_store_with_opts(store, text, project, false)
+    extract_and_store_with_opts(store, text, project, false, Importance::Critical)
 }
 
 /// Extract and store with option to store raw text as fallback.
+///
+/// `max_importance` clamps each extracted fact's auto-assigned importance.
+/// Callers that ingest **untrusted** content (hook handlers reading
+/// transcripts produced by the LLM and any tool it called) should pass
+/// `Importance::Medium` so a malicious assistant message containing
+/// `"DECISION: ..."` (which the rule-based extractor would otherwise
+/// promote to High) cannot inject itself into wake-up packs as a
+/// "critical decision". CLI / bench callers ingesting user-explicit
+/// input pass `Importance::Critical` to disable the cap.
+///
+/// This variant uses the English-only keyword scorer. For multilingual
+/// content prefer [`extract_and_store_with_embedder`].
 pub fn extract_and_store_with_opts(
     store: &SqliteStore,
     text: &str,
     project: &str,
     store_raw: bool,
+    max_importance: Importance,
 ) -> Result<usize> {
-    let facts = extract_facts(text, project);
+    extract_and_store_with_embedder(store, text, project, store_raw, max_importance, None)
+}
+
+/// Extract and store with optional embedder for multilingual scoring.
+///
+/// When `embedder` is `Some`, candidate sentences are scored against
+/// semantic anchors via cosine similarity in the embedder's vector
+/// space. The default model (`intfloat/multilingual-e5-base`) covers
+/// 100+ languages, so a French decision sentence and its English
+/// counterpart both match the decision anchor.
+///
+/// When `embedder` is `None` (e.g. `--no-embeddings` or the embedder
+/// failed to load), the function falls back to the keyword scorer in
+/// [`extract_facts`]. This preserves the pre-existing behaviour for
+/// users who run with embeddings disabled. We also fall back if the
+/// scorer's anchor-build call fails — better to extract English facts
+/// only than to extract nothing at all.
+pub fn extract_and_store_with_embedder(
+    store: &SqliteStore,
+    text: &str,
+    project: &str,
+    store_raw: bool,
+    max_importance: Importance,
+    embedder: Option<&dyn Embedder>,
+) -> Result<usize> {
+    let facts: Vec<ScoredFact> = match embedder {
+        Some(emb) => match SemanticScorer::new(emb) {
+            Ok(scorer) => extract_facts_semantic(text, project, emb, &scorer)
+                .unwrap_or_else(|_| extract_facts_with_kind(text, project)),
+            Err(_) => extract_facts_with_kind(text, project),
+        },
+        None => extract_facts_with_kind(text, project),
+    };
+
     let mut stored = 0;
-    for (topic, content, importance) in &facts {
-        let mem = Memory::new(topic.clone(), content.clone(), *importance);
+    for (topic, content, importance, kind) in &facts {
+        let mut mem = Memory::new(
+            topic.clone(),
+            content.clone(),
+            cap_importance(*importance, max_importance),
+        );
+        if let Some(k) = kind {
+            mem.keywords.push(k.as_tag().to_string());
+        }
         store.store(mem)?;
         stored += 1;
     }
@@ -47,6 +110,76 @@ pub fn extract_and_store_with_opts(
     }
 
     Ok(stored)
+}
+
+/// Adapter that wraps `extract_facts` so its output shape matches
+/// the semantic path: `(topic, content, importance, Option<AnchorKind>)`.
+fn extract_facts_with_kind(text: &str, project: &str) -> Vec<ScoredFact> {
+    extract_facts(text, project)
+        .into_iter()
+        .map(|(t, c, i)| (t, c, i, None))
+        .collect()
+}
+
+/// Score candidate sentences semantically and return the surviving
+/// ones tagged with their matched anchor kind. Falls back to
+/// `extract_facts_with_kind` if the embedder can't embed a batch.
+fn extract_facts_semantic(
+    text: &str,
+    project: &str,
+    embedder: &dyn Embedder,
+    scorer: &SemanticScorer,
+) -> Result<Vec<ScoredFact>> {
+    let sentences = split_sentences(text);
+    let candidates: Vec<&str> = sentences
+        .iter()
+        .filter(|s| {
+            let len = s.chars().count();
+            (20..=500).contains(&len)
+        })
+        .map(|s| s.as_str())
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let scored = scorer.score_batch(embedder, &candidates)?;
+
+    let mut facts: Vec<ScoredFact> = Vec::new();
+    for (sentence, result) in candidates.iter().zip(scored) {
+        if let Some((kind, _margin)) = result {
+            let dominated = facts
+                .iter()
+                .any(|(_, existing, _, _)| jaccard_similar(existing, sentence));
+            if !dominated {
+                facts.push((
+                    format!("context-{project}"),
+                    sentence.to_string(),
+                    kind.importance(),
+                    Some(kind),
+                ));
+            }
+        }
+    }
+
+    Ok(facts)
+}
+
+/// Clamp `value` to at most `cap`. `Importance` doesn't derive `Ord` (it
+/// would imply a numeric ranking that's not meaningful in all contexts),
+/// so map locally to a partial order: Critical > High > Medium > Low.
+fn cap_importance(value: Importance, cap: Importance) -> Importance {
+    let rank = |i: Importance| match i {
+        Importance::Critical => 4,
+        Importance::High => 3,
+        Importance::Medium => 2,
+        Importance::Low => 1,
+    };
+    if rank(value) > rank(cap) {
+        cap
+    } else {
+        value
+    }
 }
 
 /// Recall relevant memories and format as context preamble for prompt injection.
@@ -77,33 +210,77 @@ pub fn recall_context(
 
     // Oversample FTS results so that filtering still leaves enough candidates.
     let fts_results = store.search_fts(query, limit.saturating_mul(4).max(limit))?;
-    let filtered: Vec<Memory> = fts_results
-        .into_iter()
+    let project_filtered: Vec<Memory> = fts_results
+        .iter()
         .filter(|m| project_filter(m))
         .take(limit)
+        .cloned()
         .collect();
 
-    let relevant: Vec<_> = if filtered.is_empty() {
-        // Fallback: get all (project-matching) memories sorted by weight.
+    // Three-tier fallback for the project filter:
+    //
+    // 1. If project-scoped FTS hits found something, use them.
+    // 2. Else, if global FTS (no project filter) found something,
+    //    surface those — this catches cross-project knowledge topics
+    //    like `errors-resolved`, `lessons-learned`, or
+    //    `decisions-<other-project>` that the project filter
+    //    legitimately strips but that are still relevant to the
+    //    query. Audit finding (#185 H5): the previous code dropped
+    //    `errors-resolved` for any query in a non-matching project
+    //    and the user never saw their own past bug fixes.
+    // 3. Else, fall back to preference / identity topics only,
+    //    sorted by weight. The previous code fell back to *all*
+    //    memories sorted by weight regardless of query (#185 H4):
+    //    "qwerty xyzzy nonsense" returned the top 5 project
+    //    memories on every prompt, polluting context with
+    //    irrelevant noise. Preferences are different — they're the
+    //    always-on identity layer (PR #182 / SessionStart wake-up
+    //    already surfaces them, but legacy callers expect recall to
+    //    too). Restricting the last-ditch fallback to preferences
+    //    preserves that contract while killing the off-topic
+    //    pollution.
+    let candidate: Vec<Memory> = if !project_filtered.is_empty() {
+        project_filtered
+    } else if !fts_results.is_empty() {
+        fts_results.into_iter().take(limit).collect()
+    } else {
         let topics = store.list_topics()?;
-        let mut all = Vec::new();
+        let mut prefs: Vec<Memory> = Vec::new();
         for (topic, _) in &topics {
+            if !is_preference_topic(topic) {
+                continue;
+            }
             for mem in store.get_by_topic(topic)? {
-                if project_filter(&mem) {
-                    all.push(mem);
-                }
+                prefs.push(mem);
             }
         }
-        all.sort_by(|a, b| {
+        prefs.sort_by(|a, b| {
             b.weight
                 .partial_cmp(&a.weight)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        all.truncate(limit);
-        all
-    } else {
-        filtered
+        prefs.truncate(limit);
+        prefs
     };
+
+    // Audit #185 medium: deduplicate near-paraphrases before
+    // rendering. Without this, storing 10 paraphrases of "Patrick
+    // prefers Rust over Go" returns 5 near-identical bullets in
+    // every prompt's injection — pure token waste. The same Jaccard
+    // similarity check that `extract_facts_semantic` already uses
+    // for write-side dedup (in `extract_facts_semantic`) is reused
+    // here at render-side. Cost: O(n²) word-set intersections, but
+    // n ≤ limit (typically 5-10) so it's negligible compared to
+    // the FTS / vector search already done.
+    let mut relevant: Vec<Memory> = Vec::with_capacity(candidate.len());
+    for mem in candidate {
+        let dominated = relevant
+            .iter()
+            .any(|kept| jaccard_similar(&kept.summary, &mem.summary));
+        if !dominated {
+            relevant.push(mem);
+        }
+    }
 
     if relevant.is_empty() {
         return Ok(String::new());
@@ -151,9 +328,25 @@ pub fn recall_context(
     Ok(ctx)
 }
 
-/// Public wrapper for CLI dry-run display.
-pub fn extract_facts_public(text: &str, project: &str) -> Vec<(String, String, Importance)> {
-    extract_facts(text, project)
+/// Public wrapper for CLI dry-run that uses the semantic scorer
+/// when an embedder is provided. Falls back to the keyword scorer
+/// when `embedder` is `None` or anchor build fails. The third tuple
+/// field is the matched anchor kind (or `None` for the keyword path)
+/// so the dry-run output can show the user *why* each fact was
+/// promoted.
+pub fn extract_facts_public_with_embedder(
+    text: &str,
+    project: &str,
+    embedder: Option<&dyn Embedder>,
+) -> Vec<(String, String, Importance, Option<AnchorKind>)> {
+    if let Some(emb) = embedder {
+        if let Ok(scorer) = SemanticScorer::new(emb) {
+            if let Ok(facts) = extract_facts_semantic(text, project, emb, &scorer) {
+                return facts;
+            }
+        }
+    }
+    extract_facts_with_kind(text, project)
 }
 
 /// Extract key facts from text using keyword scoring.
@@ -178,6 +371,17 @@ fn extract_facts_with_threshold(
         }
 
         let lower = s.to_lowercase();
+
+        // Reject AI narration / action-announcement sentences before they
+        // hit the scorer. These trigger the existing keyword tables (e.g.
+        // "I'm going to **deploy**" hits the `deployed` bucket) and end up
+        // stored as if they were facts. Cheap prefix check on lowercase.
+        // Researcher audit R03/R01: ~60% of `context-icm` noise on the prod
+        // DB matched these patterns.
+        if NARRATION_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+            continue;
+        }
+
         let mut score = 0.0f32;
         let mut importance = Importance::Medium;
 
@@ -267,7 +471,11 @@ fn extract_facts_with_threshold(
             }
         }
 
-        // Decision / rationale language
+        // Decision / rationale language. R01 audit: closing-decision
+        // language ("OK so we'll...", "let's go with...", "the call is...")
+        // was missing — sentences that *finalize* a debate scored below
+        // threshold and were dropped, even though they're the highest-value
+        // memory in a session. Added here.
         for kw in &[
             "chose",
             "chosen",
@@ -281,6 +489,16 @@ fn extract_facts_with_threshold(
             "proposed",
             "introduced",
             "invented",
+            "ok so we",
+            "ok, so we",
+            "so we'll",
+            "so we will",
+            "let's go with",
+            "going with",
+            "final answer:",
+            "the call is",
+            "settled on",
+            "opted for",
         ] {
             if lower.contains(kw) {
                 score += 2.5;
@@ -537,6 +755,44 @@ fn extract_facts_with_threshold(
 /// Minimum char count for a fragment to be kept after splitting.
 const MIN_SENTENCE_LEN: usize = 30;
 
+/// Prefixes that mark a sentence as AI narration / action announcement
+/// rather than a factual statement worth remembering. Case-insensitive
+/// match on the *start* of the trimmed sentence — these are the patterns
+/// LLMs emit while working ("Let me check…", "I'll now read…") that the
+/// keyword scorer otherwise mis-classifies as decisions or actions.
+const NARRATION_PREFIXES: &[&str] = &[
+    "let me ",
+    "let's ",
+    "i will ",
+    "i'll ",
+    "i'm going to ",
+    "i am going to ",
+    "i'm now ",
+    "i am now ",
+    "now i'll ",
+    "now let me ",
+    "next, i'll ",
+    "next i'll ",
+    "first, i'll ",
+    "first i'll ",
+    "first, let me ",
+    "first let me ",
+    "reading the ",
+    "looking at the ",
+    "checking the ",
+    "running the ",
+    "storing this ",
+    "i should ",
+    "i need to check",
+    "i need to look",
+    "i need to read",
+    "i need to verify",
+    "i'll start by ",
+    "i will start by ",
+    "let me start by ",
+    "let me check ",
+];
+
 /// English-language honorific abbreviations that end in `.` followed by a
 /// space + capitalized name. The naive splitter used to break sentences
 /// like `Mr. Smith joined the team.` into `... Mr.` + `Smith joined ...`.
@@ -580,10 +836,15 @@ fn ends_with_honorific(buf: &str) -> bool {
 /// every prompt's context.
 ///
 /// Rules:
-/// - A `.`, `?`, `!`, or `:` is a sentence terminator **only if followed
+/// - A `.`, `?`, or `!` is a sentence terminator **only if followed
 ///   by whitespace or end-of-input**. A `.` followed immediately by a
 ///   non-whitespace character (letter, digit, `/`, `:`, etc.) is part
 ///   of a URL, file path, version number, or abbreviation — keep going.
+/// - `:` is *not* a terminator. In technical prose it overwhelmingly
+///   introduces a clause (`Error: ...`, `Note: ...`, `Fixed: was
+///   using ...`) rather than ending one. Splitting on `:` produced
+///   two short fragments that both fell below `MIN_SENTENCE_LEN` and
+///   the underlying fact was dropped.
 /// - `\n` is a hard boundary (preserves the existing line-aware behaviour
 ///   for lists and tool output) but the resulting fragment goes through
 ///   `is_keepable_fragment` before being kept.
@@ -592,10 +853,13 @@ fn ends_with_honorific(buf: &str) -> bool {
 ///   noise (paths, JSON, etc.).
 ///
 /// The kept fragments must (via `is_keepable_fragment`):
-/// - End in a sentence terminator (`.`, `?`, `!`, `:`).
-/// - Not start with a markdown artifact prefix (`> `, `- `, `- [`, `* `,
-///   `+ `, `# `).
 /// - Be at least `MIN_SENTENCE_LEN` chars long.
+/// - Not start with a markdown artifact prefix (`> `, `- `, `- [`, `* `,
+///   `+ `, `# `, ```` ``` ````, `|`).
+/// - Not start with a subordinating-clause connector (`because `,
+///   `rather than `, `instead of `, …) — those are mid-sentence cuts.
+/// - Not start with a lowercase letter — likewise a mid-sentence cut.
+/// - Not end in a dangling URL/path token (`://`, `/`, `\`, `=`).
 fn split_sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -639,7 +903,7 @@ fn split_sentences(text: &str) -> Vec<String> {
         let next = chars.get(i + 1).copied();
         let boundary = if ch == '\n' {
             true
-        } else if matches!(ch, '.' | '?' | '!' | ':') {
+        } else if matches!(ch, '.' | '?' | '!') {
             match next {
                 None => true,
                 Some(c) if c.is_whitespace() => {
@@ -653,6 +917,12 @@ fn split_sentences(text: &str) -> Vec<String> {
                 _ => false, // `.` inside URL/path/version/abbreviation
             }
         } else {
+            // `:` is intentionally NOT a sentence terminator. In
+            // technical prose it overwhelmingly introduces a clause
+            // (`Error: ...`, `Note: ...`, `Fixed NOT_ANY condition: was
+            // using ...`) rather than ending one. Splitting on `:`
+            // produced two short fragments that both fell below
+            // `MIN_SENTENCE_LEN`, dropping the underlying fact entirely.
             false
         };
 
@@ -693,6 +963,8 @@ fn is_keepable_fragment(s: &str) -> bool {
 
     // Markdown artifact line prefixes — these are structure, not facts.
     // Order matters: `- [` (task list) must be checked before `- `.
+    // `|` covers GFM table rows (header, separator, body) which are
+    // structural even when they happen to contain a numeric "fact".
     if stripped.starts_with("> ")
         || stripped.starts_with("- [")
         || stripped.starts_with("- ")
@@ -700,8 +972,39 @@ fn is_keepable_fragment(s: &str) -> bool {
         || stripped.starts_with("+ ")
         || stripped.starts_with("# ")
         || stripped.starts_with("```")
+        || stripped.starts_with('|')
     {
         return false;
+    }
+
+    // Subordinating-clause starters: a fragment beginning with one of
+    // these is almost always a sentence cut mid-thought (log line wraps,
+    // table cells dumped to text, partial quotes from larger blocks).
+    // The keyword scorer would otherwise promote them to High because
+    // of "because", "rather than", "instead of" — but those tokens
+    // belong in the *middle* of a decision, not the start of a
+    // standalone fact. Cheap lowercase prefix match.
+    let lower = stripped.to_lowercase();
+    if SUBORDINATING_STARTERS.iter().any(|p| lower.starts_with(p)) {
+        return false;
+    }
+
+    // Lowercase-letter start is a strong signal of a fragment cut from
+    // the *middle* of a larger sentence. Real prose almost always
+    // capitalises the first letter; even technical names that start
+    // lowercase (`iOS`, `eBPF`, `npm`) are rare enough as the *first
+    // word of a complete sentence* that the false-negative cost is
+    // small. The false-positive cost — surfacing `operator on libsql
+    // query result rather than .ok()` or `the libsql FTS5 trigger
+    // failed on UPDATE` as standalone "facts" — is large because the
+    // keyword scorer would promote them to High via decision/error
+    // tokens further down. Digits, quotes and other non-alphabetic
+    // starts are allowed (e.g. `0.10.42 shipped with the dedup fix`,
+    // `"DECISION:" lines from a transcript dump`).
+    if let Some(first) = stripped.chars().next() {
+        if first.is_alphabetic() && first.is_lowercase() {
+            return false;
+        }
     }
 
     // Catch dangling URL/path tokens at the end. Boundary detection
@@ -718,6 +1021,29 @@ fn is_keepable_fragment(s: &str) -> bool {
 
     true
 }
+
+/// Lowercase prefixes that mark a fragment as the tail of a sentence
+/// rather than the start of one. Match is on `.starts_with(...)` after
+/// `to_lowercase()`, so each entry must end with a trailing space (or
+/// punctuation) to avoid eating a real word that happens to start with
+/// the same letters (e.g. `because` must not match `becausewhen`).
+const SUBORDINATING_STARTERS: &[&str] = &[
+    "because ",
+    "rather than ",
+    "instead of ",
+    "although ",
+    "though ",
+    "since ",
+    "while ",
+    "whereas ",
+    "whether ",
+    "due to ",
+    "such that ",
+    "so that ",
+    "as if ",
+    "as though ",
+    "in order to ",
+];
 
 // ── Fact classification ──────────────────────────────────────────────────
 
@@ -1160,7 +1486,8 @@ mod tests {
     fn test_store_raw_fallback() {
         let store = SqliteStore::in_memory().unwrap();
         let text = "Just some random conversation text that has no particular keywords but is still somewhat meaningful context about the ongoing work session";
-        let stored = extract_and_store_with_opts(&store, text, "test", true).unwrap();
+        let stored =
+            extract_and_store_with_opts(&store, text, "test", true, Importance::Critical).unwrap();
         assert_eq!(stored, 1, "should store raw text as fallback");
     }
 
@@ -1237,6 +1564,155 @@ mod tests {
         assert!(
             ctx2.contains("terse responses"),
             "preferences must not be stripped by project filter: {ctx2}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_dedupes_paraphrases_at_render() {
+        // Audit #185 medium: storing N paraphrases of the same fact
+        // used to produce N near-identical bullets in the injected
+        // context. Apply Jaccard dedup at render so only one
+        // representative survives.
+        //
+        // The Jaccard threshold is 0.6 on word-set
+        // intersection-over-union, so the paraphrases here use
+        // pure word-order shuffles and minor filler additions
+        // (intersection ≥ 7/9 ≈ 0.78 between any pair) to keep
+        // the test deterministic across platforms.
+        let store = SqliteStore::in_memory().unwrap();
+        let paraphrases = [
+            "Patrick prefers Rust over Go for systems work",
+            "Patrick really prefers Rust over Go for systems work",
+            "For systems work Patrick prefers Rust over Go",
+            "Patrick prefers Rust strongly over Go for systems work",
+            "For all systems work Patrick prefers Rust over Go",
+        ];
+        for p in paraphrases {
+            store
+                .store(Memory::new(
+                    "preferences".to_string(),
+                    p.to_string(),
+                    Importance::High,
+                ))
+                .unwrap();
+        }
+
+        let ctx = recall_context(&store, "Rust Go systems work", None, 10).unwrap();
+        // Count `\n- ` bullets so the leading "Here is context..." line
+        // (which contains no `\n- ` prefix) is not double-counted.
+        let bullet_count = ctx.matches("\n- ").count();
+        assert!(
+            bullet_count <= 2,
+            "expected ≤ 2 paraphrase bullets, got {bullet_count}: {ctx}"
+        );
+        // Sanity: at least one bullet must survive — the dedup pass
+        // is not allowed to nuke everything.
+        assert!(bullet_count >= 1, "expected ≥ 1 bullet, got {bullet_count}");
+    }
+
+    #[test]
+    fn test_recall_context_surfaces_cross_project_knowledge_on_fts_hit() {
+        // Audit #185 H5: a query that matches an `errors-resolved`
+        // memory must surface it even when the user is working in a
+        // different project — those are cross-project lessons. The
+        // pre-fix project filter stripped the memory and the
+        // weight-sorted fallback returned other irrelevant memories.
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "context-projecta".to_string(),
+                "Frontend uses Svelte for the dashboard layer".to_string(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "errors-resolved".to_string(),
+                "Bug in auth middleware was fixed by adding a refresh token rotation step"
+                    .to_string(),
+                Importance::High,
+            ))
+            .unwrap();
+
+        let ctx = recall_context(
+            &store,
+            "auth middleware refresh token rotation",
+            Some("projecta"),
+            5,
+        )
+        .unwrap();
+        assert!(
+            ctx.contains("auth middleware"),
+            "errors-resolved memory should surface for matching query even on a different project: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_off_topic_query_does_not_dump_project_memories() {
+        // Audit #185 H4: a query with zero overlap should NOT pull
+        // out `context-projecta` memories sorted by weight. The
+        // pre-fix code returned the top-5 by weight regardless of
+        // query relevance, polluting every irrelevant prompt.
+        let store = SqliteStore::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new(
+                    "context-projecta".to_string(),
+                    format!("Project memory number {i} about deployment"),
+                    Importance::High,
+                ))
+                .unwrap();
+        }
+
+        let ctx = recall_context(
+            &store,
+            "qwertyzxc completely unrelated nonsense xyzzy",
+            Some("projecta"),
+            5,
+        )
+        .unwrap();
+        assert!(
+            !ctx.contains("Project memory number"),
+            "off-topic query must not surface project memories: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_off_topic_query_still_surfaces_preferences() {
+        // Sanity: even though the query is off-topic, preferences are
+        // the always-on identity layer and the last-ditch fallback
+        // surfaces them by weight. Without this, every irrelevant
+        // prompt would lose the user's coding rules.
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "context-projecta".to_string(),
+                "Project specific note here for completeness".to_string(),
+                Importance::High,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "preferences".to_string(),
+                "User always wants snake_case in Rust function names".to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+
+        let ctx = recall_context(
+            &store,
+            "qwertyzxc unrelated nonsense xyzzy",
+            Some("projecta"),
+            5,
+        )
+        .unwrap();
+        assert!(
+            ctx.contains("snake_case"),
+            "preferences must survive off-topic queries: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Project specific note"),
+            "project memories must NOT leak via fallback: {ctx}"
         );
     }
 
@@ -1463,18 +1939,149 @@ mod tests {
     }
 
     #[test]
+    fn split_drops_markdown_table_rows() {
+        // GFM table rows are structure, not facts. Both header and body
+        // rows must be filtered out — they were observed leaking into
+        // `context-icm` as standalone "memories" that contained nothing
+        // but column titles or aggregated numbers.
+        let cases = [
+            "| Fin S2 (mai 2027) | ~1 815 K€ |",
+            "| Path | p50 | Coût $ | Qualité output |",
+            "| **V9** | E2E claude -p × 5 sessions | PASS partiel |",
+            "|---|---|---|",
+        ];
+        for text in &cases {
+            let chunks = split_sentences(text);
+            assert!(
+                chunks.is_empty(),
+                "table row should be filtered: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_drops_subordinating_starters() {
+        // Fragments cut from larger sentences and starting with a
+        // subordinating conjunction should not be kept. They contain
+        // decision-keyword vocabulary ("because", "rather than") that
+        // the scorer would otherwise promote to High importance.
+        let cases = [
+            "because the keywords column was JSON, not TEXT.",
+            "rather than using a HashMap for performance reasons here.",
+            "instead of the previous SQLite-only implementation path.",
+            "although the build pipeline still requires manual triggers.",
+            "while the feature flag rollout was paused last week.",
+            "due to the shared connection pool starvation pattern observed.",
+        ];
+        for text in &cases {
+            let chunks = split_sentences(text);
+            assert!(
+                chunks.is_empty(),
+                "subordinating-clause fragment should be filtered: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_facts_drops_table_and_subordinating_fragments() {
+        // End-to-end: the scoring layer must not promote these patterns.
+        let inputs = [
+            "| Fin S2 (mai 2027) | ~1 815 K€ |",
+            "because the keywords column was JSON, not TEXT.",
+            "rather than using a HashMap for performance reasons here.",
+        ];
+        for text in &inputs {
+            let facts = extract_facts(text, "test");
+            assert!(
+                facts.is_empty(),
+                "extractor must drop fragment: {text:?} -> {facts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_drops_lowercase_start_fragments() {
+        // Bench-quality probe outputs `operator on libsql query result
+        // rather than .ok().` and `the libsql FTS5 trigger failed on
+        // UPDATE because the keywords column was JSON, not TEXT.` —
+        // both are sentence cuts that the keyword scorer would
+        // promote to High via decision/error vocabulary. The
+        // lowercase-start rule rejects them at the splitter.
+        let cases = [
+            "operator on libsql query result rather than .ok().",
+            "the libsql FTS5 trigger failed on UPDATE because the keywords column was JSON, not TEXT.",
+            "was using check_all instead of check_some in evaluator.rs throughout that module.",
+        ];
+        for text in &cases {
+            let chunks = split_sentences(text);
+            assert!(
+                chunks.is_empty(),
+                "lowercase-start fragment must be filtered: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_keeps_digit_or_quote_starts() {
+        // Digit-led and quote-led sentences are common in technical
+        // prose (version-led, transcript dumps) and must survive the
+        // lowercase-start filter — that filter only fires on
+        // alphabetic lowercase starts.
+        let cases = [
+            (
+                "0.10.42 shipped with the dedup hotfix on develop yesterday.",
+                "0.10.42",
+            ),
+            (
+                "\"DECISION:\" lines from the transcript were promoted to High.",
+                "DECISION",
+            ),
+            (
+                "`icm consolidate` produces a summary that mentions key concepts.",
+                "icm consolidate",
+            ),
+        ];
+        for (text, marker) in &cases {
+            let chunks = split_sentences(text);
+            assert!(
+                chunks.iter().any(|c| c.contains(marker)),
+                "non-alphabetic-start sentence must survive: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_facts_keeps_real_decision_with_subordinating_word_inside() {
+        // Sanity: the subordinating-starter check rejects only fragments
+        // that *begin* with one of these connectors. A real decision
+        // sentence containing "because" mid-clause must still pass.
+        let text = "We picked SQLite because Postgres was overkill for the embedded use case here.";
+        let facts = extract_facts(text, "test");
+        assert!(
+            !facts.is_empty(),
+            "real decision sentence with mid-clause `because` must survive"
+        );
+    }
+
+    #[test]
     fn split_does_not_match_honorific_substring_in_word() {
         // `weatherstr.` should not be treated as ending in `St.` (the
         // suffix matches but isn't preceded by whitespace, so it's part
-        // of a longer token).
-        let text = "The weatherstr. value contains the forecast string and is then logged.";
+        // of a longer token). With honorific suppression off the dot
+        // ends a sentence, so we expect the trailing clause to come
+        // through as a kept chunk. We use an uppercase first letter on
+        // the trailing clause so it survives `is_keepable_fragment`'s
+        // lowercase-start filter — that filter is unrelated to the
+        // honorific path under test.
+        let text = "The weatherstr. Value contains the forecast string and is then logged.";
         let chunks = split_sentences(text);
-        // It's not split-suppressed; the dot in `weatherstr.` is followed
-        // by a space + lowercase letter, so the splitter treats it as a
-        // genuine sentence boundary. Assert chunks > 0 and we don't
-        // accidentally erase content. Don't over-specify the count
-        // because either 1 or 2 chunks would be defensible — the key is
-        // we don't trigger the honorific path for a non-honorific.
-        assert!(!chunks.is_empty());
+        assert!(
+            !chunks.is_empty(),
+            "honorific NOT suppressed: weatherstr. dot should be a sentence boundary, leaving the trailing clause as a chunk: {chunks:?}"
+        );
+        assert!(
+            chunks.iter().any(|c| c.contains("Value contains")),
+            "trailing clause should survive: {chunks:?}"
+        );
     }
 }

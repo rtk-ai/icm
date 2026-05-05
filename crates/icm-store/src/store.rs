@@ -6,6 +6,7 @@ use std::sync::{Mutex, Once};
 use chrono::{DateTime, Utc};
 use lru::LruCache;
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
 use icm_core::{
@@ -68,7 +69,7 @@ impl SqliteStore {
         let conn = Connection::open(path)
             .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;",
         )
         .map_err(db_err)?;
         init_db_with_dims(&conn, embedding_dims)?;
@@ -134,7 +135,7 @@ impl SqliteStore {
         ensure_sqlite_vec();
         let conn = Connection::open_in_memory()
             .map_err(|e| IcmError::Database(format!("cannot open in-memory db: {e}")))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
             .map_err(db_err)?;
         init_db(&conn)?;
         Ok(Self {
@@ -331,22 +332,143 @@ fn sanitize_fts_query(query: &str) -> String {
 // MemoryStore impl
 // ---------------------------------------------------------------------------
 
+/// Maximum byte length of a stored summary. Audit finding: a transcript
+/// containing a 1 MB unbroken text block landed as a single memory whose
+/// summary was the full 1 MB blob. Caps the cost of a single bad write
+/// (memory bloat, embedding compute, FTS5 index growth) to a generous
+/// but bounded 64 KB.
+const MAX_SUMMARY_BYTES: usize = 64 * 1024;
+
+/// Maximum byte length of a stored topic. Topics surface in `icm
+/// topics` listings and as the routing key for project filters; a
+/// thousand-byte topic is always a bug, never legitimate user input.
+const MAX_TOPIC_BYTES: usize = 256;
+
+/// Validate and normalize a `Memory` before insertion. Trims topic
+/// whitespace and rejects inputs that we know corrupt or break the
+/// store:
+///
+/// - Empty or whitespace-only `topic` / `summary` — these would surface
+///   as blank rows in `icm topics` / `icm list` and pollute the FTS5
+///   index without conveying information.
+/// - NUL byte (`\0`) in `topic` or `summary` — libsql binds text via a
+///   NUL-terminated C string, so anything past the first `\0` is
+///   silently dropped. Rather than silently truncate, refuse the
+///   write so the caller knows.
+/// - Newline / CR / tab in `topic` — these break the `icm topics`
+///   tabular layout and could enable display-spoofing of topic names
+///   (e.g. a topic that visually overlaps another in TUI/log output).
+///   Allowed in `summary` since it's free-form prose.
+/// - `topic` longer than `MAX_TOPIC_BYTES` or `summary` longer than
+///   `MAX_SUMMARY_BYTES` — see the constant docs for rationale.
+fn validate_and_normalize(mut memory: Memory) -> IcmResult<Memory> {
+    memory.topic = memory.topic.trim().to_string();
+
+    if memory.topic.is_empty() {
+        return Err(IcmError::InvalidInput("topic cannot be empty".into()));
+    }
+    if memory.summary.trim().is_empty() {
+        return Err(IcmError::InvalidInput("summary cannot be empty".into()));
+    }
+    if memory.topic.contains('\0') {
+        return Err(IcmError::InvalidInput(
+            "topic must not contain NUL bytes".into(),
+        ));
+    }
+    if memory.summary.contains('\0') {
+        return Err(IcmError::InvalidInput(
+            "summary must not contain NUL bytes".into(),
+        ));
+    }
+    if memory.topic.contains(['\n', '\r', '\t']) {
+        return Err(IcmError::InvalidInput(
+            "topic must not contain newline / CR / tab characters".into(),
+        ));
+    }
+    if memory.topic.len() > MAX_TOPIC_BYTES {
+        return Err(IcmError::InvalidInput(format!(
+            "topic exceeds {} bytes",
+            MAX_TOPIC_BYTES
+        )));
+    }
+    if memory.summary.len() > MAX_SUMMARY_BYTES {
+        return Err(IcmError::InvalidInput(format!(
+            "summary exceeds {} bytes",
+            MAX_SUMMARY_BYTES
+        )));
+    }
+    Ok(memory)
+}
+
+/// Local total order on `Importance` (Critical > High > Medium > Low).
+/// `Importance` does not implement `Ord` because the project did not
+/// want to imply a globally meaningful ordering across all uses
+/// (e.g. presentation, filtering). For the dedup-merge path we *do*
+/// want to take the maximum so re-storing with a higher priority
+/// upgrades the existing row.
+fn importance_rank(i: Importance) -> u8 {
+    match i {
+        Importance::Critical => 4,
+        Importance::High => 3,
+        Importance::Medium => 2,
+        Importance::Low => 1,
+    }
+}
+
+/// Return the higher-priority importance. Used by the dedup path so
+/// `store(...)` semantics are "re-store with critical upgrades, never
+/// downgrades".
+fn max_importance(a: Importance, b: Importance) -> Importance {
+    if importance_rank(a) >= importance_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// SHA-256 over the normalized `(topic, summary)` pair, hex-encoded.
+/// Normalization: trim + lowercase + collapse whitespace runs to single
+/// spaces. Topic and summary are joined by `\0` to prevent boundary
+/// ambiguity (e.g. `"a"|"bc"` vs `"ab"|"c"` would otherwise hash the
+/// same). Used by the dedup `INSERT OR IGNORE` path.
+pub(crate) fn summary_hash(topic: &str, summary: &str) -> String {
+    let topic_n = topic.trim().to_lowercase();
+    let summary_n: String = summary
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+        .to_lowercase();
+    let mut h = Sha256::new();
+    h.update(topic_n.as_bytes());
+    h.update(b"\0");
+    h.update(summary_n.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
 impl SqliteStore {
     /// Insert a memory into the database without transaction management.
     /// Callers are responsible for wrapping this in a transaction.
+    ///
+    /// Dedup contract: an INSERT that collides with an existing memory on
+    /// `(topic, summary_hash)` is silently ignored, and the **existing**
+    /// row's id is returned. The caller's `memory.id` is forgotten in
+    /// that case. This keeps `store(...)` idempotent: writing the same
+    /// fact 100× ends up with one row, not 100.
     fn store_inner(&self, memory: &Memory) -> IcmResult<String> {
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_json = serde_json::to_string(&memory.related_ids)?;
         let st = source_type(&memory.source);
         let sd = source_data(&memory.source);
         let emb_blob = memory.embedding.as_deref().map(embedding_to_blob);
+        let hash = summary_hash(&memory.topic, &memory.summary);
 
-        self.conn
+        let inserted = self
+            .conn
             .execute(
-                "INSERT INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
+                "INSERT OR IGNORE INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
                  topic, summary, raw_excerpt, keywords,
-                 importance, source_type, source_data, related_ids, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 importance, source_type, source_data, related_ids, embedding, summary_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     memory.id,
                     memory.created_at.to_rfc3339(),
@@ -363,11 +485,98 @@ impl SqliteStore {
                     sd,
                     related_json,
                     emb_blob,
+                    hash,
                 ],
             )
             .map_err(db_err)?;
 
-        // Sync to vec_memories for KNN search
+        if inserted == 0 {
+            // Dedup hit: a row with the same (topic, summary_hash)
+            // already exists. Audit #185 H2: the previous behaviour
+            // returned the existing id and silently dropped the
+            // caller's importance / keywords / raw_excerpt. So
+            // running `icm store -t T -c "X" -i medium` then `icm
+            // store -t T -c "X" -i critical` left the importance at
+            // medium without warning the user.
+            //
+            // New behaviour: merge the caller's metadata into the
+            // existing row before returning the id.
+            // - importance: take the max (critical > high > medium >
+            //   low). Re-storing with a *higher* priority upgrades.
+            //   Re-storing with a *lower* priority is a no-op so a
+            //   careless write can't downgrade an already-flagged
+            //   critical memory.
+            // - keywords: union, preserving existing order then
+            //   appending new ones not already present.
+            // - raw_excerpt: prefer the new value if non-None,
+            //   otherwise keep existing.
+            // - updated_at: bumped whenever any field actually changed.
+            let (existing_id, existing_importance_str, existing_keywords_json, existing_raw): (
+                String,
+                String,
+                String,
+                Option<String>,
+            ) = self
+                .conn
+                .query_row(
+                    "SELECT id, importance, keywords, raw_excerpt FROM memories
+                     WHERE LOWER(topic) = LOWER(?1) AND summary_hash = ?2",
+                    params![memory.topic, hash],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(db_err)?;
+
+            let existing_importance: Importance = existing_importance_str
+                .parse()
+                .unwrap_or(Importance::Medium);
+            let merged_importance = max_importance(existing_importance, memory.importance);
+
+            let existing_keywords: Vec<String> =
+                serde_json::from_str(&existing_keywords_json).unwrap_or_default();
+            let mut merged_keywords = existing_keywords.clone();
+            for kw in &memory.keywords {
+                if !merged_keywords.contains(kw) {
+                    merged_keywords.push(kw.clone());
+                }
+            }
+
+            let merged_raw = memory.raw_excerpt.clone().or(existing_raw.clone());
+
+            let importance_changed = merged_importance != existing_importance;
+            let keywords_changed = merged_keywords != existing_keywords;
+            let raw_changed = merged_raw != existing_raw;
+            if importance_changed || keywords_changed || raw_changed {
+                let merged_keywords_json = serde_json::to_string(&merged_keywords)?;
+                self.conn
+                    .execute(
+                        "UPDATE memories
+                         SET importance = ?1, keywords = ?2, raw_excerpt = ?3, updated_at = ?4
+                         WHERE id = ?5",
+                        params![
+                            merged_importance.to_string(),
+                            merged_keywords_json,
+                            merged_raw,
+                            Utc::now().to_rfc3339(),
+                            existing_id,
+                        ],
+                    )
+                    .map_err(db_err)?;
+                self.cache_invalidate(&existing_id);
+            }
+
+            tracing::debug!(
+                topic = %memory.topic,
+                existing = %existing_id,
+                attempted = %memory.id,
+                imp_changed = importance_changed,
+                kw_changed = keywords_changed,
+                raw_changed = raw_changed,
+                "store: dedup'd duplicate memory (metadata merged)"
+            );
+            return Ok(existing_id);
+        }
+
+        // Sync to vec_memories for KNN search (only on a fresh insert).
         if let Some(ref blob) = emb_blob {
             self.conn
                 .execute(
@@ -383,6 +592,8 @@ impl SqliteStore {
 
 impl MemoryStore for SqliteStore {
     fn store(&self, memory: Memory) -> IcmResult<String> {
+        let memory = validate_and_normalize(memory)?;
+
         self.conn
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
@@ -427,6 +638,11 @@ impl MemoryStore for SqliteStore {
         let sd = source_data(&memory.source);
         let emb_blob = memory.embedding.as_deref().map(embedding_to_blob);
 
+        // Recompute summary_hash on update — topic or summary may have
+        // changed, and the partial unique index on (topic, summary_hash)
+        // would otherwise reflect stale state.
+        let hash = summary_hash(&memory.topic, &memory.summary);
+
         let changed = self
             .conn
             .execute(
@@ -434,7 +650,7 @@ impl MemoryStore for SqliteStore {
                  updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
                  topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
                  importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
-                 embedding = ?14
+                 embedding = ?14, summary_hash = ?15
                  WHERE id = ?1",
                 params![
                     memory.id,
@@ -451,6 +667,7 @@ impl MemoryStore for SqliteStore {
                     sd,
                     related_json,
                     emb_blob,
+                    hash,
                 ],
             )
             .map_err(db_err)?;
@@ -736,11 +953,27 @@ impl MemoryStore for SqliteStore {
 
     fn apply_decay(&self, decay_factor: f32) -> IcmResult<usize> {
         // Access-aware decay: frequently accessed memories decay slower.
-        // decay = base_rate * importance_multiplier / (1 + access_count * 0.1)
-        // critical: never decays
-        // high: 0.5x decay (half speed)
-        // medium: 1.0x decay (normal)
-        // low: 2.0x decay (double speed)
+        // decay = base_rate * importance_multiplier / (1 + min(access_count, 5) * 0.1)
+        //
+        // Audit #185 H7: the access-count term used to be uncapped
+        // (`1 + access_count * 0.1`). A memory with `access_count=100`
+        // got a 11x slowdown on its decay, which made it effectively
+        // immune to pruning even at low importance. Anyone (or any
+        // bench loop, or any benign hook-driven recall pattern) that
+        // touched a memory many times pinned it near the top of the
+        // ranking forever — the same gaming class as the M01 issue
+        // the maintainer flagged earlier.
+        //
+        // Cap at 5 accesses → max 1.5x slowdown (33%). That preserves
+        // the original intent ("useful memories decay a bit slower")
+        // without giving any single memory infinite decay immunity.
+        // Critical-importance memories still skip decay entirely.
+        //
+        // Importance multipliers:
+        //   critical: never decays (filtered by WHERE clause)
+        //   high:     0.5x decay (half speed)
+        //   medium:   1.0x decay (normal)
+        //   low:      2.0x decay (double speed)
         let changed = self
             .conn
             .execute(
@@ -751,7 +984,7 @@ impl MemoryStore for SqliteStore {
                         WHEN 'low' THEN 2.0
                         ELSE 1.0
                     END
-                    / (1.0 + access_count * 0.1)
+                    / (1.0 + MIN(access_count, 5) * 0.1)
                 )
                 WHERE importance != 'critical'",
                 params![decay_factor],
@@ -2928,6 +3161,125 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_upgrades_importance_on_dedup() {
+        // Audit #185 H2: re-storing the same content with a higher
+        // importance must upgrade the existing row, not silently
+        // drop the new value.
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.importance = Importance::Medium;
+        let id1 = store.store(first).unwrap();
+
+        let mut second = make_memory("topic", "long enough summary content for storage");
+        second.importance = Importance::Critical;
+        let id2 = store.store(second).unwrap();
+        assert_eq!(id1, id2, "dedup must return the same id");
+
+        let merged = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            merged.importance,
+            Importance::Critical,
+            "re-store with higher priority must upgrade importance"
+        );
+    }
+
+    #[test]
+    fn test_restore_does_not_downgrade_importance_on_dedup() {
+        // Sanity: a re-store with a lower priority is a no-op so an
+        // accidental write can't downgrade an already-flagged
+        // critical memory.
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.importance = Importance::Critical;
+        let id1 = store.store(first).unwrap();
+
+        let mut second = make_memory("topic", "long enough summary content for storage");
+        second.importance = Importance::Low;
+        store.store(second).unwrap();
+
+        let preserved = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            preserved.importance,
+            Importance::Critical,
+            "re-store with lower priority must not downgrade importance"
+        );
+    }
+
+    #[test]
+    fn test_restore_unions_keywords_on_dedup() {
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.keywords = vec!["alpha".into(), "beta".into()];
+        let id1 = store.store(first).unwrap();
+
+        let mut second = make_memory("topic", "long enough summary content for storage");
+        second.keywords = vec!["beta".into(), "gamma".into()];
+        store.store(second).unwrap();
+
+        let merged = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            merged.keywords,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string(),],
+            "keywords must be unioned and deduped, preserving existing order"
+        );
+    }
+
+    #[test]
+    fn test_restore_sets_raw_excerpt_when_previously_none() {
+        let store = test_store();
+        let first = make_memory("topic", "long enough summary content for storage");
+        let id1 = store.store(first).unwrap();
+        assert!(store.get(&id1).unwrap().unwrap().raw_excerpt.is_none());
+
+        let mut second = make_memory("topic", "long enough summary content for storage");
+        second.raw_excerpt = Some("verbatim copy from source".into());
+        store.store(second).unwrap();
+
+        let merged = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            merged.raw_excerpt.as_deref(),
+            Some("verbatim copy from source"),
+        );
+    }
+
+    #[test]
+    fn test_restore_keeps_existing_raw_excerpt_when_new_is_none() {
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.raw_excerpt = Some("important verbatim".into());
+        let id1 = store.store(first).unwrap();
+
+        let second = make_memory("topic", "long enough summary content for storage");
+        store.store(second).unwrap();
+
+        let preserved = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            preserved.raw_excerpt.as_deref(),
+            Some("important verbatim"),
+            "re-store with None must not erase existing raw_excerpt"
+        );
+    }
+
+    #[test]
+    fn test_restore_unchanged_metadata_is_noop() {
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.importance = Importance::High;
+        first.keywords = vec!["alpha".into()];
+        let id1 = store.store(first.clone()).unwrap();
+        let original = store.get(&id1).unwrap().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.store(first).unwrap();
+        let after = store.get(&id1).unwrap().unwrap();
+
+        assert_eq!(
+            original.updated_at, after.updated_at,
+            "no-op re-store must not bump updated_at"
+        );
+    }
+
+    #[test]
     fn test_apply_decay() {
         let store = test_store();
         store.store(make_memory("test", "decayable")).unwrap();
@@ -2938,6 +3290,72 @@ mod tests {
 
         let affected = store.apply_decay(0.9).unwrap();
         assert_eq!(affected, 1); // Only the non-critical one
+    }
+
+    #[test]
+    fn test_apply_decay_caps_access_count_amplification() {
+        // Audit #185 H7: the pre-fix decay formula had an uncapped
+        // `1 + access_count * 0.1` term, which let memories with 100+
+        // accesses become effectively decay-immune. Repro the gaming
+        // and assert the capped formula prevents it.
+        //
+        // After 5 decay rounds at factor=0.8:
+        // - real (access=0): naively 0.95 ^ 5 ≈ 0.77 → with importance
+        //   medium and the capped slowdown, weight should drop to
+        //   roughly 0.5×.
+        // - junk (access=100): pre-fix it stayed near 0.95 (no decay
+        //   amplification immune); post-fix it's capped at 5 accesses
+        //   so it decays at the same rate as a memory with 5 accesses.
+        // The exact ratio depends on the cap; the crucial property is
+        // that after enough decay rounds, junk's weight no longer
+        // exceeds real's weight. We assert that property directly
+        // rather than pinning specific weight numbers.
+        let store = test_store();
+
+        let mut real = make_memory("topic", "real high-importance fact");
+        real.importance = Importance::Medium;
+        let real_id = store.store(real).unwrap();
+
+        let mut junk = make_memory("topic", "junk fact accessed by gaming loop");
+        junk.importance = Importance::Medium;
+        let junk_id = store.store(junk).unwrap();
+
+        // Inflate junk's access_count to 100 (the M01 reproduction).
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET access_count = 100 WHERE id = ?1",
+                params![junk_id],
+            )
+            .unwrap();
+
+        // 5 aggressive decay rounds.
+        for _ in 0..5 {
+            store.apply_decay(0.8).unwrap();
+        }
+
+        let real_after = store.get(&real_id).unwrap().unwrap();
+        let junk_after = store.get(&junk_id).unwrap().unwrap();
+
+        // Pre-fix: junk weight ≈ 0.95, real weight ≈ 0.31 → junk dominates.
+        // Post-fix: with the cap, junk decays meaningfully even at
+        // access=100. We require junk weight < real weight + a small
+        // headroom — the cap must not let a low-relevance, frequently-
+        // accessed memory overtake real same-importance memories.
+        assert!(
+            junk_after.weight < real_after.weight * 1.6,
+            "junk weight {} must not dominate real weight {} after 5 decay rounds (cap is broken)",
+            junk_after.weight,
+            real_after.weight,
+        );
+
+        // Sanity: junk did still decay measurably (cap didn't make it
+        // permanent).
+        assert!(
+            junk_after.weight < 0.97,
+            "junk weight {} barely decayed at all (cap is too aggressive a slowdown)",
+            junk_after.weight,
+        );
     }
 
     #[test]
@@ -3669,42 +4087,138 @@ mod tests {
     }
 
     #[test]
-    fn test_null_bytes_in_content() {
+    fn test_null_bytes_in_summary_rejected() {
+        // Audit finding: libsql binds text via NUL-terminated C strings,
+        // so anything past the first `\0` was silently dropped — a
+        // memory written as `"before\0after"` came back as `"before"`.
+        // We now reject the write so callers know their data isn't
+        // round-tripping intact.
         let store = test_store();
         let mem = make_memory("test", "before\0after");
-        store.store(mem.clone()).unwrap();
-        let retrieved = store.get(&mem.id).unwrap().unwrap();
-        assert!(retrieved.summary.contains("before"));
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("NUL")),
+            "expected InvalidInput(NUL...) got {err:?}"
+        );
     }
 
     #[test]
-    fn test_unicode_boundary_content() {
+    fn test_null_bytes_in_topic_rejected() {
+        let store = test_store();
+        let mem = make_memory("topic\0fake", "real summary content");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("NUL")),
+            "expected InvalidInput(NUL...) got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_unicode_topic_with_trailing_null_rejected() {
+        // The previous permissive behaviour stored the topic
+        // `\u{1F600}\u{1F4A9}\u{0000}` and round-tripped only the
+        // pre-NUL prefix. Now we reject so callers don't think they
+        // stored what they passed.
         let store = test_store();
         let unicode_topic = "\u{1F600}\u{1F4A9}\u{0000}";
-        let mem = make_memory(unicode_topic, "emoji topic");
-        store.store(mem.clone()).unwrap();
-        let retrieved = store.get(&mem.id).unwrap().unwrap();
-        assert!(retrieved.topic.starts_with('\u{1F600}'));
+        let mem = make_memory(unicode_topic, "emoji topic content here");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("NUL")),
+            "expected NUL rejection on emoji+NUL topic, got {err:?}"
+        );
     }
 
     #[test]
-    fn test_very_long_summary() {
+    fn test_unicode_emoji_topic_without_null_accepted() {
+        // Sanity: legitimate emoji topics should still work.
+        let store = test_store();
+        let mem = make_memory("\u{1F525}-decisions", "real content here please");
+        let id = store.store(mem.clone()).unwrap();
+        let retrieved = store.get(&id).unwrap().unwrap();
+        assert!(retrieved.topic.starts_with('\u{1F525}'));
+    }
+
+    #[test]
+    fn test_summary_within_cap_accepted() {
+        let store = test_store();
+        let summary = "a".repeat(60_000);
+        let mem = make_memory("test", &summary);
+        store.store(mem.clone()).unwrap();
+        let retrieved = store.get(&mem.id).unwrap().unwrap();
+        assert_eq!(retrieved.summary.len(), 60_000);
+    }
+
+    #[test]
+    fn test_summary_exceeding_cap_rejected() {
+        // Audit finding: a 1 MB single text block landed verbatim as a
+        // single memory's summary, blowing up DB size and embedding
+        // compute. Cap at 64 KB.
         let store = test_store();
         let long_summary = "a".repeat(100_000);
         let mem = make_memory("test", &long_summary);
-        store.store(mem.clone()).unwrap();
-        let retrieved = store.get(&mem.id).unwrap().unwrap();
-        assert_eq!(retrieved.summary.len(), 100_000);
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("summary exceeds")),
+            "expected summary-size rejection got {err:?}"
+        );
     }
 
     #[test]
-    fn test_empty_strings() {
+    fn test_empty_topic_rejected() {
         let store = test_store();
-        let mem = make_memory("", "");
-        store.store(mem.clone()).unwrap();
-        let retrieved = store.get(&mem.id).unwrap().unwrap();
-        assert_eq!(retrieved.topic, "");
-        assert_eq!(retrieved.summary, "");
+        let mem = make_memory("", "real summary content here");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("topic cannot be empty")),
+            "expected empty-topic rejection got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_topic_rejected() {
+        let store = test_store();
+        let mem = make_memory("   \t  ", "real summary content here");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("topic cannot be empty")),
+            "expected empty-after-trim rejection got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_empty_summary_rejected() {
+        let store = test_store();
+        let mem = make_memory("topic", "");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("summary cannot be empty")),
+            "expected empty-summary rejection got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_topic_with_newline_rejected() {
+        let store = test_store();
+        let mem = make_memory("topic\nfake-topic", "real summary content here");
+        let err = store.store(mem).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(ref m) if m.contains("newline")),
+            "expected newline rejection got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_topic_trailing_whitespace_trimmed_on_store() {
+        // Two topics that visually look identical (`"trail "` vs
+        // `"trail"`) should land in the same bucket. We trim on the
+        // way in.
+        let store = test_store();
+        let id1 = store
+            .store(make_memory("  trail  ", "summary one content"))
+            .unwrap();
+        let mem1 = store.get(&id1).unwrap().unwrap();
+        assert_eq!(mem1.topic, "trail", "topic should be trimmed");
     }
 
     #[test]
@@ -5105,6 +5619,44 @@ mod tests {
         assert_eq!(got.get(&id).unwrap().summary, "warm");
     }
 
+    // ── content-hash dedup ───────────────────────────────────────────────
+
+    #[test]
+    fn test_dedup_same_topic_summary_collapses() {
+        let store = test_store();
+        let m1 = make_memory("dedup", "Use Turso for cloud sync");
+        let m2 = make_memory("dedup", "Use Turso for cloud sync"); // identical content
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+        // Both calls return the SAME id (the first row's). Second store
+        // is a no-op at the DB level, but the contract still returns an
+        // id pointing at a real row.
+        assert_eq!(id1, id2, "dedup must return the existing row's id");
+        assert_eq!(store.count().unwrap(), 1, "only one row in memories");
+    }
+
+    #[test]
+    fn test_dedup_normalizes_whitespace_and_case() {
+        let store = test_store();
+        let m1 = make_memory("DEDUP", "Use   Turso   for cloud sync");
+        let m2 = make_memory("dedup", "use turso for cloud sync");
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+        assert_eq!(id1, id2);
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_dedup_different_topic_keeps_both() {
+        let store = test_store();
+        let m1 = make_memory("topic-a", "shared body");
+        let m2 = make_memory("topic-b", "shared body");
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+        assert_ne!(id1, id2, "different topic = different row");
+        assert_eq!(store.count().unwrap(), 2);
+    }
+
     #[test]
     fn test_store_is_atomic() {
         let store = test_store();
@@ -5132,12 +5684,18 @@ mod tests {
 
     #[test]
     fn test_busy_timeout_pragma() {
+        // Audit #185 M: 6/20 parallel hook handlers timed out at the
+        // previous 5s busy_timeout. Bumping to 30s covers realistic
+        // burst-write contention (large transcript extraction triggers
+        // many writes on PreCompact/SessionEnd) without hiding genuine
+        // lock issues — anyone holding a write lock for >30s has a
+        // real bug worth surfacing.
         let store = test_store();
         let timeout: i64 = store
             .conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(timeout, 5000);
+        assert_eq!(timeout, 30000);
     }
 
     #[test]

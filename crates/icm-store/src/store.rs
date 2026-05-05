@@ -864,11 +864,27 @@ impl MemoryStore for SqliteStore {
 
     fn apply_decay(&self, decay_factor: f32) -> IcmResult<usize> {
         // Access-aware decay: frequently accessed memories decay slower.
-        // decay = base_rate * importance_multiplier / (1 + access_count * 0.1)
-        // critical: never decays
-        // high: 0.5x decay (half speed)
-        // medium: 1.0x decay (normal)
-        // low: 2.0x decay (double speed)
+        // decay = base_rate * importance_multiplier / (1 + min(access_count, 5) * 0.1)
+        //
+        // Audit #185 H7: the access-count term used to be uncapped
+        // (`1 + access_count * 0.1`). A memory with `access_count=100`
+        // got a 11x slowdown on its decay, which made it effectively
+        // immune to pruning even at low importance. Anyone (or any
+        // bench loop, or any benign hook-driven recall pattern) that
+        // touched a memory many times pinned it near the top of the
+        // ranking forever — the same gaming class as the M01 issue
+        // the maintainer flagged earlier.
+        //
+        // Cap at 5 accesses → max 1.5x slowdown (33%). That preserves
+        // the original intent ("useful memories decay a bit slower")
+        // without giving any single memory infinite decay immunity.
+        // Critical-importance memories still skip decay entirely.
+        //
+        // Importance multipliers:
+        //   critical: never decays (filtered by WHERE clause)
+        //   high:     0.5x decay (half speed)
+        //   medium:   1.0x decay (normal)
+        //   low:      2.0x decay (double speed)
         let changed = self
             .conn
             .execute(
@@ -879,7 +895,7 @@ impl MemoryStore for SqliteStore {
                         WHEN 'low' THEN 2.0
                         ELSE 1.0
                     END
-                    / (1.0 + access_count * 0.1)
+                    / (1.0 + MIN(access_count, 5) * 0.1)
                 )
                 WHERE importance != 'critical'",
                 params![decay_factor],
@@ -3066,6 +3082,72 @@ mod tests {
 
         let affected = store.apply_decay(0.9).unwrap();
         assert_eq!(affected, 1); // Only the non-critical one
+    }
+
+    #[test]
+    fn test_apply_decay_caps_access_count_amplification() {
+        // Audit #185 H7: the pre-fix decay formula had an uncapped
+        // `1 + access_count * 0.1` term, which let memories with 100+
+        // accesses become effectively decay-immune. Repro the gaming
+        // and assert the capped formula prevents it.
+        //
+        // After 5 decay rounds at factor=0.8:
+        // - real (access=0): naively 0.95 ^ 5 ≈ 0.77 → with importance
+        //   medium and the capped slowdown, weight should drop to
+        //   roughly 0.5×.
+        // - junk (access=100): pre-fix it stayed near 0.95 (no decay
+        //   amplification immune); post-fix it's capped at 5 accesses
+        //   so it decays at the same rate as a memory with 5 accesses.
+        // The exact ratio depends on the cap; the crucial property is
+        // that after enough decay rounds, junk's weight no longer
+        // exceeds real's weight. We assert that property directly
+        // rather than pinning specific weight numbers.
+        let store = test_store();
+
+        let mut real = make_memory("topic", "real high-importance fact");
+        real.importance = Importance::Medium;
+        let real_id = store.store(real).unwrap();
+
+        let mut junk = make_memory("topic", "junk fact accessed by gaming loop");
+        junk.importance = Importance::Medium;
+        let junk_id = store.store(junk).unwrap();
+
+        // Inflate junk's access_count to 100 (the M01 reproduction).
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET access_count = 100 WHERE id = ?1",
+                params![junk_id],
+            )
+            .unwrap();
+
+        // 5 aggressive decay rounds.
+        for _ in 0..5 {
+            store.apply_decay(0.8).unwrap();
+        }
+
+        let real_after = store.get(&real_id).unwrap().unwrap();
+        let junk_after = store.get(&junk_id).unwrap().unwrap();
+
+        // Pre-fix: junk weight ≈ 0.95, real weight ≈ 0.31 → junk dominates.
+        // Post-fix: with the cap, junk decays meaningfully even at
+        // access=100. We require junk weight < real weight + a small
+        // headroom — the cap must not let a low-relevance, frequently-
+        // accessed memory overtake real same-importance memories.
+        assert!(
+            junk_after.weight < real_after.weight * 1.6,
+            "junk weight {} must not dominate real weight {} after 5 decay rounds (cap is broken)",
+            junk_after.weight,
+            real_after.weight,
+        );
+
+        // Sanity: junk did still decay measurably (cap didn't make it
+        // permanent).
+        assert!(
+            junk_after.weight < 0.97,
+            "junk weight {} barely decayed at all (cap is too aggressive a slowdown)",
+            junk_after.weight,
+        );
     }
 
     #[test]

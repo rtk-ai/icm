@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.10.44](https://github.com/rtk-ai/icm/compare/icm-v0.10.43...icm-v0.10.44) (2026-05-05)
+
+
+### Features
+
+* **consolidate:** pluggable LLM summarizer (TOML/CLI/TUI, claude/codex/gemini/ollama) ([#178](https://github.com/rtk-ai/icm/issues/178)) ([d58026a](https://github.com/rtk-ai/icm/commit/d58026a5c833bbfc41e13b3163664768aafd5861))
+* **extract:** multilingual semantic scoring via embedder anchors ([#183](https://github.com/rtk-ai/icm/issues/183)) ([71339fb](https://github.com/rtk-ai/icm/commit/71339fbd825b639502323a08de6bd397b4a63450))
+
+
+### Bug Fixes
+
+* **cli, recall:** paraphrase dedup + reject duplicate --db flag ([#195](https://github.com/rtk-ai/icm/issues/195)) ([27d1c21](https://github.com/rtk-ai/icm/commit/27d1c2139f899475c2cb522857282262132ad9c4))
+* **cli:** contract violations on recall --format and decay --factor ([#189](https://github.com/rtk-ai/icm/issues/189)) ([5a569bb](https://github.com/rtk-ai/icm/commit/5a569bb85449a30e2d17f695769117a5678c9d19))
+* **cli:** forget rejects id+topic combo and empty topic ([#193](https://github.com/rtk-ai/icm/issues/193)) ([2102729](https://github.com/rtk-ai/icm/commit/21027291f95a11e70bb39a051c5b635a00de8188))
+* **extract:** drop mid-sentence fragments from auto-extraction ([#182](https://github.com/rtk-ai/icm/issues/182)) ([38b6566](https://github.com/rtk-ai/icm/commit/38b656667aa0c63dd7fca1b9533c649e79a964ee))
+* **extract:** refine anchors for CJK + Constraint + Architecture + Preference ([#194](https://github.com/rtk-ai/icm/issues/194)) ([165b737](https://github.com/rtk-ai/icm/commit/165b737376ddf89628f0e3e9caafbacf4437e912))
+* **hooks:** swallow non-UTF8 stdin + bump busy_timeout to 30s ([#192](https://github.com/rtk-ai/icm/issues/192)) ([dc5f6f9](https://github.com/rtk-ai/icm/commit/dc5f6f9184999d83dbdc5b9627f21ee5a8beefe5))
+* **recall:** cross-project knowledge fallback + drop noise on off-topic queries ([#188](https://github.com/rtk-ai/icm/issues/188)) ([db39af7](https://github.com/rtk-ai/icm/commit/db39af7a3df8536bce0098529b3b2d1274008c24))
+* **safety:** input validation + transcript read cap ([#187](https://github.com/rtk-ai/icm/issues/187)) ([d04a24a](https://github.com/rtk-ai/icm/commit/d04a24abe85ef92e77924cca358306847e979714))
+* **security:** reject shell substitution + redirection in PreToolUse auto-allow ([#184](https://github.com/rtk-ai/icm/issues/184)) ([c919045](https://github.com/rtk-ai/icm/commit/c9190454478a4d16434f0bc6dd53f5176d7ccf97))
+
 ## [0.10.43](https://github.com/rtk-ai/icm/compare/icm-v0.10.42...icm-v0.10.43) (2026-05-02)
 
 

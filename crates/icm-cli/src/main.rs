@@ -2039,9 +2039,9 @@ fn cmd_transcript_forget(store: &SqliteStore, session: &str) -> Result<()> {
 /// PreToolUse hook: auto-allow `icm` CLI commands.
 /// Reads JSON from stdin, outputs hook response JSON to stdout.
 fn cmd_hook_pre() -> Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let Some(input) = read_stdin_utf8_lossy() else {
+        return Ok(());
+    };
 
     let json: Value = match serde_json::from_str(&input) {
         Ok(v) => v,
@@ -2113,6 +2113,22 @@ fn read_transcript_capped(path: &str) -> std::io::Result<String> {
     let mut s = String::new();
     limited.read_to_string(&mut s)?;
     Ok(s)
+}
+
+/// Read JSON-payload bytes from stdin into a UTF-8 string. Returns
+/// `None` when stdin is not valid UTF-8 — hook handlers must treat
+/// that as "no usable input" and exit cleanly, never crash. The
+/// pre-existing `read_to_string`-with-`?` exits with code 1 on
+/// non-UTF-8 input, which violates the Claude Code hook contract
+/// ("never block the user, never crash"). Audit #185 M (Hooks
+/// robustness).
+fn read_stdin_utf8_lossy() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    if std::io::stdin().read_to_end(&mut bytes).is_err() {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Check if a bash command is **purely** icm invocations.
@@ -2206,9 +2222,9 @@ fn cmd_hook_post(
     extract_every: usize,
     store_raw: bool,
 ) -> Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let Some(input) = read_stdin_utf8_lossy() else {
+        return Ok(());
+    };
 
     let json: Value = match serde_json::from_str(&input) {
         Ok(v) => v,
@@ -2312,9 +2328,9 @@ fn extract_from_hook_transcript(
     memory_cfg: &crate::config::MemoryConfig,
     source: &str,
 ) -> Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let Some(input) = read_stdin_utf8_lossy() else {
+        return Ok(());
+    };
 
     let json: Value = match serde_json::from_str(&input) {
         Ok(v) => v,
@@ -2497,9 +2513,9 @@ pub(crate) fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 /// Reads JSON from stdin with `user_message`, recalls relevant memories,
 /// and prints context to stdout (Claude Code appends it as system-reminder).
 fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let Some(input) = read_stdin_utf8_lossy() else {
+        return Ok(());
+    };
 
     let json: Value = match serde_json::from_str(&input) {
         Ok(v) => v,
@@ -2572,9 +2588,7 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
 /// Set `ICM_HOOK_DEBUG=1` in the environment to get stderr diagnostics when
 /// the hook decides to suppress output (empty store, no matching memories).
 fn cmd_hook_start(store: &SqliteStore, max_tokens: usize) -> Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let input = read_stdin_utf8_lossy().unwrap_or_default();
 
     let pack = build_hook_start_pack(store, &input, max_tokens)?;
     if pack.is_empty() {

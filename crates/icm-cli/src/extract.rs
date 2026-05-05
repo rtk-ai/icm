@@ -210,32 +210,57 @@ pub fn recall_context(
 
     // Oversample FTS results so that filtering still leaves enough candidates.
     let fts_results = store.search_fts(query, limit.saturating_mul(4).max(limit))?;
-    let filtered: Vec<Memory> = fts_results
-        .into_iter()
+    let project_filtered: Vec<Memory> = fts_results
+        .iter()
         .filter(|m| project_filter(m))
         .take(limit)
+        .cloned()
         .collect();
 
-    let relevant: Vec<_> = if filtered.is_empty() {
-        // Fallback: get all (project-matching) memories sorted by weight.
+    // Three-tier fallback for the project filter:
+    //
+    // 1. If project-scoped FTS hits found something, use them.
+    // 2. Else, if global FTS (no project filter) found something,
+    //    surface those — this catches cross-project knowledge topics
+    //    like `errors-resolved`, `lessons-learned`, or
+    //    `decisions-<other-project>` that the project filter
+    //    legitimately strips but that are still relevant to the
+    //    query. Audit finding (#185 H5): the previous code dropped
+    //    `errors-resolved` for any query in a non-matching project
+    //    and the user never saw their own past bug fixes.
+    // 3. Else, fall back to preference / identity topics only,
+    //    sorted by weight. The previous code fell back to *all*
+    //    memories sorted by weight regardless of query (#185 H4):
+    //    "qwerty xyzzy nonsense" returned the top 5 project
+    //    memories on every prompt, polluting context with
+    //    irrelevant noise. Preferences are different — they're the
+    //    always-on identity layer (PR #182 / SessionStart wake-up
+    //    already surfaces them, but legacy callers expect recall to
+    //    too). Restricting the last-ditch fallback to preferences
+    //    preserves that contract while killing the off-topic
+    //    pollution.
+    let relevant: Vec<Memory> = if !project_filtered.is_empty() {
+        project_filtered
+    } else if !fts_results.is_empty() {
+        fts_results.into_iter().take(limit).collect()
+    } else {
         let topics = store.list_topics()?;
-        let mut all = Vec::new();
+        let mut prefs: Vec<Memory> = Vec::new();
         for (topic, _) in &topics {
+            if !is_preference_topic(topic) {
+                continue;
+            }
             for mem in store.get_by_topic(topic)? {
-                if project_filter(&mem) {
-                    all.push(mem);
-                }
+                prefs.push(mem);
             }
         }
-        all.sort_by(|a, b| {
+        prefs.sort_by(|a, b| {
             b.weight
                 .partial_cmp(&a.weight)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        all.truncate(limit);
-        all
-    } else {
-        filtered
+        prefs.truncate(limit);
+        prefs
     };
 
     if relevant.is_empty() {
@@ -1520,6 +1545,112 @@ mod tests {
         assert!(
             ctx2.contains("terse responses"),
             "preferences must not be stripped by project filter: {ctx2}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_surfaces_cross_project_knowledge_on_fts_hit() {
+        // Audit #185 H5: a query that matches an `errors-resolved`
+        // memory must surface it even when the user is working in a
+        // different project — those are cross-project lessons. The
+        // pre-fix project filter stripped the memory and the
+        // weight-sorted fallback returned other irrelevant memories.
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "context-projecta".to_string(),
+                "Frontend uses Svelte for the dashboard layer".to_string(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "errors-resolved".to_string(),
+                "Bug in auth middleware was fixed by adding a refresh token rotation step"
+                    .to_string(),
+                Importance::High,
+            ))
+            .unwrap();
+
+        let ctx = recall_context(
+            &store,
+            "auth middleware refresh token rotation",
+            Some("projecta"),
+            5,
+        )
+        .unwrap();
+        assert!(
+            ctx.contains("auth middleware"),
+            "errors-resolved memory should surface for matching query even on a different project: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_off_topic_query_does_not_dump_project_memories() {
+        // Audit #185 H4: a query with zero overlap should NOT pull
+        // out `context-projecta` memories sorted by weight. The
+        // pre-fix code returned the top-5 by weight regardless of
+        // query relevance, polluting every irrelevant prompt.
+        let store = SqliteStore::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new(
+                    "context-projecta".to_string(),
+                    format!("Project memory number {i} about deployment"),
+                    Importance::High,
+                ))
+                .unwrap();
+        }
+
+        let ctx = recall_context(
+            &store,
+            "qwertyzxc completely unrelated nonsense xyzzy",
+            Some("projecta"),
+            5,
+        )
+        .unwrap();
+        assert!(
+            !ctx.contains("Project memory number"),
+            "off-topic query must not surface project memories: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_off_topic_query_still_surfaces_preferences() {
+        // Sanity: even though the query is off-topic, preferences are
+        // the always-on identity layer and the last-ditch fallback
+        // surfaces them by weight. Without this, every irrelevant
+        // prompt would lose the user's coding rules.
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "context-projecta".to_string(),
+                "Project specific note here for completeness".to_string(),
+                Importance::High,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "preferences".to_string(),
+                "User always wants snake_case in Rust function names".to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+
+        let ctx = recall_context(
+            &store,
+            "qwertyzxc unrelated nonsense xyzzy",
+            Some("projecta"),
+            5,
+        )
+        .unwrap();
+        assert!(
+            ctx.contains("snake_case"),
+            "preferences must survive off-topic queries: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Project specific note"),
+            "project memories must NOT leak via fallback: {ctx}"
         );
     }
 

@@ -400,6 +400,32 @@ fn validate_and_normalize(mut memory: Memory) -> IcmResult<Memory> {
     Ok(memory)
 }
 
+/// Local total order on `Importance` (Critical > High > Medium > Low).
+/// `Importance` does not implement `Ord` because the project did not
+/// want to imply a globally meaningful ordering across all uses
+/// (e.g. presentation, filtering). For the dedup-merge path we *do*
+/// want to take the maximum so re-storing with a higher priority
+/// upgrades the existing row.
+fn importance_rank(i: Importance) -> u8 {
+    match i {
+        Importance::Critical => 4,
+        Importance::High => 3,
+        Importance::Medium => 2,
+        Importance::Low => 1,
+    }
+}
+
+/// Return the higher-priority importance. Used by the dedup path so
+/// `store(...)` semantics are "re-store with critical upgrades, never
+/// downgrades".
+fn max_importance(a: Importance, b: Importance) -> Importance {
+    if importance_rank(a) >= importance_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
 /// SHA-256 over the normalized `(topic, summary)` pair, hex-encoded.
 /// Normalization: trim + lowercase + collapse whitespace runs to single
 /// spaces. Topic and summary are joined by `\0` to prevent boundary
@@ -465,24 +491,87 @@ impl SqliteStore {
             .map_err(db_err)?;
 
         if inserted == 0 {
-            // Dedup hit: a row with the same (topic, summary_hash) already
-            // exists. Look up its id and return that — preserves the
-            // contract that the returned id always refers to an actual
-            // row in the table.
-            let existing_id: String = self
+            // Dedup hit: a row with the same (topic, summary_hash)
+            // already exists. Audit #185 H2: the previous behaviour
+            // returned the existing id and silently dropped the
+            // caller's importance / keywords / raw_excerpt. So
+            // running `icm store -t T -c "X" -i medium` then `icm
+            // store -t T -c "X" -i critical` left the importance at
+            // medium without warning the user.
+            //
+            // New behaviour: merge the caller's metadata into the
+            // existing row before returning the id.
+            // - importance: take the max (critical > high > medium >
+            //   low). Re-storing with a *higher* priority upgrades.
+            //   Re-storing with a *lower* priority is a no-op so a
+            //   careless write can't downgrade an already-flagged
+            //   critical memory.
+            // - keywords: union, preserving existing order then
+            //   appending new ones not already present.
+            // - raw_excerpt: prefer the new value if non-None,
+            //   otherwise keep existing.
+            // - updated_at: bumped whenever any field actually changed.
+            let (existing_id, existing_importance_str, existing_keywords_json, existing_raw): (
+                String,
+                String,
+                String,
+                Option<String>,
+            ) = self
                 .conn
                 .query_row(
-                    "SELECT id FROM memories
+                    "SELECT id, importance, keywords, raw_excerpt FROM memories
                      WHERE LOWER(topic) = LOWER(?1) AND summary_hash = ?2",
                     params![memory.topic, hash],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(db_err)?;
+
+            let existing_importance: Importance = existing_importance_str
+                .parse()
+                .unwrap_or(Importance::Medium);
+            let merged_importance = max_importance(existing_importance, memory.importance);
+
+            let existing_keywords: Vec<String> =
+                serde_json::from_str(&existing_keywords_json).unwrap_or_default();
+            let mut merged_keywords = existing_keywords.clone();
+            for kw in &memory.keywords {
+                if !merged_keywords.contains(kw) {
+                    merged_keywords.push(kw.clone());
+                }
+            }
+
+            let merged_raw = memory.raw_excerpt.clone().or(existing_raw.clone());
+
+            let importance_changed = merged_importance != existing_importance;
+            let keywords_changed = merged_keywords != existing_keywords;
+            let raw_changed = merged_raw != existing_raw;
+            if importance_changed || keywords_changed || raw_changed {
+                let merged_keywords_json = serde_json::to_string(&merged_keywords)?;
+                self.conn
+                    .execute(
+                        "UPDATE memories
+                         SET importance = ?1, keywords = ?2, raw_excerpt = ?3, updated_at = ?4
+                         WHERE id = ?5",
+                        params![
+                            merged_importance.to_string(),
+                            merged_keywords_json,
+                            merged_raw,
+                            Utc::now().to_rfc3339(),
+                            existing_id,
+                        ],
+                    )
+                    .map_err(db_err)?;
+                self.cache_invalidate(&existing_id);
+            }
+
             tracing::debug!(
                 topic = %memory.topic,
                 existing = %existing_id,
                 attempted = %memory.id,
-                "store: dedup'd duplicate memory"
+                imp_changed = importance_changed,
+                kw_changed = keywords_changed,
+                raw_changed = raw_changed,
+                "store: dedup'd duplicate memory (metadata merged)"
             );
             return Ok(existing_id);
         }
@@ -3069,6 +3158,125 @@ mod tests {
         assert_eq!(topics.len(), 2);
         assert!(topics.contains(&("alpha".into(), 2)));
         assert!(topics.contains(&("beta".into(), 1)));
+    }
+
+    #[test]
+    fn test_restore_upgrades_importance_on_dedup() {
+        // Audit #185 H2: re-storing the same content with a higher
+        // importance must upgrade the existing row, not silently
+        // drop the new value.
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.importance = Importance::Medium;
+        let id1 = store.store(first).unwrap();
+
+        let mut second = make_memory("topic", "long enough summary content for storage");
+        second.importance = Importance::Critical;
+        let id2 = store.store(second).unwrap();
+        assert_eq!(id1, id2, "dedup must return the same id");
+
+        let merged = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            merged.importance,
+            Importance::Critical,
+            "re-store with higher priority must upgrade importance"
+        );
+    }
+
+    #[test]
+    fn test_restore_does_not_downgrade_importance_on_dedup() {
+        // Sanity: a re-store with a lower priority is a no-op so an
+        // accidental write can't downgrade an already-flagged
+        // critical memory.
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.importance = Importance::Critical;
+        let id1 = store.store(first).unwrap();
+
+        let mut second = make_memory("topic", "long enough summary content for storage");
+        second.importance = Importance::Low;
+        store.store(second).unwrap();
+
+        let preserved = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            preserved.importance,
+            Importance::Critical,
+            "re-store with lower priority must not downgrade importance"
+        );
+    }
+
+    #[test]
+    fn test_restore_unions_keywords_on_dedup() {
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.keywords = vec!["alpha".into(), "beta".into()];
+        let id1 = store.store(first).unwrap();
+
+        let mut second = make_memory("topic", "long enough summary content for storage");
+        second.keywords = vec!["beta".into(), "gamma".into()];
+        store.store(second).unwrap();
+
+        let merged = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            merged.keywords,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string(),],
+            "keywords must be unioned and deduped, preserving existing order"
+        );
+    }
+
+    #[test]
+    fn test_restore_sets_raw_excerpt_when_previously_none() {
+        let store = test_store();
+        let first = make_memory("topic", "long enough summary content for storage");
+        let id1 = store.store(first).unwrap();
+        assert!(store.get(&id1).unwrap().unwrap().raw_excerpt.is_none());
+
+        let mut second = make_memory("topic", "long enough summary content for storage");
+        second.raw_excerpt = Some("verbatim copy from source".into());
+        store.store(second).unwrap();
+
+        let merged = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            merged.raw_excerpt.as_deref(),
+            Some("verbatim copy from source"),
+        );
+    }
+
+    #[test]
+    fn test_restore_keeps_existing_raw_excerpt_when_new_is_none() {
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.raw_excerpt = Some("important verbatim".into());
+        let id1 = store.store(first).unwrap();
+
+        let second = make_memory("topic", "long enough summary content for storage");
+        store.store(second).unwrap();
+
+        let preserved = store.get(&id1).unwrap().unwrap();
+        assert_eq!(
+            preserved.raw_excerpt.as_deref(),
+            Some("important verbatim"),
+            "re-store with None must not erase existing raw_excerpt"
+        );
+    }
+
+    #[test]
+    fn test_restore_unchanged_metadata_is_noop() {
+        let store = test_store();
+        let mut first = make_memory("topic", "long enough summary content for storage");
+        first.importance = Importance::High;
+        first.keywords = vec!["alpha".into()];
+        let id1 = store.store(first.clone()).unwrap();
+        let original = store.get(&id1).unwrap().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.store(first).unwrap();
+        let after = store.get(&id1).unwrap().unwrap();
+
+        assert_eq!(
+            original.updated_at, after.updated_at,
+            "no-op re-store must not bump updated_at"
+        );
     }
 
     #[test]

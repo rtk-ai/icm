@@ -1631,13 +1631,29 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
 
 fn cmd_forget(store: &SqliteStore, id: Option<&str>, topic: Option<&str>) -> Result<()> {
     match (id, topic) {
-        (_, Some(topic)) => {
-            let memories = store.get_by_topic(topic)?;
+        (Some(_), Some(_)) => {
+            // Audit #185 medium: previously the topic path silently
+            // won and the id was discarded. Reject the ambiguous combo
+            // so a careless user isn't surprised by a topic-wide
+            // delete when they expected a single-id forget.
+            anyhow::bail!("cannot pass both a memory ID and --topic; use one or the other");
+        }
+        (None, Some(topic)) => {
+            // Audit #185 low: `--topic ""` deletes every memory in
+            // the empty-topic bucket without confirmation. Empty
+            // topics shouldn't exist post-#187 (validation rejects
+            // them on store), but reject here too so old data with
+            // legacy empty topics can't be wiped by typo.
+            let trimmed = topic.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("--topic cannot be empty");
+            }
+            let memories = store.get_by_topic(trimmed)?;
             let count = memories.len();
             for m in &memories {
                 store.delete(&m.id)?;
             }
-            println!("Deleted {count} memories from topic: {topic}");
+            println!("Deleted {count} memories from topic: {trimmed}");
         }
         (Some(id), None) => {
             store.delete(id)?;
@@ -6917,6 +6933,70 @@ mod is_icm_command_tests {
         // for a one-time permission on `icm recall '<>'`.
         assert!(!is_icm_command(r#"icm recall "<>""#));
         assert!(!is_icm_command(r#"icm recall 'a > b'"#));
+    }
+}
+
+#[cfg(test)]
+mod cmd_forget_tests {
+    use super::*;
+    use icm_core::{Importance, Memory};
+    use icm_store::SqliteStore;
+
+    /// Audit #185 medium: `forget <ID> -t TOPIC` used to silently nuke
+    /// the whole topic and discard the id. Now we reject the
+    /// ambiguous combo.
+    #[test]
+    fn rejects_id_and_topic_together() {
+        let store = SqliteStore::in_memory().unwrap();
+        let id = store
+            .store(Memory::new(
+                "topic".into(),
+                "content here for storage".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+
+        let err = cmd_forget(&store, Some(&id), Some("topic")).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot pass both"),
+            "expected ambiguous-combo rejection, got {err}"
+        );
+
+        // Both should still exist — neither path executed.
+        assert!(store.get(&id).unwrap().is_some());
+    }
+
+    /// Audit #185 low: `forget --topic ""` deleted every empty-topic
+    /// memory without confirmation. Reject explicitly so old data
+    /// with legacy empty topics can't be wiped by typo.
+    #[test]
+    fn rejects_empty_topic() {
+        let store = SqliteStore::in_memory().unwrap();
+        let err = cmd_forget(&store, None, Some("")).unwrap_err();
+        assert!(
+            err.to_string().contains("--topic cannot be empty"),
+            "expected empty-topic rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_whitespace_only_topic() {
+        let store = SqliteStore::in_memory().unwrap();
+        let err = cmd_forget(&store, None, Some("   \t  ")).unwrap_err();
+        assert!(
+            err.to_string().contains("--topic cannot be empty"),
+            "expected whitespace-topic rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_neither_id_nor_topic() {
+        let store = SqliteStore::in_memory().unwrap();
+        let err = cmd_forget(&store, None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("required"),
+            "expected required rejection, got {err}"
+        );
     }
 }
 

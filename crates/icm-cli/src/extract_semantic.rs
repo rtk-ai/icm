@@ -98,6 +98,15 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
         pattern:
             "We fixed a regression that was breaking the production deployment of the service.",
     },
+    // Audit #185 B1: short conversational bugfix phrasings ("Fixed
+    // the cache returning stale entries", "バグを修正しました",
+    // "修复了... 错误") under-matched against the longer English
+    // anchors. A briefer anchor in the same form lifts CJK and
+    // tweet-length bugfix margins above the threshold.
+    Anchor {
+        kind: AnchorKind::BugFix,
+        pattern: "Fixed the cache where it returned stale entries.",
+    },
     Anchor {
         kind: AnchorKind::Preference,
         pattern:
@@ -106,6 +115,13 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
     Anchor {
         kind: AnchorKind::Preference,
         pattern: "The user prefers this style and wants it applied consistently going forward.",
+    },
+    // Audit #185 B4: explicit "user preference:" / "user wants..."
+    // phrasings rejected even though semantically obvious. Add an
+    // anchor that mirrors the explicit form.
+    Anchor {
+        kind: AnchorKind::Preference,
+        pattern: "User preference: never use this pattern in production code.",
     },
     Anchor {
         kind: AnchorKind::Milestone,
@@ -116,6 +132,15 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
         pattern:
             "This describes a component, module, or system architecture choice in the project.",
     },
+    // Audit #185 B3: the original Architecture anchor was confused
+    // with BugFix on "The X middleware sits between Y and Z" — too
+    // many shared "service / module" tokens with the bug anchors.
+    // This anchor pins the structural-relation form ("X is the layer
+    // that...", "X sits between Y and Z").
+    Anchor {
+        kind: AnchorKind::Architecture,
+        pattern: "The auth middleware is the layer that sits between the gateway and the application servers.",
+    },
     Anchor {
         kind: AnchorKind::Performance,
         pattern: "We measured performance and report concrete latency or throughput numbers.",
@@ -124,6 +149,13 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
         kind: AnchorKind::Constraint,
         pattern:
             "This is a hard constraint or limitation in the system that cannot be worked around.",
+    },
+    // Audit #185 B2: phrasings like "X does not work with Y" /
+    // "X breaks when Y" rejected even though they're textbook
+    // constraints. Add an anchor that captures the negation form.
+    Anchor {
+        kind: AnchorKind::Constraint,
+        pattern: "The crate does not work with cross-compilation for ARM64 on Linux runners.",
     },
 ];
 
@@ -499,6 +531,47 @@ mod tests {
                 "Je vais regarder le fichier et réfléchir à comment aborder ça.",
                 "fr",
                 None,
+            ),
+            // ── B1: CJK bugfix natural phrasing (was 0/3 ja, 1/3 zh/ko/vi
+            //   on develop tip before this PR) ──
+            (
+                "キャッシュが古いエントリを返すバグを修正しました。",
+                "ja",
+                Some(AnchorKind::BugFix),
+            ),
+            (
+                "修复了缓存返回过期条目的错误。",
+                "zh",
+                Some(AnchorKind::BugFix),
+            ),
+            (
+                "캐시가 오래된 항목을 반환하는 버그를 수정했습니다.",
+                "ko",
+                Some(AnchorKind::BugFix),
+            ),
+            (
+                "Đã sửa lỗi cache trả về các mục đã hết hạn.",
+                "vi",
+                Some(AnchorKind::BugFix),
+            ),
+            // ── B2: constraint "X does not work with Y" (was rejected) ──
+            (
+                "The fastembed crate does not work with cross-compilation for ARM64 on Linux CI runners.",
+                "en",
+                Some(AnchorKind::Constraint),
+            ),
+            // ── B3: architecture "X sits between Y and Z"
+            //   (was misclassified as bugfix) ──
+            (
+                "The auth middleware sits between the gateway and the application servers as a Rust microservice.",
+                "en",
+                Some(AnchorKind::Architecture),
+            ),
+            // ── B4: explicit "User preference:" form (was rejected) ──
+            (
+                "User preference: never use unwrap() in production code.",
+                "en",
+                Some(AnchorKind::Preference),
             ),
         ];
 

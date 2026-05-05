@@ -1,13 +1,23 @@
 //! Rule-based extraction and context injection for auto-extraction layers.
 //!
-//! Layer 0: Extract facts from text using keyword scoring (zero LLM cost).
+//! Layer 0: Extract facts from text using keyword scoring (zero LLM cost,
+//! English-only). When an `Embedder` is supplied, the keyword scorer is
+//! replaced by [`crate::extract_semantic::SemanticScorer`] which works
+//! cross-lingually via the multilingual embedder.
 //! Layer 2: Recall and format context for prompt injection.
 
 use std::collections::HashSet;
 
 use anyhow::Result;
-use icm_core::{is_preference_topic, project_matches, Importance, Memory, MemoryStore};
+use icm_core::{is_preference_topic, project_matches, Embedder, Importance, Memory, MemoryStore};
 use icm_store::SqliteStore;
+
+use crate::extract_semantic::{AnchorKind, SemanticScorer};
+
+/// `(topic, content, importance, anchor_kind)` — internal shape for
+/// the unified scoring pipeline. Kind is `None` for facts produced by
+/// the keyword scorer (legacy English path).
+type ScoredFact = (String, String, Importance, Option<AnchorKind>);
 
 /// Extract key facts from text and store them in ICM.
 /// Returns the number of facts stored.
@@ -25,6 +35,9 @@ pub fn extract_and_store(store: &SqliteStore, text: &str, project: &str) -> Resu
 /// promote to High) cannot inject itself into wake-up packs as a
 /// "critical decision". CLI / bench callers ingesting user-explicit
 /// input pass `Importance::Critical` to disable the cap.
+///
+/// This variant uses the English-only keyword scorer. For multilingual
+/// content prefer [`extract_and_store_with_embedder`].
 pub fn extract_and_store_with_opts(
     store: &SqliteStore,
     text: &str,
@@ -32,14 +45,50 @@ pub fn extract_and_store_with_opts(
     store_raw: bool,
     max_importance: Importance,
 ) -> Result<usize> {
-    let facts = extract_facts(text, project);
+    extract_and_store_with_embedder(store, text, project, store_raw, max_importance, None)
+}
+
+/// Extract and store with optional embedder for multilingual scoring.
+///
+/// When `embedder` is `Some`, candidate sentences are scored against
+/// semantic anchors via cosine similarity in the embedder's vector
+/// space. The default model (`intfloat/multilingual-e5-base`) covers
+/// 100+ languages, so a French decision sentence and its English
+/// counterpart both match the decision anchor.
+///
+/// When `embedder` is `None` (e.g. `--no-embeddings` or the embedder
+/// failed to load), the function falls back to the keyword scorer in
+/// [`extract_facts`]. This preserves the pre-existing behaviour for
+/// users who run with embeddings disabled. We also fall back if the
+/// scorer's anchor-build call fails — better to extract English facts
+/// only than to extract nothing at all.
+pub fn extract_and_store_with_embedder(
+    store: &SqliteStore,
+    text: &str,
+    project: &str,
+    store_raw: bool,
+    max_importance: Importance,
+    embedder: Option<&dyn Embedder>,
+) -> Result<usize> {
+    let facts: Vec<ScoredFact> = match embedder {
+        Some(emb) => match SemanticScorer::new(emb) {
+            Ok(scorer) => extract_facts_semantic(text, project, emb, &scorer)
+                .unwrap_or_else(|_| extract_facts_with_kind(text, project)),
+            Err(_) => extract_facts_with_kind(text, project),
+        },
+        None => extract_facts_with_kind(text, project),
+    };
+
     let mut stored = 0;
-    for (topic, content, importance) in &facts {
-        let mem = Memory::new(
+    for (topic, content, importance, kind) in &facts {
+        let mut mem = Memory::new(
             topic.clone(),
             content.clone(),
             cap_importance(*importance, max_importance),
         );
+        if let Some(k) = kind {
+            mem.keywords.push(k.as_tag().to_string());
+        }
         store.store(mem)?;
         stored += 1;
     }
@@ -61,6 +110,59 @@ pub fn extract_and_store_with_opts(
     }
 
     Ok(stored)
+}
+
+/// Adapter that wraps `extract_facts` so its output shape matches
+/// the semantic path: `(topic, content, importance, Option<AnchorKind>)`.
+fn extract_facts_with_kind(text: &str, project: &str) -> Vec<ScoredFact> {
+    extract_facts(text, project)
+        .into_iter()
+        .map(|(t, c, i)| (t, c, i, None))
+        .collect()
+}
+
+/// Score candidate sentences semantically and return the surviving
+/// ones tagged with their matched anchor kind. Falls back to
+/// `extract_facts_with_kind` if the embedder can't embed a batch.
+fn extract_facts_semantic(
+    text: &str,
+    project: &str,
+    embedder: &dyn Embedder,
+    scorer: &SemanticScorer,
+) -> Result<Vec<ScoredFact>> {
+    let sentences = split_sentences(text);
+    let candidates: Vec<&str> = sentences
+        .iter()
+        .filter(|s| {
+            let len = s.chars().count();
+            (20..=500).contains(&len)
+        })
+        .map(|s| s.as_str())
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let scored = scorer.score_batch(embedder, &candidates)?;
+
+    let mut facts: Vec<ScoredFact> = Vec::new();
+    for (sentence, result) in candidates.iter().zip(scored) {
+        if let Some((kind, _margin)) = result {
+            let dominated = facts
+                .iter()
+                .any(|(_, existing, _, _)| jaccard_similar(existing, sentence));
+            if !dominated {
+                facts.push((
+                    format!("context-{project}"),
+                    sentence.to_string(),
+                    kind.importance(),
+                    Some(kind),
+                ));
+            }
+        }
+    }
+
+    Ok(facts)
 }
 
 /// Clamp `value` to at most `cap`. `Importance` doesn't derive `Ord` (it
@@ -182,9 +284,25 @@ pub fn recall_context(
     Ok(ctx)
 }
 
-/// Public wrapper for CLI dry-run display.
-pub fn extract_facts_public(text: &str, project: &str) -> Vec<(String, String, Importance)> {
-    extract_facts(text, project)
+/// Public wrapper for CLI dry-run that uses the semantic scorer
+/// when an embedder is provided. Falls back to the keyword scorer
+/// when `embedder` is `None` or anchor build fails. The third tuple
+/// field is the matched anchor kind (or `None` for the keyword path)
+/// so the dry-run output can show the user *why* each fact was
+/// promoted.
+pub fn extract_facts_public_with_embedder(
+    text: &str,
+    project: &str,
+    embedder: Option<&dyn Embedder>,
+) -> Vec<(String, String, Importance, Option<AnchorKind>)> {
+    if let Some(emb) = embedder {
+        if let Ok(scorer) = SemanticScorer::new(emb) {
+            if let Ok(facts) = extract_facts_semantic(text, project, emb, &scorer) {
+                return facts;
+            }
+        }
+    }
+    extract_facts_with_kind(text, project)
 }
 
 /// Extract key facts from text using keyword scoring.

@@ -4,6 +4,7 @@ mod bench_knowledge;
 pub mod cloud;
 mod config;
 mod extract;
+mod extract_semantic;
 mod import;
 #[cfg(test)]
 mod learn_tests;
@@ -1240,7 +1241,10 @@ fn main() -> Result<()> {
             text,
             dry_run,
             store_raw,
-        } => cmd_extract(&store, &project, text, dry_run, store_raw),
+        } => {
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            cmd_extract(&store, emb_ref, &project, text, dry_run, store_raw)
+        }
         Commands::Import {
             path,
             format,
@@ -2168,12 +2172,15 @@ fn cmd_hook_post(
     // Extract facts and store (with raw text fallback if enabled).
     // Cap auto-extracted importance at Medium: tool output is untrusted
     // (a malicious tool could emit decision-keyword text to poison wake-up).
-    match extract::extract_and_store_with_opts(
+    // Pass the embedder so non-English content is also scored: the keyword
+    // scorer is English-only and would silently drop FR/DE/etc. facts.
+    match extract::extract_and_store_with_embedder(
         store,
         tool_output,
         &project,
         store_raw,
         icm_core::Importance::Medium,
+        embedder,
     ) {
         Ok(n) if n > 0 => {
             eprintln!("[icm] auto-extracted {n} facts from tool output");
@@ -2366,12 +2373,14 @@ fn extract_from_hook_transcript(
     // the transcript can be crafted to trigger decision/error keywords and
     // self-promote to High. Clamp to Medium so wake-up never surfaces
     // hook-extracted content under "Identity & preferences" or as Critical.
-    match extract::extract_and_store_with_opts(
+    // Embedder is passed so multilingual transcripts are also scored.
+    match extract::extract_and_store_with_embedder(
         store,
         text,
         &project,
         true,
         icm_core::Importance::Medium,
+        embedder,
     ) {
         Ok(n) if n > 0 => {
             eprintln!("[icm] {source}: extracted {n} facts from transcript");
@@ -4204,6 +4213,7 @@ fn cmd_consolidate(
 
 fn cmd_extract(
     store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
     project: &str,
     text: Option<String>,
     dry_run: bool,
@@ -4222,23 +4232,28 @@ fn cmd_extract(
     };
 
     if dry_run {
-        let facts = extract::extract_facts_public(&input, project);
+        let facts = extract::extract_facts_public_with_embedder(&input, project, embedder);
         if facts.is_empty() {
             println!("No facts extracted.");
         } else {
             println!("Would extract {} facts:", facts.len());
-            for (topic, content, importance) in &facts {
-                println!("  [{importance}] ({topic}) {content}");
+            for (topic, content, importance, kind) in &facts {
+                let kind_tag = kind.map(|k| format!(" {}", k.as_tag())).unwrap_or_default();
+                println!("  [{importance}{kind_tag}] ({topic}) {content}");
             }
         }
     } else {
         // CLI `icm extract` is user-explicit input; no importance cap.
-        let stored = extract::extract_and_store_with_opts(
+        // Pass the embedder so multilingual content gets scored
+        // (without it, the keyword-only fallback ignores any language
+        // other than English).
+        let stored = extract::extract_and_store_with_embedder(
             store,
             &input,
             project,
             store_raw,
             icm_core::Importance::Critical,
+            embedder,
         )?;
         println!("Extracted and stored {stored} facts.");
     }

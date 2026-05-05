@@ -239,7 +239,7 @@ pub fn recall_context(
     //    too). Restricting the last-ditch fallback to preferences
     //    preserves that contract while killing the off-topic
     //    pollution.
-    let relevant: Vec<Memory> = if !project_filtered.is_empty() {
+    let candidate: Vec<Memory> = if !project_filtered.is_empty() {
         project_filtered
     } else if !fts_results.is_empty() {
         fts_results.into_iter().take(limit).collect()
@@ -262,6 +262,25 @@ pub fn recall_context(
         prefs.truncate(limit);
         prefs
     };
+
+    // Audit #185 medium: deduplicate near-paraphrases before
+    // rendering. Without this, storing 10 paraphrases of "Patrick
+    // prefers Rust over Go" returns 5 near-identical bullets in
+    // every prompt's injection — pure token waste. The same Jaccard
+    // similarity check that `extract_facts_semantic` already uses
+    // for write-side dedup (in `extract_facts_semantic`) is reused
+    // here at render-side. Cost: O(n²) word-set intersections, but
+    // n ≤ limit (typically 5-10) so it's negligible compared to
+    // the FTS / vector search already done.
+    let mut relevant: Vec<Memory> = Vec::with_capacity(candidate.len());
+    for mem in candidate {
+        let dominated = relevant
+            .iter()
+            .any(|kept| jaccard_similar(&kept.summary, &mem.summary));
+        if !dominated {
+            relevant.push(mem);
+        }
+    }
 
     if relevant.is_empty() {
         return Ok(String::new());
@@ -1545,6 +1564,41 @@ mod tests {
         assert!(
             ctx2.contains("terse responses"),
             "preferences must not be stripped by project filter: {ctx2}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_dedupes_paraphrases_at_render() {
+        // Audit #185 medium: storing N paraphrases of the same fact
+        // used to produce N near-identical bullets in the injected
+        // context. Apply Jaccard dedup at render so only one
+        // representative survives.
+        let store = SqliteStore::in_memory().unwrap();
+        let paraphrases = [
+            "Patrick prefers Rust over Go for systems work",
+            "Patrick prefers Rust over Go when working on systems",
+            "For systems work Patrick prefers Rust over Go",
+            "Patrick generally prefers Rust over Go for systems",
+            "Rust is preferred over Go by Patrick for systems work",
+        ];
+        for p in paraphrases {
+            store
+                .store(Memory::new(
+                    "preferences".to_string(),
+                    p.to_string(),
+                    Importance::High,
+                ))
+                .unwrap();
+        }
+
+        let ctx = recall_context(&store, "Rust over Go", None, 10).unwrap();
+        // Count `- Patrick` bullets — pre-fix this would be ~5;
+        // post-fix it's 1 (or at most 2 if a paraphrase is sufficiently
+        // distant in token-set space).
+        let bullet_count = ctx.matches("- ").count();
+        assert!(
+            bullet_count <= 2,
+            "expected ≤ 2 paraphrase bullets, got {bullet_count}: {ctx}"
         );
     }
 

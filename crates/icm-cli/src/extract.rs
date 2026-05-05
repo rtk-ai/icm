@@ -674,10 +674,15 @@ fn ends_with_honorific(buf: &str) -> bool {
 /// every prompt's context.
 ///
 /// Rules:
-/// - A `.`, `?`, `!`, or `:` is a sentence terminator **only if followed
+/// - A `.`, `?`, or `!` is a sentence terminator **only if followed
 ///   by whitespace or end-of-input**. A `.` followed immediately by a
 ///   non-whitespace character (letter, digit, `/`, `:`, etc.) is part
 ///   of a URL, file path, version number, or abbreviation — keep going.
+/// - `:` is *not* a terminator. In technical prose it overwhelmingly
+///   introduces a clause (`Error: ...`, `Note: ...`, `Fixed: was
+///   using ...`) rather than ending one. Splitting on `:` produced
+///   two short fragments that both fell below `MIN_SENTENCE_LEN` and
+///   the underlying fact was dropped.
 /// - `\n` is a hard boundary (preserves the existing line-aware behaviour
 ///   for lists and tool output) but the resulting fragment goes through
 ///   `is_keepable_fragment` before being kept.
@@ -686,10 +691,13 @@ fn ends_with_honorific(buf: &str) -> bool {
 ///   noise (paths, JSON, etc.).
 ///
 /// The kept fragments must (via `is_keepable_fragment`):
-/// - End in a sentence terminator (`.`, `?`, `!`, `:`).
-/// - Not start with a markdown artifact prefix (`> `, `- `, `- [`, `* `,
-///   `+ `, `# `).
 /// - Be at least `MIN_SENTENCE_LEN` chars long.
+/// - Not start with a markdown artifact prefix (`> `, `- `, `- [`, `* `,
+///   `+ `, `# `, ```` ``` ````, `|`).
+/// - Not start with a subordinating-clause connector (`because `,
+///   `rather than `, `instead of `, …) — those are mid-sentence cuts.
+/// - Not start with a lowercase letter — likewise a mid-sentence cut.
+/// - Not end in a dangling URL/path token (`://`, `/`, `\`, `=`).
 fn split_sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -733,7 +741,7 @@ fn split_sentences(text: &str) -> Vec<String> {
         let next = chars.get(i + 1).copied();
         let boundary = if ch == '\n' {
             true
-        } else if matches!(ch, '.' | '?' | '!' | ':') {
+        } else if matches!(ch, '.' | '?' | '!') {
             match next {
                 None => true,
                 Some(c) if c.is_whitespace() => {
@@ -747,6 +755,12 @@ fn split_sentences(text: &str) -> Vec<String> {
                 _ => false, // `.` inside URL/path/version/abbreviation
             }
         } else {
+            // `:` is intentionally NOT a sentence terminator. In
+            // technical prose it overwhelmingly introduces a clause
+            // (`Error: ...`, `Note: ...`, `Fixed NOT_ANY condition: was
+            // using ...`) rather than ending one. Splitting on `:`
+            // produced two short fragments that both fell below
+            // `MIN_SENTENCE_LEN`, dropping the underlying fact entirely.
             false
         };
 
@@ -787,6 +801,8 @@ fn is_keepable_fragment(s: &str) -> bool {
 
     // Markdown artifact line prefixes — these are structure, not facts.
     // Order matters: `- [` (task list) must be checked before `- `.
+    // `|` covers GFM table rows (header, separator, body) which are
+    // structural even when they happen to contain a numeric "fact".
     if stripped.starts_with("> ")
         || stripped.starts_with("- [")
         || stripped.starts_with("- ")
@@ -794,8 +810,39 @@ fn is_keepable_fragment(s: &str) -> bool {
         || stripped.starts_with("+ ")
         || stripped.starts_with("# ")
         || stripped.starts_with("```")
+        || stripped.starts_with('|')
     {
         return false;
+    }
+
+    // Subordinating-clause starters: a fragment beginning with one of
+    // these is almost always a sentence cut mid-thought (log line wraps,
+    // table cells dumped to text, partial quotes from larger blocks).
+    // The keyword scorer would otherwise promote them to High because
+    // of "because", "rather than", "instead of" — but those tokens
+    // belong in the *middle* of a decision, not the start of a
+    // standalone fact. Cheap lowercase prefix match.
+    let lower = stripped.to_lowercase();
+    if SUBORDINATING_STARTERS.iter().any(|p| lower.starts_with(p)) {
+        return false;
+    }
+
+    // Lowercase-letter start is a strong signal of a fragment cut from
+    // the *middle* of a larger sentence. Real prose almost always
+    // capitalises the first letter; even technical names that start
+    // lowercase (`iOS`, `eBPF`, `npm`) are rare enough as the *first
+    // word of a complete sentence* that the false-negative cost is
+    // small. The false-positive cost — surfacing `operator on libsql
+    // query result rather than .ok()` or `the libsql FTS5 trigger
+    // failed on UPDATE` as standalone "facts" — is large because the
+    // keyword scorer would promote them to High via decision/error
+    // tokens further down. Digits, quotes and other non-alphabetic
+    // starts are allowed (e.g. `0.10.42 shipped with the dedup fix`,
+    // `"DECISION:" lines from a transcript dump`).
+    if let Some(first) = stripped.chars().next() {
+        if first.is_alphabetic() && first.is_lowercase() {
+            return false;
+        }
     }
 
     // Catch dangling URL/path tokens at the end. Boundary detection
@@ -812,6 +859,29 @@ fn is_keepable_fragment(s: &str) -> bool {
 
     true
 }
+
+/// Lowercase prefixes that mark a fragment as the tail of a sentence
+/// rather than the start of one. Match is on `.starts_with(...)` after
+/// `to_lowercase()`, so each entry must end with a trailing space (or
+/// punctuation) to avoid eating a real word that happens to start with
+/// the same letters (e.g. `because` must not match `becausewhen`).
+const SUBORDINATING_STARTERS: &[&str] = &[
+    "because ",
+    "rather than ",
+    "instead of ",
+    "although ",
+    "though ",
+    "since ",
+    "while ",
+    "whereas ",
+    "whether ",
+    "due to ",
+    "such that ",
+    "so that ",
+    "as if ",
+    "as though ",
+    "in order to ",
+];
 
 // ── Fact classification ──────────────────────────────────────────────────
 
@@ -1558,18 +1628,149 @@ mod tests {
     }
 
     #[test]
+    fn split_drops_markdown_table_rows() {
+        // GFM table rows are structure, not facts. Both header and body
+        // rows must be filtered out — they were observed leaking into
+        // `context-icm` as standalone "memories" that contained nothing
+        // but column titles or aggregated numbers.
+        let cases = [
+            "| Fin S2 (mai 2027) | ~1 815 K€ |",
+            "| Path | p50 | Coût $ | Qualité output |",
+            "| **V9** | E2E claude -p × 5 sessions | PASS partiel |",
+            "|---|---|---|",
+        ];
+        for text in &cases {
+            let chunks = split_sentences(text);
+            assert!(
+                chunks.is_empty(),
+                "table row should be filtered: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_drops_subordinating_starters() {
+        // Fragments cut from larger sentences and starting with a
+        // subordinating conjunction should not be kept. They contain
+        // decision-keyword vocabulary ("because", "rather than") that
+        // the scorer would otherwise promote to High importance.
+        let cases = [
+            "because the keywords column was JSON, not TEXT.",
+            "rather than using a HashMap for performance reasons here.",
+            "instead of the previous SQLite-only implementation path.",
+            "although the build pipeline still requires manual triggers.",
+            "while the feature flag rollout was paused last week.",
+            "due to the shared connection pool starvation pattern observed.",
+        ];
+        for text in &cases {
+            let chunks = split_sentences(text);
+            assert!(
+                chunks.is_empty(),
+                "subordinating-clause fragment should be filtered: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_facts_drops_table_and_subordinating_fragments() {
+        // End-to-end: the scoring layer must not promote these patterns.
+        let inputs = [
+            "| Fin S2 (mai 2027) | ~1 815 K€ |",
+            "because the keywords column was JSON, not TEXT.",
+            "rather than using a HashMap for performance reasons here.",
+        ];
+        for text in &inputs {
+            let facts = extract_facts(text, "test");
+            assert!(
+                facts.is_empty(),
+                "extractor must drop fragment: {text:?} -> {facts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_drops_lowercase_start_fragments() {
+        // Bench-quality probe outputs `operator on libsql query result
+        // rather than .ok().` and `the libsql FTS5 trigger failed on
+        // UPDATE because the keywords column was JSON, not TEXT.` —
+        // both are sentence cuts that the keyword scorer would
+        // promote to High via decision/error vocabulary. The
+        // lowercase-start rule rejects them at the splitter.
+        let cases = [
+            "operator on libsql query result rather than .ok().",
+            "the libsql FTS5 trigger failed on UPDATE because the keywords column was JSON, not TEXT.",
+            "was using check_all instead of check_some in evaluator.rs throughout that module.",
+        ];
+        for text in &cases {
+            let chunks = split_sentences(text);
+            assert!(
+                chunks.is_empty(),
+                "lowercase-start fragment must be filtered: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_keeps_digit_or_quote_starts() {
+        // Digit-led and quote-led sentences are common in technical
+        // prose (version-led, transcript dumps) and must survive the
+        // lowercase-start filter — that filter only fires on
+        // alphabetic lowercase starts.
+        let cases = [
+            (
+                "0.10.42 shipped with the dedup hotfix on develop yesterday.",
+                "0.10.42",
+            ),
+            (
+                "\"DECISION:\" lines from the transcript were promoted to High.",
+                "DECISION",
+            ),
+            (
+                "`icm consolidate` produces a summary that mentions key concepts.",
+                "icm consolidate",
+            ),
+        ];
+        for (text, marker) in &cases {
+            let chunks = split_sentences(text);
+            assert!(
+                chunks.iter().any(|c| c.contains(marker)),
+                "non-alphabetic-start sentence must survive: {text:?} -> {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_facts_keeps_real_decision_with_subordinating_word_inside() {
+        // Sanity: the subordinating-starter check rejects only fragments
+        // that *begin* with one of these connectors. A real decision
+        // sentence containing "because" mid-clause must still pass.
+        let text = "We picked SQLite because Postgres was overkill for the embedded use case here.";
+        let facts = extract_facts(text, "test");
+        assert!(
+            !facts.is_empty(),
+            "real decision sentence with mid-clause `because` must survive"
+        );
+    }
+
+    #[test]
     fn split_does_not_match_honorific_substring_in_word() {
         // `weatherstr.` should not be treated as ending in `St.` (the
         // suffix matches but isn't preceded by whitespace, so it's part
-        // of a longer token).
-        let text = "The weatherstr. value contains the forecast string and is then logged.";
+        // of a longer token). With honorific suppression off the dot
+        // ends a sentence, so we expect the trailing clause to come
+        // through as a kept chunk. We use an uppercase first letter on
+        // the trailing clause so it survives `is_keepable_fragment`'s
+        // lowercase-start filter — that filter is unrelated to the
+        // honorific path under test.
+        let text = "The weatherstr. Value contains the forecast string and is then logged.";
         let chunks = split_sentences(text);
-        // It's not split-suppressed; the dot in `weatherstr.` is followed
-        // by a space + lowercase letter, so the splitter treats it as a
-        // genuine sentence boundary. Assert chunks > 0 and we don't
-        // accidentally erase content. Don't over-specify the count
-        // because either 1 or 2 chunks would be defensible — the key is
-        // we don't trigger the honorific path for a non-honorific.
-        assert!(!chunks.is_empty());
+        assert!(
+            !chunks.is_empty(),
+            "honorific NOT suppressed: weatherstr. dot should be a sentence boundary, leaving the trailing clause as a chunk: {chunks:?}"
+        );
+        assert!(
+            chunks.iter().any(|c| c.contains("Value contains")),
+            "trailing clause should survive: {chunks:?}"
+        );
     }
 }

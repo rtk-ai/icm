@@ -320,6 +320,59 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 所有选项请参见 [config/default.toml](config/default.toml)。
 
+## 多项目与多智能体
+
+ICM 是为以下场景设计的：一位用户与多个智能体在多个项目之间协作。记忆必须保持相关性：项目 A 的决策绝不应泄漏到项目 B，`dev` 智能体也不应被加载 `mentor` 智能体所存储的内容。
+
+### 项目隔离
+
+ICM 通过 **topic 命名约定** 来对记忆进行分域，而不是通过单独的列。约定如下：
+
+```
+{kind}-{project}              # e.g. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
+preferences                   # global, always included
+identity                      # global, always included
+```
+
+`icm_wake_up { project: "icm" }` 执行 **按片段感知** 的匹配：`"icm"` 匹配 `decisions-icm`、`errors-icm-core`、`contexte-icm`，但永远不匹配 `icmp-notes`（不会误报）。topic 按 `-`、`.`、`_`、`/`、`:` 进行切分。preference 和 identity 类的 topic 在设计上是跨项目的——用户层面的指引永远不会被剥离。
+
+`UserPromptSubmit` 钩子（`icm hook prompt`）和 `SessionStart` 钩子（`icm hook start`）都从钩子 JSON 中的 `cwd` 字段（工作目录的 `basename`）推导出项目名。在各自的项目目录下运行每个项目，即可自动实现隔离。
+
+### 编写优质的记忆
+
+`icm_memory_store` 要求智能体自行选择 `topic` 与 `content`——不存在自动分类器。最佳实践：
+
+| 字段 | 指引 |
+|------|----------|
+| `topic` | `{kind}-{project}`。kind 取值：`decisions`、`errors-resolved`、`contexte`、`preferences`。 |
+| `content` | 每次只存一条事实。用密集的英文摘要——`topic + content` 即为 embedding 文本。 |
+| `raw_excerpt` | 仅用于原文逐字记录（代码、精确的错误信息、命令输出）。 |
+| `keywords` | 3–5 个词，用于增强 BM25 检索。 |
+| `importance` | `critical` 表示永不遗忘，`high` 用于项目决策，`medium` 为默认，`low` 用于短暂内容。 |
+
+其余由 ICM 处理：**85% 相似度去重**、语义相近记忆之间的 **自动关联**、单个 topic 超过 10 条时的 **自动整合**，以及按访问次数加权的 **衰减**。每次只存一条事实优于批量倾倒——检索器会给单独存储的事实更高的排名。
+
+### 多智能体角色
+
+ICM 目前还没有一等公民的 `role` 列。如今，角色通过 topic 后缀加上各智能体独立的工作目录来模拟：
+
+```
+decisions-icm-dev             # dev agent: code patterns, library choices, refactors
+decisions-icm-architect       # architect: design, workflows, subtask decomposition
+decisions-icm-mentor          # mentor / BA: business goals, non-technical context
+```
+
+每个智能体在各自的工作目录中运行（`~/projects/icm-dev/`、`~/projects/icm-architect/` 等），这样 `icm hook prompt` 和 `icm hook start` 会从 `cwd` 推导出不同的项目片段，并且只召回匹配的记忆。preferences 始终是全局的——用户身份会延续到所有角色。
+
+在同一个智能体内部，你也可以手动收窄召回范围：
+
+```jsonc
+// icm_memory_recall
+{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
+```
+
+一等公民的 `role` 字段（在 wake-up 和 recall 中提供原生过滤）已列入路线图。在此之前，topic 后缀约定是受支持的模式。
+
 ## 自动提取
 
 ICM 通过三个层次自动提取记忆：

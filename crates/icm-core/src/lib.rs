@@ -39,6 +39,9 @@ pub use wake_up::{
 
 pub use learn::{learn_project, LearnResult};
 
+pub mod time_fmt;
+pub use time_fmt::format_local;
+
 /// Common message for empty search results.
 pub const MSG_NO_MEMORIES: &str = "No memories found.";
 

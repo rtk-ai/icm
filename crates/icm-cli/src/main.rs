@@ -24,9 +24,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    build_wake_up, is_preference_topic, keyword_matches, project_matches, topic_matches, Concept,
-    ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
+    build_wake_up, format_local, is_preference_topic, keyword_matches, project_matches,
+    topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir,
+    MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -1950,7 +1950,10 @@ fn cmd_transcript_search(
             "  session:  {} ({}, project={}, agent={})",
             hit.session.id, hit.message.role, proj, hit.session.agent
         );
-        println!("  ts:       {}", hit.message.ts.format("%Y-%m-%d %H:%M:%S"));
+        println!(
+            "  ts:       {}",
+            format_local(&hit.message.ts, "%Y-%m-%d %H:%M:%S")
+        );
         println!("  score:    {:.3}", hit.score);
         if let Some(t) = &hit.message.tool_name {
             println!("  tool:     {t}");
@@ -1985,8 +1988,8 @@ fn cmd_transcript_list_sessions(
             short_id,
             truncate(&s.agent, 14),
             truncate(proj, 18),
-            s.started_at.format("%Y-%m-%d %H:%M:%S"),
-            s.updated_at.format("%Y-%m-%d %H:%M:%S"),
+            format_local(&s.started_at, "%Y-%m-%d %H:%M:%S"),
+            format_local(&s.updated_at, "%Y-%m-%d %H:%M:%S"),
         );
     }
     Ok(())
@@ -2007,14 +2010,14 @@ fn cmd_transcript_show(store: &SqliteStore, session: &str, limit: usize) -> Resu
         "agent={} project={} started={} updated={}",
         meta.agent,
         meta.project.as_deref().unwrap_or("-"),
-        meta.started_at.format("%Y-%m-%d %H:%M:%S"),
-        meta.updated_at.format("%Y-%m-%d %H:%M:%S"),
+        format_local(&meta.started_at, "%Y-%m-%d %H:%M:%S"),
+        format_local(&meta.updated_at, "%Y-%m-%d %H:%M:%S"),
     );
     println!();
 
     let messages = store.list_session_messages(session, limit, 0)?;
     for m in messages {
-        let ts = m.ts.format("%H:%M:%S");
+        let ts = format_local(&m.ts, "%H:%M:%S");
         let tool = m
             .tool_name
             .as_ref()
@@ -2043,8 +2046,8 @@ fn cmd_transcript_stats(store: &SqliteStore) -> Result<()> {
     if let (Some(o), Some(n)) = (&s.oldest, &s.newest) {
         println!(
             "Range:         {} -> {}",
-            o.format("%Y-%m-%d %H:%M"),
-            n.format("%Y-%m-%d %H:%M")
+            format_local(o, "%Y-%m-%d %H:%M"),
+            format_local(n, "%Y-%m-%d %H:%M")
         );
     }
     if !s.by_role.is_empty() {
@@ -2727,10 +2730,10 @@ fn cmd_stats(store: &SqliteStore) -> Result<()> {
     println!("Topics:    {}", stats.total_topics);
     println!("Avg weight: {:.3}", stats.avg_weight);
     if let Some(oldest) = stats.oldest_memory {
-        println!("Oldest:    {}", oldest.format("%Y-%m-%d %H:%M"));
+        println!("Oldest:    {}", format_local(&oldest, "%Y-%m-%d %H:%M"));
     }
     if let Some(newest) = stats.newest_memory {
-        println!("Newest:    {}", newest.format("%Y-%m-%d %H:%M"));
+        println!("Newest:    {}", format_local(&newest, "%Y-%m-%d %H:%M"));
     }
     Ok(())
 }
@@ -4647,10 +4650,13 @@ fn print_memory_detail(mem: &Memory, score: Option<f32>) {
     println!("  topic:      {}", mem.topic);
     println!("  importance: {}", mem.importance);
     println!("  weight:     {:.3}", mem.weight);
-    println!("  created:    {}", mem.created_at.format("%Y-%m-%d %H:%M"));
+    println!(
+        "  created:    {}",
+        format_local(&mem.created_at, "%Y-%m-%d %H:%M")
+    );
     println!(
         "  accessed:   {} (x{})",
-        mem.last_accessed.format("%Y-%m-%d %H:%M"),
+        format_local(&mem.last_accessed, "%Y-%m-%d %H:%M"),
         mem.access_count
     );
     println!("  summary:    {}", mem.summary);
@@ -5763,11 +5769,11 @@ fn cmd_memoir_show(store: &SqliteStore, name: &str) -> Result<()> {
     }
     println!(
         "  created:     {}",
-        memoir.created_at.format("%Y-%m-%d %H:%M")
+        format_local(&memoir.created_at, "%Y-%m-%d %H:%M")
     );
     println!(
         "  updated:     {}",
-        memoir.updated_at.format("%Y-%m-%d %H:%M")
+        format_local(&memoir.updated_at, "%Y-%m-%d %H:%M")
     );
     println!("  concepts:    {}", stats.total_concepts);
     println!("  links:       {}", stats.total_links);
@@ -6215,8 +6221,14 @@ fn print_concept(c: &Concept) {
         let labels_str = c.format_labels();
         println!("  labels:     {labels_str}");
     }
-    println!("  created:    {}", c.created_at.format("%Y-%m-%d %H:%M"));
-    println!("  updated:    {}", c.updated_at.format("%Y-%m-%d %H:%M"));
+    println!(
+        "  created:    {}",
+        format_local(&c.created_at, "%Y-%m-%d %H:%M")
+    );
+    println!(
+        "  updated:    {}",
+        format_local(&c.updated_at, "%Y-%m-%d %H:%M")
+    );
     if !c.source_memory_ids.is_empty() {
         println!("  sources:    {}", c.source_memory_ids.join(", "));
     }

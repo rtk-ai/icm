@@ -2616,10 +2616,70 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
     };
     let ctx = extract::recall_context(store, query, project_filter, 5)?;
     if !ctx.is_empty() {
-        print!("{ctx}");
+        emit_hook_context(&ctx);
     }
 
     Ok(())
+}
+
+/// Output target for hook stdout. Different agent runtimes have
+/// incompatible contracts for what they expect on stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOutputFormat {
+    /// Plain text. Claude Code, Gemini CLI, and Codex CLI all treat
+    /// any non-JSON stdout from a hook as injected context — so a
+    /// markdown wake-up pack or recall block is the right shape.
+    Plain,
+    /// JSON `{"additional_context": "..."}`. Cursor's hook runtime
+    /// requires JSON output matching its per-event schema; plain
+    /// text triggers `JSON Parse Error: Unexpected token …`.
+    /// Issue #120.
+    CursorJson,
+}
+
+/// Detect which output format this hook invocation should emit.
+///
+/// Cursor injects `CURSOR_PROJECT_DIR` (and historically also
+/// `CURSOR_VERSION`) into the hook environment, so the presence of
+/// either flips the format. `ICM_HOOK_OUTPUT_FORMAT` lets a user (or
+/// the wrapper script in `~/.cursor/hooks/`) override the auto-detect:
+///
+///   ICM_HOOK_OUTPUT_FORMAT=plain    # force passthrough (Claude shape)
+///   ICM_HOOK_OUTPUT_FORMAT=cursor   # force JSON wrap
+fn detect_hook_output_format() -> HookOutputFormat {
+    if let Ok(v) = std::env::var("ICM_HOOK_OUTPUT_FORMAT") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "cursor" | "json" => return HookOutputFormat::CursorJson,
+            "plain" | "claude" => return HookOutputFormat::Plain,
+            _ => {}
+        }
+    }
+    if std::env::var("CURSOR_PROJECT_DIR").is_ok() || std::env::var("CURSOR_VERSION").is_ok() {
+        return HookOutputFormat::CursorJson;
+    }
+    HookOutputFormat::Plain
+}
+
+/// Wrap recalled / wake-up context for the active hook runtime and
+/// write it to stdout. Issue #120: previously the hook commands wrote
+/// raw markdown via `print!`, which Cursor's hook runtime rejected
+/// with a JSON parse error on every fire.
+fn emit_hook_context(ctx: &str) {
+    print!("{}", format_hook_context(ctx, detect_hook_output_format()));
+}
+
+/// Pure helper for `emit_hook_context`. Public-in-crate so tests can
+/// pin the wrapping behavior without mutating process env vars.
+fn format_hook_context(ctx: &str, fmt: HookOutputFormat) -> String {
+    match fmt {
+        HookOutputFormat::Plain => ctx.to_string(),
+        HookOutputFormat::CursorJson => {
+            // serde_json escapes the string and emits a one-line JSON
+            // object — exactly the shape Cursor's hook runtime parses
+            // for `additional_context`.
+            serde_json::json!({ "additional_context": ctx }).to_string()
+        }
+    }
 }
 
 /// SessionStart hook (Layer 0): inject a wake-up pack of critical memories at
@@ -2649,7 +2709,7 @@ fn cmd_hook_start(store: &SqliteStore, max_tokens: usize) -> Result<()> {
         }
         return Ok(());
     }
-    print!("{pack}");
+    emit_hook_context(&pack);
     Ok(())
 }
 
@@ -7655,5 +7715,53 @@ mod windows_path_tests {
         // A pattern about icm must not match a non-icm tool just because
         // ".exe" appears.
         assert!(!cmd_matches_icm_pattern("/bin/foo.exe hook", "icm hook"));
+    }
+}
+
+#[cfg(test)]
+mod hook_output_format_tests {
+    //! Issue #120: Cursor's hook runtime requires JSON output. The
+    //! previous behavior — plain markdown via `print!` — triggered
+    //! `JSON Parse Error: Unexpected token …` on every Cursor hook
+    //! fire. These tests pin the wrapping shape and the auto-detect
+    //! logic without mutating process env vars (which are global
+    //! state and would race with sibling tests).
+    use super::*;
+
+    #[test]
+    fn plain_format_passes_through_unchanged() {
+        let ctx = "# Wake-up\n- foo\n- bar\n";
+        assert_eq!(format_hook_context(ctx, HookOutputFormat::Plain), ctx);
+    }
+
+    #[test]
+    fn cursor_format_wraps_as_additional_context_json() {
+        let out = format_hook_context("# Wake-up\n- foo\n", HookOutputFormat::CursorJson);
+        // Must parse as JSON with exactly the expected key.
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.get("additional_context")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "# Wake-up\n- foo\n",
+        );
+    }
+
+    /// Wake-up packs include backticks, headers, and other markdown
+    /// punctuation. They must round-trip through JSON without breaking
+    /// (escape, then unescape).
+    #[test]
+    fn cursor_format_round_trips_markdown_special_chars() {
+        let ctx = "# H\n\"quoted\"\n```rust\nfn main() {}\n```\nbackslash: \\n\n";
+        let wrapped = format_hook_context(ctx, HookOutputFormat::CursorJson);
+        let v: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
+        assert_eq!(v.get("additional_context").unwrap().as_str().unwrap(), ctx);
+    }
+
+    #[test]
+    fn cursor_format_handles_empty_string() {
+        let out = format_hook_context("", HookOutputFormat::CursorJson);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v.get("additional_context").unwrap().as_str().unwrap(), "");
     }
 }

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -243,6 +243,18 @@ impl App {
 }
 
 /// Entry point for the TUI dashboard.
+/// Issue #181: on Windows, crossterm emits both `Press` and `Release`
+/// `KeyEventKind` values for every keystroke. Without filtering, every
+/// dashboard action fires twice — pressing `c` to consolidate runs the
+/// confirmation prompt and then `c` again cancels it. On Unix only
+/// `Press` is emitted, so this filter is a no-op there.
+///
+/// `Repeat` (held key) is treated as actionable so users can hold an
+/// arrow to scroll a long list.
+fn is_actionable_key(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
 pub fn run_dashboard(store: &SqliteStore, db_path: Option<&str>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -276,6 +288,9 @@ fn run_loop(
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
+                if !is_actionable_key(key.kind) {
+                    continue;
+                }
                 // Confirmation dialog
                 if !matches!(app.confirm, Confirm::None) {
                     match key.code {
@@ -1509,4 +1524,30 @@ fn importance_distribution(health: &[TopicHealth]) -> Vec<Line<'static>> {
             Span::raw(format!(" {healthy_pct}%")),
         ]),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #181: Release events on Windows must not trigger actions —
+    /// they're the second half of every keystroke and would double-fire
+    /// commands like `c`-to-consolidate (which then immediately cancels).
+    #[test]
+    fn is_actionable_key_drops_release() {
+        assert!(!is_actionable_key(KeyEventKind::Release));
+    }
+
+    /// Press is the canonical actionable kind on every platform.
+    #[test]
+    fn is_actionable_key_accepts_press() {
+        assert!(is_actionable_key(KeyEventKind::Press));
+    }
+
+    /// Repeat must remain actionable so a held arrow key still scrolls
+    /// long lists at the OS-driven repeat rate.
+    #[test]
+    fn is_actionable_key_accepts_repeat() {
+        assert!(is_actionable_key(KeyEventKind::Repeat));
+    }
 }

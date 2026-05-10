@@ -1,0 +1,8 @@
+{
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo hello"
+  },
+  "tool_output": "hello\n",
+  "cwd": "/home/user/myproj"
+}

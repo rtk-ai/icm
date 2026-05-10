@@ -1,0 +1,8 @@
+{
+  "tool_name": "shell",
+  "tool_input": {
+    "command": "echo hi"
+  },
+  "tool_response": "hi\n",
+  "cwd": "/home/user/myproj"
+}

@@ -2229,8 +2229,12 @@ fn is_icm_command(cmd: &str) -> bool {
             continue;
         }
         let first_token = trimmed.split_whitespace().next().unwrap_or("");
-        let basename = first_token.rsplit('/').next().unwrap_or("");
-        if basename == "icm" {
+        // On Windows the basename can include `\` separators too — same fix
+        // shape as issue #180. Strip both separators when extracting the
+        // basename so `C:\Users\...\icm.exe` and `~/.local/bin/icm` both
+        // resolve to `icm` / `icm.exe`.
+        let basename = first_token.rsplit(['/', '\\']).next().unwrap_or("");
+        if basename == "icm" || basename == "icm.exe" {
             saw_any = true;
         } else {
             // Any non-icm segment vetoes auto-allow for the whole command.
@@ -2263,6 +2267,32 @@ fn has_shell_metacharacter(cmd: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Pull the tool's stdout from a PostToolUse hook payload.
+///
+/// **CRITICAL bug fix**: Claude Code 2.x switched the field shape from a
+/// top-level `"tool_output": "..."` to a nested
+/// `"tool_response": { "output": "..." }`. The previous implementation
+/// only read `tool_output`, so auto-extraction silently produced zero
+/// memories on every Claude Code 2.x install — the hook fired, the
+/// counter incremented, but `tool_output` was always empty.
+///
+/// We accept three shapes, in priority order:
+///
+///   1. `tool_output: "<str>"`              — legacy / Codex / Gemini older
+///   2. `tool_response: { output: "<str>" }`— Claude Code 2.x
+///   3. `tool_response: "<str>"`            — some Codex/Gemini variants
+fn extract_tool_output(json: &Value) -> Option<&str> {
+    json.get("tool_output")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("tool_response").and_then(|v| {
+                v.get("output")
+                    .and_then(|o| o.as_str())
+                    .or_else(|| v.as_str())
+            })
+        })
 }
 
 /// PostToolUse hook: auto-extract context every N tool calls.
@@ -2301,11 +2331,14 @@ fn cmd_hook_post(
     // Reset counter after triggering extraction
     let _ = store.reset_hook_counter();
 
-    // Extract from tool output
-    let tool_output = json
-        .get("tool_output")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // Extract from tool output. Claude Code 2.x switched the field shape
+    // from a top-level `"tool_output": "..."` to a nested
+    // `"tool_response": { "output": "..." }`, silently breaking
+    // auto-extraction for everyone on the new client until they upgraded
+    // ICM. Accept both shapes plus a `tool_response: "..."` string fallback
+    // (some Codex/Gemini versions). Legacy `tool_output` stays first so
+    // older clients keep working unchanged.
+    let tool_output = extract_tool_output(&json).unwrap_or("");
 
     if tool_output.is_empty() {
         return Ok(());
@@ -3767,7 +3800,7 @@ fn inject_settings_hook(
     if let Some(m) = matcher {
         entry
             .as_object_mut()
-            .unwrap()
+            .expect("inline json! literal above is always Object")
             .insert("matcher".into(), serde_json::json!(m));
     }
     event_arr.push(entry);
@@ -3847,7 +3880,7 @@ fn inject_codex_hook(
     if let Some(m) = matcher {
         entry
             .as_object_mut()
-            .unwrap()
+            .expect("inline json! literal above is always Object")
             .insert("matcher".into(), serde_json::json!(m));
     }
     event_arr.push(entry);
@@ -4104,7 +4137,12 @@ fn inject_mcp_server(
 
     mcp_servers
         .as_object_mut()
-        .unwrap()
+        .with_context(|| {
+            format!(
+                "`{servers_key}` in {} is not a JSON object",
+                config_path.display()
+            )
+        })?
         .insert(name.to_string(), entry.clone());
 
     let output = serde_json::to_string_pretty(&config)?;
@@ -4143,7 +4181,12 @@ fn inject_zed_mcp_server(config_path: &Path, name: &str, bin_path: &str) -> Resu
 
     servers
         .as_object_mut()
-        .unwrap()
+        .with_context(|| {
+            format!(
+                "`context_servers` in {} is not a JSON object",
+                config_path.display()
+            )
+        })?
         .insert(name.to_string(), zed_entry);
 
     let output = serde_json::to_string_pretty(&config)?;
@@ -4181,15 +4224,23 @@ fn inject_copilot_cli_mcp_server(
         }
     }
 
-    servers.as_object_mut().unwrap().insert(
-        name.to_string(),
-        serde_json::json!({
-            "type": "local",
-            "command": icm_bin,
-            "args": ["serve"],
-            "tools": ["*"]
-        }),
-    );
+    servers
+        .as_object_mut()
+        .with_context(|| {
+            format!(
+                "`mcpServers` in {} is not a JSON object",
+                config_path.display()
+            )
+        })?
+        .insert(
+            name.to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": icm_bin,
+                "args": ["serve"],
+                "tools": ["*"]
+            }),
+        );
 
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
@@ -4356,7 +4407,12 @@ fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Res
 
     mcp_servers
         .as_table_mut()
-        .unwrap()
+        .with_context(|| {
+            format!(
+                "`mcp_servers` in {} is not a TOML table",
+                config_path.display()
+            )
+        })?
         .insert(name.to_string(), toml::Value::Table(server));
 
     let output = toml::to_string_pretty(&config)?;
@@ -4391,14 +4447,16 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
         }
     }
 
-    mcp.as_object_mut().unwrap().insert(
-        name.to_string(),
-        serde_json::json!({
-            "type": "local",
-            "command": [icm_bin, "serve"],
-            "enabled": true
-        }),
-    );
+    mcp.as_object_mut()
+        .with_context(|| format!("`mcp` in {} is not a JSON object", config_path.display()))?
+        .insert(
+            name.to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": [icm_bin, "serve"],
+                "enabled": true
+            }),
+        );
 
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
@@ -7763,5 +7821,92 @@ mod hook_output_format_tests {
         let out = format_hook_context("", HookOutputFormat::CursorJson);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v.get("additional_context").unwrap().as_str().unwrap(), "");
+    }
+}
+
+#[cfg(test)]
+mod hook_payload_tests {
+    //! Regression for the silent auto-extraction failure on Claude Code 2.x.
+    //! Before the fix, only the legacy `tool_output: "..."` shape was read.
+    //! Claude Code 2.x sends `tool_response: { output: "..." }` instead, so
+    //! `cmd_hook_post` saw an empty string and returned without extracting
+    //! anything. The store grew zero memories despite the hook firing on
+    //! every tool call.
+    use super::*;
+
+    #[test]
+    fn legacy_tool_output_top_level_string() {
+        let v: Value = serde_json::from_str(r#"{"tool_output":"hello world"}"#).unwrap();
+        assert_eq!(extract_tool_output(&v), Some("hello world"));
+    }
+
+    /// Claude Code 2.x payload shape — the bug.
+    #[test]
+    fn claude_code_2x_tool_response_dot_output() {
+        let v: Value = serde_json::from_str(r#"{"tool_response":{"output":"new shape"}}"#).unwrap();
+        assert_eq!(extract_tool_output(&v), Some("new shape"));
+    }
+
+    /// Some Codex / Gemini variants put a string directly under
+    /// `tool_response`. Accept it as a fallback.
+    #[test]
+    fn tool_response_string_variant() {
+        let v: Value = serde_json::from_str(r#"{"tool_response":"raw string"}"#).unwrap();
+        assert_eq!(extract_tool_output(&v), Some("raw string"));
+    }
+
+    /// Legacy wins when both shapes are present (defensive: don't change
+    /// behavior for old clients that happen to also include the new field).
+    #[test]
+    fn legacy_takes_priority_when_both_shapes_present() {
+        let v: Value =
+            serde_json::from_str(r#"{"tool_output":"legacy","tool_response":{"output":"new"}}"#)
+                .unwrap();
+        assert_eq!(extract_tool_output(&v), Some("legacy"));
+    }
+
+    #[test]
+    fn empty_or_missing_returns_none() {
+        let v1: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(extract_tool_output(&v1), None);
+        let v2: Value = serde_json::from_str(r#"{"tool_name":"Bash"}"#).unwrap();
+        assert_eq!(extract_tool_output(&v2), None);
+    }
+
+    // ── Pinned upstream payload fixtures ───────────────────────────────
+    //
+    // The synthetic tests above pin the *abstract* shapes, but not the
+    // concrete payloads each agent runtime emits. If Claude Code adds
+    // a wrapper field (e.g. `event: { tool_response: {...} }`), the
+    // synthetic tests still pass while users get zero extractions.
+    //
+    // The fixtures below are byte-for-byte snapshots of real PostToolUse
+    // payloads. Refresh by recapturing per the README in
+    // `tests/fixtures/hook_payloads/`. A failing fixture test is the
+    // canary that an upstream tool changed its hook contract.
+
+    #[test]
+    fn fixture_claude_code_2x_post_tool_yields_output() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/claude_code_2x_post_tool.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        let out = extract_tool_output(&v).expect("Claude Code 2.x fixture must yield output");
+        assert!(
+            out.contains("file1") && out.contains("file2"),
+            "expected ls output content, got {out:?}",
+        );
+    }
+
+    #[test]
+    fn fixture_legacy_post_tool_yields_output() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/legacy_post_tool.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        assert_eq!(extract_tool_output(&v), Some("hello\n"));
+    }
+
+    #[test]
+    fn fixture_tool_response_string_yields_output() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/tool_response_string.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        assert_eq!(extract_tool_output(&v), Some("hi\n"));
     }
 }

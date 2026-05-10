@@ -2,10 +2,10 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
-    add_backrefs, auto_link_memory, build_wake_up, is_preference_topic, keyword_matches,
-    project_matches, topic_matches, AutoLinkOptions, Concept, ConceptLink, Embedder, Feedback,
-    FeedbackStore, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
-    WakeUpOptions, MSG_NO_MEMORIES,
+    add_backrefs, auto_link_memory, build_wake_up, format_local, is_preference_topic,
+    keyword_matches, project_matches, topic_matches, AutoLinkOptions, Concept, ConceptLink,
+    Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation,
+    WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -1410,10 +1410,16 @@ fn tool_stats(store: &SqliteStore) -> ToolResult {
                 stats.total_memories, stats.total_topics, stats.avg_weight
             );
             if let Some(oldest) = stats.oldest_memory {
-                output.push_str(&format!("Oldest: {}\n", oldest.format("%Y-%m-%d %H:%M")));
+                output.push_str(&format!(
+                    "Oldest: {}\n",
+                    format_local(&oldest, "%Y-%m-%d %H:%M")
+                ));
             }
             if let Some(newest) = stats.newest_memory {
-                output.push_str(&format!("Newest: {}\n", newest.format("%Y-%m-%d %H:%M")));
+                output.push_str(&format!(
+                    "Newest: {}\n",
+                    format_local(&newest, "%Y-%m-%d %H:%M")
+                ));
             }
             ToolResult::text(output)
         }

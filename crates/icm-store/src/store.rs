@@ -16,7 +16,7 @@ use icm_core::{
     TranscriptStats, TranscriptStore,
 };
 
-use crate::schema::{init_db, init_db_with_dims};
+use crate::schema::init_db_with_dims;
 
 /// Convert rusqlite::Error to IcmError::Database
 pub(crate) fn db_err(e: rusqlite::Error) -> IcmError {
@@ -132,12 +132,18 @@ impl SqliteStore {
     }
 
     pub fn in_memory() -> IcmResult<Self> {
+        Self::in_memory_with_dims(icm_core::DEFAULT_EMBEDDING_DIMS)
+    }
+
+    /// Open an in-memory store with a specific embedding dimension.
+    /// Useful for tests that exercise the dim-migration / dim-drift paths.
+    pub fn in_memory_with_dims(embedding_dims: usize) -> IcmResult<Self> {
         ensure_sqlite_vec();
         let conn = Connection::open_in_memory()
             .map_err(|e| IcmError::Database(format!("cannot open in-memory db: {e}")))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
             .map_err(db_err)?;
-        init_db(&conn)?;
+        init_db_with_dims(&conn, embedding_dims)?;
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),

@@ -36,9 +36,11 @@ fn create_vec_table(conn: &Connection, embedding_dims: usize) -> Result<(), IcmE
     Ok(())
 }
 
-/// Initialize the database schema. `embedding_dims` controls the sqlite-vec vector size.
-/// Pass `None` to skip vector table creation (no embeddings feature).
-pub fn init_db(conn: &Connection) -> Result<(), IcmError> {
+/// Test-only convenience wrapper around `init_db_with_dims` that uses the
+/// default embedding dim. Production callers always pass an explicit dim
+/// resolved from the loaded embedder, so this lives behind `cfg(test)`.
+#[cfg(test)]
+fn init_db(conn: &Connection) -> Result<(), IcmError> {
     init_db_with_dims(conn, icm_core::DEFAULT_EMBEDDING_DIMS)
 }
 
@@ -385,16 +387,42 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             .and_then(|s| s.parse().ok())
             .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
         if stored != embedding_dims {
-            // Model changed — drop vec table and clear embeddings
-            conn.execute_batch("DROP TABLE IF EXISTS vec_memories")
+            // Model changed — drop vec table and clear embeddings.
+            // Wrap the swap in a transaction so a partial failure cannot
+            // leave the DB with metadata at the new dim while the legacy
+            // BLOBs in `memories.embedding` still hold the old dim — that
+            // drift triggers `Dimension mismatch` errors in auto-link
+            // back-refs (issue #200).
+            let tx = conn.unchecked_transaction().map_err(db_err)?;
+            tx.execute_batch("DROP TABLE IF EXISTS vec_memories")
                 .map_err(db_err)?;
-            conn.execute("UPDATE memories SET embedding = NULL", [])
+            tx.execute("UPDATE memories SET embedding = NULL", [])
                 .map_err(db_err)?;
-            create_vec_table(conn, embedding_dims)?;
+            create_vec_table(&tx, embedding_dims)?;
+            tx.commit().map_err(db_err)?;
         }
     } else {
         create_vec_table(conn, embedding_dims)?;
     }
+
+    // Defensive dim-drift sweep (issue #200).
+    //
+    // If a previous migration partially failed, or the user upgraded across
+    // versions in a way that flipped `icm_metadata.embedding_dims` without
+    // clearing the BLOBs, `memories.embedding` may still hold rows at the
+    // old dim. The sqlite-vec INSERT in auto-link back-refs (`store.rs`)
+    // then rejects every neighbour update with "Dimension mismatch".
+    //
+    // This sweep is cheap (O(n) on rows that have a non-null embedding,
+    // single UPDATE), idempotent, and self-healing: after one open the DB
+    // is consistent regardless of how it got into the bad state.
+    let dim_bytes = (embedding_dims * 4) as i64;
+    conn.execute(
+        "UPDATE memories SET embedding = NULL \
+         WHERE embedding IS NOT NULL AND length(embedding) != ?1",
+        [dim_bytes],
+    )
+    .map_err(db_err)?;
 
     Ok(())
 }
@@ -599,5 +627,127 @@ mod tests {
         assert!(tables.contains(&"concept_links".to_string()));
         assert!(tables.contains(&"concepts_fts".to_string()));
         assert!(tables.contains(&"vec_memories".to_string()));
+    }
+
+    /// Insert a memories row with a raw embedding BLOB of the given dim.
+    /// Bypasses `SqliteStore::store` so we can plant blobs of the "wrong"
+    /// dim and exercise the sweep path.
+    fn insert_raw_memory_with_blob_dim(conn: &Connection, id: &str, dim: usize) {
+        let blob = vec![0u8; dim * 4];
+        conn.execute(
+            "INSERT INTO memories \
+             (id, created_at, last_accessed, topic, summary, importance, source_type, embedding) \
+             VALUES (?1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', \
+                     'drift', 'drifted blob', 'medium', 'manual', ?2)",
+            rusqlite::params![id, blob],
+        )
+        .unwrap();
+    }
+
+    fn embedding_byte_len(conn: &Connection, id: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT length(embedding) FROM memories WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #200: switching the embedding model (e.g. 768d → 384d) must
+    /// clear the legacy embedding BLOBs, otherwise auto-link back-refs
+    /// fail with "Dimension mismatch" on every subsequent store.
+    #[test]
+    fn test_dim_change_clears_legacy_blobs() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_with_dims(&conn, 768).unwrap();
+        insert_raw_memory_with_blob_dim(&conn, "old-768", 768);
+        assert_eq!(embedding_byte_len(&conn, "old-768"), Some(768 * 4));
+
+        // Switch to a smaller-dim model — the migration branch must run.
+        init_db_with_dims(&conn, 384).unwrap();
+
+        // Legacy blob must be cleared (not just the metadata flipped).
+        assert_eq!(
+            embedding_byte_len(&conn, "old-768"),
+            None,
+            "switching dims must NULL out blobs of the old dim (issue #200)"
+        );
+    }
+
+    /// Issue #200: defensive sweep must repair a DB whose metadata says
+    /// the dim is correct but where some blobs still carry the old dim.
+    /// This mirrors users who upgraded across versions in a way that left
+    /// the migration half-applied.
+    #[test]
+    fn test_defensive_sweep_clears_drifted_blobs() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_with_dims(&conn, 384).unwrap();
+
+        // Plant a row with a 768d blob even though the DB metadata is at
+        // 384d — simulates a half-finished prior migration.
+        insert_raw_memory_with_blob_dim(&conn, "drift-768", 768);
+        // And a row with a correct 384d blob — must be kept.
+        insert_raw_memory_with_blob_dim(&conn, "ok-384", 384);
+
+        // Re-running init at the *same* dim should still trigger the sweep.
+        init_db_with_dims(&conn, 384).unwrap();
+
+        assert_eq!(
+            embedding_byte_len(&conn, "drift-768"),
+            None,
+            "drifted 768d blob must be cleared by the defensive sweep"
+        );
+        assert_eq!(
+            embedding_byte_len(&conn, "ok-384"),
+            Some(384 * 4),
+            "correctly-sized 384d blob must be preserved"
+        );
+    }
+
+    /// Issue #200: dim-change migration must be atomic. After it returns Ok,
+    /// the metadata, the vec_memories table dim, and the embedding column
+    /// state must all agree.
+    #[test]
+    fn test_dim_change_is_consistent() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_with_dims(&conn, 768).unwrap();
+        insert_raw_memory_with_blob_dim(&conn, "before", 768);
+
+        init_db_with_dims(&conn, 384).unwrap();
+
+        // Metadata reflects the new dim.
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "384");
+
+        // vec_memories was recreated.
+        let vec_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type='table' AND name='vec_memories'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(vec_exists);
+
+        // No row carries a stale blob.
+        let stale_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories \
+                 WHERE embedding IS NOT NULL AND length(embedding) != 1536",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_count, 0);
     }
 }

@@ -2838,9 +2838,41 @@ fn cmd_extract_patterns(
     Ok(())
 }
 
+/// Stringify the icm binary path for embedding in a hook config command
+/// string. Issue #180: on Windows `current_exe()` returns
+/// `C:\Users\…\icm.exe`, and bash on Windows (Git Bash, the shell every
+/// AI agent CLI invokes) interprets the backslashes as escape sequences
+/// — `\U`, `\A`, `\b` etc. get stripped, yielding nonsense like
+/// `C:UsersusernameAppDataLocal…`. Windows accepts forward slashes in
+/// file paths, so normalize once at the boundary where the path enters a
+/// command string.
+fn portable_command_path(path: &Path) -> String {
+    path.to_string_lossy().to_string().replace('\\', "/")
+}
+
+/// Substring-match a hook command against a canonical Unix-style pattern,
+/// also accepting the equivalent Windows form. Issue #180: with the
+/// canonical `icm hook pre` pattern, a Windows command
+/// `C:/.../icm.exe hook pre` was missed by every detect site (init
+/// idempotency, doctor binary check, codex/copilot injectors), so init
+/// re-injected duplicates and doctor reported zero hooks.
+fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
+    if cmd.contains(pattern) {
+        return true;
+    }
+    // (a) `icm hook ...` written as `icm.exe hook ...`
+    let with_exe = pattern.replacen("icm hook", "icm.exe hook", 1);
+    if with_exe != pattern && cmd.contains(&with_exe) {
+        return true;
+    }
+    // (b) legacy bare-basename patterns (`icm-post-tool`, `icm-pretool`)
+    //     that point at a standalone `.exe` on Windows.
+    cmd.contains(&format!("{pattern}.exe"))
+}
+
 fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
-    let icm_bin_str = icm_bin.to_string_lossy().to_string();
+    let icm_bin_str = portable_command_path(&icm_bin);
     let home = home_dir_str()?;
 
     // Per-CLI config directories, with env var overrides honored.
@@ -3399,7 +3431,7 @@ struct DoctorTarget {
 /// Inspect a single hook command string. Returns `Some((bin_path, exists))`
 /// if the command references ICM, `None` if it should be skipped.
 fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
-    if !cmd.contains("icm hook") && !cmd.contains("icm-post-tool") {
+    if !cmd_matches_icm_pattern(cmd, "icm hook") && !cmd_matches_icm_pattern(cmd, "icm-post-tool") {
         return None;
     }
     let bin_path = cmd.split_whitespace().next().unwrap_or("");
@@ -3632,7 +3664,10 @@ fn inject_settings_hook(
             let Some(current) = h.get("command").and_then(|c| c.as_str()) else {
                 continue;
             };
-            if !detect_patterns.iter().any(|p| current.contains(p)) {
+            if !detect_patterns
+                .iter()
+                .any(|p| cmd_matches_icm_pattern(current, p))
+            {
                 continue;
             }
             if current == hook_command {
@@ -3728,7 +3763,11 @@ fn inject_codex_hook(
                 hooks.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|c| detect_patterns.iter().any(|p| c.contains(p)))
+                        .map(|c| {
+                            detect_patterns
+                                .iter()
+                                .any(|p| cmd_matches_icm_pattern(c, p))
+                        })
                         .unwrap_or(false)
                 })
             })
@@ -4178,7 +4217,7 @@ fn inject_copilot_hooks(copilot_dir: &std::path::Path, icm_bin: &str) -> Result<
                 a.iter().any(|h| {
                     h.get("bash")
                         .and_then(|b| b.as_str())
-                        .map(|s| s.contains("icm hook"))
+                        .map(|s| cmd_matches_icm_pattern(s, "icm hook"))
                         .unwrap_or(false)
                 })
             })
@@ -7536,5 +7575,85 @@ mod doctor_tests {
         let (checked, broken) = check_json_target(&target);
         assert_eq!(checked, 0, "non-ICM hooks must not contribute to checked");
         assert_eq!(broken, 0);
+    }
+}
+
+#[cfg(test)]
+mod windows_path_tests {
+    //! Regression tests for issue #180.
+    //!
+    //! Two failure modes on Windows:
+    //!
+    //! 1. `current_exe()` returns `C:\Users\…\icm.exe`. Bash on Windows
+    //!    interprets `\U`, `\A`, `\b` as escape sequences and strips them,
+    //!    so the command at hook fire time is `C:UsersusernameAppData…`
+    //!    — "command not found".
+    //!
+    //! 2. The detect-existing logic uses `cmd.contains("icm hook")`. The
+    //!    Windows command literally reads `icm.exe hook ...`, so the
+    //!    substring never matches. Init re-adds the hook on every run,
+    //!    and `doctor` reports zero hooks even when they're configured.
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn portable_command_path_converts_windows_backslashes_to_forward_slashes() {
+        let p = PathBuf::from(r"C:\Users\jspelletier\AppData\Local\icm\bin\icm.exe");
+        assert_eq!(
+            portable_command_path(&p),
+            "C:/Users/jspelletier/AppData/Local/icm/bin/icm.exe"
+        );
+    }
+
+    #[test]
+    fn portable_command_path_is_a_noop_on_unix_paths() {
+        let p = PathBuf::from("/home/patrick/.local/bin/icm");
+        assert_eq!(portable_command_path(&p), "/home/patrick/.local/bin/icm");
+    }
+
+    #[test]
+    fn cmd_matches_icm_pattern_handles_unix_form() {
+        assert!(cmd_matches_icm_pattern(
+            "/home/p/.local/bin/icm hook pre",
+            "icm hook pre"
+        ));
+        assert!(cmd_matches_icm_pattern(
+            "/home/p/.local/bin/icm hook end",
+            "icm hook"
+        ));
+    }
+
+    /// Issue #180 root cause: `icm.exe hook pre` doesn't contain the
+    /// substring `icm hook pre`. The helper must accept the Windows
+    /// form so init's idempotency and doctor's binary check both work.
+    #[test]
+    fn cmd_matches_icm_pattern_handles_windows_exe_form() {
+        assert!(cmd_matches_icm_pattern(
+            "C:/Users/u/AppData/Local/icm/bin/icm.exe hook pre",
+            "icm hook pre"
+        ));
+        assert!(cmd_matches_icm_pattern(
+            "C:/Users/u/AppData/Local/icm/bin/icm.exe hook end",
+            "icm hook"
+        ));
+    }
+
+    /// Legacy basename-only patterns (`icm-post-tool`, `icm-pretool`)
+    /// also need a Windows variant — those were standalone executables.
+    #[test]
+    fn cmd_matches_icm_pattern_handles_windows_legacy_basename() {
+        assert!(cmd_matches_icm_pattern(
+            "C:/x/icm-post-tool.exe",
+            "icm-post-tool"
+        ));
+    }
+
+    #[test]
+    fn cmd_matches_icm_pattern_rejects_non_icm_commands() {
+        assert!(!cmd_matches_icm_pattern("rtk hook claude", "icm hook"));
+        assert!(!cmd_matches_icm_pattern("npx prettier", "icm hook"));
+        // A pattern about icm must not match a non-icm tool just because
+        // ".exe" appears.
+        assert!(!cmd_matches_icm_pattern("/bin/foo.exe hook", "icm hook"));
     }
 }

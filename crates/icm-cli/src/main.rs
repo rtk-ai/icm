@@ -2269,30 +2269,67 @@ fn has_shell_metacharacter(cmd: &str) -> bool {
     false
 }
 
-/// Pull the tool's stdout from a PostToolUse hook payload.
+/// Pull the tool's text payload from a PostToolUse hook stdin JSON.
 ///
-/// **CRITICAL bug fix**: Claude Code 2.x switched the field shape from a
-/// top-level `"tool_output": "..."` to a nested
-/// `"tool_response": { "output": "..." }`. The previous implementation
-/// only read `tool_output`, so auto-extraction silently produced zero
-/// memories on every Claude Code 2.x install — the hook fired, the
-/// counter incremented, but `tool_output` was always empty.
+/// **CRITICAL bug fix history**:
 ///
-/// We accept three shapes, in priority order:
+/// - 0.10.46 (#212): Claude Code 2.x switched from a top-level
+///   `tool_output: "..."` to a nested `tool_response.output`. The
+///   previous reader only looked at `tool_output`, so auto-extraction
+///   silently produced zero memories.
 ///
-///   1. `tool_output: "<str>"`              — legacy / Codex / Gemini older
-///   2. `tool_response: { output: "<str>" }`— Claude Code 2.x
-///   3. `tool_response: "<str>"`            — some Codex/Gemini variants
+/// - 0.10.47: live `claude -p` testing showed `tool_response` doesn't
+///   actually carry an `output` field on Claude Code 2.1.138 — every
+///   built-in tool nests its content under a tool-specific key:
+///
+///   | Tool   | Path with extractable content |
+///   |--------|-------------------------------|
+///   | Bash   | `tool_response.stdout`        |
+///   | Read   | `tool_response.file.content`  |
+///   | Write  | `tool_response.content`       |
+///   | Edit   | `tool_response.content`       |
+///
+/// We probe in priority order so older clients keep working unchanged.
+/// `tool_response.output` stays in the list for Codex / older Gemini
+/// builds. The Read shape (`tool_response.file.content`) is checked
+/// last since it's the only one that nests a level deeper.
 fn extract_tool_output(json: &Value) -> Option<&str> {
-    json.get("tool_output")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            json.get("tool_response").and_then(|v| {
-                v.get("output")
-                    .and_then(|o| o.as_str())
-                    .or_else(|| v.as_str())
-            })
-        })
+    fn nonempty_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+        v.get(key)
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    // 1. Legacy top-level
+    if let Some(s) = nonempty_str(json, "tool_output") {
+        return Some(s);
+    }
+
+    let tr = json.get("tool_response")?;
+
+    // 2. tool_response itself is a string (some Codex variants).
+    if let Some(s) = tr.as_str().filter(|s| !s.is_empty()) {
+        return Some(s);
+    }
+
+    // 3-5. Probe known content fields. Order matters: `stdout` first
+    // because Bash output is the most common; then `output` and
+    // `content` (covers Codex `output`, Write/Edit `content`, and
+    // Codex/Gemini variants we've seen).
+    for key in ["stdout", "output", "content"] {
+        if let Some(s) = nonempty_str(tr, key) {
+            return Some(s);
+        }
+    }
+
+    // 6. Read tool nests under `file.content`.
+    if let Some(file) = tr.get("file") {
+        if let Some(s) = nonempty_str(file, "content") {
+            return Some(s);
+        }
+    }
+
+    None
 }
 
 /// PostToolUse hook: auto-extract context every N tool calls.
@@ -7908,5 +7945,46 @@ mod hook_payload_tests {
         let raw = include_str!("../tests/fixtures/hook_payloads/tool_response_string.json");
         let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
         assert_eq!(extract_tool_output(&v), Some("hi\n"));
+    }
+
+    /// Real Claude Code 2.1.138 Bash payload — `tool_response.stdout`.
+    /// Captured via a tap script during a `claude -p` smoke test on
+    /// 2026-05-10 after #212 shipped, when Patrick reported the hook
+    /// still wasn't extracting on his live sessions.
+    #[test]
+    fn fixture_claude_code_2x_bash_yields_stdout() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/claude_code_2x_bash.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        let out = extract_tool_output(&v).expect("Claude Code 2.x Bash must yield stdout");
+        assert!(
+            out.contains("rollout") || out.contains("deployment") || out.len() > 30,
+            "expected non-trivial Bash stdout content, got {out:?}",
+        );
+    }
+
+    /// Real Claude Code 2.1.138 Read payload — `tool_response.file.content`.
+    /// This nested-key shape was the second reason the original bug
+    /// fix in #212 still left auto-extraction broken.
+    #[test]
+    fn fixture_claude_code_2x_read_yields_file_content() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/claude_code_2x_read.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        let out = extract_tool_output(&v).expect("Claude Code 2.x Read must yield file.content");
+        assert!(
+            !out.is_empty(),
+            "expected non-empty Read content, got {out:?}",
+        );
+    }
+
+    /// Real Claude Code 2.1.138 Write payload — `tool_response.content`.
+    #[test]
+    fn fixture_claude_code_2x_write_yields_content() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/claude_code_2x_write.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        let out = extract_tool_output(&v).expect("Claude Code 2.x Write must yield content");
+        assert!(
+            !out.is_empty(),
+            "expected non-empty Write content, got {out:?}",
+        );
     }
 }

@@ -1,0 +1,24 @@
+{
+  "session_id": "07814506-b761-4fe0-8151-700a6c59515e",
+  "transcript_path": "/home/user/.claude/projects/-home-patrick-dev-github-wshm-dev-wshm/07814506-b761-4fe0-8151-700a6c59515e.jsonl",
+  "cwd": "/home/user/dev/github/wshm-dev/wshm",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "xhigh"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "kubectl -n wshm-pro rollout restart deployment/wshm-pro 2>&1\nsleep 30\nkubectl -n wshm-pro rollout status deployment/wshm-pro --timeout=180s 2>&1\necho \"---pod state---\"\nkubectl -n wshm-pro get pod -l app=wshm-pro -o jsonpath='{.items[0].metadata.name}: {.items[0].status.phase} ({.items[0].spec.contai...[truncated for fixture]",
+    "description": "Restart K8s + verify new pod healthy on 0.31.7-pro-ai"
+  },
+  "tool_response": {
+    "stdout": "deployment.apps/wshm-pro restarted\nWaiting for deployment \"wshm-pro\" rollout to finish: 0 of 1 updated replicas are available...\ndeployment \"wshm-pro\" successfully rolled out\n---pod state---\nwshm-pro-76c656b874-czxc8: Running (docker.io/innovtech/wshm-pro:latest-ai)  \n---health logs---\nDefaulted con...[truncated for fixture]",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false,
+    "noOutputExpected": false
+  },
+  "tool_use_id": "toolu_01PWpJ7LyYZgNExG8619Z1Ax",
+  "duration_ms": 43640
+}

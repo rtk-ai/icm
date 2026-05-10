@@ -1,0 +1,26 @@
+{
+  "session_id": "7f183cf7-8a27-4dc0-a87f-6f34af20d3cc",
+  "transcript_path": "/home/user/.claude/projects/-tmp-icm-hook-live-test/7f183cf7-8a27-4dc0-a87f-6f34af20d3cc.jsonl",
+  "cwd": "/tmp/icm-hook-live-test",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "xhigh"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/tmp/icm-hook-live-test/NOTES.md"
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "/tmp/icm-hook-live-test/NOTES.md",
+      "content": "We decided to use Postgres for billing. This is the architecture call.\nArchitecture: locked-in choice. Tantivy beats Sonic for full-text search.\n",
+      "numLines": 3,
+      "startLine": 1,
+      "totalLines": 3
+    }
+  },
+  "tool_use_id": "toolu_01Ai6dfbhDnEFZ9awdgJrsqR",
+  "duration_ms": 2
+}

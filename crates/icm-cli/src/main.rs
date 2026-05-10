@@ -3369,83 +3369,190 @@ fn inject_icm_block(path: &Path, block: &str) -> Result<String> {
     }
 }
 
+/// Where in the hook entry the binary path lives. Differs across CLIs.
+#[derive(Clone, Copy)]
+enum HookCommandField {
+    /// `{"hooks":[{"type":"command","command":"..."}]}` — Claude Code, Gemini, Codex.
+    Command,
+    /// `{"type":"command","bash":"...","timeoutSec":N}` — Copilot CLI.
+    BashTopLevel,
+}
+
+/// One host platform's hook configuration layout.
+struct DoctorTarget {
+    label: &'static str,
+    path: PathBuf,
+    events: &'static [&'static str],
+    field: HookCommandField,
+}
+
+/// Inspect a single hook command string. Returns `Some((bin_path, exists))`
+/// if the command references ICM, `None` if it should be skipped.
+fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
+    if !cmd.contains("icm hook") && !cmd.contains("icm-post-tool") {
+        return None;
+    }
+    let bin_path = cmd.split_whitespace().next().unwrap_or("");
+    let exists = std::path::Path::new(bin_path).exists();
+    Some((bin_path, exists))
+}
+
+/// Walk a settings/hooks JSON file for one platform, printing one line per
+/// ICM hook entry. Returns `(checked, broken)`.
+fn check_json_target(target: &DoctorTarget) -> (usize, usize) {
+    if !target.path.exists() {
+        println!(
+            "[{}] {} (no settings file, skipped)",
+            target.label,
+            target.path.display()
+        );
+        return (0, 0);
+    }
+    let config: Value = match parse_json_config(&target.path) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "[{}] {}: parse error ({e})",
+                target.label,
+                target.path.display()
+            );
+            return (0, 1);
+        }
+    };
+    let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
+        println!("[{}] no hooks block configured", target.label);
+        return (0, 0);
+    };
+
+    let mut checked = 0;
+    let mut broken = 0;
+    for event in target.events {
+        let Some(arr) = hooks.get(*event).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for entry in arr {
+            // Two shapes:
+            //   Command       -> entry.hooks[].command
+            //   BashTopLevel  -> entry.bash (entry IS the hook)
+            let commands: Vec<&str> = match target.field {
+                HookCommandField::Command => entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|hs| {
+                        hs.iter()
+                            .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                HookCommandField::BashTopLevel => entry
+                    .get("bash")
+                    .and_then(|c| c.as_str())
+                    .into_iter()
+                    .collect(),
+            };
+
+            for cmd in commands {
+                let Some((bin_path, exists)) = check_icm_hook_command(cmd) else {
+                    continue;
+                };
+                checked += 1;
+                if exists {
+                    println!("[{}] {event:<19} ✓  {bin_path}", target.label);
+                } else {
+                    println!("[{}] {event:<19} ✗  {bin_path}  (missing)", target.label);
+                    broken += 1;
+                }
+            }
+        }
+    }
+    (checked, broken)
+}
+
+/// OpenCode installs a TypeScript plugin instead of a JSON hook entry, so
+/// it has no command path to validate — only file existence.
+fn check_opencode_plugin(home: &str) -> usize {
+    let plugin = PathBuf::from(home).join(".config/opencode/plugins/icm.ts");
+    if plugin.exists() {
+        println!("[OpenCode] {:<19} ✓  {}", "plugin", plugin.display());
+        1
+    } else {
+        // Not "broken" — could legitimately be uninstalled. Just inform.
+        println!(
+            "[OpenCode] {} (no plugin installed, skipped)",
+            plugin.display()
+        );
+        0
+    }
+}
+
 fn cmd_doctor() -> Result<()> {
     let home = home_dir_str()?;
     let current_bin = std::env::current_exe().ok();
 
-    let targets: Vec<(&str, PathBuf, &[&str])> = vec![
-        (
-            "Claude Code",
-            PathBuf::from(&home).join(".claude/settings.json"),
-            &[
+    // Claude Code, Gemini CLI, and Codex CLI all use the
+    // `{hooks:{Event:[{hooks:[{command:...}]}]}}` shape but at different
+    // paths and event names. Copilot CLI uses the same outer shape but
+    // its hook entries put the command in a top-level `bash` field
+    // instead of nesting under `hooks[]`.
+    let targets: Vec<DoctorTarget> = vec![
+        DoctorTarget {
+            label: "Claude Code",
+            path: PathBuf::from(&home).join(".claude/settings.json"),
+            events: &[
                 "PreToolUse",
                 "PostToolUse",
                 "PreCompact",
                 "UserPromptSubmit",
                 "SessionStart",
+                "SessionEnd",
             ],
-        ),
-        (
-            "Gemini CLI",
-            PathBuf::from(&home).join(".gemini/settings.json"),
-            &[
+            field: HookCommandField::Command,
+        },
+        DoctorTarget {
+            label: "Gemini CLI",
+            path: PathBuf::from(&home).join(".gemini/settings.json"),
+            events: &[
                 "SessionStart",
                 "BeforeTool",
                 "AfterTool",
                 "PreCompress",
                 "BeforeAgent",
             ],
-        ),
+            field: HookCommandField::Command,
+        },
+        DoctorTarget {
+            label: "Codex CLI",
+            path: PathBuf::from(&home).join(".codex/hooks.json"),
+            events: &[
+                "SessionStart",
+                "PreToolUse",
+                "PostToolUse",
+                "UserPromptSubmit",
+            ],
+            field: HookCommandField::Command,
+        },
+        DoctorTarget {
+            label: "Copilot CLI",
+            path: PathBuf::from(&home).join(".copilot/settings.json"),
+            events: &[
+                "sessionStart",
+                "preToolUse",
+                "postToolUse",
+                "userPromptSubmitted",
+            ],
+            field: HookCommandField::BashTopLevel,
+        },
     ];
 
     let mut broken = 0usize;
     let mut checked = 0usize;
 
-    for (label, path, events) in &targets {
-        if !path.exists() {
-            println!("[{label}] {} (no settings file, skipped)", path.display());
-            continue;
-        }
-        let config: Value = match parse_json_config(path) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("[{label}] {}: parse error ({e})", path.display());
-                broken += 1;
-                continue;
-            }
-        };
-        let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
-            println!("[{label}] no hooks block configured");
-            continue;
-        };
-        for event in *events {
-            let Some(arr) = hooks.get(*event).and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for entry in arr {
-                let Some(hooks_arr) = entry.get("hooks").and_then(|h| h.as_array()) else {
-                    continue;
-                };
-                for h in hooks_arr {
-                    let Some(cmd) = h.get("command").and_then(|c| c.as_str()) else {
-                        continue;
-                    };
-                    if !cmd.contains("icm hook") && !cmd.contains("icm-post-tool") {
-                        continue;
-                    }
-                    checked += 1;
-                    let bin_path = cmd.split_whitespace().next().unwrap_or("");
-                    let exists = std::path::Path::new(bin_path).exists();
-                    if exists {
-                        println!("[{label}] {event:<17} ✓  {bin_path}");
-                    } else {
-                        println!("[{label}] {event:<17} ✗  {bin_path}  (missing)");
-                        broken += 1;
-                    }
-                }
-            }
-        }
+    for target in &targets {
+        let (c, b) = check_json_target(target);
+        checked += c;
+        broken += b;
     }
+    checked += check_opencode_plugin(&home);
 
     println!();
     if checked == 0 {
@@ -7078,5 +7185,247 @@ mod cli_contracts_tests {
         for &good in &[0.0_f32, 0.5, 0.95, 0.999_999] {
             cmd_decay(&store, good).unwrap_or_else(|e| panic!("factor={good} rejected: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    //! Issue #174: `icm doctor` must walk every platform `icm init`
+    //! configures (Claude Code, Gemini, Codex, Copilot, OpenCode), not
+    //! just Gemini. These tests use temp settings.json fixtures to lock
+    //! in: each layout shape, the "missing binary" path, and the
+    //! count of entries reported.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_settings(dir: &TempDir, rel: &str, content: &str) -> PathBuf {
+        let path = dir.path().join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Drop a fake `icm` binary at `<dir>/bin/icm` so doctor's
+    /// "binary exists" check has something real to point at, AND so the
+    /// stringified path contains the literal substring `icm` followed by
+    /// ` hook` once we append the subcommand. Real installs always end
+    /// in `.../icm`; the cargo test runner's binary is `icm-<hash>`,
+    /// which fails the `contains("icm hook")` substring filter.
+    fn fake_icm_binary(dir: &TempDir) -> PathBuf {
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("icm");
+        std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        bin
+    }
+
+    fn make_target(
+        label: &'static str,
+        path: PathBuf,
+        events: &'static [&'static str],
+        field: HookCommandField,
+    ) -> DoctorTarget {
+        DoctorTarget {
+            label,
+            path,
+            events,
+            field,
+        }
+    }
+
+    #[test]
+    fn check_icm_hook_command_filters_non_icm_commands() {
+        // Other tools' hooks (rtk, prettier, custom scripts) must not be
+        // counted, only icm-owned ones.
+        assert!(check_icm_hook_command("/usr/bin/rtk hook claude").is_none());
+        assert!(check_icm_hook_command("npx prettier --write").is_none());
+        let (bin, exists) = check_icm_hook_command("/usr/local/bin/icm hook pre").unwrap();
+        assert_eq!(bin, "/usr/local/bin/icm");
+        // Path doesn't actually exist on the test runner — `exists` is `false`.
+        assert!(!exists);
+    }
+
+    #[test]
+    fn check_icm_hook_command_marks_existing_binary_as_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_icm_binary(&dir);
+        let cmd = format!("{} hook pre", bin.display());
+        let (_, exists) = check_icm_hook_command(&cmd).unwrap();
+        assert!(exists, "binary at {bin:?} should be detected as present");
+    }
+
+    /// Claude Code shape: command nested under `entry.hooks[].command`.
+    /// Issue #174: SessionEnd must be in the events list.
+    #[test]
+    fn claude_code_shape_finds_all_six_events_including_session_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_icm_binary(&dir);
+        let bin_str = bin.display().to_string();
+        let json = format!(
+            r#"{{
+              "hooks": {{
+                "PreToolUse":       [{{"matcher":"Bash","hooks":[{{"type":"command","command":"{bin_str} hook pre"}}]}}],
+                "PostToolUse":      [{{"hooks":[{{"type":"command","command":"{bin_str} hook post"}}]}}],
+                "PreCompact":       [{{"hooks":[{{"type":"command","command":"{bin_str} hook compact"}}]}}],
+                "UserPromptSubmit": [{{"hooks":[{{"type":"command","command":"{bin_str} hook prompt"}}]}}],
+                "SessionStart":     [{{"hooks":[{{"type":"command","command":"{bin_str} hook start"}}]}}],
+                "SessionEnd":       [{{"hooks":[{{"type":"command","command":"{bin_str} hook end"}}]}}]
+              }}
+            }}"#
+        );
+        let path = write_settings(&dir, ".claude/settings.json", &json);
+        let target = make_target(
+            "Claude Code",
+            path,
+            &[
+                "PreToolUse",
+                "PostToolUse",
+                "PreCompact",
+                "UserPromptSubmit",
+                "SessionStart",
+                "SessionEnd",
+            ],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 6, "must count all 6 Claude Code hooks");
+        assert_eq!(
+            broken, 0,
+            "all binaries exist, none should be flagged broken"
+        );
+    }
+
+    /// Copilot CLI uses a top-level `bash` field on each entry, not a
+    /// nested `hooks[].command`. Without explicit support this entire
+    /// platform was silently ignored by `icm doctor` (issue #174).
+    #[test]
+    fn copilot_cli_shape_uses_bash_field_not_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_icm_binary(&dir);
+        let bin_str = bin.display().to_string();
+        let json = format!(
+            r#"{{
+              "hooks": {{
+                "sessionStart":         [{{"type":"command","bash":"{bin_str} hook start","timeoutSec":10}}],
+                "preToolUse":           [{{"type":"command","bash":"{bin_str} hook pre","timeoutSec":5}}],
+                "postToolUse":          [{{"type":"command","bash":"{bin_str} hook post","timeoutSec":10}}],
+                "userPromptSubmitted":  [{{"type":"command","bash":"{bin_str} hook prompt","timeoutSec":10}}]
+              }}
+            }}"#
+        );
+        let path = write_settings(&dir, ".copilot/settings.json", &json);
+        let target = make_target(
+            "Copilot CLI",
+            path,
+            &[
+                "sessionStart",
+                "preToolUse",
+                "postToolUse",
+                "userPromptSubmitted",
+            ],
+            HookCommandField::BashTopLevel,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 4);
+        assert_eq!(broken, 0);
+    }
+
+    /// Stale-binary detection: a hook pointing at a path that doesn't
+    /// exist must be counted as broken so the user is told to run
+    /// `icm init --mode hook --force`.
+    #[test]
+    fn stale_binary_path_is_flagged_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+          "hooks": {
+            "SessionStart": [{"hooks":[{"type":"command","command":"/no/such/path/icm hook start"}]}]
+          }
+        }"#;
+        let path = write_settings(&dir, ".claude/settings.json", json);
+        let target = make_target(
+            "Claude Code",
+            path,
+            &["SessionStart"],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 1);
+        assert_eq!(broken, 1);
+    }
+
+    /// Codex CLI lives at `~/.codex/hooks.json`, not `settings.json`.
+    /// Same JSON shape as Claude/Gemini.
+    #[test]
+    fn codex_cli_hooks_json_is_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_icm_binary(&dir);
+        let bin_str = bin.display().to_string();
+        let json = format!(
+            r#"{{
+              "hooks": {{
+                "SessionStart":     [{{"hooks":[{{"type":"command","command":"{bin_str} hook start"}}]}}],
+                "PreToolUse":       [{{"matcher":"Bash","hooks":[{{"type":"command","command":"{bin_str} hook pre"}}]}}],
+                "PostToolUse":      [{{"hooks":[{{"type":"command","command":"{bin_str} hook post"}}]}}],
+                "UserPromptSubmit": [{{"hooks":[{{"type":"command","command":"{bin_str} hook prompt"}}]}}]
+              }}
+            }}"#
+        );
+        let path = write_settings(&dir, ".codex/hooks.json", &json);
+        let target = make_target(
+            "Codex CLI",
+            path,
+            &[
+                "SessionStart",
+                "PreToolUse",
+                "PostToolUse",
+                "UserPromptSubmit",
+            ],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 4);
+        assert_eq!(broken, 0);
+    }
+
+    /// Missing settings file is silent (skip), not broken.
+    #[test]
+    fn missing_settings_file_is_silently_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = make_target(
+            "Codex CLI",
+            dir.path().join(".codex/hooks.json"),
+            &["SessionStart"],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 0);
+        assert_eq!(broken, 0);
+    }
+
+    /// Hooks unrelated to ICM (e.g. rtk-ai/rtk, user scripts) must not
+    /// be counted — `check_icm_hook_command` filters them out.
+    #[test]
+    fn non_icm_hooks_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+          "hooks": {
+            "PreToolUse": [
+              {"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]},
+              {"matcher":"Bash","hooks":[{"type":"command","command":"npx prettier --write"}]}
+            ]
+          }
+        }"#;
+        let path = write_settings(&dir, ".claude/settings.json", json);
+        let target = make_target(
+            "Claude Code",
+            path,
+            &["PreToolUse"],
+            HookCommandField::Command,
+        );
+        let (checked, broken) = check_json_target(&target);
+        assert_eq!(checked, 0, "non-ICM hooks must not contribute to checked");
+        assert_eq!(broken, 0);
     }
 }

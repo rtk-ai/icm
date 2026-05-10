@@ -7221,6 +7221,15 @@ mod doctor_tests {
         bin
     }
 
+    /// Stringify a binary path for embedding in a JSON fixture. On Windows,
+    /// `path.display()` emits `C:\Users\…\bin\icm`, where `\U` is an
+    /// invalid JSON escape — serde_json then rejects the whole document
+    /// before we can even walk the hooks. Windows accepts forward slashes
+    /// in file paths, so normalize before interpolating.
+    fn json_safe_path(path: &Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
     fn make_target(
         label: &'static str,
         path: PathBuf,
@@ -7262,7 +7271,7 @@ mod doctor_tests {
     fn claude_code_shape_finds_all_six_events_including_session_end() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_icm_binary(&dir);
-        let bin_str = bin.display().to_string();
+        let bin_str = json_safe_path(&bin);
         let json = format!(
             r#"{{
               "hooks": {{
@@ -7304,7 +7313,7 @@ mod doctor_tests {
     fn copilot_cli_shape_uses_bash_field_not_command() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_icm_binary(&dir);
-        let bin_str = bin.display().to_string();
+        let bin_str = json_safe_path(&bin);
         let json = format!(
             r#"{{
               "hooks": {{
@@ -7361,7 +7370,7 @@ mod doctor_tests {
     fn codex_cli_hooks_json_is_walked() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_icm_binary(&dir);
-        let bin_str = bin.display().to_string();
+        let bin_str = json_safe_path(&bin);
         let json = format!(
             r#"{{
               "hooks": {{

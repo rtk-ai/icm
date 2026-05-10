@@ -734,7 +734,11 @@ fn extract_facts_with_threshold(
         }
     }
 
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    // NaN should not appear in keyword scores (they're sums of f32 multiplications
+    // bounded above by integer counts), but a single NaN would otherwise panic
+    // the entire extraction pipeline. Treat NaN pairs as equal so the sort is
+    // total even on degenerate input.
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(max_facts.max(1) * 2); // Keep 2x for dedup pass
 
     // Dedup similar sentences

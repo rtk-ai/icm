@@ -2229,8 +2229,12 @@ fn is_icm_command(cmd: &str) -> bool {
             continue;
         }
         let first_token = trimmed.split_whitespace().next().unwrap_or("");
-        let basename = first_token.rsplit('/').next().unwrap_or("");
-        if basename == "icm" {
+        // On Windows the basename can include `\` separators too — same fix
+        // shape as issue #180. Strip both separators when extracting the
+        // basename so `C:\Users\...\icm.exe` and `~/.local/bin/icm` both
+        // resolve to `icm` / `icm.exe`.
+        let basename = first_token.rsplit(['/', '\\']).next().unwrap_or("");
+        if basename == "icm" || basename == "icm.exe" {
             saw_any = true;
         } else {
             // Any non-icm segment vetoes auto-allow for the whole command.
@@ -2263,6 +2267,32 @@ fn has_shell_metacharacter(cmd: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Pull the tool's stdout from a PostToolUse hook payload.
+///
+/// **CRITICAL bug fix**: Claude Code 2.x switched the field shape from a
+/// top-level `"tool_output": "..."` to a nested
+/// `"tool_response": { "output": "..." }`. The previous implementation
+/// only read `tool_output`, so auto-extraction silently produced zero
+/// memories on every Claude Code 2.x install — the hook fired, the
+/// counter incremented, but `tool_output` was always empty.
+///
+/// We accept three shapes, in priority order:
+///
+///   1. `tool_output: "<str>"`              — legacy / Codex / Gemini older
+///   2. `tool_response: { output: "<str>" }`— Claude Code 2.x
+///   3. `tool_response: "<str>"`            — some Codex/Gemini variants
+fn extract_tool_output(json: &Value) -> Option<&str> {
+    json.get("tool_output")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("tool_response").and_then(|v| {
+                v.get("output")
+                    .and_then(|o| o.as_str())
+                    .or_else(|| v.as_str())
+            })
+        })
 }
 
 /// PostToolUse hook: auto-extract context every N tool calls.
@@ -2301,11 +2331,14 @@ fn cmd_hook_post(
     // Reset counter after triggering extraction
     let _ = store.reset_hook_counter();
 
-    // Extract from tool output
-    let tool_output = json
-        .get("tool_output")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // Extract from tool output. Claude Code 2.x switched the field shape
+    // from a top-level `"tool_output": "..."` to a nested
+    // `"tool_response": { "output": "..." }`, silently breaking
+    // auto-extraction for everyone on the new client until they upgraded
+    // ICM. Accept both shapes plus a `tool_response: "..."` string fallback
+    // (some Codex/Gemini versions). Legacy `tool_output` stays first so
+    // older clients keep working unchanged.
+    let tool_output = extract_tool_output(&json).unwrap_or("");
 
     if tool_output.is_empty() {
         return Ok(());
@@ -7763,5 +7796,55 @@ mod hook_output_format_tests {
         let out = format_hook_context("", HookOutputFormat::CursorJson);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v.get("additional_context").unwrap().as_str().unwrap(), "");
+    }
+}
+
+#[cfg(test)]
+mod hook_payload_tests {
+    //! Regression for the silent auto-extraction failure on Claude Code 2.x.
+    //! Before the fix, only the legacy `tool_output: "..."` shape was read.
+    //! Claude Code 2.x sends `tool_response: { output: "..." }` instead, so
+    //! `cmd_hook_post` saw an empty string and returned without extracting
+    //! anything. The store grew zero memories despite the hook firing on
+    //! every tool call.
+    use super::*;
+
+    #[test]
+    fn legacy_tool_output_top_level_string() {
+        let v: Value = serde_json::from_str(r#"{"tool_output":"hello world"}"#).unwrap();
+        assert_eq!(extract_tool_output(&v), Some("hello world"));
+    }
+
+    /// Claude Code 2.x payload shape — the bug.
+    #[test]
+    fn claude_code_2x_tool_response_dot_output() {
+        let v: Value = serde_json::from_str(r#"{"tool_response":{"output":"new shape"}}"#).unwrap();
+        assert_eq!(extract_tool_output(&v), Some("new shape"));
+    }
+
+    /// Some Codex / Gemini variants put a string directly under
+    /// `tool_response`. Accept it as a fallback.
+    #[test]
+    fn tool_response_string_variant() {
+        let v: Value = serde_json::from_str(r#"{"tool_response":"raw string"}"#).unwrap();
+        assert_eq!(extract_tool_output(&v), Some("raw string"));
+    }
+
+    /// Legacy wins when both shapes are present (defensive: don't change
+    /// behavior for old clients that happen to also include the new field).
+    #[test]
+    fn legacy_takes_priority_when_both_shapes_present() {
+        let v: Value =
+            serde_json::from_str(r#"{"tool_output":"legacy","tool_response":{"output":"new"}}"#)
+                .unwrap();
+        assert_eq!(extract_tool_output(&v), Some("legacy"));
+    }
+
+    #[test]
+    fn empty_or_missing_returns_none() {
+        let v1: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(extract_tool_output(&v1), None);
+        let v2: Value = serde_json::from_str(r#"{"tool_name":"Bash"}"#).unwrap();
+        assert_eq!(extract_tool_output(&v2), None);
     }
 }

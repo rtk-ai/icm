@@ -1,0 +1,15 @@
+{
+  "session_id": "abc-123-def-456",
+  "transcript_path": "/home/user/.claude/projects/-home-user-myproj/abc-123-def-456.jsonl",
+  "cwd": "/home/user/myproj",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "ls -la",
+    "description": "list directory"
+  },
+  "tool_response": {
+    "output": "total 16\ndrwxr-xr-x 2 user user 4096 May 10 10:30 .\ndrwxr-xr-x 8 user user 4096 May 10 10:30 ..\n-rw-r--r-- 1 user user  220 May 10 10:30 file1\n-rw-r--r-- 1 user user 3526 May 10 10:30 file2\n",
+    "exit_code": 0
+  }
+}

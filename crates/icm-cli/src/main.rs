@@ -7847,4 +7847,41 @@ mod hook_payload_tests {
         let v2: Value = serde_json::from_str(r#"{"tool_name":"Bash"}"#).unwrap();
         assert_eq!(extract_tool_output(&v2), None);
     }
+
+    // ── Pinned upstream payload fixtures ───────────────────────────────
+    //
+    // The synthetic tests above pin the *abstract* shapes, but not the
+    // concrete payloads each agent runtime emits. If Claude Code adds
+    // a wrapper field (e.g. `event: { tool_response: {...} }`), the
+    // synthetic tests still pass while users get zero extractions.
+    //
+    // The fixtures below are byte-for-byte snapshots of real PostToolUse
+    // payloads. Refresh by recapturing per the README in
+    // `tests/fixtures/hook_payloads/`. A failing fixture test is the
+    // canary that an upstream tool changed its hook contract.
+
+    #[test]
+    fn fixture_claude_code_2x_post_tool_yields_output() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/claude_code_2x_post_tool.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        let out = extract_tool_output(&v).expect("Claude Code 2.x fixture must yield output");
+        assert!(
+            out.contains("file1") && out.contains("file2"),
+            "expected ls output content, got {out:?}",
+        );
+    }
+
+    #[test]
+    fn fixture_legacy_post_tool_yields_output() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/legacy_post_tool.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        assert_eq!(extract_tool_output(&v), Some("hello\n"));
+    }
+
+    #[test]
+    fn fixture_tool_response_string_yields_output() {
+        let raw = include_str!("../tests/fixtures/hook_payloads/tool_response_string.json");
+        let v: Value = serde_json::from_str(raw).expect("fixture must be valid JSON");
+        assert_eq!(extract_tool_output(&v), Some("hi\n"));
+    }
 }

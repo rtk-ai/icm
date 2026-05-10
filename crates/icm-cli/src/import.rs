@@ -684,6 +684,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cmd_import_does_not_panic_on_multibyte_at_boundary() {
+        // End-to-end regression for #199. To trigger the raw_excerpt slice
+        // path the test needs (a) extract_and_classify to return >= 1 fact,
+        // (b) joined text > 500 bytes, (c) byte 500 of the joined text inside
+        // a multibyte char. exchanges_to_text prefixes user content with
+        // "[user]: " (8 bytes), so we place `→` at inner byte 490 so it lands
+        // at joined bytes 498..501 — byte 500 strictly inside the char. The
+        // decision sentence ensures the multilingual scorer extracts a fact.
+        let prefix = "We decided to use Rust for the storage layer because of safety. ";
+        assert!(prefix.len() < 490);
+        let mut text = String::new();
+        text.push_str(prefix);
+        text.push_str(&"a".repeat(490 - prefix.len()));
+        text.push('→'); // inner bytes 490..493 -> joined bytes 498..501
+        text.push_str(&"b".repeat(60));
+
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, line).unwrap();
+
+        let store = SqliteStore::in_memory().unwrap();
+        // Pre-fix this panicked with "byte index 500 is not a char boundary".
+        cmd_import(&store, path, None, "test".into(), false).unwrap();
+    }
+
+    #[test]
     fn test_import_roundtrip() {
         let store = SqliteStore::in_memory().unwrap();
         let jsonl = concat!(

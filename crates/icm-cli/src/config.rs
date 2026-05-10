@@ -79,6 +79,16 @@ pub struct ExtractionConfig {
     pub extract_every: usize,
     /// Store raw text as fallback when no facts are extracted.
     pub store_raw: bool,
+    /// LLM-backed extraction provider. When set to anything other than
+    /// `none`, hooks switch to the **fast async path**: tool output is
+    /// stored verbatim into a `pending_extractions` queue (~50ms / fire,
+    /// no embedder load) and a separate worker dequeues it later via
+    /// the configured LLM CLI. See `icm extract-pending` and the
+    /// SessionEnd async trigger.
+    ///
+    /// `provider = "none"` (default) keeps the existing inline fastembed
+    /// behavior so this feature is fully opt-in and zero-regression.
+    pub summarizer: SummarizerConfig,
 }
 
 /// Context recall/injection settings (Layer 2).
@@ -225,6 +235,8 @@ impl Default for ExtractionConfig {
             max_facts: 20,
             extract_every: 3,
             store_raw: true,
+            // Default = none → inline fastembed path, no behavior change.
+            summarizer: SummarizerConfig::default(),
         }
     }
 }

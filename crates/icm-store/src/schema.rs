@@ -296,6 +296,23 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
         CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
         CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
+
+        -- Async-extraction queue. When `[extraction.summarizer].provider`
+        -- is set to anything other than `none`, hooks insert raw tool
+        -- output here (one row per fire) instead of running the inline
+        -- fastembed extractor (which costs ~3.7s per process due to model
+        -- load). A separate worker (`icm extract-pending` or the
+        -- SessionEnd async fork) dequeues rows in batches and calls the
+        -- configured LLM CLI. See feat/extraction-provider-async PR.
+        CREATE TABLE IF NOT EXISTS pending_extractions (
+            id TEXT PRIMARY KEY,
+            project TEXT NOT NULL,
+            tool_name TEXT NOT NULL DEFAULT '',
+            raw_output TEXT NOT NULL,
+            captured_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_extractions_captured
+            ON pending_extractions(captured_at);
         ",
     )
     .map_err(db_err)?;

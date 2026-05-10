@@ -1403,6 +1403,7 @@ dependencies = [
  "sqlite-vec",
  "tempfile",
  "tracing",
+ "ulid",
  "zerocopy",
 ]
 

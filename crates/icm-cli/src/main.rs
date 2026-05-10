@@ -195,6 +195,29 @@ enum Commands {
     /// Show global statistics
     Stats,
 
+    /// Process the async extraction queue (LLM-backed). Reads pending
+    /// raw tool outputs captured by hooks when
+    /// `extraction.summarizer.provider != none` and runs the configured
+    /// LLM CLI to extract facts. Designed to be invoked from a cron, a
+    /// SessionEnd async fork, or manually.
+    ExtractPending {
+        /// Maximum rows to process in this run.
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Optional CLI override of `extraction.summarizer.provider`.
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Optional CLI override of `extraction.summarizer.model`.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Don't actually call the LLM — just print what would be sent.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Apply temporal decay to memory weights
     Decay {
         /// Decay factor (default: 0.95)
@@ -1179,6 +1202,19 @@ fn main() -> Result<()> {
         } => cmd_extract_patterns(&store, &topic, memoir.as_deref(), min_cluster_size),
         Commands::Topics => cmd_topics(&store),
         Commands::Stats => cmd_stats(&store),
+        Commands::ExtractPending {
+            limit,
+            provider,
+            model,
+            dry_run,
+        } => cmd_extract_pending(
+            &store,
+            &cfg.extraction.summarizer,
+            limit,
+            provider.as_deref(),
+            model.as_deref(),
+            dry_run,
+        ),
         Commands::Decay { factor } => cmd_decay(&store, factor),
         Commands::Prune { threshold, dry_run } => cmd_prune(&store, threshold, dry_run),
         Commands::Consolidate {
@@ -1377,6 +1413,7 @@ fn main() -> Result<()> {
                     &cfg.memory,
                     extract_every,
                     cfg.extraction.store_raw,
+                    &cfg.extraction.summarizer,
                 )
             }
             HookCommands::Compact => {
@@ -1400,7 +1437,7 @@ fn main() -> Result<()> {
                 let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
                 #[cfg(not(feature = "embeddings"))]
                 let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                cmd_hook_end(&store, emb_ref, &cfg.memory)
+                cmd_hook_end(&store, emb_ref, &cfg.memory, &cfg.extraction.summarizer)
             }
         },
         #[cfg(feature = "tui")]
@@ -2334,12 +2371,25 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
 
 /// PostToolUse hook: auto-extract context every N tool calls.
 /// Reads JSON from stdin. Runs extraction asynchronously.
+///
+/// Two paths are wired up:
+///
+/// 1. **Async path** (`extraction.summarizer.provider != "none"`).
+///    The hook stores the raw tool output verbatim in
+///    `pending_extractions` (~50ms / fire, no embedder load) and a
+///    separate worker (`icm extract-pending` or the SessionEnd async
+///    fork) dequeues it later and runs the configured LLM CLI.
+///
+/// 2. **Inline path** (default, `provider = "none"`). Current
+///    fastembed semantic-scoring extractor — multilingual, but pays
+///    a ~3.7s model-load cost per process.
 fn cmd_hook_post(
     store: &SqliteStore,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     extract_every: usize,
     store_raw: bool,
+    extraction_summarizer: &crate::config::SummarizerConfig,
 ) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
         return Ok(());
@@ -2387,7 +2437,35 @@ fn cmd_hook_post(
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "project".to_string());
 
-    // Extract facts and store (with raw text fallback if enabled).
+    // Async path: enqueue raw output and return without loading the
+    // embedder. The worker (`icm extract-pending` / SessionEnd fork) will
+    // dequeue and run the configured LLM CLI. ~50ms / fire vs ~3.7s
+    // for the inline fastembed path below.
+    if extraction_summarizer.provider != "none" {
+        // Cap to 8 KB to keep the queue reasonable. LLM extraction works
+        // fine on the most recent slice; very long outputs are rare and
+        // their tail is what matters most for auto-context anyway.
+        let capped = if tool_output.len() > 8192 {
+            &tool_output[tool_output.len() - 8192..]
+        } else {
+            tool_output
+        };
+        match store.enqueue_pending_extraction(&project, tool_name, capped) {
+            Ok(_) => {
+                eprintln!(
+                    "[icm] enqueued raw output for async LLM extraction (provider={})",
+                    extraction_summarizer.provider,
+                );
+            }
+            Err(e) => {
+                eprintln!("[icm] enqueue failed, falling back inline: {e}");
+                // Fall through to inline path on storage failure.
+            }
+        }
+        return Ok(());
+    }
+
+    // Inline path: current behavior, fastembed semantic scoring.
     // Cap auto-extracted importance at Medium: tool output is untrusted
     // (a malicious tool could emit decision-keyword text to poison wake-up).
     // Pass the embedder so non-English content is also scored: the keyword
@@ -2434,7 +2512,58 @@ fn cmd_hook_end(
     store: &SqliteStore,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    extraction_summarizer: &crate::config::SummarizerConfig,
 ) -> Result<()> {
+    // Async path: when a provider is configured, drain the
+    // pending_extractions queue in a detached subprocess and return
+    // immediately so Claude Code doesn't kill us with "Hook cancelled".
+    // The transcript-extract path below stays for back-compat (it's
+    // still cheap when --no-embeddings is set).
+    if extraction_summarizer.provider != "none" {
+        if let Ok(self_path) = std::env::current_exe() {
+            // `nohup`-style detach: redirect std{in,out,err} to /dev/null
+            // and let the child outlive us. The child reads the same
+            // config so it picks up the same provider.
+            let mut cmd = std::process::Command::new(&self_path);
+            cmd.arg("extract-pending").arg("--limit").arg("20");
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            // On Unix, set a new session so the child survives our exit.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    cmd.pre_exec(|| {
+                        // Detach from controlling tty / process group.
+                        libc::setsid();
+                        Ok(())
+                    });
+                }
+            }
+            match cmd.spawn() {
+                Ok(_) => {
+                    eprintln!(
+                        "[icm] session-end: forked async LLM worker (provider={})",
+                        extraction_summarizer.provider,
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[icm] session-end: fork failed ({e}), falling back to inline transcript extract",
+                    );
+                    return extract_from_hook_transcript(
+                        store,
+                        embedder,
+                        memory_cfg,
+                        "session-end",
+                    );
+                }
+            }
+            return Ok(());
+        }
+    }
+    // Inline path (legacy): scan transcript and extract via fastembed.
     extract_from_hook_transcript(store, embedder, memory_cfg, "session-end")
 }
 
@@ -4560,6 +4689,146 @@ fn resolve_consolidate_provider(
         }
         other => other,
     })
+}
+
+/// Process the async extraction queue.
+///
+/// Reads up to `limit` oldest pending rows from `pending_extractions`,
+/// concatenates their raw outputs, asks the configured LLM CLI to extract
+/// decisions / architecture / preferences, parses the bullet response,
+/// and stores the results as Memory rows. Successfully-processed rows
+/// are deleted from the queue regardless of whether facts were
+/// extracted (so an output with no extractable content doesn't loop
+/// forever).
+#[allow(clippy::too_many_arguments)]
+fn cmd_extract_pending(
+    store: &SqliteStore,
+    cfg: &config::SummarizerConfig,
+    limit: usize,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let pending = store.list_pending_extractions(limit)?;
+    if pending.is_empty() {
+        println!("No pending extractions.");
+        return Ok(());
+    }
+
+    let provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
+    if matches!(provider_kind, summarizer::ProviderKind::None) {
+        bail!(
+            "extraction.summarizer.provider = \"none\" — nothing would be \
+             extracted. Set it to auto/claude/codex/gemini/ollama, or \
+             pass --provider on this command."
+        );
+    }
+
+    // Build a single LLM prompt covering all rows. The prompt asks for
+    // a structured bullet list so we can deterministically split into
+    // facts. Each bullet becomes one Memory.
+    let mut joined = String::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut project_for_each: Vec<String> = Vec::new();
+    for (id, project, tool_name, raw, _ts) in &pending {
+        joined.push_str(&format!("=== tool={tool_name} project={project} ===\n"));
+        joined.push_str(raw);
+        joined.push_str("\n\n");
+        ids.push(id.clone());
+        project_for_each.push(project.clone());
+    }
+
+    let model_owned: Option<String> = cli_model.map(|s| s.to_string()).or_else(|| {
+        if cfg.model.is_empty() {
+            None
+        } else {
+            Some(cfg.model.clone())
+        }
+    });
+    let max_tokens = cfg.max_tokens;
+
+    let prompt = format!(
+        "From the tool outputs below, extract durable facts that an AI agent \
+         should remember across sessions: architecture decisions, resolved \
+         errors, user preferences, project-specific context.\n\
+         \n\
+         Output format: one fact per line, prefixed with `- `. Each fact \
+         must be a complete, standalone sentence — no pronouns referring to \
+         missing context. Skip routine noise (file listings, build progress, \
+         git status). If nothing durable is present, output exactly `- (none)`.\n\
+         \n\
+         {joined}",
+    );
+
+    if dry_run {
+        println!("=== Dry run ===");
+        println!("provider: {provider_kind:?}");
+        println!(
+            "model: {}",
+            model_owned.as_deref().unwrap_or("<provider default>")
+        );
+        println!("rows: {}", pending.len());
+        println!("--- prompt ---");
+        println!("{prompt}");
+        return Ok(());
+    }
+
+    let provider = summarizer::make_summarizer(provider_kind)?;
+    let req = summarizer::SummarizeRequest {
+        prompt: &prompt,
+        model: model_owned.as_deref(),
+        max_tokens,
+        timeout: std::time::Duration::from_secs(cfg.timeout_secs),
+    };
+    let response = match provider.summarize(&req) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => {
+            eprintln!("[extract-pending] provider returned empty output");
+            // Still drop the rows so we don't loop forever on bad inputs.
+            store.delete_pending_extractions(&ids)?;
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("[extract-pending] provider failed: {e}");
+            // Don't delete — let the next run retry.
+            return Err(e);
+        }
+    };
+
+    // Parse bullet output into individual facts.
+    let mut stored = 0usize;
+    for line in response.lines() {
+        let line = line.trim();
+        let fact = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line)
+            .trim();
+        if fact.is_empty() || fact == "(none)" || fact.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        // Use the first row's project as the topic anchor — most batches
+        // will be from a single session anyway. Multi-project batches
+        // get a slightly weaker per-fact attribution; not worth more
+        // ceremony in v1.
+        let project = project_for_each
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("project");
+        let topic = format!("context-{project}");
+        let mem = Memory::new(topic, fact.to_string(), Importance::Medium);
+        store.store(mem)?;
+        stored += 1;
+    }
+
+    let deleted = store.delete_pending_extractions(&ids)?;
+    println!(
+        "Processed {} rows, extracted {} facts, dequeued {}.",
+        pending.len(),
+        stored,
+        deleted,
+    );
+    Ok(())
 }
 
 /// Lexical fallback: concat all summaries with " | " — the historical behavior

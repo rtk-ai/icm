@@ -23,6 +23,10 @@ pub(crate) fn db_err(e: rusqlite::Error) -> IcmError {
     IcmError::Database(e.to_string())
 }
 
+/// One row from the `pending_extractions` queue, in column order:
+/// `(id, project, tool_name, raw_output, captured_at_rfc3339)`.
+pub type PendingRow = (String, String, String, String, String);
+
 /// Collect mapped rows into a Vec, converting rusqlite errors.
 fn collect_rows<T>(
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
@@ -129,6 +133,85 @@ impl SqliteStore {
             )
             .map_err(db_err)?;
         Ok(())
+    }
+
+    // ── Async extraction queue ─────────────────────────────────────────
+    //
+    // Row tuple shape: `(id, project, tool_name, raw_output, captured_at)`
+    //
+    // When `[extraction.summarizer].provider` is set to something other
+    // than `"none"`, PostToolUse hooks INSERT raw tool output here in
+    // ~50ms (no embedder load) and a worker (`icm extract-pending` or
+    // the SessionEnd async fork) dequeues batches and runs the LLM CLI.
+
+    /// Enqueue raw tool output for later LLM extraction. Returns the
+    /// generated row id so the caller can correlate logs.
+    pub fn enqueue_pending_extraction(
+        &self,
+        project: &str,
+        tool_name: &str,
+        raw_output: &str,
+    ) -> IcmResult<String> {
+        let id = ulid::Ulid::new().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO pending_extractions (id, project, tool_name, raw_output, captured_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, project, tool_name, raw_output, now],
+            )
+            .map_err(db_err)?;
+        Ok(id)
+    }
+
+    /// Pop up to `limit` oldest pending rows. Caller is expected to call
+    /// `delete_pending_extractions` after successful processing.
+    pub fn list_pending_extractions(&self, limit: usize) -> IcmResult<Vec<PendingRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, tool_name, raw_output, captured_at
+                 FROM pending_extractions
+                 ORDER BY captured_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Delete pending rows by id. Used after a worker has processed them.
+    pub fn delete_pending_extractions(&self, ids: &[String]) -> IcmResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM pending_extractions WHERE id IN ({placeholders})");
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let n = self.conn.execute(&sql, params.as_slice()).map_err(db_err)?;
+        Ok(n)
+    }
+
+    /// Total rows currently waiting in the queue. Used by `icm doctor`.
+    pub fn pending_extraction_count(&self) -> IcmResult<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pending_extractions", [], |r| r.get(0))
+            .map_err(db_err)?;
+        Ok(n as usize)
     }
 
     pub fn in_memory() -> IcmResult<Self> {

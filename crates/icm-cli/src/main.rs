@@ -1778,6 +1778,13 @@ fn cmd_health(store: &SqliteStore, topic_filter: Option<&str>) -> Result<()> {
         needs_consolidation,
         total_stale
     );
+    if needs_consolidation > 0 {
+        // Issue #186: be explicit that the default consolidate is a
+        // lexical join, not summarization, so users (and agents acting
+        // on this output) don't silently degrade memory quality.
+        println!();
+        println!("{}", health_consolidate_tip());
+    }
     Ok(())
 }
 
@@ -4258,6 +4265,35 @@ fn lexical_consolidate(memories: &[Memory]) -> String {
     summaries.join(" | ")
 }
 
+/// Build the warning printed when `icm consolidate` runs in lexical-join
+/// mode (provider=none). Issue #186: `icm health` flags topics for
+/// consolidation but the default consolidate degrades quality, so we make
+/// the trade-off explicit on every invocation. The `keep_originals` flag
+/// changes the wording because dropping originals on a lexical join is
+/// strictly worse than keeping them.
+fn lexical_consolidate_warning(keep_originals: bool) -> String {
+    let originals_clause = if keep_originals {
+        ""
+    } else {
+        " Originals will be deleted; pass --keep-originals to retain them."
+    };
+    format!(
+        "warning: consolidating with provider=none — summaries will be \
+         joined with ' | ' (no LLM summarization). Pass \
+         --summarizer-provider <claude|codex|gemini|ollama> for real \
+         consolidation.{originals_clause}"
+    )
+}
+
+/// Hint appended to `icm health` output when one or more topics are flagged
+/// for consolidation. Issue #186: makes it visible that the default
+/// `icm consolidate` is a lexical join, so agents/users don't silently
+/// degrade memory by following the recommendation blindly.
+fn health_consolidate_tip() -> String {
+    "Tip: run `icm consolidate -t <topic> --summarizer-provider <claude|codex|gemini|ollama> --keep-originals`\n\
+     The default (provider=none) joins summaries with ' | ' instead of summarizing.".to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_consolidate(
     store: &SqliteStore,
@@ -4284,6 +4320,10 @@ fn cmd_consolidate(
     });
 
     let merged_summary = if matches!(provider_kind, summarizer::ProviderKind::None) {
+        // Issue #186: lexical concatenation isn't a real consolidation —
+        // it grows past input size, dilutes the embedding, and (without
+        // --keep-originals) destroys the originals it replaces.
+        eprintln!("{}", lexical_consolidate_warning(keep_originals));
         lexical_consolidate(&memories)
     } else {
         let provider = summarizer::make_summarizer(provider_kind)?;
@@ -7078,5 +7118,53 @@ mod cli_contracts_tests {
         for &good in &[0.0_f32, 0.5, 0.95, 0.999_999] {
             cmd_decay(&store, good).unwrap_or_else(|e| panic!("factor={good} rejected: {e}"));
         }
+    }
+
+    /// Issue #186: lexical-mode consolidate must announce that it is NOT
+    /// summarizing and must point users at the LLM-backed flag. Without
+    /// this, agents acting on `icm health` recommendations silently
+    /// degrade memory quality.
+    #[test]
+    fn lexical_consolidate_warning_names_the_real_flag() {
+        let warning = lexical_consolidate_warning(false);
+        assert!(
+            warning.contains("provider=none"),
+            "must name the actual mode it is in: {warning}"
+        );
+        assert!(
+            warning.contains("--summarizer-provider"),
+            "must point at the flag that fixes it: {warning}"
+        );
+        assert!(
+            warning.to_lowercase().contains("warning"),
+            "must be visibly a warning, not info: {warning}"
+        );
+    }
+
+    /// Issue #186: when --keep-originals is omitted, the warning must say
+    /// so explicitly — that's the destructive case.
+    #[test]
+    fn lexical_consolidate_warning_flags_destructive_default() {
+        let destructive = lexical_consolidate_warning(false);
+        let safe = lexical_consolidate_warning(true);
+        assert!(
+            destructive.contains("Originals will be deleted"),
+            "warning must call out destructive behavior when keep_originals=false: {destructive}"
+        );
+        assert!(
+            !safe.contains("Originals will be deleted"),
+            "no destructive-deletion clause when keep_originals=true: {safe}"
+        );
+    }
+
+    /// Issue #186: `icm health` must expose `--summarizer-provider` to
+    /// users it nudges toward consolidation, otherwise it's the source of
+    /// the silent-degradation flow.
+    #[test]
+    fn health_consolidate_tip_names_real_summarizer_flag() {
+        let tip = health_consolidate_tip();
+        assert!(tip.contains("--summarizer-provider"));
+        assert!(tip.contains("provider=none"));
+        assert!(tip.contains("--keep-originals"));
     }
 }

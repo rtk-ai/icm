@@ -511,6 +511,26 @@ enum Commands {
         command: HookCommands,
     },
 
+    /// Show recent hook telemetry rows (start, end, post, pre, prompt, compact)
+    HookLog {
+        /// Number of rows to show, newest first.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Filter by event name (start | end | pre | post | prompt | compact)
+        #[arg(long)]
+        event: Option<String>,
+        /// Delete rows older than the given RFC3339 timestamp and exit.
+        #[arg(long)]
+        prune_older_than: Option<String>,
+    },
+
+    /// Aggregate hook telemetry: counts, error rate, and latency percentiles per event
+    HookStats {
+        /// Lookback window in hours.
+        #[arg(long, default_value = "24")]
+        since_hours: u64,
+    },
+
     /// Launch interactive TUI dashboard
     #[cfg(feature = "tui")]
     Dashboard,
@@ -1398,48 +1418,92 @@ fn main() -> Result<()> {
             let use_compact = compact || cfg.mcp.compact;
             icm_mcp::run_server(&store, emb_ref, use_compact)
         }
-        Commands::Hook { command } => match command {
-            HookCommands::Pre => cmd_hook_pre(),
-            HookCommands::Post { every } => {
-                // CLI flag wins over config; absent flag falls back to config.
-                let extract_every = every.unwrap_or(cfg.extraction.extract_every);
-                #[cfg(feature = "embeddings")]
-                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-                #[cfg(not(feature = "embeddings"))]
-                let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                cmd_hook_post(
-                    &store,
-                    emb_ref,
-                    &cfg.memory,
-                    extract_every,
-                    cfg.extraction.store_raw,
-                    &cfg.extraction.summarizer,
-                )
-            }
-            HookCommands::Compact => {
-                #[cfg(feature = "embeddings")]
-                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-                #[cfg(not(feature = "embeddings"))]
-                let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                cmd_hook_compact(&store, emb_ref, &cfg.memory)
-            }
-            HookCommands::Prompt => cmd_hook_prompt(&store),
-            HookCommands::Start { max_tokens } => {
-                let tokens = if max_tokens > 0 {
-                    max_tokens
+        Commands::HookLog {
+            limit,
+            event,
+            prune_older_than,
+        } => cmd_hook_log(&store, limit, event.as_deref(), prune_older_than.as_deref()),
+        Commands::HookStats { since_hours } => cmd_hook_stats(&store, since_hours),
+        Commands::Hook { command } => {
+            // Wrap every hook dispatch with structured telemetry so the
+            // user can audit "did SessionEnd fire? how long?" via
+            // `icm hook-log` / `icm hook-stats`. The event name matches
+            // the subcommand. Errors from `record_hook_event` are
+            // swallowed so telemetry can never block the hook from
+            // returning to Claude Code.
+            let event_name = match &command {
+                HookCommands::Pre => "pre",
+                HookCommands::Post { .. } => "post",
+                HookCommands::Compact => "compact",
+                HookCommands::Prompt => "prompt",
+                HookCommands::Start { .. } => "start",
+                HookCommands::End => "end",
+            };
+            let started = std::time::Instant::now();
+            let result = match command {
+                HookCommands::Pre => cmd_hook_pre(),
+                HookCommands::Post { every } => {
+                    // CLI flag wins over config; absent flag falls back to config.
+                    let extract_every = every.unwrap_or(cfg.extraction.extract_every);
+                    #[cfg(feature = "embeddings")]
+                    let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                    #[cfg(not(feature = "embeddings"))]
+                    let emb_ref: Option<&dyn icm_core::Embedder> = None;
+                    cmd_hook_post(
+                        &store,
+                        emb_ref,
+                        &cfg.memory,
+                        extract_every,
+                        cfg.extraction.store_raw,
+                        &cfg.extraction.summarizer,
+                    )
+                }
+                HookCommands::Compact => {
+                    #[cfg(feature = "embeddings")]
+                    let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                    #[cfg(not(feature = "embeddings"))]
+                    let emb_ref: Option<&dyn icm_core::Embedder> = None;
+                    cmd_hook_compact(&store, emb_ref, &cfg.memory)
+                }
+                HookCommands::Prompt => cmd_hook_prompt(&store),
+                HookCommands::Start { max_tokens } => {
+                    let tokens = if max_tokens > 0 {
+                        max_tokens
+                    } else {
+                        cfg.wakeup.max_tokens
+                    };
+                    cmd_hook_start(&store, tokens)
+                }
+                HookCommands::End => {
+                    #[cfg(feature = "embeddings")]
+                    let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                    #[cfg(not(feature = "embeddings"))]
+                    let emb_ref: Option<&dyn icm_core::Embedder> = None;
+                    cmd_hook_end(&store, emb_ref, &cfg.memory, &cfg.extraction.summarizer)
+                }
+            };
+            let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            let exit_code = if result.is_ok() { 0 } else { 1 };
+            let note = result.as_ref().err().map(|e| {
+                let s = e.to_string();
+                if s.len() > 200 {
+                    s[..200].to_string()
                 } else {
-                    cfg.wakeup.max_tokens
-                };
-                cmd_hook_start(&store, tokens)
-            }
-            HookCommands::End => {
-                #[cfg(feature = "embeddings")]
-                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-                #[cfg(not(feature = "embeddings"))]
-                let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                cmd_hook_end(&store, emb_ref, &cfg.memory, &cfg.extraction.summarizer)
-            }
-        },
+                    s
+                }
+            });
+            let _ = store.record_hook_event(&icm_store::HookEventInsert {
+                event: event_name.to_string(),
+                project: None,
+                session_id: None,
+                tool_name: None,
+                duration_ms: Some(duration_ms),
+                exit_code,
+                payload_size: None,
+                note,
+            });
+            result
+        }
         #[cfg(feature = "tui")]
         Commands::Dashboard => {
             let db_path_str = db_path.to_string_lossy().to_string();
@@ -2499,6 +2563,79 @@ fn cmd_hook_compact(
     memory_cfg: &crate::config::MemoryConfig,
 ) -> Result<()> {
     extract_from_hook_transcript(store, embedder, memory_cfg, "pre-compact")
+}
+
+// ── Hook telemetry CLI ─────────────────────────────────────────────────
+
+/// `icm hook-log` — print recent rows from the structured `hook_events`
+/// table. Used to verify SessionEnd / SessionStart hooks actually fired
+/// (Claude Code does not log SessionEnd attachments in its session
+/// JSONL, so this DB-side log is the source of truth).
+fn cmd_hook_log(
+    store: &SqliteStore,
+    limit: usize,
+    event: Option<&str>,
+    prune_older_than: Option<&str>,
+) -> Result<()> {
+    if let Some(cutoff) = prune_older_than {
+        let n = store.prune_hook_events(cutoff)?;
+        println!("Pruned {n} rows older than {cutoff}.");
+        return Ok(());
+    }
+    let rows = store.hook_events_recent(limit, event)?;
+    if rows.is_empty() {
+        match event {
+            Some(e) => println!("No hook events matching event=\"{e}\"."),
+            None => println!("No hook events recorded yet."),
+        }
+        return Ok(());
+    }
+    println!(
+        "{:>5}  {:<25}  {:<8}  {:>6}  {:>4}  note",
+        "id", "ts", "event", "ms", "exit"
+    );
+    for r in rows {
+        let ts = icm_core::format_local(&r.ts, "%Y-%m-%d %H:%M:%S");
+        let dur = r
+            .duration_ms
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "-".into());
+        let note = r.note.as_deref().unwrap_or("");
+        println!(
+            "{:>5}  {:<25}  {:<8}  {:>6}  {:>4}  {}",
+            r.id, ts, r.event, dur, r.exit_code, note
+        );
+    }
+    Ok(())
+}
+
+/// `icm hook-stats` — aggregate `hook_events` over a lookback window.
+/// Reports per-event count, error rate, and latency p50/p99 so users can
+/// confirm the async path stays under its budget.
+fn cmd_hook_stats(store: &SqliteStore, since_hours: u64) -> Result<()> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(since_hours as i64);
+    let rows = store.hook_stats(&cutoff.to_rfc3339())?;
+    if rows.is_empty() {
+        println!("No hook events in the last {since_hours}h.");
+        return Ok(());
+    }
+    println!("Hook telemetry — last {since_hours}h\n");
+    println!(
+        "{:<8}  {:>6}  {:>6}  {:>8}  {:>8}  {:>8}",
+        "event", "count", "errors", "avg ms", "p50 ms", "p99 ms"
+    );
+    for r in rows {
+        println!(
+            "{:<8}  {:>6}  {:>6}  {:>8.1}  {:>8}  {:>8}",
+            r.event,
+            r.count,
+            r.error_count,
+            r.avg_duration_ms,
+            r.p50_duration_ms,
+            r.p99_duration_ms,
+        );
+    }
+    Ok(())
 }
 
 /// SessionEnd hook (Layer 1b): extract memories from transcript before the

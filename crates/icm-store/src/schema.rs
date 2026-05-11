@@ -313,6 +313,28 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         );
         CREATE INDEX IF NOT EXISTS idx_pending_extractions_captured
             ON pending_extractions(captured_at);
+
+        -- Structured hook telemetry. Every `icm hook <event>` invocation
+        -- records one row so users can audit what fired, how long it took,
+        -- what its outcome was, and whether the async extraction path was
+        -- triggered. Designed for fast inserts (no FTS, single insert per
+        -- fire). Used by `icm hook-log` and `icm hook-stats`.
+        CREATE TABLE IF NOT EXISTS hook_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            event TEXT NOT NULL,
+            project TEXT,
+            session_id TEXT,
+            tool_name TEXT,
+            duration_ms INTEGER,
+            exit_code INTEGER NOT NULL DEFAULT 0,
+            payload_size INTEGER,
+            note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_hook_events_ts
+            ON hook_events(ts);
+        CREATE INDEX IF NOT EXISTS idx_hook_events_event
+            ON hook_events(event);
         ",
     )
     .map_err(db_err)?;

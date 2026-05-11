@@ -27,6 +27,48 @@ pub(crate) fn db_err(e: rusqlite::Error) -> IcmError {
 /// `(id, project, tool_name, raw_output, captured_at_rfc3339)`.
 pub type PendingRow = (String, String, String, String, String);
 
+/// Structured hook telemetry event written by every `icm hook <event>`
+/// invocation. Read back by `icm hook-log` / `icm hook-stats`.
+#[derive(Debug, Clone)]
+pub struct HookEvent {
+    pub id: i64,
+    pub ts: DateTime<Utc>,
+    pub event: String,
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub exit_code: i32,
+    pub payload_size: Option<i64>,
+    pub note: Option<String>,
+}
+
+/// Insert payload for a single `hook_events` row. `id` and `ts` are filled
+/// in by the store.
+#[derive(Debug, Clone, Default)]
+pub struct HookEventInsert {
+    pub event: String,
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub exit_code: i32,
+    pub payload_size: Option<i64>,
+    pub note: Option<String>,
+}
+
+/// Aggregate counts/percentiles for a slice of hook history. Returned by
+/// `SqliteStore::hook_stats`.
+#[derive(Debug, Clone, Default)]
+pub struct HookStatsRow {
+    pub event: String,
+    pub count: i64,
+    pub error_count: i64,
+    pub avg_duration_ms: f64,
+    pub p50_duration_ms: i64,
+    pub p99_duration_ms: i64,
+}
+
 /// Collect mapped rows into a Vec, converting rusqlite errors.
 fn collect_rows<T>(
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
@@ -210,6 +252,188 @@ impl SqliteStore {
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM pending_extractions", [], |r| r.get(0))
+            .map_err(db_err)?;
+        Ok(n as usize)
+    }
+
+    // ── Hook telemetry ─────────────────────────────────────────────────
+    //
+    // Every `icm hook <event>` fire writes one row to `hook_events`. Read
+    // back via `hook_events_recent` / `hook_stats`. Inserts are designed
+    // to be cheap (single statement, no FTS) so they stay well under the
+    // <50ms async-path budget.
+
+    /// Append one hook telemetry row. Errors are swallowed by callers in
+    /// hook paths (logging must never block the user), but tests can
+    /// inspect the `Result`.
+    pub fn record_hook_event(&self, ev: &HookEventInsert) -> IcmResult<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO hook_events
+                 (ts, event, project, session_id, tool_name,
+                  duration_ms, exit_code, payload_size, note)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    now,
+                    ev.event,
+                    ev.project,
+                    ev.session_id,
+                    ev.tool_name,
+                    ev.duration_ms,
+                    ev.exit_code,
+                    ev.payload_size,
+                    ev.note,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Most recent `limit` hook events, newest first. Optional `event`
+    /// filter (e.g. `Some("end")` to see only SessionEnd hooks).
+    pub fn hook_events_recent(
+        &self,
+        limit: usize,
+        event_filter: Option<&str>,
+    ) -> IcmResult<Vec<HookEvent>> {
+        let limit_i64 = limit as i64;
+        let row_to_event = |row: &rusqlite::Row<'_>| -> rusqlite::Result<HookEvent> {
+            let ts_str: String = row.get(1)?;
+            let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(HookEvent {
+                id: row.get(0)?,
+                ts,
+                event: row.get(2)?,
+                project: row.get(3)?,
+                session_id: row.get(4)?,
+                tool_name: row.get(5)?,
+                duration_ms: row.get(6)?,
+                exit_code: row.get(7)?,
+                payload_size: row.get(8)?,
+                note: row.get(9)?,
+            })
+        };
+        match event_filter {
+            Some(e) => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, ts, event, project, session_id, tool_name,
+                                duration_ms, exit_code, payload_size, note
+                         FROM hook_events
+                         WHERE event = ?1
+                         ORDER BY id DESC
+                         LIMIT ?2",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![e, limit_i64], row_to_event)
+                    .map_err(db_err)?;
+                collect_rows(rows)
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, ts, event, project, session_id, tool_name,
+                                duration_ms, exit_code, payload_size, note
+                         FROM hook_events
+                         ORDER BY id DESC
+                         LIMIT ?1",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![limit_i64], row_to_event)
+                    .map_err(db_err)?;
+                collect_rows(rows)
+            }
+        }
+    }
+
+    /// Aggregate counts and latency percentiles per event type, over a
+    /// time window starting `since` (RFC3339). Used by `icm hook-stats`.
+    pub fn hook_stats(&self, since_rfc3339: &str) -> IcmResult<Vec<HookStatsRow>> {
+        // Pull each event type and compute percentiles in Rust — SQLite
+        // has no native percentile function and the row count is small
+        // enough (~1k/day worst case) that an in-process sort is fine.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT event, duration_ms, exit_code
+                 FROM hook_events
+                 WHERE ts >= ?1
+                 ORDER BY event",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([since_rfc3339], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, i32>(2)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut by_event: std::collections::BTreeMap<String, Vec<(Option<i64>, i32)>> =
+            std::collections::BTreeMap::new();
+        for r in rows {
+            let (ev, dur, exit) = r.map_err(db_err)?;
+            by_event.entry(ev).or_default().push((dur, exit));
+        }
+        let mut out = Vec::with_capacity(by_event.len());
+        for (event, mut items) in by_event {
+            let count = items.len() as i64;
+            let error_count = items.iter().filter(|(_, e)| *e != 0).count() as i64;
+            let mut durations: Vec<i64> = items.iter().filter_map(|(d, _)| *d).collect();
+            durations.sort_unstable();
+            let avg = if durations.is_empty() {
+                0.0
+            } else {
+                durations.iter().sum::<i64>() as f64 / durations.len() as f64
+            };
+            let p = |q: f64| -> i64 {
+                if durations.is_empty() {
+                    0
+                } else {
+                    let idx = ((durations.len() as f64 - 1.0) * q).round() as usize;
+                    durations[idx.min(durations.len() - 1)]
+                }
+            };
+            out.push(HookStatsRow {
+                event,
+                count,
+                error_count,
+                avg_duration_ms: avg,
+                p50_duration_ms: p(0.50),
+                p99_duration_ms: p(0.99),
+            });
+            // Avoid clippy 'unused variable' on items after move
+            let _ = &mut items;
+        }
+        Ok(out)
+    }
+
+    /// Delete hook telemetry rows older than `cutoff_rfc3339`. Used by an
+    /// optional retention pass (`icm hook-log --prune-older-than ...`).
+    pub fn prune_hook_events(&self, cutoff_rfc3339: &str) -> IcmResult<usize> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM hook_events WHERE ts < ?1",
+                rusqlite::params![cutoff_rfc3339],
+            )
+            .map_err(db_err)?;
+        Ok(n)
+    }
+
+    /// Total rows currently in `hook_events`. Used by tests and `icm doctor`.
+    pub fn hook_event_count(&self) -> IcmResult<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM hook_events", [], |r| r.get(0))
             .map_err(db_err)?;
         Ok(n as usize)
     }
@@ -6008,5 +6232,96 @@ mod tests {
         let msgs = store.list_session_messages(&s, 10, 0).unwrap();
         let got: Vec<_> = msgs.iter().map(|m| m.id.clone()).collect();
         assert_eq!(got, ids);
+    }
+
+    // ── Hook telemetry ─────────────────────────────────────────────────
+
+    fn insert(event: &str, duration_ms: i64, exit_code: i32) -> HookEventInsert {
+        HookEventInsert {
+            event: event.into(),
+            project: None,
+            session_id: None,
+            tool_name: None,
+            duration_ms: Some(duration_ms),
+            exit_code,
+            payload_size: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn test_record_hook_event_persists() {
+        let store = test_store();
+        let id = store.record_hook_event(&insert("post", 12, 0)).unwrap();
+        assert!(id > 0);
+        assert_eq!(store.hook_event_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_hook_events_recent_orders_newest_first_and_filters() {
+        let store = test_store();
+        store.record_hook_event(&insert("post", 10, 0)).unwrap();
+        store.record_hook_event(&insert("end", 9, 0)).unwrap();
+        store.record_hook_event(&insert("post", 20, 1)).unwrap();
+
+        let all = store.hook_events_recent(10, None).unwrap();
+        assert_eq!(all.len(), 3);
+        // Newest first: third insert wins position 0.
+        assert_eq!(all[0].event, "post");
+        assert_eq!(all[0].exit_code, 1);
+
+        let posts = store.hook_events_recent(10, Some("post")).unwrap();
+        assert_eq!(posts.len(), 2);
+        assert!(posts.iter().all(|r| r.event == "post"));
+
+        let ends = store.hook_events_recent(10, Some("end")).unwrap();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].duration_ms, Some(9));
+    }
+
+    #[test]
+    fn test_hook_stats_buckets_by_event_and_computes_percentiles() {
+        let store = test_store();
+        // post: durations [10, 20, 30] — p50=20, p99=30
+        store.record_hook_event(&insert("post", 10, 0)).unwrap();
+        store.record_hook_event(&insert("post", 20, 0)).unwrap();
+        store.record_hook_event(&insert("post", 30, 1)).unwrap();
+        // end: single 9ms success
+        store.record_hook_event(&insert("end", 9, 0)).unwrap();
+
+        // Use a wide window so all rows fall inside.
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let stats = store.hook_stats(&cutoff).unwrap();
+        let by_event: std::collections::HashMap<_, _> =
+            stats.into_iter().map(|r| (r.event.clone(), r)).collect();
+
+        let post = &by_event["post"];
+        assert_eq!(post.count, 3);
+        assert_eq!(post.error_count, 1);
+        assert_eq!(post.p50_duration_ms, 20);
+        assert_eq!(post.p99_duration_ms, 30);
+
+        let end = &by_event["end"];
+        assert_eq!(end.count, 1);
+        assert_eq!(end.error_count, 0);
+        assert_eq!(end.p50_duration_ms, 9);
+    }
+
+    #[test]
+    fn test_prune_hook_events_drops_old_rows_only() {
+        let store = test_store();
+        store.record_hook_event(&insert("post", 10, 0)).unwrap();
+        // Cutoff in the future → wipes everything.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let n = store.prune_hook_events(&future).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.hook_event_count().unwrap(), 0);
+
+        // Re-insert, then prune with a past cutoff → keeps row.
+        store.record_hook_event(&insert("post", 10, 0)).unwrap();
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let n = store.prune_hook_events(&past).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(store.hook_event_count().unwrap(), 1);
     }
 }

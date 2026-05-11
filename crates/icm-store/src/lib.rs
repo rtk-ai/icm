@@ -1,4 +1,4 @@
 mod schema;
 mod store;
 
-pub use store::SqliteStore;
+pub use store::{HookEvent, HookEventInsert, HookStatsRow, PendingRow, SqliteStore};

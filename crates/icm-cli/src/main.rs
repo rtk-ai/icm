@@ -37,12 +37,7 @@ use icm_store::SqliteStore;
     about = "Infinite Context Memory - persistent memory for LLMs"
 )]
 struct Cli {
-    /// Path to the SQLite database. Audit #185 medium: `clap`'s
-    /// `global = true` lets the same flag appear at both the parent
-    /// and subcommand level (`icm --db A stats --db B`), with the
-    /// last occurrence winning silently. We collect into a `Vec` so
-    /// we can detect that case and reject it with a clear error
-    /// instead of letting the user lose data with the wrong DB.
+    /// Path to the SQLite database (overrides config and ICM_DB env var)
     #[arg(long, global = true, action = clap::ArgAction::Append)]
     db: Vec<PathBuf>,
 

@@ -22,22 +22,22 @@ ICM gives your AI agent a real memory — not a note-taking tool, not a context 
 
 ```
                        ICM (Infinite Context Memory)
-            ┌──────────────────────┬─────────────────────────┐
-            │   MEMORIES (Topics)  │   MEMOIRS (Knowledge)   │
-            │                      │                         │
-            │  Episodic, temporal  │  Permanent, structured  │
-            │                      │                         │
-            │  ┌───┐ ┌───┐ ┌───┐  │    ┌───┐               │
-            │  │ m │ │ m │ │ m │  │    │ C │──depends_on──┐ │
-            │  └─┬─┘ └─┬─┘ └─┬─┘  │    └───┘              │ │
-            │    │decay │     │    │      │ refines      ┌─▼─┐│
-            │    ▼      ▼     ▼    │    ┌─▼─┐            │ C ││
-            │  weight decreases    │    │ C │──part_of──>└───┘│
-            │  over time unless    │    └───┘                 │
+            ┌──────────────────────┬──────────────────────────┐
+            │   MEMORIES (Topics)  │   MEMOIRS (Knowledge)    │
+            │                      │                          │
+            │  Episodic, temporal  │  Permanent, structured   │
+            │                      │                          │
+            │  ┌───┐ ┌───┐ ┌───┐   │    ┌───┐                 │
+            │  │ m │ │ m │ │ m │   │    │ C │──depends_on──┐  │
+            │  └─┬─┘ └─┬─┘ └─┬─┘   │    └───┘              │  │
+            │    │decay│     │     │      │ refines        │  │
+            │    ▼     ▼     ▼     │    ┌─▼─┐            ┌─▼─┐│
+            │  weight decreases    │    │ C │──part_of──>│ C ││
+            │  over time unless    │    └───┘            └───┘│
             │  accessed/critical   │  Concepts + Relations    │
-            ├──────────────────────┴─────────────────────────┤
-            │             SQLite + FTS5 + sqlite-vec          │
-            │        Hybrid search: BM25 (30%) + cosine (70%) │
+            ├──────────────────────┴──────────────────────────┤
+            │          SQLite + FTS5 + sqlite-vec             │
+            │     Hybrid search: BM25 (30%) + cosine (70%)    │
             └─────────────────────────────────────────────────┘
 ```
 

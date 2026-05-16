@@ -3735,7 +3735,11 @@ Search ICM memory for: $ARGUMENTS
 
 Run:
 ```bash
-icm recall \"$ARGUMENTS\"
+if [ -z \"$ARGUMENTS\" ]; then
+  icm wake-up --max-tokens 800
+else
+  icm recall \"$ARGUMENTS\" --limit 10
+fi
 ```
 ";
         let icm_remember_prompt = "\

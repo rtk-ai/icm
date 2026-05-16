@@ -29,7 +29,7 @@ pub use memoir_store::MemoirStore;
 pub use memory::{
     Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
 };
-pub use store::MemoryStore;
+pub use store::{find_similar_memory, MemoryStore, DEDUP_SIMILARITY_THRESHOLD};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;
 pub use wake_up::{

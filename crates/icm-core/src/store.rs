@@ -1,6 +1,26 @@
 use crate::error::IcmResult;
 use crate::memory::{Memory, StoreStats, TopicHealth};
 
+/// Similarity score above which a new memory is considered a duplicate of an existing one.
+pub const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.85;
+
+/// Find an existing memory that is similar enough to be considered a duplicate.
+///
+/// Returns the closest match and its similarity score if the score exceeds `threshold`
+/// and the match belongs to the same topic. Returns `None` otherwise.
+pub fn find_similar_memory(
+    store: &dyn MemoryStore,
+    embed_text: &str,
+    embedding: &[f32],
+    topic: &str,
+    threshold: f32,
+) -> IcmResult<Option<(Memory, f32)>> {
+    let similar = store.search_hybrid(embed_text, embedding, 1)?;
+    Ok(similar
+        .into_iter()
+        .find(|(m, score)| *score > threshold && m.topic == topic))
+}
+
 pub trait MemoryStore {
     // CRUD
     fn store(&self, memory: Memory) -> IcmResult<String>;

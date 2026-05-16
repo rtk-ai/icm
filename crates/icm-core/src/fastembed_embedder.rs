@@ -109,6 +109,9 @@ impl FastEmbedder {
         }
         let (emb_model, _) = resolve_model(&self.model_name)?;
         let cache = cache_dir();
+        std::fs::create_dir_all(&cache)
+            .and_then(|()| cachedir::ensure_tag(&cache))
+            .unwrap_or_else(|e| tracing::warn!("could not tag cache dir: {e}"));
         let model = TextEmbedding::try_new(
             InitOptions::new(emb_model)
                 .with_show_download_progress(true)

@@ -45,6 +45,7 @@ directories = "6"
 
 # Caching
 lru = "0.18"
+cachedir = "0.3"
 
 # HTTP (cloud sync)
 ureq = { version = "2", features = ["json"] }

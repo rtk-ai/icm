@@ -58,6 +58,20 @@ pub(crate) fn apply(
             .unwrap_or(LocationKind::MarkdownBlock);
 
         let result: Result<StripResult> = (|| {
+            // Refuse to mutate paths that are symlinks: the backup
+            // session deliberately doesn't dereference them, and writing
+            // through a symlink would silently mutate a shared target
+            // (e.g. a dotfiles repo) without any safety net.
+            if let Ok(m) = std::fs::symlink_metadata(&hit.path) {
+                if m.file_type().is_symlink() {
+                    return Ok(StripResult::Ambiguous {
+                        reason: format!(
+                            "{} is a symlink — refusing to mutate the target without an explicit backup; resolve manually.",
+                            hit.path.display()
+                        ),
+                    });
+                }
+            }
             if let Some(b) = backup.as_mut() {
                 b.stage(&hit.path)?;
             }

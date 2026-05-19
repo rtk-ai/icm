@@ -304,6 +304,15 @@ enum Commands {
         /// are left untouched, even if their binary path no longer exists.
         #[arg(short, long)]
         force: bool,
+
+        /// Also write project-level instruction files into the current
+        /// directory (`CLAUDE.md`, `AGENTS.md`, `.windsurfrules`,
+        /// `.aider.conventions.md`, `.github/copilot-instructions.md`).
+        /// Default behavior writes only to global per-tool paths
+        /// (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, etc.) so init
+        /// doesn't pollute every project tree.
+        #[arg(long)]
+        per_project: bool,
     },
 
     /// Diagnose ICM integration: check hook binary paths in Claude Code settings
@@ -1329,7 +1338,11 @@ fn main() -> Result<()> {
                 cmd_memoir_distill(&store, &from_topic, &into)
             }
         },
-        Commands::Init { mode, force } => cmd_init(mode, force),
+        Commands::Init {
+            mode,
+            force,
+            per_project,
+        } => cmd_init(mode, force, per_project),
         Commands::Doctor => cmd_doctor(),
         Commands::Extract {
             project,
@@ -3284,7 +3297,7 @@ fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     cmd.contains(&format!("{pattern}.exe"))
 }
 
-fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
+fn cmd_init(mode: InitMode, force: bool, per_project: bool) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
     let home = home_dir_str()?;
@@ -3496,6 +3509,17 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     }
 
     // --- CLI mode: inject instructions into each tool's file ---
+    //
+    // Two write surfaces:
+    //   - GLOBAL paths (the default): each tool's HOME-level instruction
+    //     file. Claude Code reads CLAUDE.md upward to $HOME, Codex
+    //     scans for AGENTS.md, Gemini reads ~/.gemini/GEMINI.md, etc.
+    //     One file per tool, used across every project.
+    //   - PROJECT paths (the `--per-project` flag): cwd-level files for
+    //     tools that only support per-project (Copilot, Windsurf,
+    //     Aider) or for users who want project-specific overrides.
+    //     This is the pre-fix/init-secure behaviour, kept available
+    //     opt-in.
     if do_cli {
         let cwd = std::env::current_dir().context("failed to get current directory")?;
 
@@ -3533,25 +3557,71 @@ icm topics                                # list all topics\n\
 ```\n\
 <!-- icm:end -->";
 
-        // (tool_label, detect_name, path)
-        // `detect_name` is the key used by `detect_tool`; `tool_label`
-        // is what we print and record in the manifest.
-        let instruction_files: Vec<(&str, &str, PathBuf)> = vec![
-            ("Claude Code", "Claude Code", cwd.join("CLAUDE.md")),
-            ("Codex", "Codex CLI", cwd.join("AGENTS.md")),
+        // Global write targets: (tool_label, detect_name, path).
+        // Tools that support a HOME-level instruction file get one here
+        // and the cwd file is only written when --per-project is set.
+        let global_files: Vec<(&str, &str, PathBuf)> = vec![
+            ("Claude Code", "Claude Code", claude_dir.join("CLAUDE.md")),
+            ("Codex", "Codex CLI", codex_dir.join("AGENTS.md")),
             ("Gemini", "Gemini", gemini_dir.join("GEMINI.md")),
+        ];
+
+        // Project-only write targets (no global equivalent at the tool):
+        // Copilot, Windsurf, Aider only support per-project context
+        // files. Skipped unless --per-project is given.
+        let project_only_files: Vec<(&str, &str, PathBuf)> = vec![
             (
                 "Copilot",
                 "Copilot CLI",
                 cwd.join(".github/copilot-instructions.md"),
             ),
             ("Windsurf", "Windsurf", cwd.join(".windsurfrules")),
-            // Aider has no `detect_tool` entry — keep the previous
-            // permissive behavior by always writing when do_cli is on.
             ("Aider", "Aider", cwd.join(".aider.conventions.md")),
         ];
 
-        for (label, detect, path) in &instruction_files {
+        for (label, detect, path) in &global_files {
+            if !force && !detect_tool(detect, &home, &vscode_data) {
+                println!("[cli] {label:<16} skipped (not detected)");
+                continue;
+            }
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                path,
+                label,
+                install_manifest::EntryKind::MarkdownBlock,
+            ) {
+                manifest.record(e);
+            }
+            let status = inject_icm_block(path, icm_block)?;
+            println!("[cli] {label:<16} {status}");
+
+            // With --per-project, also drop the cwd-level marker so
+            // users who manually open this project in a fresh editor
+            // session still get the bloc in-tree.
+            if per_project {
+                let cwd_path = match *label {
+                    "Claude Code" => Some(cwd.join("CLAUDE.md")),
+                    "Codex" => Some(cwd.join("AGENTS.md")),
+                    _ => None,
+                };
+                if let Some(p) = cwd_path {
+                    if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                        &p,
+                        label,
+                        install_manifest::EntryKind::MarkdownBlock,
+                    ) {
+                        manifest.record(e);
+                    }
+                    let status = inject_icm_block(&p, icm_block)?;
+                    println!("[cli] {label:<16} (cwd) {status}");
+                }
+            }
+        }
+
+        for (label, detect, path) in &project_only_files {
+            if !per_project {
+                println!("[cli] {label:<16} skipped (project-level only — pass --per-project)");
+                continue;
+            }
             if !force && !detect_tool(detect, &home, &vscode_data) {
                 println!("[cli] {label:<16} skipped (not detected)");
                 continue;

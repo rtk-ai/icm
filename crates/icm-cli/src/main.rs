@@ -6,6 +6,7 @@ mod config;
 mod extract;
 mod extract_semantic;
 mod import;
+mod install_manifest;
 #[cfg(test)]
 mod learn_tests;
 mod recall_format;

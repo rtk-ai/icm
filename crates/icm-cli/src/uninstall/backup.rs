@@ -15,8 +15,6 @@
 //! `files/` mirrors the original absolute paths with the leading `/`
 //! stripped, so a recursive copy lands every config back where it was.
 
-#![allow(dead_code)] // wired up by the mutator immediately below
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

@@ -4,8 +4,6 @@
 //! Side effects are intentionally isolated here so the strippers in
 //! `formats.rs` stay pure (string in, string out).
 
-#![allow(dead_code)] // used by `run()` from this same commit
-
 use anyhow::Result;
 
 use super::backup::BackupSession;

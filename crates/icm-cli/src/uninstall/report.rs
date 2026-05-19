@@ -1,14 +1,13 @@
 //! Stdout formatters for the read-only modes (`--check`, `--dry-run`,
-//! `--audit`). Mutation reports land in a later commit alongside the
-//! mutator itself.
-
-#![allow(dead_code)] // additional formatters land with the mutator
+//! `--audit`) and the post-mutation summary.
 
 use super::discover::{HitDetail, RemovalPlan};
 
 /// Print the audit / dry-run preview. Groups hits by file so users see
 /// each path once with all the things uninstall would touch under it.
-pub(crate) fn print_audit(plan: &RemovalPlan, header: &str) {
+/// `purge_data` toggles the wording for [`HitDetail::DataDir`] so the
+/// preview matches what the run is actually about to do.
+pub(crate) fn print_audit(plan: &RemovalPlan, header: &str, purge_data: bool) {
     println!("{header}");
     println!("{}", "=".repeat(header.len()));
 
@@ -17,9 +16,13 @@ pub(crate) fn print_audit(plan: &RemovalPlan, header: &str) {
         return;
     }
 
-    print_section("Configured locations", &plan.hits);
+    print_section("Configured locations", &plan.hits, purge_data);
     if !plan.scan_dir_hits.is_empty() {
-        print_section("Project tree references (--scan-dir)", &plan.scan_dir_hits);
+        print_section(
+            "Project tree references (--scan-dir)",
+            &plan.scan_dir_hits,
+            purge_data,
+        );
     }
 
     if !plan.processes.is_empty() {
@@ -34,7 +37,7 @@ pub(crate) fn print_audit(plan: &RemovalPlan, header: &str) {
     println!("Total: {} item(s).", plan.total_hits());
 }
 
-fn print_section(title: &str, hits: &[super::discover::LocationHit]) {
+fn print_section(title: &str, hits: &[super::discover::LocationHit], purge_data: bool) {
     if hits.is_empty() {
         return;
     }
@@ -85,10 +88,12 @@ fn print_section(title: &str, hits: &[super::discover::LocationHit]) {
                 println!("  Owned file ({} byte(s)) — will be deleted", bytes);
             }
             HitDetail::DataDir { bytes_total, files } => {
-                println!(
-                    "  Data directory: {files} file(s), {} byte(s) — kept unless --purge-data",
-                    bytes_total
-                );
+                let tag = if purge_data {
+                    "will be deleted (--purge-data)"
+                } else {
+                    "kept unless --purge-data"
+                };
+                println!("  Data directory: {files} file(s), {bytes_total} byte(s) — {tag}",);
             }
         }
     }

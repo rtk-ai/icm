@@ -7,8 +7,6 @@
 //! return type is a `StripResult` so callers can distinguish "nothing to
 //! do", "removed N entries", and "ambiguous — manual review needed".
 
-#![allow(dead_code)] // exposed to the mutator immediately below
-
 use anyhow::{Context, Result};
 use serde_json::Value;
 

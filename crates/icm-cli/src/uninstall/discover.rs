@@ -7,8 +7,6 @@
 //! enough detail (which key? which line? how many bytes?) for the audit
 //! / dry-run output to be actionable.
 
-#![allow(dead_code)] // consumed by report + mutate in the next two commits
-
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;

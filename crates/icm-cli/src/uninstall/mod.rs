@@ -69,7 +69,6 @@ pub struct UninstallOpts {
 /// | 2    | user declined the confirmation prompt |
 /// | 3    | partial success — residue remains after mutation (e.g. ambiguous YAML) |
 /// | 4    | I/O or parse error during mutation |
-#[allow(dead_code)] // populated incrementally across follow-up commits in this PR
 pub mod exit_codes {
     pub const CLEAN: i32 = 0;
     pub const CHECK_RESIDUE: i32 = 1;
@@ -94,11 +93,11 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
         return Ok(report::print_check(&plan));
     }
     if opts.audit {
-        report::print_audit(&plan, "ICM uninstall audit");
+        report::print_audit(&plan, "ICM uninstall audit", opts.purge_data);
         return Ok(exit_codes::CLEAN);
     }
     if opts.dry_run {
-        report::print_audit(&plan, "ICM uninstall (dry run)");
+        report::print_audit(&plan, "ICM uninstall (dry run)", opts.purge_data);
         return Ok(exit_codes::CLEAN);
     }
 
@@ -107,7 +106,7 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
         println!("Nothing to uninstall — already clean.");
         return Ok(exit_codes::CLEAN);
     }
-    report::print_audit(&plan, "ICM uninstall plan");
+    report::print_audit(&plan, "ICM uninstall plan", opts.purge_data);
 
     if !opts.yes && !mutate::confirm("Proceed with removal?") {
         println!("Aborted (no changes made).");

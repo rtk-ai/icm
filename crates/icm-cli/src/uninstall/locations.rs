@@ -9,10 +9,6 @@
 //! Path resolution honors the same environment overrides as `cmd_init`:
 //! `CLAUDE_CONFIG_DIR`, `GEMINI_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`.
 
-// The catalog is consumed by `discover` in the next commit on this PR;
-// suppress dead-code warnings until that hooks up.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 use anyhow::Result;

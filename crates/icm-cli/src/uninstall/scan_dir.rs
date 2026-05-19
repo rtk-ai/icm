@@ -6,8 +6,6 @@
 //! current cwd; if the user wants to clean up multiple project clones
 //! they point `--scan-dir <PATH>` at the root and we walk from there.
 
-#![allow(dead_code)] // consumed by `run()` once flagged in mod.rs
-
 use std::path::Path;
 
 use anyhow::Result;

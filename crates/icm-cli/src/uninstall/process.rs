@@ -12,8 +12,6 @@
 //!   `tasklist /v` or `sysinfo`; uninstall still works without it,
 //!   we just don't print a warning.
 
-#![allow(dead_code)] // wired into the orchestrator immediately after this commit
-
 use super::discover::RunningProcess;
 
 /// Return every process whose command line contains `"icm serve"`. The

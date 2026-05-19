@@ -7,6 +7,16 @@
 //! Each test spawns the compiled `icm` binary inside a private
 //! `HOME=<tempdir>` with a stripped `PATH` so no real AI binary is
 //! detected.
+//!
+//! Gated to Linux: these assertions hard-code XDG-style paths
+//! (`.local/share/icm`, `.claude/CLAUDE.md`, etc.). On macOS the
+//! `directories` crate routes data to `Library/Application Support/icm/`
+//! and on Windows to `%APPDATA%\icm\icm\data\`, so the same fake-HOME
+//! scaffolding doesn't line up. The cross-OS logic itself is exercised
+//! by the in-binary unit tests in `crates/icm-cli/src/install_manifest.rs`
+//! which use the real `directories` crate on both sides.
+
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::Command;

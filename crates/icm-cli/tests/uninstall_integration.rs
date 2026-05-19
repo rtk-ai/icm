@@ -150,6 +150,12 @@ fn uninstall_is_idempotent_when_already_clean() {
     );
 }
 
+// `directories::ProjectDirs` returns OS-specific data/cache paths that
+// don't match the Linux XDG layout this test seeds. Gate it to Linux
+// where seed and code agree — the macOS/Windows path resolution is
+// covered by the unit tests inside the binary which use the real
+// `directories` crate at the right side of the boundary.
+#[cfg(target_os = "linux")]
 #[test]
 fn purge_data_does_not_recreate_db_dir() {
     let tmp = tempfile::tempdir().unwrap();

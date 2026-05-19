@@ -4043,6 +4043,12 @@ fn inject_settings_hook(
     let mut config: Value = if settings_path.exists() {
         parse_json_config(settings_path)?
     } else {
+        // Create the parent directory eagerly. `inject_codex_hook` and
+        // friends already do this; without it, `icm init --mode hook`
+        // crashes on a fresh home when ~/.claude/ does not exist yet.
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
         serde_json::json!({})
     };
 

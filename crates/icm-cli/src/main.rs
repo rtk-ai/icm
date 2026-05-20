@@ -12,6 +12,7 @@ mod recall_format;
 mod summarizer;
 #[cfg(feature = "tui")]
 mod tui;
+mod uninstall;
 mod upgrade;
 #[cfg(feature = "web")]
 mod web;
@@ -307,6 +308,15 @@ enum Commands {
 
     /// Diagnose ICM integration: check hook binary paths in Claude Code settings
     Doctor,
+
+    /// Reverse `icm init`: remove ICM config from every detected AI tool.
+    ///
+    /// Default behavior: timestamped backups under
+    /// `~/.icm-uninstall-backups/<ts>/`, preserves your SQLite memory DB.
+    /// Use `--purge-data` to delete the DB and fastembed cache too.
+    /// Use `--dry-run` or `--audit` for a preview; `--check` for an exit-code
+    /// signal (0 = clean). See issue #229.
+    Uninstall(uninstall::UninstallOpts),
 
     /// Run performance benchmark on in-memory store
     Bench {
@@ -1093,9 +1103,21 @@ fn main() -> Result<()> {
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
     let db_path = cli_db.clone().unwrap_or_else(default_db_path);
+
+    // `icm uninstall` must NOT open the SQLite store: a default
+    // `open_store` call would recreate the DB directory and WAL/SHM files
+    // immediately after `--purge-data` removed them, leaving the user's
+    // data dir non-empty even though the run reported success. Dispatch
+    // it before `open_store` runs.
+    let command = cli.command;
+    if let Commands::Uninstall(opts) = command {
+        let code = uninstall::run(opts)?;
+        std::process::exit(code);
+    }
+
     let store = open_store(cli_db, embedding_dims)?;
 
-    match cli.command {
+    match command {
         Commands::Store {
             topic,
             content,
@@ -1330,6 +1352,7 @@ fn main() -> Result<()> {
         },
         Commands::Init { mode, force } => cmd_init(mode, force),
         Commands::Doctor => cmd_doctor(),
+        Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
         Commands::Extract {
             project,
             text,
@@ -3269,7 +3292,7 @@ fn portable_command_path(path: &Path) -> String {
 /// `C:/.../icm.exe hook pre` was missed by every detect site (init
 /// idempotency, doctor binary check, codex/copilot injectors), so init
 /// re-injected duplicates and doctor reported zero hooks.
-fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
+pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     if cmd.contains(pattern) {
         return true;
     }
@@ -4296,7 +4319,7 @@ fn strip_jsonc_comments(content: &str) -> String {
 /// Parse a JSON config file with lenient parsing: accepts trailing commas
 /// and JSONC comments (// and /* */). This is the only place we use lenient
 /// parsing — all other JSON handling uses strict serde_json.
-fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
+pub(crate) fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("cannot read {}", config_path.display()))?;
     let clean = strip_jsonc_comments(&content);
@@ -4349,7 +4372,7 @@ pub(crate) fn home_dir_str() -> Result<String> {
 /// Falls back to `$HOME/{default_subdir}` if the env var is unset or empty.
 /// Mirrors how each tool documents its own override (CLAUDE_CONFIG_DIR,
 /// GEMINI_CONFIG_DIR, CODEX_HOME, COPILOT_HOME).
-fn cli_config_dir(env_var: &str, default_subdir: &str, home: &str) -> PathBuf {
+pub(crate) fn cli_config_dir(env_var: &str, default_subdir: &str, home: &str) -> PathBuf {
     match std::env::var(env_var) {
         Ok(custom) if !custom.is_empty() => PathBuf::from(custom),
         _ => PathBuf::from(home).join(default_subdir),

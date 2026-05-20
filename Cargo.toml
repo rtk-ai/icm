@@ -46,6 +46,9 @@ directories = "6"
 # Caching
 lru = "0.18"
 
+# Filesystem walking (used by `icm uninstall --scan-dir`)
+walkdir = "2"
+
 # HTTP (cloud sync)
 ureq = { version = "2", features = ["json"] }
 rpassword = "5"

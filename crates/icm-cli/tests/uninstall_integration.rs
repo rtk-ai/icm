@@ -5,6 +5,13 @@
 //! These tests complement the in-binary unit tests in
 //! `crates/icm-cli/src/uninstall/*.rs` by validating the full
 //! discovery → mutation → re-scan loop through the public CLI surface.
+//!
+//! Gated to Linux: the assertions hard-code XDG-style data paths and
+//! the seeded JSON command literals use a sample binary path
+//! (`/x/icm`) that doesn't fit Windows. The in-binary unit tests
+//! exercise the cross-OS logic directly through `directories`.
+
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::Command;

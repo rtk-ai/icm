@@ -13,19 +13,46 @@
 // to deliver recalled context into the agent's context window.
 
 import type { Plugin } from "@opencode-ai/plugin"
-import { execFileSync } from "child_process"
+import { execFileSync, spawn } from "child_process"
 
+// Capture tool output every N tool calls...
 const EXTRACT_EVERY = 3
+// ...but only drain the extraction queue (the step that loads the
+// fastembed model) once per N enqueues. Issue #239: running a full
+// `icm extract` on every 3rd tool call reloaded the embedding model
+// from scratch each time (~3.7s CPU + a few hundred MB RAM), so
+// reading many files produced visible CPU/RAM spikes. Enqueuing is
+// cheap (~50ms, no model); the heavy work is batched into one
+// detached drain.
+const DRAIN_EVERY = 10
 let toolCallCount = 0
+let enqueueCount = 0
 
-function icmExtract(args: string[], input: string): void {
+/// Enqueue raw text for deferred extraction. `icm extract --enqueue`
+/// only writes a queue row — it never loads the embedding model.
+function icmEnqueue(project: string, input: string): void {
   try {
-    execFileSync("icm", args, {
+    execFileSync("icm", ["extract", "--enqueue", "-p", project], {
       encoding: "utf-8",
       timeout: 10000,
       input,
       stdio: ["pipe", "pipe", "pipe"],
     })
+  } catch {
+    // silent — extraction is best-effort
+  }
+}
+
+/// Drain the pending-extraction queue in a detached background process.
+/// Fire-and-forget: the chat turn never waits on it, and the heavy
+/// fastembed model load happens at most once per drain.
+function icmDrainDetached(): void {
+  try {
+    const child = spawn("icm", ["extract-pending", "--limit", "30"], {
+      detached: true,
+      stdio: "ignore",
+    })
+    child.unref()
   } catch {
     // silent — extraction is best-effort
   }
@@ -81,10 +108,13 @@ export const IcmPlugin: Plugin = async ({ $, directory }) => {
         result?.metadata?.output ?? result?.output ?? (typeof result === "string" ? result : "")
       if (!output || typeof output !== "string" || output.length < 20) return
 
-      try {
-        icmExtract(["extract", "--store-raw", "-p", project], output.slice(0, 4000))
-      } catch {
-        // silent
+      // Enqueue only (cheap, no model load), then drain once per
+      // DRAIN_EVERY enqueues in a detached process — see issue #239.
+      icmEnqueue(project, output.slice(0, 8000))
+      enqueueCount++
+      if (enqueueCount >= DRAIN_EVERY) {
+        enqueueCount = 0
+        icmDrainDetached()
       }
     },
 
@@ -109,11 +139,11 @@ export const IcmPlugin: Plugin = async ({ $, directory }) => {
 
       if (text.length < 50) return
 
-      try {
-        icmExtract(["extract", "--store-raw", "-p", project], text)
-      } catch {
-        // silent
-      }
+      // Compaction is a natural flush point: enqueue the conversation
+      // slice and drain the whole queue once in a detached process.
+      icmEnqueue(project, text)
+      enqueueCount = 0
+      icmDrainDetached()
     },
 
     // Layer 2: log on session creation. OpenCode's `session.created` hook

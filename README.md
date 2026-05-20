@@ -18,6 +18,26 @@
 
 ---
 
+> ⚠️ **Project status: experimental**
+>
+> ICM is pre-1.0 and under active development. Breaking changes can land
+> in any minor release, and hooks/MCP configuration formats may shift.
+>
+> That said, I (the maintainer) use ICM every day as my primary AI
+> coding memory layer — it's experimental in API stability, not in
+> day-to-day usefulness.
+>
+> My focus is currently on [rtk](https://github.com/rtk-ai/rtk); ICM
+> updates are merged on a best-effort cadence. Issues and pull requests
+> are welcome but may take longer to review than usual.
+>
+> ICM is Apache-2.0 licensed and ships **as-is, without warranty of any
+> kind** (see [LICENSE](LICENSE)). Before any destructive operation, run
+> the read-only equivalent first (`icm uninstall --dry-run`,
+> `icm uninstall --check`).
+
+---
+
 ICM gives your AI agent a real memory — not a note-taking tool, not a context manager, a **memory**.
 
 ```
@@ -46,6 +66,34 @@ ICM gives your AI agent a real memory — not a note-taking tool, not a context 
 - **Memories** — store/recall with temporal decay by importance. Critical memories never fade, low-importance ones decay naturally. Filter by topic or keyword.
 - **Memoirs** — permanent knowledge graphs. Concepts linked by typed relations (`depends_on`, `contradicts`, `superseded_by`, ...). Filter by label.
 - **Feedback** — record corrections when AI predictions are wrong. Search past mistakes before making new predictions. Closed-loop learning.
+
+## One memory, every AI tool — no re-explaining
+
+The point of ICM: **you stop re-explaining context every time you switch
+AI tools**. Tell Claude Code about your project's auth strategy on
+Monday — Tuesday's Gemini session already knows it. Hit a Postgres
+indexing gotcha in a Codex run — next week's Cursor session finds the
+fix in `errors-resolved`.
+
+This works because every AI tool you configure with `icm init` reads
+and writes the **same SQLite database** at the OS-standard data
+location (e.g. `~/.local/share/icm/memories.db` on Linux,
+`~/Library/Application Support/icm/memories.db` on macOS,
+`%APPDATA%\icm\icm\data\memories.db` on Windows):
+
+- A `icm store -t decisions-myapp -c "..."` from Claude Code is
+  immediately visible to Codex, Gemini, Cursor, Roo, Amp, Aider, ...
+- `icm recall "query"` from any tool searches the same corpus.
+- Topics (`decisions-myapp`, `preferences`, `errors-resolved`, ...)
+  are global — there is no per-tool partition.
+
+The [multi-agent benchmark](#multi-agent-unified-memory) below confirms
+it end-to-end: facts seeded through ICM are recalled with 100% accuracy
+by Claude Code, Gemini CLI, Copilot CLI, Cursor Agent, and Aider —
+**98% cross-agent efficiency** on the standard test.
+
+If you want isolation (per-project, per-tool, etc.) pass `--db <path>`
+or set `ICM_DB_PATH`; each path is an independent corpus.
 
 ## Install
 

@@ -86,8 +86,10 @@ pub struct ExtractionConfig {
     /// the configured LLM CLI. See `icm extract-pending` and the
     /// SessionEnd async trigger.
     ///
-    /// `provider = "none"` (default) keeps the existing inline fastembed
-    /// behavior so this feature is fully opt-in and zero-regression.
+    /// Defaults to `auto`: ICM detects an installed LLM CLI and uses the
+    /// async queue path. With no CLI installed, `extract-pending` drains
+    /// via a batched fastembed pass. Set `provider = "none"` explicitly
+    /// to force the legacy per-fire inline fastembed behavior.
     pub summarizer: SummarizerConfig,
 }
 
@@ -235,8 +237,15 @@ impl Default for ExtractionConfig {
             max_facts: 20,
             extract_every: 3,
             store_raw: true,
-            // Default = none → inline fastembed path, no behavior change.
-            summarizer: SummarizerConfig::default(),
+            // Default = auto: detect an installed LLM CLI and route
+            // extraction through the #219 async queue (~50ms hooks, no
+            // fastembed load). `extract-pending` falls back to a batched
+            // fastembed drain when no CLI is found. Shipping `none` here
+            // left every default install on the heavy inline path (#239).
+            summarizer: SummarizerConfig {
+                provider: "auto".into(),
+                ..SummarizerConfig::default()
+            },
         }
     }
 }

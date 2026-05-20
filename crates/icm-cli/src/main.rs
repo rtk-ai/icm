@@ -6,12 +6,14 @@ mod config;
 mod extract;
 mod extract_semantic;
 mod import;
+mod install_manifest;
 #[cfg(test)]
 mod learn_tests;
 mod recall_format;
 mod summarizer;
 #[cfg(feature = "tui")]
 mod tui;
+mod uninstall;
 mod upgrade;
 #[cfg(feature = "web")]
 mod web;
@@ -303,10 +305,28 @@ enum Commands {
         /// are left untouched, even if their binary path no longer exists.
         #[arg(short, long)]
         force: bool,
+
+        /// Also write project-level instruction files into the current
+        /// directory (`CLAUDE.md`, `AGENTS.md`, `.windsurfrules`,
+        /// `.aider.conventions.md`, `.github/copilot-instructions.md`).
+        /// Default behavior writes only to global per-tool paths
+        /// (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, etc.) so init
+        /// doesn't pollute every project tree.
+        #[arg(long)]
+        per_project: bool,
     },
 
     /// Diagnose ICM integration: check hook binary paths in Claude Code settings
     Doctor,
+
+    /// Reverse `icm init`: remove ICM config from every detected AI tool.
+    ///
+    /// Default behavior: timestamped backups under
+    /// `~/.icm-uninstall-backups/<ts>/`, preserves your SQLite memory DB.
+    /// Use `--purge-data` to delete the DB and fastembed cache too.
+    /// Use `--dry-run` or `--audit` for a preview; `--check` for an exit-code
+    /// signal (0 = clean). See issue #229.
+    Uninstall(uninstall::UninstallOpts),
 
     /// Run performance benchmark on in-memory store
     Bench {
@@ -332,6 +352,14 @@ enum Commands {
         /// Store raw text as low-importance memory when no facts are extracted
         #[arg(long)]
         store_raw: bool,
+
+        /// Queue the raw text for deferred extraction instead of running
+        /// the embedder inline. ~50ms, no model load — drain later with
+        /// `icm extract-pending`. Editor hooks use this so the fastembed
+        /// model is loaded once per drain instead of once per tool call
+        /// (issue #239: CPU/RAM spikes on every read).
+        #[arg(long)]
+        enqueue: bool,
     },
 
     /// Import conversations from external sources (Claude.ai, ChatGPT, Claude Code, Slack, text)
@@ -1085,9 +1113,21 @@ fn main() -> Result<()> {
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
     let db_path = cli_db.clone().unwrap_or_else(default_db_path);
+
+    // `icm uninstall` must NOT open the SQLite store: a default
+    // `open_store` call would recreate the DB directory and WAL/SHM files
+    // immediately after `--purge-data` removed them, leaving the user's
+    // data dir non-empty even though the run reported success. Dispatch
+    // it before `open_store` runs.
+    let command = cli.command;
+    if let Commands::Uninstall(opts) = command {
+        let code = uninstall::run(opts)?;
+        std::process::exit(code);
+    }
+
     let store = open_store(cli_db, embedding_dims)?;
 
-    match cli.command {
+    match command {
         Commands::Store {
             topic,
             content,
@@ -1227,14 +1267,18 @@ fn main() -> Result<()> {
             provider,
             model,
             dry_run,
-        } => cmd_extract_pending(
-            &store,
-            &cfg.extraction.summarizer,
-            limit,
-            provider.as_deref(),
-            model.as_deref(),
-            dry_run,
-        ),
+        } => {
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            cmd_extract_pending(
+                &store,
+                emb_ref,
+                &cfg.extraction.summarizer,
+                limit,
+                provider.as_deref(),
+                model.as_deref(),
+                dry_run,
+            )
+        }
         Commands::Decay { factor } => cmd_decay(&store, factor),
         Commands::Prune { threshold, dry_run } => cmd_prune(&store, threshold, dry_run),
         Commands::Consolidate {
@@ -1316,16 +1360,26 @@ fn main() -> Result<()> {
                 cmd_memoir_distill(&store, &from_topic, &into)
             }
         },
-        Commands::Init { mode, force } => cmd_init(mode, force),
+        Commands::Init {
+            mode,
+            force,
+            per_project,
+        } => cmd_init(mode, force, per_project),
         Commands::Doctor => cmd_doctor(),
+        Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
         Commands::Extract {
             project,
             text,
             dry_run,
             store_raw,
+            enqueue,
         } => {
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            cmd_extract(&store, emb_ref, &project, text, dry_run, store_raw)
+            if enqueue {
+                cmd_extract_enqueue(&store, &project, text)
+            } else {
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                cmd_extract(&store, emb_ref, &project, text, dry_run, store_raw)
+            }
         }
         Commands::Import {
             path,
@@ -3252,7 +3306,7 @@ fn portable_command_path(path: &Path) -> String {
 /// `C:/.../icm.exe hook pre` was missed by every detect site (init
 /// idempotency, doctor binary check, codex/copilot injectors), so init
 /// re-injected duplicates and doctor reported zero hooks.
-fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
+pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     if cmd.contains(pattern) {
         return true;
     }
@@ -3266,7 +3320,7 @@ fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     cmd.contains(&format!("{pattern}.exe"))
 }
 
-fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
+fn cmd_init(mode: InitMode, force: bool, per_project: bool) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
     let home = home_dir_str()?;
@@ -3285,6 +3339,19 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
     let do_skill = matches!(mode, InitMode::Skill | InitMode::All | InitMode::Standard);
     let do_hook = matches!(mode, InitMode::Hook | InitMode::All | InitMode::Standard);
 
+    // Shared across every mode for tool detection.
+    let vscode_data = if cfg!(target_os = "macos") {
+        PathBuf::from(&home).join("Library/Application Support/Code/User")
+    } else {
+        PathBuf::from(&home).join(".config/Code/User")
+    };
+
+    // Load (or create) the install manifest. Every configured path gets
+    // recorded so a future `icm uninstall` doesn't have to derive the
+    // surface from a hard-coded mirror of this function.
+    let manifest_path = install_manifest::default_manifest_path();
+    let mut manifest = install_manifest::InstallManifest::load(&manifest_path)?;
+
     // --- MCP mode: configure MCP servers for all detected tools ---
     if do_mcp {
         let icm_server_entry = serde_json::json!({
@@ -3292,12 +3359,6 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
             "args": ["serve"],
             "env": {}
         });
-
-        let vscode_data = if cfg!(target_os = "macos") {
-            PathBuf::from(&home).join("Library/Application Support/Code/User")
-        } else {
-            PathBuf::from(&home).join(".config/Code/User")
-        };
 
         // Claude Code's legacy MCP config lives at `~/.claude.json` (a
         // sibling of `~/.claude/`). When the user has set
@@ -3374,6 +3435,13 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
                 println!("[mcp] {name:<16} skipped (not detected)");
                 continue;
             }
+            if let Ok(entry) = install_manifest::InstallManifest::entry_from_disk(
+                config_path,
+                name,
+                install_manifest::EntryKind::JsonMcpServer,
+            ) {
+                manifest.record(entry);
+            }
             let status = inject_mcp_server(config_path, "icm", &icm_server_entry, key)?;
             println!("[mcp] {name:<16} {status}");
         }
@@ -3387,6 +3455,13 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         if !force && !detect_tool("Zed", &home, &vscode_data) {
             println!("[mcp] {:<16} skipped (not detected)", "Zed");
         } else {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &zed_path,
+                "Zed",
+                install_manifest::EntryKind::JsonMcpServer,
+            ) {
+                manifest.record(e);
+            }
             let zed_status = inject_zed_mcp_server(&zed_path, "icm", &icm_bin_str)?;
             println!("[mcp] {:<16} {zed_status}", "Zed");
         }
@@ -3396,6 +3471,13 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         if !force && !detect_tool("Codex CLI", &home, &vscode_data) {
             println!("[mcp] {:<16} skipped (not detected)", "Codex CLI");
         } else {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &codex_path,
+                "Codex CLI",
+                install_manifest::EntryKind::TomlMcpServer,
+            ) {
+                manifest.record(e);
+            }
             let codex_status = inject_codex_mcp_server(&codex_path, "icm", &icm_bin_str)?;
             println!("[mcp] {:<16} {codex_status}", "Codex CLI");
         }
@@ -3405,6 +3487,13 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         if !force && !detect_tool("OpenCode", &home, &vscode_data) {
             println!("[mcp] {:<16} skipped (not detected)", "OpenCode");
         } else {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &opencode_path,
+                "OpenCode",
+                install_manifest::EntryKind::JsonMcpServer,
+            ) {
+                manifest.record(e);
+            }
             let opencode_status = inject_opencode_mcp_server(&opencode_path, "icm", &icm_bin_str)?;
             println!("[mcp] {:<16} {opencode_status}", "OpenCode");
         }
@@ -3414,6 +3503,13 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         if !force && !detect_tool("Copilot CLI", &home, &vscode_data) {
             println!("[mcp] {:<16} skipped (not detected)", "Copilot CLI");
         } else {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &copilot_path,
+                "Copilot CLI",
+                install_manifest::EntryKind::JsonMcpServer,
+            ) {
+                manifest.record(e);
+            }
             let copilot_status = inject_copilot_cli_mcp_server(&copilot_path, "icm", &icm_bin_str)?;
             println!("[mcp] {:<16} {copilot_status}", "Copilot CLI");
         }
@@ -3423,12 +3519,30 @@ fn cmd_init(mode: InitMode, force: bool) -> Result<()> {
         if !force && !detect_tool("Continue.dev", &home, &vscode_data) {
             println!("[mcp] {:<16} skipped (not detected)", "Continue.dev");
         } else {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &continue_path,
+                "Continue.dev",
+                install_manifest::EntryKind::YamlContinue,
+            ) {
+                manifest.record(e);
+            }
             let continue_status = inject_continue_mcp_server(&continue_path, "icm", &icm_bin_str)?;
             println!("[mcp] {:<16} {continue_status}", "Continue.dev");
         }
     }
 
     // --- CLI mode: inject instructions into each tool's file ---
+    //
+    // Two write surfaces:
+    //   - GLOBAL paths (the default): each tool's HOME-level instruction
+    //     file. Claude Code reads CLAUDE.md upward to $HOME, Codex
+    //     scans for AGENTS.md, Gemini reads ~/.gemini/GEMINI.md, etc.
+    //     One file per tool, used across every project.
+    //   - PROJECT paths (the `--per-project` flag): cwd-level files for
+    //     tools that only support per-project (Copilot, Windsurf,
+    //     Aider) or for users who want project-specific overrides.
+    //     This is the pre-fix/init-secure behaviour, kept available
+    //     opt-in.
     if do_cli {
         let cwd = std::env::current_dir().context("failed to get current directory")?;
 
@@ -3466,19 +3580,84 @@ icm topics                                # list all topics\n\
 ```\n\
 <!-- icm:end -->";
 
-        // Each AI tool uses its own instruction file
-        let instruction_files: Vec<(&str, PathBuf)> = vec![
-            ("Claude Code", cwd.join("CLAUDE.md")),
-            ("Codex", cwd.join("AGENTS.md")),
-            ("Gemini", gemini_dir.join("GEMINI.md")),
-            ("Copilot", cwd.join(".github/copilot-instructions.md")),
-            ("Windsurf", cwd.join(".windsurfrules")),
-            ("Aider", cwd.join(".aider.conventions.md")),
+        // Global write targets: (tool_label, detect_name, path).
+        // Tools that support a HOME-level instruction file get one here
+        // and the cwd file is only written when --per-project is set.
+        let global_files: Vec<(&str, &str, PathBuf)> = vec![
+            ("Claude Code", "Claude Code", claude_dir.join("CLAUDE.md")),
+            ("Codex", "Codex CLI", codex_dir.join("AGENTS.md")),
+            ("Gemini", "Gemini", gemini_dir.join("GEMINI.md")),
         ];
 
-        for (tool_name, path) in &instruction_files {
+        // Project-only write targets (no global equivalent at the tool):
+        // Copilot, Windsurf, Aider only support per-project context
+        // files. Skipped unless --per-project is given.
+        let project_only_files: Vec<(&str, &str, PathBuf)> = vec![
+            (
+                "Copilot",
+                "Copilot CLI",
+                cwd.join(".github/copilot-instructions.md"),
+            ),
+            ("Windsurf", "Windsurf", cwd.join(".windsurfrules")),
+            ("Aider", "Aider", cwd.join(".aider.conventions.md")),
+        ];
+
+        for (label, detect, path) in &global_files {
+            if !force && !detect_tool(detect, &home, &vscode_data) {
+                println!("[cli] {label:<16} skipped (not detected)");
+                continue;
+            }
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                path,
+                label,
+                install_manifest::EntryKind::MarkdownBlock,
+            ) {
+                manifest.record(e);
+            }
             let status = inject_icm_block(path, icm_block)?;
-            println!("[cli] {tool_name:<16} {status}");
+            println!("[cli] {label:<16} {status}");
+
+            // With --per-project, also drop the cwd-level marker so
+            // users who manually open this project in a fresh editor
+            // session still get the bloc in-tree.
+            if per_project {
+                let cwd_path = match *label {
+                    "Claude Code" => Some(cwd.join("CLAUDE.md")),
+                    "Codex" => Some(cwd.join("AGENTS.md")),
+                    _ => None,
+                };
+                if let Some(p) = cwd_path {
+                    if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                        &p,
+                        label,
+                        install_manifest::EntryKind::MarkdownBlock,
+                    ) {
+                        manifest.record(e);
+                    }
+                    let status = inject_icm_block(&p, icm_block)?;
+                    println!("[cli] {label:<16} (cwd) {status}");
+                }
+            }
+        }
+
+        for (label, detect, path) in &project_only_files {
+            if !per_project {
+                println!("[cli] {label:<16} skipped (project-level only — pass --per-project)");
+                continue;
+            }
+            if !force && !detect_tool(detect, &home, &vscode_data) {
+                println!("[cli] {label:<16} skipped (not detected)");
+                continue;
+            }
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                path,
+                label,
+                install_manifest::EntryKind::MarkdownBlock,
+            ) {
+                manifest.record(e);
+            }
+            let status = inject_icm_block(path, icm_block)?;
+            println!("[cli] {label:<16} {status}");
         }
     }
 
@@ -3503,18 +3682,31 @@ icm store -t \"note\" -c \"$ARGUMENTS\"
 
         // Claude Code: ~/.claude/commands/ (or $CLAUDE_CONFIG_DIR/commands/)
         let claude_skills_dir = claude_dir.join("commands");
-        install_skill(
-            &claude_skills_dir,
-            "recall.md",
-            icm_recall_prompt,
-            "Claude Code /recall",
-        )?;
-        install_skill(
-            &claude_skills_dir,
-            "remember.md",
-            icm_remember_prompt,
-            "Claude Code /remember",
-        )?;
+        if force || detect_tool("Claude Code", &home, &vscode_data) {
+            for fname in ["recall.md", "remember.md"] {
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &claude_skills_dir.join(fname),
+                    "Claude Code skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+            }
+            install_skill(
+                &claude_skills_dir,
+                "recall.md",
+                icm_recall_prompt,
+                "Claude Code /recall",
+            )?;
+            install_skill(
+                &claude_skills_dir,
+                "remember.md",
+                icm_remember_prompt,
+                "Claude Code /remember",
+            )?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "Claude Code");
+        }
 
         // Cursor: ~/.cursor/rules/ (project or global)
         let cursor_rules_dir = PathBuf::from(&home).join(".cursor/rules");
@@ -3541,230 +3733,326 @@ icm recall \"query\"
 
 Do this BEFORE responding to the user. Not optional.
 ";
-        install_skill(&cursor_rules_dir, "icm.mdc", cursor_icm_rule, "Cursor rule")?;
+        if force || detect_tool("Cursor", &home, &vscode_data) {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &cursor_rules_dir.join("icm.mdc"),
+                "Cursor rule",
+                install_manifest::EntryKind::OwnedFile,
+            ) {
+                manifest.record(e);
+            }
+            install_skill(&cursor_rules_dir, "icm.mdc", cursor_icm_rule, "Cursor rule")?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "Cursor");
+        }
 
         // Roo Code: ~/.roo/rules/ (global)
         let roo_rules_dir = PathBuf::from(&home).join(".roo/rules");
-        install_skill(&roo_rules_dir, "icm.md", cursor_icm_rule, "Roo Code rule")?;
+        if force || detect_tool("Roo Code", &home, &vscode_data) {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &roo_rules_dir.join("icm.md"),
+                "Roo Code rule",
+                install_manifest::EntryKind::OwnedFile,
+            ) {
+                manifest.record(e);
+            }
+            install_skill(&roo_rules_dir, "icm.md", cursor_icm_rule, "Roo Code rule")?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "Roo Code");
+        }
 
         // Amp: ~/.config/amp/skills/
         let amp_skills_dir = PathBuf::from(&home).join(".config/amp/skills");
-        install_skill(
-            &amp_skills_dir,
-            "icm-recall.md",
-            icm_recall_prompt,
-            "Amp /icm-recall",
-        )?;
-        install_skill(
-            &amp_skills_dir,
-            "icm-remember.md",
-            icm_remember_prompt,
-            "Amp /icm-remember",
-        )?;
+        if force || detect_tool("Amp", &home, &vscode_data) {
+            for fname in ["icm-recall.md", "icm-remember.md"] {
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &amp_skills_dir.join(fname),
+                    "Amp skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+            }
+            install_skill(
+                &amp_skills_dir,
+                "icm-recall.md",
+                icm_recall_prompt,
+                "Amp /icm-recall",
+            )?;
+            install_skill(
+                &amp_skills_dir,
+                "icm-remember.md",
+                icm_remember_prompt,
+                "Amp /icm-remember",
+            )?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "Amp");
+        }
     }
 
-    // --- Hook mode: install Claude Code hooks (full Rust, no shell scripts) ---
+    // --- Hook mode: install hooks for each detected tool ---
     if do_hook {
         let claude_settings_path = claude_dir.join("settings.json");
+        let claude_installed = force || detect_tool("Claude Code", &home, &vscode_data);
 
-        // PreToolUse hook: `icm hook pre` (auto-allow icm commands)
-        let pre_cmd = format!("{} hook pre", icm_bin_str);
-        let pre_status = inject_settings_hook(
-            &claude_settings_path,
-            "PreToolUse",
-            &pre_cmd,
-            Some("Bash"),
-            &["icm-pretool", "icm hook pre"],
-            force,
-        )?;
-        println!("[hook] Claude Code PreToolUse (auto-allow): {pre_status}");
+        if !claude_installed {
+            println!("[hook] {:<16} skipped (not detected)", "Claude Code");
+        } else {
+            // Record manifest once for this file before any mutation.
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &claude_settings_path,
+                "Claude Code hooks",
+                install_manifest::EntryKind::JsonHooks,
+            ) {
+                manifest.record(e);
+            }
+        }
 
-        // PostToolUse hook: `icm hook post` (auto-extract context)
-        let post_cmd = format!("{} hook post", icm_bin_str);
-        let post_status = inject_settings_hook(
-            &claude_settings_path,
-            "PostToolUse",
-            &post_cmd,
-            None,
-            &["icm hook", "icm-post-tool"],
-            force,
-        )?;
-        println!("[hook] Claude Code PostToolUse (auto-extract): {post_status}");
+        if claude_installed {
+            // PreToolUse hook: `icm hook pre` (auto-allow icm commands)
+            let pre_status = inject_settings_hook(
+                &claude_settings_path,
+                "PreToolUse",
+                &format!("{} hook pre", icm_bin_str),
+                Some("Bash"),
+                &["icm-pretool", "icm hook pre"],
+                force,
+            )?;
+            println!("[hook] Claude Code PreToolUse (auto-allow): {pre_status}");
 
-        // PreCompact hook: `icm hook compact` (extract from transcript before compression)
-        let compact_cmd = format!("{} hook compact", icm_bin_str);
-        let compact_status = inject_settings_hook(
-            &claude_settings_path,
-            "PreCompact",
-            &compact_cmd,
-            None,
-            &["icm hook", "icm-post-tool"],
-            force,
-        )?;
-        println!("[hook] Claude Code PreCompact (transcript extract): {compact_status}");
+            // PostToolUse hook: `icm hook post` (auto-extract context)
+            let post_status = inject_settings_hook(
+                &claude_settings_path,
+                "PostToolUse",
+                &format!("{} hook post", icm_bin_str),
+                None,
+                &["icm hook", "icm-post-tool"],
+                force,
+            )?;
+            println!("[hook] Claude Code PostToolUse (auto-extract): {post_status}");
 
-        // UserPromptSubmit hook: `icm hook prompt` (recall context on each prompt)
-        let prompt_cmd = format!("{} hook prompt", icm_bin_str);
-        let prompt_status = inject_settings_hook(
-            &claude_settings_path,
-            "UserPromptSubmit",
-            &prompt_cmd,
-            None,
-            &["icm hook", "icm-post-tool"],
-            force,
-        )?;
-        println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
+            // PreCompact: extract from transcript before compression
+            let compact_status = inject_settings_hook(
+                &claude_settings_path,
+                "PreCompact",
+                &format!("{} hook compact", icm_bin_str),
+                None,
+                &["icm hook", "icm-post-tool"],
+                force,
+            )?;
+            println!("[hook] Claude Code PreCompact (transcript extract): {compact_status}");
 
-        // SessionStart hook: `icm hook start` (inject wake-up pack of critical facts)
-        let start_cmd = format!("{} hook start", icm_bin_str);
-        let start_status = inject_settings_hook(
-            &claude_settings_path,
-            "SessionStart",
-            &start_cmd,
-            None,
-            &["icm hook start", "icm hook", "icm-post-tool"],
-            force,
-        )?;
-        println!("[hook] Claude Code SessionStart (wake-up pack): {start_status}");
+            // UserPromptSubmit: recall context on each prompt
+            let prompt_status = inject_settings_hook(
+                &claude_settings_path,
+                "UserPromptSubmit",
+                &format!("{} hook prompt", icm_bin_str),
+                None,
+                &["icm hook", "icm-post-tool"],
+                force,
+            )?;
+            println!("[hook] Claude Code UserPromptSubmit (auto-recall): {prompt_status}");
 
-        // SessionEnd hook: `icm hook end` (extract from transcript before /exit, /clear, etc.)
-        // Catches the path PreCompact misses — compaction does not fire on /clear.
-        let end_cmd = format!("{} hook end", icm_bin_str);
-        let end_status = inject_settings_hook(
-            &claude_settings_path,
-            "SessionEnd",
-            &end_cmd,
-            None,
-            &["icm hook end", "icm hook", "icm-post-tool"],
-            force,
-        )?;
-        println!("[hook] Claude Code SessionEnd (transcript extract): {end_status}");
+            // SessionStart: inject wake-up pack of critical facts
+            let start_status = inject_settings_hook(
+                &claude_settings_path,
+                "SessionStart",
+                &format!("{} hook start", icm_bin_str),
+                None,
+                &["icm hook start", "icm hook", "icm-post-tool"],
+                force,
+            )?;
+            println!("[hook] Claude Code SessionStart (wake-up pack): {start_status}");
+
+            // SessionEnd: extract before /exit, /clear (PreCompact doesn't fire on /clear).
+            let end_status = inject_settings_hook(
+                &claude_settings_path,
+                "SessionEnd",
+                &format!("{} hook end", icm_bin_str),
+                None,
+                &["icm hook end", "icm hook", "icm-post-tool"],
+                force,
+            )?;
+            println!("[hook] Claude Code SessionEnd (transcript extract): {end_status}");
+        }
 
         // OpenCode plugin: install TS plugin using native @opencode-ai/plugin SDK
         let opencode_plugins_dir = PathBuf::from(&home).join(".config/opencode/plugins");
         let opencode_plugin_path = opencode_plugins_dir.join("icm.ts");
-        // Remove old .js plugin if it exists
-        let old_js_plugin = opencode_plugins_dir.join("icm.js");
-        if old_js_plugin.exists() {
-            std::fs::remove_file(&old_js_plugin).ok();
-        }
-        if opencode_plugin_path.exists() {
-            println!("[hook] OpenCode plugin: already configured");
+        if force || detect_tool("OpenCode", &home, &vscode_data) {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &opencode_plugin_path,
+                "OpenCode plugin",
+                install_manifest::EntryKind::OwnedFile,
+            ) {
+                manifest.record(e);
+            }
+            let old_js_plugin = opencode_plugins_dir.join("icm.js");
+            if old_js_plugin.exists() {
+                std::fs::remove_file(&old_js_plugin).ok();
+            }
+            if opencode_plugin_path.exists() {
+                println!("[hook] OpenCode plugin: already configured");
+            } else {
+                std::fs::create_dir_all(&opencode_plugins_dir).ok();
+                let plugin_content = include_str!("../../../plugins/opencode-icm.ts");
+                std::fs::write(&opencode_plugin_path, plugin_content)
+                    .with_context(|| format!("cannot write {}", opencode_plugin_path.display()))?;
+                println!("[hook] OpenCode plugin: installed");
+            }
         } else {
-            std::fs::create_dir_all(&opencode_plugins_dir).ok();
-            let plugin_content = include_str!("../../../plugins/opencode-icm.ts");
-            std::fs::write(&opencode_plugin_path, plugin_content)
-                .with_context(|| format!("cannot write {}", opencode_plugin_path.display()))?;
-            println!("[hook] OpenCode plugin: installed");
+            println!("[hook] {:<16} skipped (not detected)", "OpenCode");
         }
 
-        // --- Gemini CLI hooks (same settings.json format as Claude Code, different event names) ---
+        // --- Gemini CLI hooks (same shape as Claude, different event names) ---
         let gemini_settings_path = gemini_dir.join("settings.json");
         let detect = &["icm hook", "icm-post-tool"];
 
-        // SessionStart → same name in Gemini CLI
-        let status = inject_settings_hook(
-            &gemini_settings_path,
-            "SessionStart",
-            &format!("{} hook start", icm_bin_str),
-            None,
-            &["icm hook start", "icm hook", "icm-post-tool"],
-            force,
-        )?;
-        println!("[hook] Gemini CLI SessionStart (wake-up pack): {status}");
+        if force || detect_tool("Gemini", &home, &vscode_data) {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &gemini_settings_path,
+                "Gemini CLI hooks",
+                install_manifest::EntryKind::JsonHooks,
+            ) {
+                manifest.record(e);
+            }
+            let status = inject_settings_hook(
+                &gemini_settings_path,
+                "SessionStart",
+                &format!("{} hook start", icm_bin_str),
+                None,
+                &["icm hook start", "icm hook", "icm-post-tool"],
+                force,
+            )?;
+            println!("[hook] Gemini CLI SessionStart (wake-up pack): {status}");
 
-        // BeforeTool → equivalent of PreToolUse (auto-allow icm commands)
-        // Gemini CLI uses "run_shell_command" as the Bash tool name
-        let status = inject_settings_hook(
-            &gemini_settings_path,
-            "BeforeTool",
-            &format!("{} hook pre", icm_bin_str),
-            Some("run_shell_command"),
-            &["icm-pretool", "icm hook pre"],
-            force,
-        )?;
-        println!("[hook] Gemini CLI BeforeTool (auto-allow): {status}");
+            let status = inject_settings_hook(
+                &gemini_settings_path,
+                "BeforeTool",
+                &format!("{} hook pre", icm_bin_str),
+                Some("run_shell_command"),
+                &["icm-pretool", "icm hook pre"],
+                force,
+            )?;
+            println!("[hook] Gemini CLI BeforeTool (auto-allow): {status}");
 
-        // AfterTool → equivalent of PostToolUse (auto-extract context)
-        let status = inject_settings_hook(
-            &gemini_settings_path,
-            "AfterTool",
-            &format!("{} hook post", icm_bin_str),
-            None,
-            detect,
-            force,
-        )?;
-        println!("[hook] Gemini CLI AfterTool (auto-extract): {status}");
+            let status = inject_settings_hook(
+                &gemini_settings_path,
+                "AfterTool",
+                &format!("{} hook post", icm_bin_str),
+                None,
+                detect,
+                force,
+            )?;
+            println!("[hook] Gemini CLI AfterTool (auto-extract): {status}");
 
-        // PreCompress → equivalent of PreCompact (extract from transcript)
-        let status = inject_settings_hook(
-            &gemini_settings_path,
-            "PreCompress",
-            &format!("{} hook compact", icm_bin_str),
-            None,
-            detect,
-            force,
-        )?;
-        println!("[hook] Gemini CLI PreCompress (transcript extract): {status}");
+            let status = inject_settings_hook(
+                &gemini_settings_path,
+                "PreCompress",
+                &format!("{} hook compact", icm_bin_str),
+                None,
+                detect,
+                force,
+            )?;
+            println!("[hook] Gemini CLI PreCompress (transcript extract): {status}");
 
-        // BeforeAgent → equivalent of UserPromptSubmit (auto-recall on each prompt)
-        let status = inject_settings_hook(
-            &gemini_settings_path,
-            "BeforeAgent",
-            &format!("{} hook prompt", icm_bin_str),
-            None,
-            detect,
-            force,
-        )?;
-        println!("[hook] Gemini CLI BeforeAgent (auto-recall): {status}");
+            let status = inject_settings_hook(
+                &gemini_settings_path,
+                "BeforeAgent",
+                &format!("{} hook prompt", icm_bin_str),
+                None,
+                detect,
+                force,
+            )?;
+            println!("[hook] Gemini CLI BeforeAgent (auto-recall): {status}");
+        } else {
+            println!("[hook] {:<16} skipped (not detected)", "Gemini");
+        }
 
         // --- Codex CLI hooks (separate hooks.json file) ---
         let codex_hooks_path = codex_dir.join("hooks.json");
 
-        let status = inject_codex_hook(
-            &codex_hooks_path,
-            "SessionStart",
-            &format!("{} hook start", icm_bin_str),
-            None,
-            &["icm hook start", "icm hook"],
-        )?;
-        println!("[hook] Codex CLI SessionStart (wake-up pack): {status}");
+        if force || detect_tool("Codex CLI", &home, &vscode_data) {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &codex_hooks_path,
+                "Codex CLI hooks",
+                install_manifest::EntryKind::JsonHooks,
+            ) {
+                manifest.record(e);
+            }
+            let status = inject_codex_hook(
+                &codex_hooks_path,
+                "SessionStart",
+                &format!("{} hook start", icm_bin_str),
+                None,
+                &["icm hook start", "icm hook"],
+            )?;
+            println!("[hook] Codex CLI SessionStart (wake-up pack): {status}");
 
-        let status = inject_codex_hook(
-            &codex_hooks_path,
-            "PreToolUse",
-            &format!("{} hook pre", icm_bin_str),
-            Some("Bash"),
-            &["icm-pretool", "icm hook pre"],
-        )?;
-        println!("[hook] Codex CLI PreToolUse (auto-allow): {status}");
+            let status = inject_codex_hook(
+                &codex_hooks_path,
+                "PreToolUse",
+                &format!("{} hook pre", icm_bin_str),
+                Some("Bash"),
+                &["icm-pretool", "icm hook pre"],
+            )?;
+            println!("[hook] Codex CLI PreToolUse (auto-allow): {status}");
 
-        let status = inject_codex_hook(
-            &codex_hooks_path,
-            "PostToolUse",
-            &format!("{} hook post", icm_bin_str),
-            None,
-            detect,
-        )?;
-        println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+            let status = inject_codex_hook(
+                &codex_hooks_path,
+                "PostToolUse",
+                &format!("{} hook post", icm_bin_str),
+                None,
+                detect,
+            )?;
+            println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
 
-        let status = inject_codex_hook(
-            &codex_hooks_path,
-            "UserPromptSubmit",
-            &format!("{} hook prompt", icm_bin_str),
-            None,
-            detect,
-        )?;
-        println!("[hook] Codex CLI UserPromptSubmit (auto-recall): {status}");
+            let status = inject_codex_hook(
+                &codex_hooks_path,
+                "UserPromptSubmit",
+                &format!("{} hook prompt", icm_bin_str),
+                None,
+                detect,
+            )?;
+            println!("[hook] Codex CLI UserPromptSubmit (auto-recall): {status}");
+        } else {
+            println!("[hook] {:<16} skipped (not detected)", "Codex CLI");
+        }
 
         // --- Copilot CLI hooks (user-global ~/.copilot/settings.json) ---
-        let copilot_status = inject_copilot_hooks(&copilot_dir, &icm_bin_str)?;
-        println!("[hook] Copilot CLI (all hooks): {copilot_status}");
+        if force || detect_tool("Copilot CLI", &home, &vscode_data) {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &copilot_dir.join("settings.json"),
+                "Copilot CLI hooks",
+                install_manifest::EntryKind::JsonCopilotHooks,
+            ) {
+                manifest.record(e);
+            }
+            let copilot_status = inject_copilot_hooks(&copilot_dir, &icm_bin_str)?;
+            println!("[hook] Copilot CLI (all hooks): {copilot_status}");
+        } else {
+            println!("[hook] {:<16} skipped (not detected)", "Copilot CLI");
+        }
+    }
+
+    // Persist the install manifest. Subsequent `icm uninstall` reads
+    // it instead of re-deriving paths from a hard-coded mirror of this
+    // function.
+    if !manifest.is_empty() {
+        manifest.save(&manifest_path)?;
     }
 
     println!();
-    println!("  binary: {icm_bin_str}");
-    println!("  db:     {}", default_db_path().display());
+    println!("  binary:   {icm_bin_str}");
+    println!("  db:       {}", default_db_path().display());
+    if !manifest.is_empty() {
+        println!(
+            "  manifest: {} ({} entr{})",
+            manifest_path.display(),
+            manifest.len(),
+            if manifest.len() == 1 { "y" } else { "ies" }
+        );
+    }
     println!();
     println!("Restart your AI tool to activate.");
 
@@ -4026,6 +4314,12 @@ fn inject_settings_hook(
     let mut config: Value = if settings_path.exists() {
         parse_json_config(settings_path)?
     } else {
+        // Create the parent directory eagerly. `inject_codex_hook` and
+        // friends already do this; without it, `icm init --mode hook`
+        // crashes on a fresh home when ~/.claude/ does not exist yet.
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
         serde_json::json!({})
     };
 
@@ -4279,7 +4573,7 @@ fn strip_jsonc_comments(content: &str) -> String {
 /// Parse a JSON config file with lenient parsing: accepts trailing commas
 /// and JSONC comments (// and /* */). This is the only place we use lenient
 /// parsing — all other JSON handling uses strict serde_json.
-fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
+pub(crate) fn parse_json_config(config_path: &std::path::Path) -> Result<Value> {
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("cannot read {}", config_path.display()))?;
     let clean = strip_jsonc_comments(&content);
@@ -4332,7 +4626,7 @@ pub(crate) fn home_dir_str() -> Result<String> {
 /// Falls back to `$HOME/{default_subdir}` if the env var is unset or empty.
 /// Mirrors how each tool documents its own override (CLAUDE_CONFIG_DIR,
 /// GEMINI_CONFIG_DIR, CODEX_HOME, COPILOT_HOME).
-fn cli_config_dir(env_var: &str, default_subdir: &str, home: &str) -> PathBuf {
+pub(crate) fn cli_config_dir(env_var: &str, default_subdir: &str, home: &str) -> PathBuf {
     match std::env::var(env_var) {
         Ok(custom) if !custom.is_empty() => PathBuf::from(custom),
         _ => PathBuf::from(home).join(default_subdir),
@@ -4387,6 +4681,8 @@ fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
         "Continue.dev" => {
             vscode_present() && vscode_data.join("globalStorage/continue.continue").exists()
         }
+        // Aider is a Python CLI (pip-installable); check the binary.
+        "Aider" => binary_in_path("aider"),
         _ => true,
     }
 }
@@ -4828,18 +5124,56 @@ fn resolve_consolidate_provider(
     })
 }
 
+/// Check whether `name` resolves to an executable file on `$PATH`.
+///
+/// Used by the extraction drain to decide whether a configured LLM CLI
+/// (claude/codex/gemini/ollama) is actually usable, or whether it should
+/// fall back to the fastembed extractor.
+fn cli_on_path(name: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&candidate)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
+}
+
 /// Process the async extraction queue.
 ///
-/// Reads up to `limit` oldest pending rows from `pending_extractions`,
-/// concatenates their raw outputs, asks the configured LLM CLI to extract
-/// decisions / architecture / preferences, parses the bullet response,
-/// and stores the results as Memory rows. Successfully-processed rows
-/// are deleted from the queue regardless of whether facts were
-/// extracted (so an output with no extractable content doesn't loop
-/// forever).
+/// Reads up to `limit` oldest pending rows from `pending_extractions`.
+///
+/// With an LLM provider configured, it concatenates their raw outputs,
+/// asks the configured LLM CLI to extract decisions / architecture /
+/// preferences, parses the bullet response, and stores the results as
+/// Memory rows.
+///
+/// With `provider = "none"`, or when the resolved CLI is not installed,
+/// it falls back to the fastembed extractor — but runs it **once** over
+/// the whole drained batch instead of once per hook fire. That is the
+/// deferred half of the issue #239 fix: editor hooks enqueue cheaply,
+/// and the heavy model load happens here, once per drain.
+///
+/// Successfully-processed rows are deleted from the queue regardless of
+/// whether facts were extracted (so an output with no extractable
+/// content doesn't loop forever).
 #[allow(clippy::too_many_arguments)]
 fn cmd_extract_pending(
     store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
     cfg: &config::SummarizerConfig,
     limit: usize,
     cli_provider: Option<&str>,
@@ -4852,13 +5186,60 @@ fn cmd_extract_pending(
         return Ok(());
     }
 
-    let provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
-    if matches!(provider_kind, summarizer::ProviderKind::None) {
-        bail!(
-            "extraction.summarizer.provider = \"none\" — nothing would be \
-             extracted. Set it to auto/claude/codex/gemini/ollama, or \
-             pass --provider on this command."
+    let mut provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
+    // `auto` always resolves to a concrete CLI provider (Claude is the
+    // ultimate fallback in `detect_provider`). If that CLI is not actually
+    // on PATH, the LLM drain would fail on every run and the queue would
+    // never empty — so downgrade to the batched fastembed path when the
+    // binary is missing.
+    if !matches!(provider_kind, summarizer::ProviderKind::None)
+        && !cli_on_path(provider_kind.as_str())
+    {
+        eprintln!(
+            "[extract-pending] '{}' CLI not found on PATH — draining with \
+             the fastembed extractor instead",
+            provider_kind.as_str()
         );
+        provider_kind = summarizer::ProviderKind::None;
+    }
+    if matches!(provider_kind, summarizer::ProviderKind::None) {
+        // No usable LLM CLI — drain with the fastembed extractor. The
+        // model loads once for this whole batch, instead of once per
+        // tool call as the pre-#239 hook path did.
+        let ids: Vec<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
+
+        if dry_run {
+            println!("=== Dry run (fastembed) ===");
+            println!("rows: {}", pending.len());
+            return Ok(());
+        }
+
+        let mut stored = 0usize;
+        for (_, project, _, raw, _) in &pending {
+            // Cap auto-extracted importance at Medium: queued tool
+            // output is untrusted (a malicious tool could emit
+            // decision-keyword text to poison wake-up).
+            match extract::extract_and_store_with_embedder(
+                store,
+                raw,
+                project,
+                false,
+                icm_core::Importance::Medium,
+                embedder,
+            ) {
+                Ok(n) => stored += n,
+                Err(e) => eprintln!("[extract-pending] fastembed row failed: {e}"),
+            }
+        }
+
+        let deleted = store.delete_pending_extractions(&ids)?;
+        println!(
+            "Processed {} rows (fastembed), extracted {} facts, dequeued {}.",
+            pending.len(),
+            stored,
+            deleted,
+        );
+        return Ok(());
     }
 
     // Build a single LLM prompt covering all rows. The prompt asks for
@@ -5154,6 +5535,49 @@ fn cmd_extract(
         )?;
         println!("Extracted and stored {stored} facts.");
     }
+    Ok(())
+}
+
+/// `icm extract --enqueue`: queue raw text into `pending_extractions`
+/// without touching the embedder.
+///
+/// Editor hooks (the OpenCode plugin, etc.) call this on every Nth tool
+/// call. The previous behavior shelled out to a full `icm extract`,
+/// which reloads the ~multilingual-e5-small ONNX model from scratch in
+/// each short-lived process (~3.7s CPU + a few hundred MB RAM). Reading
+/// many files therefore produced a model reload every few reads — the
+/// CPU/RAM spikes reported in issue #239. Enqueuing instead costs ~50ms
+/// and never loads the model; `icm extract-pending` drains the queue
+/// later, loading the model once for the whole batch.
+fn cmd_extract_enqueue(store: &SqliteStore, project: &str, text: Option<String>) -> Result<()> {
+    let input = match text {
+        Some(t) => t,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("failed to read stdin")?;
+            buf
+        }
+    };
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    // Cap to 8 KB — same bound as the PostToolUse async path. Long tool
+    // outputs are rare and their trailing slice carries the freshest
+    // context.
+    let capped = if trimmed.len() > 8192 {
+        &trimmed[trimmed.len() - 8192..]
+    } else {
+        trimmed
+    };
+
+    let id = store.enqueue_pending_extraction(project, "extract", capped)?;
+    eprintln!("[icm] enqueued raw text for deferred extraction (id={id})");
     Ok(())
 }
 

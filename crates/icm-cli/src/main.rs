@@ -76,6 +76,25 @@ enum Commands {
         raw: Option<String>,
     },
 
+    /// Shorthand for `store` with positional content. Topic defaults to the
+    /// auto-detected project name (git remote or cwd).
+    Remember {
+        /// Fact to remember
+        content: String,
+
+        /// Topic/category (default: auto-detected project name)
+        #[arg(short, long)]
+        topic: Option<String>,
+
+        /// Importance level
+        #[arg(short, long, default_value = "medium")]
+        importance: CliImportance,
+
+        /// Keywords (comma-separated)
+        #[arg(short, long)]
+        keywords: Option<String>,
+    },
+
     /// Search memories
     Recall {
         /// Search query
@@ -1145,6 +1164,26 @@ fn main() -> Result<()> {
                 raw,
             )
         }
+        Commands::Remember {
+            content,
+            topic,
+            importance,
+            keywords,
+        } => {
+            #[cfg(feature = "embeddings")]
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            #[cfg(not(feature = "embeddings"))]
+            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            cmd_remember(
+                &store,
+                emb_ref,
+                &cfg.memory,
+                content,
+                topic,
+                importance.into(),
+                keywords,
+            )
+        }
         Commands::Recall {
             query,
             topic,
@@ -1658,6 +1697,38 @@ fn cmd_store(
     maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
 
     Ok(())
+}
+
+/// `remember` is `store` with a positional content arg and an auto-detected
+/// topic when `--topic` is omitted.
+#[allow(clippy::too_many_arguments)]
+fn cmd_remember(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+    content: String,
+    topic: Option<String>,
+    importance: Importance,
+    keywords: Option<String>,
+) -> Result<()> {
+    if content.trim().is_empty() {
+        anyhow::bail!("content cannot be empty - provide something to remember");
+    }
+    let resolved_topic = topic.unwrap_or_else(|| {
+        let project = detect_project();
+        eprintln!("Project: {project}");
+        project
+    });
+    cmd_store(
+        store,
+        embedder,
+        memory_cfg,
+        resolved_topic,
+        content,
+        importance,
+        keywords,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3672,7 +3743,7 @@ Store the following in ICM memory: $ARGUMENTS
 
 Run:
 ```bash
-icm store -t \"note\" -c \"$ARGUMENTS\"
+icm remember \"$ARGUMENTS\"
 ```
 ";
 
@@ -8812,5 +8883,104 @@ mod hook_payload_tests {
             !out.is_empty(),
             "expected non-empty Write content, got {out:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod cmd_remember_tests {
+    //! Parse `icm remember ...` through clap so a broken variant
+    //! (wrong positional, swapped fields, dropped default) fails here
+    //! rather than only at runtime.
+    use super::*;
+
+    /// Positional content, default topic None, default importance medium.
+    #[test]
+    fn parses_positional_content_with_defaults() {
+        let cli = Cli::try_parse_from(["icm", "remember", "some fact"]).unwrap();
+        let Commands::Remember {
+            content,
+            topic,
+            importance,
+            keywords,
+        } = cli.command
+        else {
+            panic!("expected Commands::Remember");
+        };
+        assert_eq!(content, "some fact");
+        assert_eq!(topic, None);
+        assert!(matches!(importance, CliImportance::Medium));
+        assert_eq!(keywords, None);
+    }
+
+    /// `--topic` and `--importance` overrides land on the Remember variant.
+    #[test]
+    fn parses_topic_and_importance_overrides() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "remember",
+            "critical deployment constraint",
+            "--topic",
+            "preferences",
+            "--importance",
+            "high",
+        ])
+        .unwrap();
+        let Commands::Remember {
+            content,
+            topic,
+            importance,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Commands::Remember");
+        };
+        assert_eq!(content, "critical deployment constraint");
+        assert_eq!(topic.as_deref(), Some("preferences"));
+        assert!(matches!(importance, CliImportance::High));
+    }
+
+    /// Missing positional content is a parse error.
+    #[test]
+    fn missing_content_is_a_parse_error() {
+        assert!(Cli::try_parse_from(["icm", "remember"]).is_err());
+    }
+
+    /// `remember` appends; prior memories under the same topic stay intact.
+    #[test]
+    fn remember_appends_status_update_to_existing_memories() {
+        use icm_core::{Importance, MemoryStore};
+        use icm_store::SqliteStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let cfg = crate::config::MemoryConfig::default();
+
+        cmd_store(
+            &store,
+            None,
+            &cfg,
+            "icm".into(),
+            "TODO: wire FTS5 trigger for memory updates".into(),
+            Importance::Medium,
+            None,
+            None,
+        )
+        .unwrap();
+
+        cmd_remember(
+            &store,
+            None,
+            &cfg,
+            "FTS5 trigger now syncs on update; closes the recall gap".into(),
+            Some("icm".into()),
+            Importance::Medium,
+            None,
+        )
+        .unwrap();
+
+        let memories = store.get_by_topic("icm").unwrap();
+        assert_eq!(memories.len(), 2, "remember appends, never overwrites");
+        assert!(memories.iter().any(|m| m.summary.contains("TODO")));
+        assert!(memories
+            .iter()
+            .any(|m| m.summary.contains("closes the recall gap")));
     }
 }

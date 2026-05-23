@@ -45,6 +45,7 @@ directories = "6"
 
 # Caching
 lru = "0.18"
+cachedir = "0.3"
 
 # Filesystem walking (used by `icm uninstall --scan-dir`)
 walkdir = "2"

@@ -2279,18 +2279,19 @@ fn cmd_hook_pre() -> Result<()> {
         return Ok(());
     }
 
-    // Auto-allow: output hook response JSON
-    let tool_input = json
-        .get("tool_input")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
+    // Auto-allow: output hook response JSON.
+    //
+    // `updatedInput` is intentionally omitted — we are not rewriting the
+    // tool input, only granting permission. Including it as a passthrough
+    // worked on early Claude Code builds but codex-cli 0.130.0 rejects
+    // the response with "PreToolUse hook returned unsupported
+    // updatedInput" (issue #237), and the Claude Code spec lists the
+    // field as optional. Omitting it is forward-compatible.
     let response = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "permissionDecisionReason": "ICM auto-allow",
-            "updatedInput": tool_input
+            "permissionDecisionReason": "ICM auto-allow"
         }
     });
 
@@ -3570,7 +3571,7 @@ You MUST call `icm store` when ANY of the following happens:\n\
 \n\
 Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
-Do NOT store: trivial details, info already in CLAUDE.md, ephemeral state (build logs, git status).\n\
+Do NOT store: trivial details, info already in this file, ephemeral state (build logs, git status).\n\
 \n\
 ### Other commands\n\
 ```bash\n\

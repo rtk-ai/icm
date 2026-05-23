@@ -3746,11 +3746,37 @@ Run:
 icm remember \"$ARGUMENTS\"
 ```
 ";
+        let icm_remember_session_prompt = "\
+Checkpoint this session: store non-obvious, reusable lessons in ICM long-term memory.
 
+Target 3-10 pertinent stores total. Store the lesson, not the play-by-play. One fact per call, one sentence each, covering *what*, *why*, and *outcome*. Always pair a problem with its resolution if both happened this session; never store a gap alone. Anchor in VCS: prefer PR numbers and branch names. Feature-branch SHAs drift on amend; if you cite one, include the commit title so it stays grep-able.
+
+| Kind                         | Topic                  | Importance |
+| ---------------------------- | ---------------------- | ---------- |
+| Decision + reason            | `decisions-<project>`  | high       |
+| Error + root cause + fix     | `errors-resolved`      | high       |
+| User preference / correction | `preferences`          | critical   |
+| Pattern or invariant found   | `review-patterns`      | high       |
+| Significant work completed   | `context-<project>`    | high       |
+
+`<project>` = current project name (e.g. `decisions-icm`).
+
+Skip: facts derivable from code or `git log`, transient build state, anything already stored this session (on re-run, capture only the delta).
+
+Run:
+
+    icm remember \"<fact>\" --topic <topic> --importance <level> [--keywords \"k1,k2\"]
+
+Example:
+
+    icm remember \"Fixed flaky test by using fake timers; race condition only appeared under CI load\" --topic errors-resolved --importance high --keywords \"tests,flaky\"
+
+End with a one-line recap.
+";
         // Claude Code: ~/.claude/commands/ (or $CLAUDE_CONFIG_DIR/commands/)
         let claude_skills_dir = claude_dir.join("commands");
         if force || detect_tool("Claude Code", &home, &vscode_data) {
-            for fname in ["recall.md", "remember.md"] {
+            for fname in ["recall.md", "remember.md", "remember-session.md"] {
                 if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
                     &claude_skills_dir.join(fname),
                     "Claude Code skill",
@@ -3770,6 +3796,12 @@ icm remember \"$ARGUMENTS\"
                 "remember.md",
                 icm_remember_prompt,
                 "Claude Code /remember",
+            )?;
+            install_skill(
+                &claude_skills_dir,
+                "remember-session.md",
+                icm_remember_session_prompt,
+                "Claude Code /remember-session",
             )?;
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Claude Code");
@@ -3831,7 +3863,11 @@ Do this BEFORE responding to the user. Not optional.
         // Amp: ~/.config/amp/skills/
         let amp_skills_dir = PathBuf::from(&home).join(".config/amp/skills");
         if force || detect_tool("Amp", &home, &vscode_data) {
-            for fname in ["icm-recall.md", "icm-remember.md"] {
+            for fname in [
+                "icm-recall.md",
+                "icm-remember.md",
+                "icm-remember-session.md",
+            ] {
                 if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
                     &amp_skills_dir.join(fname),
                     "Amp skill",
@@ -3851,6 +3887,12 @@ Do this BEFORE responding to the user. Not optional.
                 "icm-remember.md",
                 icm_remember_prompt,
                 "Amp /icm-remember",
+            )?;
+            install_skill(
+                &amp_skills_dir,
+                "icm-remember-session.md",
+                icm_remember_session_prompt,
+                "Amp /icm-remember-session",
             )?;
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Amp");

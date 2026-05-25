@@ -449,7 +449,8 @@ enum Commands {
 
         /// Also write project-level instruction files into the current
         /// directory (`CLAUDE.md`, `AGENTS.md`, `.windsurfrules`,
-        /// `.aider.conventions.md`, `.github/copilot-instructions.md`).
+        /// `.aider.conventions.md`, `.github/copilot-instructions.md`)
+        /// and set up a project-local database under `.icm/`.
         /// Default behavior writes only to global per-tool paths
         /// (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, etc.) so init
         /// doesn't pollute every project tree.
@@ -1557,21 +1558,108 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("memories.db"))
 }
 
-fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<Store> {
-    let path = db.unwrap_or_else(default_db_path);
-    Store::with_dims(&path, embedding_dims).context("failed to open database")
+/// Detect the project root (git repository root) from the current directory.
+fn detect_project_root() -> Option<PathBuf> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(path))
+                }
+            } else {
+                None
+            }
+        })
+}
+
+/// Resolve database path using hierarchical resolution:
+///
+/// 1. `--db` CLI flag (highest priority)
+/// 2. `$ICM_DB` environment variable
+/// 3. Global config `[store].path` from config file
+/// 4. Project-local `.icm/config.toml` `[store].path` at git root
+/// 5. Project-local `.icm/memories.db` at git root (if file exists)
+/// 6. Default platform data directory
+fn resolve_db_path(cli_db: Option<PathBuf>, cfg: &config::Config) -> PathBuf {
+    // 1. --db CLI flag
+    if let Some(db) = cli_db {
+        return db;
+    }
+
+    // 2. $ICM_DB env var
+    if let Ok(env_db) = std::env::var("ICM_DB") {
+        let path = PathBuf::from(env_db);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+
+    // 3. Global config [store].path
+    if let Some(config_path) = &cfg.store.path {
+        let path = PathBuf::from(config_path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+
+    // 4. Project-local .icm/ directory (at git root)
+    if let Some(project_root) = detect_project_root() {
+        let icm_dir = project_root.join(".icm");
+        if icm_dir.is_dir() {
+            // 4a. .icm/config.toml with [store].path
+            let project_cfg = icm_dir.join("config.toml");
+            if project_cfg.exists() {
+                if let Ok(content) = std::fs::read_to_string(&project_cfg) {
+                    if let Ok(value) = content.parse::<toml::Value>() {
+                        if let Some(path_str) = value
+                            .get("store")
+                            .and_then(|s| s.get("path"))
+                            .and_then(|p| p.as_str())
+                        {
+                            let path = if Path::new(path_str).is_absolute() {
+                                PathBuf::from(path_str)
+                            } else {
+                                project_root.join(path_str)
+                            };
+                            if !path.as_os_str().is_empty() {
+                                return path;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4b. .icm/memories.db (if file exists)
+            let project_db = icm_dir.join("memories.db");
+            if project_db.exists() {
+                return project_db;
+            }
+        }
+    }
+
+    // 5. Default platform data dir
+    default_db_path()
+}
+
+fn open_store(db: PathBuf, embedding_dims: usize) -> Result<Store> {
+    Store::with_dims(&db, embedding_dims).context("failed to open database")
 }
 
 /// Open the store and, if `backup_cfg.enabled`, trigger an automatic backup
 /// when the last backup is older than `interval_days`. Backup errors are
 /// logged as warnings — they must not block the normal workflow.
 fn open_store_with_backup(
-    db: Option<PathBuf>,
+    path: PathBuf,
     embedding_dims: usize,
     backup_cfg: &crate::config::BackupConfig,
 ) -> Result<Store> {
-    let path = db.clone().unwrap_or_else(default_db_path);
-    let store = open_store(db, embedding_dims)?;
+    let store = open_store(path.clone(), embedding_dims)?;
 
     if backup_cfg.enabled && path.exists() {
         if backup_cfg.keep_backups == 0 {
@@ -1709,8 +1797,7 @@ fn cmd_backup(db_path: &std::path::Path, output: Option<&std::path::Path>) -> Re
 /// the same way as [`open_store`] and rejects with a helpful message
 /// if the DB doesn't exist yet — read-only mode cannot bootstrap a
 /// fresh DB.
-fn open_store_readonly(db: Option<PathBuf>) -> Result<Store> {
-    let path = db.unwrap_or_else(default_db_path);
+fn open_store_readonly(path: PathBuf) -> Result<Store> {
     Store::open_readonly(&path).with_context(|| {
         format!(
             "failed to open database read-only at {} \
@@ -1746,14 +1833,13 @@ fn read_only_requested(cli_flag: bool) -> bool {
 ///    `DEFAULT_EMBEDDING_DIMS` (fresh install, nothing to lose).
 fn resolve_embedding_dims(
     embedder: Option<&dyn icm_core::Embedder>,
-    cli_db: Option<&PathBuf>,
+    db_path: &Path,
     _cfg: &crate::config::Config,
 ) -> usize {
     if let Some(e) = embedder {
         return e.dimensions();
     }
-    let path = cli_db.cloned().unwrap_or_else(default_db_path);
-    match Store::read_stored_embedding_dims(&path) {
+    match Store::read_stored_embedding_dims(db_path) {
         Ok(Some(dims)) => dims,
         // No DB or no metadata row → fresh install path; default is safe.
         Ok(None) => icm_core::DEFAULT_EMBEDDING_DIMS,
@@ -1765,78 +1851,12 @@ fn resolve_embedding_dims(
             tracing::warn!(
                 "could not peek stored embedding dims at {} ({}); \
                  falling back to DEFAULT_EMBEDDING_DIMS",
-                path.display(),
+                db_path.display(),
                 e,
             );
             icm_core::DEFAULT_EMBEDDING_DIMS
         }
     }
-}
-
-#[cfg(feature = "embeddings")]
-fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
-    Some(icm_core::FastEmbedder::with_model(model))
-}
-
-/// Placeholder embedder for builds without the `embeddings` feature.
-///
-/// It is never instantiated (`init_embedder` always returns `None` and the
-/// runtime guards on `embeddings_enabled`), but giving the no-embeddings
-/// build a concrete `Embedder` type lets the many
-/// `embedder.as_ref().map(|e| e as &dyn Embedder)` call sites compile
-/// without per-site `#[cfg]` gates.
-#[cfg(not(feature = "embeddings"))]
-struct DisabledEmbedder;
-
-#[cfg(not(feature = "embeddings"))]
-impl icm_core::Embedder for DisabledEmbedder {
-    fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
-        Err(icm_core::IcmError::Embedding(
-            "this build was compiled without the `embeddings` feature".into(),
-        ))
-    }
-    fn embed_batch(&self, _texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
-        Err(icm_core::IcmError::Embedding(
-            "this build was compiled without the `embeddings` feature".into(),
-        ))
-    }
-    fn dimensions(&self) -> usize {
-        icm_core::DEFAULT_EMBEDDING_DIMS
-    }
-}
-
-#[cfg(not(feature = "embeddings"))]
-fn init_embedder(_model: &str) -> Option<DisabledEmbedder> {
-    None
-}
-
-/// `icm embeddings status|download` — manage the semantic-search runtime.
-/// Behavior depends on how this binary was built (issue #345).
-fn cmd_embeddings(action: &EmbeddingsAction) -> Result<()> {
-    match action {
-        EmbeddingsAction::Status => {
-            #[cfg(feature = "embeddings-dynamic")]
-            ort_runtime::cmd_status();
-            #[cfg(all(feature = "embeddings", not(feature = "embeddings-dynamic")))]
-            println!(
-                "onnxruntime is statically linked into this build — semantic search is \
-                 always available."
-            );
-            #[cfg(not(feature = "embeddings"))]
-            println!("This build was compiled without embeddings (keyword-only search).");
-        }
-        EmbeddingsAction::Download => {
-            #[cfg(feature = "embeddings-dynamic")]
-            {
-                ort_runtime::cmd_download()?;
-            }
-            #[cfg(all(feature = "embeddings", not(feature = "embeddings-dynamic")))]
-            println!("Nothing to download: onnxruntime is statically linked into this build.");
-            #[cfg(not(feature = "embeddings"))]
-            println!("This build was compiled without embeddings; nothing to download.");
-        }
-    }
-    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -1903,11 +1923,6 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let embedding_dims = resolve_embedding_dims(
-        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
-        cli.db.first(),
-        &cfg,
-    );
     // Audit #185 medium: reject `--db A ... --db B` (or with `=`)
     // instead of silently letting the last occurrence win. Clap
     // alone doesn't catch the parent+subcommand split case (the
@@ -1929,11 +1944,19 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
-    // `db_path` feeds the extract-pending worker lock (#322) and some
+    // `db_path` centralizes hierarchical resolution (issue #257): --db flag,
+    // $ICM_DB env var, global config, project-local .icm/, then the platform
+    // default. It feeds the extract-pending worker lock (#322), doctor/repair/
+    // backup (which bypass the normal store open below), and some
     // feature-gated commands (e.g. the embeddings-only `embed`); it can be
     // unused in the leanest builds.
     #[allow(unused_variables)]
-    let db_path = cli_db.clone().unwrap_or_else(default_db_path);
+    let db_path = resolve_db_path(cli_db.clone(), &cfg);
+    let embedding_dims = resolve_embedding_dims(
+        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
+        &db_path,
+        &cfg,
+    );
 
     // `icm uninstall` must NOT open the SQLite store: a default
     // `open_store` call would recreate the DB directory and WAL/SHM files
@@ -1981,7 +2004,7 @@ fn main() -> Result<()> {
         );
         let mut reader = open_export_reader(from_export)?;
         let dims = peek_export_embedding_dims(&mut reader).unwrap_or(embedding_dims);
-        let store = open_store_with_backup(cli_db.clone(), dims, &cfg.store.backup)?;
+        let store = open_store_with_backup(db_path.clone(), dims, &cfg.store.backup)?;
         return cmd_import_from_export(&store, reader, dry_run);
     }
     if let Commands::Import {
@@ -1992,7 +2015,7 @@ fn main() -> Result<()> {
     {
         let mut reader = open_export_reader(src)?;
         let dims = peek_export_embedding_dims(&mut reader).unwrap_or(embedding_dims);
-        let store = open_store_with_backup(cli_db.clone(), dims, &cfg.store.backup)?;
+        let store = open_store_with_backup(db_path.clone(), dims, &cfg.store.backup)?;
         return cmd_import_from_export(&store, reader, dry_run);
     }
     // `icm hook disable` only edits AI-tool settings files — it needs neither
@@ -2011,9 +2034,9 @@ fn main() -> Result<()> {
     }
 
     let store = if read_only_requested(cli.read_only) {
-        open_store_readonly(cli_db)?
+        open_store_readonly(db_path.clone())?
     } else {
-        open_store_with_backup(cli_db, embedding_dims, &cfg.store.backup)?
+        open_store_with_backup(db_path.clone(), embedding_dims, &cfg.store.backup)?
     };
 
     match command {
@@ -2374,7 +2397,7 @@ fn main() -> Result<()> {
             force,
             per_project,
             with_codex_post_hook,
-        } => cmd_init(mode, force, per_project, with_codex_post_hook),
+        } => cmd_init(mode, force, per_project, with_codex_post_hook, &db_path),
         // Doctor, Repair and Backup are dispatched before `open_store` above;
         // these arms exist only for match exhaustiveness and are unreachable.
         Commands::Doctor => unreachable!("dispatched before open_store"),
@@ -2493,7 +2516,7 @@ fn main() -> Result<()> {
             println!("{result}");
             Ok(())
         }
-        Commands::Config => cmd_config(),
+        Commands::Config => cmd_config(cli_db, &cfg),
         Commands::Upgrade { apply, check } => upgrade::cmd_upgrade(apply, check),
         #[cfg(feature = "bench")]
         Commands::Bench { count } => cmd_bench(count),
@@ -5045,6 +5068,7 @@ fn cmd_init(
     force: bool,
     per_project: bool,
     with_codex_post_hook: bool,
+    db_path: &Path,
 ) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
@@ -5917,9 +5941,35 @@ description: ICM persistent memory — /{name}
         manifest.save(&manifest_path)?;
     }
 
+    // --- Project-local .icm/ setup ---
+    // When --per-project is set, create a project-local database config
+    // so ICM uses a separate database per project. This creates:
+    //   <git-root>/.icm/config.toml  with  [store] path = "memories.db"
+    // On subsequent invocations, the resolver will pick this up.
+    if per_project {
+        let project_root = detect_project_root()
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(root) = project_root {
+            let icm_dir = root.join(".icm");
+            if !icm_dir.is_dir() {
+                std::fs::create_dir_all(&icm_dir)
+                    .with_context(|| format!("creating {}", icm_dir.display()))?;
+                let project_cfg = icm_dir.join("config.toml");
+                std::fs::write(
+                    &project_cfg,
+                    "[store]\npath = \"memories.db\"\n",
+                )
+                .with_context(|| format!("writing {}", project_cfg.display()))?;
+                println!("[project] created project-local .icm/ at {}", root.display());
+            } else {
+                println!("[project] .icm/ already exists at {}", root.display());
+            }
+        }
+    }
+
     println!();
     println!("  binary:   {icm_bin_str}");
-    println!("  db:       {}", default_db_path().display());
+    println!("  db:       {}", db_path.display());
     if !manifest.is_empty() {
         println!(
             "  manifest: {} ({} entr{})",
@@ -7681,18 +7731,51 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
     Ok("configured".into())
 }
 
-fn cmd_config() -> Result<()> {
-    let cfg = config::load_config()?;
+fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
     println!("Config: {}", config::show_config_path());
     println!();
     println!("[store]");
-    println!(
-        "  path = {}",
-        cfg.store
-            .path
-            .as_deref()
-            .unwrap_or("(default platform path)")
-    );
+    let env_db = std::env::var("ICM_DB").ok();
+    let project_root = detect_project_root();
+    let resolved = resolve_db_path(cli_db, cfg);
+    println!("  resolved = {}", resolved.display());
+    println!("  path (config) = {}", cfg.store.path.as_deref().unwrap_or("(not set)"));
+    if let Some(ref env) = env_db {
+        println!("  ICM_DB (env)  = {env}");
+    } else {
+        println!("  ICM_DB (env)  = (not set)");
+    }
+    if let Some(root) = &project_root {
+        println!();
+        println!("[project]");
+        println!("  root = {}", root.display());
+        let icm_dir = root.join(".icm");
+        if icm_dir.is_dir() {
+            println!("  .icm/ exists");
+            let project_cfg = icm_dir.join("config.toml");
+            if project_cfg.exists() {
+                if let Ok(content) = std::fs::read_to_string(&project_cfg) {
+                    if let Ok(value) = content.parse::<toml::Value>() {
+                        if let Some(path_str) = value
+                            .get("store")
+                            .and_then(|s| s.get("path"))
+                            .and_then(|p| p.as_str())
+                        {
+                            println!("  .icm/config.toml [store].path = {path_str}");
+                        }
+                    }
+                }
+            }
+            let project_db = icm_dir.join("memories.db");
+            if project_db.exists() {
+                println!("  .icm/memories.db exists");
+            } else {
+                println!("  .icm/memories.db (not found)");
+            }
+        } else {
+            println!("  .icm/ (not found)");
+        }
+    }
     println!();
     println!("[memory]");
     println!("  default_importance = {}", cfg.memory.default_importance);

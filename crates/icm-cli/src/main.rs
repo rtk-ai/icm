@@ -8984,3 +8984,475 @@ mod cmd_remember_tests {
             .any(|m| m.summary.contains("closes the recall gap")));
     }
 }
+
+#[cfg(test)]
+mod cmd_memoir_tests {
+    use super::*;
+    use icm_store::SqliteStore;
+
+    #[track_caller]
+    fn store() -> SqliteStore {
+        SqliteStore::in_memory().unwrap()
+    }
+
+    #[track_caller]
+    fn make_memoir(store: &SqliteStore, name: &str) {
+        cmd_memoir_create(store, name.into(), "test memoir".into()).unwrap();
+    }
+
+    #[track_caller]
+    fn add_concept(store: &SqliteStore, memoir: &str, name: &str, def: &str) {
+        cmd_memoir_add_concept(store, memoir, name.into(), def.into(), None).unwrap();
+    }
+
+    #[track_caller]
+    fn memoir_id(store: &SqliteStore, name: &str) -> String {
+        store.get_memoir_by_name(name).unwrap().unwrap().id
+    }
+
+    #[test]
+    fn create_memoir_stores_and_is_retrievable() {
+        let s = store();
+        cmd_memoir_create(&s, "my-memoir".into(), "a description".into()).unwrap();
+        let m = s.get_memoir_by_name("my-memoir").unwrap().unwrap();
+        assert_eq!(m.name, "my-memoir");
+        assert_eq!(m.description, "a description");
+    }
+
+    // Memoir names are unique; second create with the same name must error.
+    #[test]
+    fn create_duplicate_memoir_errors() {
+        let s = store();
+        make_memoir(&s, "dup");
+        let err = cmd_memoir_create(&s, "dup".into(), "test memoir".into()).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unique")
+                || err.to_string().to_lowercase().contains("already"),
+            "expected uniqueness error, got: {err}"
+        );
+    }
+
+    // Concepts cascade-delete with their parent memoir; no orphans left behind.
+    #[test]
+    fn delete_removes_memoir_and_cascades_concepts() {
+        let s = store();
+        make_memoir(&s, "to-delete");
+        add_concept(&s, "to-delete", "concept-a", "definition a");
+        let cid = s
+            .get_concept_by_name(&memoir_id(&s, "to-delete"), "concept-a")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        cmd_memoir_delete(&s, "to-delete").unwrap();
+
+        assert!(s.get_memoir_by_name("to-delete").unwrap().is_none());
+        assert!(
+            s.get_concept(&cid).unwrap().is_none(),
+            "concept must be cascade-deleted with its memoir"
+        );
+    }
+
+    // Deleting a missing memoir surfaces a "not found" error, not silent Ok.
+    #[test]
+    fn delete_unknown_memoir_errors() {
+        let s = store();
+        let err = cmd_memoir_delete(&s, "no-such").unwrap_err();
+        assert!(err.to_string().contains("memoir not found"), "got: {err}");
+    }
+
+    #[test]
+    fn add_concept_is_retrievable_by_name() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "alpha", "the alpha definition");
+        let c = s
+            .get_concept_by_name(&memoir_id(&s, "m"), "alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.definition, "the alpha definition");
+    }
+
+    // CLI label string "ns:val,ns:val" parses into structured Label{namespace,value} pairs.
+    #[test]
+    fn add_concept_with_labels_parses_correctly() {
+        let s = store();
+        make_memoir(&s, "m");
+        cmd_memoir_add_concept(
+            &s,
+            "m",
+            "labelled".into(),
+            "def".into(),
+            Some("type:decision,domain:arch".into()),
+        )
+        .unwrap();
+        let c = s
+            .get_concept_by_name(&memoir_id(&s, "m"), "labelled")
+            .unwrap()
+            .unwrap();
+        let pairs: Vec<(&str, &str)> = c
+            .labels
+            .iter()
+            .map(|l| (l.namespace.as_str(), l.value.as_str()))
+            .collect();
+        assert!(
+            pairs.contains(&("type", "decision")),
+            "missing type:decision in {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("domain", "arch")),
+            "missing domain:arch in {pairs:?}"
+        );
+        assert_eq!(c.labels.len(), 2, "no extra labels");
+    }
+
+    // Concept names are unique per memoir; second add with the same name must error.
+    #[test]
+    fn add_concept_duplicate_name_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "beta", "first");
+        let err =
+            cmd_memoir_add_concept(&s, "m", "beta".into(), "second".into(), None).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unique")
+                || err.to_string().to_lowercase().contains("already"),
+            "expected duplicate concept error, got: {err}"
+        );
+    }
+
+    // Bare value with no colon is shorthand: parses as tag:<value>, the default namespace.
+    #[test]
+    fn add_concept_label_without_colon_defaults_to_tag_namespace() {
+        let s = store();
+        make_memoir(&s, "m");
+        cmd_memoir_add_concept(&s, "m", "c".into(), "def".into(), Some("bare-value".into()))
+            .unwrap();
+        let c = s
+            .get_concept_by_name(&memoir_id(&s, "m"), "c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.labels.len(), 1);
+        assert_eq!(c.labels[0].namespace, "tag");
+        assert_eq!(c.labels[0].value, "bare-value");
+    }
+
+    // Refine writes the new definition AND bumps revision; both must happen.
+    #[test]
+    fn refine_updates_definition_and_increments_revision() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "c", "original definition");
+        let mid = memoir_id(&s, "m");
+        let before = s.get_concept_by_name(&mid, "c").unwrap().unwrap();
+        assert_eq!(before.revision, 1);
+
+        cmd_memoir_refine(&s, "m", "c", "updated definition").unwrap();
+
+        let after = s.get_concept_by_name(&mid, "c").unwrap().unwrap();
+        assert_eq!(after.definition, "updated definition");
+        assert_eq!(after.revision, 2, "revision must increment on refine");
+    }
+
+    // Refining a missing concept errors, does not silently insert it.
+    #[test]
+    fn refine_unknown_concept_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        let err = cmd_memoir_refine(&s, "m", "no-such", "new def").unwrap_err();
+        assert!(err.to_string().contains("concept not found"), "got: {err}");
+    }
+
+    // Links are directed: source≠target ordering matters, and the relation kind survives.
+    #[test]
+    fn link_creates_directed_edge() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "source", "src def");
+        add_concept(&s, "m", "target", "tgt def");
+        cmd_memoir_link(&s, "m", "source", "target", Relation::DependsOn).unwrap();
+
+        let mid = memoir_id(&s, "m");
+        let src = s.get_concept_by_name(&mid, "source").unwrap().unwrap();
+        let tgt = s.get_concept_by_name(&mid, "target").unwrap().unwrap();
+        let links = s.get_links_for_memoir(&mid).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].source_id, src.id,
+            "source must be 'source' concept"
+        );
+        assert_eq!(
+            links[0].target_id, tgt.id,
+            "target must be 'target' concept"
+        );
+        assert_eq!(links[0].relation, Relation::DependsOn, "relation preserved");
+    }
+
+    // Missing source concept halts the link with an error; no dangling edge.
+    #[test]
+    fn link_unknown_from_concept_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "target", "def");
+        let err = cmd_memoir_link(&s, "m", "no-such", "target", Relation::RelatedTo).unwrap_err();
+        assert!(err.to_string().contains("concept not found"), "got: {err}");
+    }
+
+    // Missing target concept halts the link with an error; no dangling edge.
+    #[test]
+    fn link_unknown_to_concept_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "source", "def");
+        let err = cmd_memoir_link(&s, "m", "source", "no-such", Relation::RelatedTo).unwrap_err();
+        assert!(err.to_string().contains("concept not found"), "got: {err}");
+    }
+
+    // Smoke: cmd handles the "has results" print branch without panicking.
+    #[test]
+    fn search_runs_without_error_when_results_found() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "redis-cache", "use redis for caching hot data");
+        add_concept(&s, "m", "postgres-db", "primary relational database");
+        cmd_memoir_search(&s, "m", "redis", None, 10).unwrap();
+    }
+
+    // Smoke: cmd handles the "No concepts found." branch without panicking.
+    #[test]
+    fn search_runs_without_error_when_no_results() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "redis-cache", "use redis for caching hot data");
+        cmd_memoir_search(&s, "m", "nonexistent-term", None, 10).unwrap();
+    }
+
+    // Smoke: cmd accepts a label filter string without panicking.
+    #[test]
+    fn search_with_label_filter_does_not_error() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "fast-cache", "redis based hot path");
+        cmd_memoir_search(&s, "m", "redis", Some("domain:infra"), 10).unwrap();
+    }
+
+    // label+query intersection: a concept matching the label but not the query must be excluded;
+    // a concept matching the query but not the label must also be excluded.
+    #[test]
+    fn label_filter_intersects_with_query_excludes_cross_label_results() {
+        let s = store();
+        make_memoir(&s, "m");
+        cmd_memoir_add_concept(
+            &s,
+            "m",
+            "fast-cache".into(),
+            "redis based hot path".into(),
+            Some("domain:infra".into()),
+        )
+        .unwrap();
+        cmd_memoir_add_concept(
+            &s,
+            "m",
+            "slow-cache".into(),
+            "disk based cold path".into(),
+            Some("domain:infra".into()),
+        )
+        .unwrap();
+        cmd_memoir_add_concept(
+            &s,
+            "m",
+            "ui-redis".into(),
+            "redis but used by ui".into(),
+            Some("domain:ui".into()),
+        )
+        .unwrap();
+
+        let mid = memoir_id(&s, "m");
+        let label: Label = "domain:infra".parse().unwrap();
+        let mut by_label = s.search_concepts_by_label(&mid, &label, 10).unwrap();
+        let q = "redis";
+        by_label.retain(|c| {
+            c.name.to_lowercase().contains(q) || c.definition.to_lowercase().contains(q)
+        });
+        let names: Vec<&str> = by_label.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["fast-cache"],
+            "slow-cache must be dropped (label match, query miss); ui-redis must be dropped (query match, label miss)"
+        );
+    }
+
+    // Smoke: search-all walks every memoir without panicking.
+    #[test]
+    fn search_all_runs_across_memoirs() {
+        let s = store();
+        make_memoir(&s, "m1");
+        make_memoir(&s, "m2");
+        add_concept(&s, "m1", "ca", "shared keyword alpha");
+        add_concept(&s, "m2", "cb", "shared keyword alpha");
+        cmd_memoir_search_all(&s, "alpha", 10).unwrap();
+    }
+
+    // Smoke: JSON export of concepts + links serializes cleanly.
+    #[test]
+    fn export_json_does_not_error() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "c", "some definition");
+        cmd_memoir_export(&s, "m", "json").unwrap();
+    }
+
+    // Smoke: DOT export emits a parseable digraph.
+    #[test]
+    fn export_dot_does_not_error() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "c", "some definition");
+        cmd_memoir_export(&s, "m", "dot").unwrap();
+    }
+
+    // Unsupported format must surface the format name in the error.
+    #[test]
+    fn export_unknown_format_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        let err = cmd_memoir_export(&s, "m", "yaml").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unknown")
+                || err.to_string().to_lowercase().contains("unsupported"),
+            "got: {err}"
+        );
+    }
+
+    // Clap routes --memoir/--name/--definition to AddConcept; --labels defaults to None.
+    #[test]
+    fn parses_add_concept_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "memoir",
+            "add-concept",
+            "--memoir",
+            "git-workflow",
+            "--name",
+            "deploy-order",
+            "--definition",
+            "the merge order for deploy branch",
+        ])
+        .unwrap();
+        let Commands::Memoir { command } = cli.command else {
+            panic!()
+        };
+        let MemoirCommands::AddConcept {
+            memoir,
+            name,
+            definition,
+            labels,
+        } = command
+        else {
+            panic!("expected AddConcept");
+        };
+        assert_eq!(memoir, "git-workflow");
+        assert_eq!(name, "deploy-order");
+        assert_eq!(definition, "the merge order for deploy branch");
+        assert!(labels.is_none());
+    }
+
+    // --labels is wired to the labels field, not silently dropped.
+    #[test]
+    fn parses_add_concept_with_labels() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "memoir",
+            "add-concept",
+            "--memoir",
+            "git-workflow",
+            "--name",
+            "deploy-order",
+            "--definition",
+            "the merge order for deploy branch",
+            "--labels",
+            "type:decision",
+        ])
+        .unwrap();
+        let Commands::Memoir { command } = cli.command else {
+            panic!()
+        };
+        let MemoirCommands::AddConcept { labels, .. } = command else {
+            panic!("expected AddConcept");
+        };
+        assert_eq!(
+            labels.as_deref(),
+            Some("type:decision"),
+            "--labels must be passed through as Some"
+        );
+    }
+
+    // Clap routes --memoir/--name/--definition to Refine; all three fields are required.
+    #[test]
+    fn parses_refine_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "memoir",
+            "refine",
+            "--memoir",
+            "git-workflow",
+            "--name",
+            "deploy-order",
+            "--definition",
+            "updated definition",
+        ])
+        .unwrap();
+        let Commands::Memoir { command } = cli.command else {
+            panic!()
+        };
+        let MemoirCommands::Refine {
+            memoir,
+            name,
+            definition,
+        } = command
+        else {
+            panic!("expected Refine");
+        };
+        assert_eq!(memoir, "git-workflow");
+        assert_eq!(name, "deploy-order");
+        assert_eq!(definition, "updated definition");
+    }
+
+    // Clap routes --from/--to to source/target and --relation parses into CliRelation.
+    #[test]
+    fn parses_link_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "memoir",
+            "link",
+            "--memoir",
+            "git-workflow",
+            "--from",
+            "concept-a",
+            "--to",
+            "concept-b",
+            "--relation",
+            "depends-on",
+        ])
+        .unwrap();
+        let Commands::Memoir { command } = cli.command else {
+            panic!()
+        };
+        let MemoirCommands::Link {
+            memoir,
+            from,
+            to,
+            relation,
+        } = command
+        else {
+            panic!("expected Link");
+        };
+        assert_eq!(memoir, "git-workflow");
+        assert_eq!(from, "concept-a");
+        assert_eq!(to, "concept-b");
+        assert!(
+            matches!(relation, CliRelation::DependsOn),
+            "relation must map to depends-on"
+        );
+    }
+}

@@ -4132,7 +4132,7 @@ Do this BEFORE responding to the user. Not optional.
     // --- Project-local .icm/ setup ---
     // When --per-project is set, create a project-local database config
     // so ICM uses a separate database per project. This creates:
-    //   <git-root>/.icm/config.toml  with  [store] path = "memories.db"
+    //   <git-root>/.icm/config.toml  with  [store] path = ".icm/memories.db"
     // On subsequent invocations, the resolver will pick this up.
     if per_project {
         let project_root = detect_project_root()
@@ -4145,7 +4145,7 @@ Do this BEFORE responding to the user. Not optional.
                 let project_cfg = icm_dir.join("config.toml");
                 std::fs::write(
                     &project_cfg,
-                    "[store]\npath = \"memories.db\"\n",
+                    "[store]\npath = \".icm/memories.db\"\n",
                 )
                 .with_context(|| format!("writing {}", project_cfg.display()))?;
                 println!("[project] created project-local .icm/ at {}", root.display());

@@ -15,8 +15,11 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { execFileSync, spawn } from "child_process"
 
+// Tools whose output is not worth extracting (file writes, questions, tracking)
+const NOISE_TOOLS = new Set(["Edit", "Write", "Question", "skill", "todowrite", "notify", "notification"])
+
 // Capture tool output every N tool calls...
-const EXTRACT_EVERY = 3
+const EXTRACT_EVERY = 10
 // ...but only drain the extraction queue (the step that loads the
 // fastembed model) once per N enqueues. Issue #239: running a full
 // `icm extract` on every 3rd tool call reloaded the embedding model
@@ -30,13 +33,14 @@ let enqueueCount = 0
 
 /// Enqueue raw text for deferred extraction. `icm extract --enqueue`
 /// only writes a queue row — it never loads the embedding model.
-function icmEnqueue(project: string, input: string): void {
+function icmEnqueue(project: string, input: string, cwd?: string): void {
   try {
     execFileSync("icm", ["extract", "--enqueue", "-p", project], {
       encoding: "utf-8",
       timeout: 10000,
       input,
       stdio: ["pipe", "pipe", "pipe"],
+      cwd,
     })
   } catch {
     // silent — extraction is best-effort
@@ -46,11 +50,12 @@ function icmEnqueue(project: string, input: string): void {
 /// Drain the pending-extraction queue in a detached background process.
 /// Fire-and-forget: the chat turn never waits on it, and the heavy
 /// fastembed model load happens at most once per drain.
-function icmDrainDetached(): void {
+function icmDrainDetached(cwd?: string): void {
   try {
     const child = spawn("icm", ["extract-pending", "--limit", "30"], {
       detached: true,
       stdio: "ignore",
+      cwd,
     })
     child.unref()
   } catch {
@@ -61,12 +66,13 @@ function icmDrainDetached(): void {
 /// Capture stdout of `icm <args>` synchronously. Returns the empty string on
 /// any failure so a missing/old binary or empty memory store can never break
 /// a chat turn.
-function icmCapture(args: string[]): string {
+function icmCapture(args: string[], cwd?: string): string {
   try {
     const out = execFileSync("icm", args, {
       encoding: "utf-8",
       timeout: 10000,
       stdio: ["ignore", "pipe", "pipe"],
+      cwd,
     })
     return String(out).trim()
   } catch {
@@ -98,6 +104,7 @@ export const IcmPlugin: Plugin = async ({ $, directory }) => {
     "tool.execute.after": async (input: any, result: any) => {
       const tool = String(input?.tool ?? "")
       if (!tool || tool.startsWith("icm") || tool.startsWith("mcp__icm__")) return
+      if (NOISE_TOOLS.has(tool)) return
 
       toolCallCount++
       if (toolCallCount < EXTRACT_EVERY) return
@@ -110,11 +117,11 @@ export const IcmPlugin: Plugin = async ({ $, directory }) => {
 
       // Enqueue only (cheap, no model load), then drain once per
       // DRAIN_EVERY enqueues in a detached process — see issue #239.
-      icmEnqueue(project, output.slice(0, 8000))
+      icmEnqueue(project, output.slice(0, 8000), directory)
       enqueueCount++
       if (enqueueCount >= DRAIN_EVERY) {
         enqueueCount = 0
-        icmDrainDetached()
+        icmDrainDetached(directory)
       }
     },
 
@@ -141,9 +148,9 @@ export const IcmPlugin: Plugin = async ({ $, directory }) => {
 
       // Compaction is a natural flush point: enqueue the conversation
       // slice and drain the whole queue once in a detached process.
-      icmEnqueue(project, text)
+      icmEnqueue(project, text, directory)
       enqueueCount = 0
-      icmDrainDetached()
+      icmDrainDetached(directory)
     },
 
     // Layer 2: log on session creation. OpenCode's `session.created` hook
@@ -168,13 +175,13 @@ export const IcmPlugin: Plugin = async ({ $, directory }) => {
       injectedSessions.add(sessionID)
 
       // Wake-up pack: critical/high-importance facts + preferences.
-      const wakeUp = icmCapture(["wake-up", "--project", project])
+      const wakeUp = icmCapture(["wake-up", "--project", project], directory)
       if (wakeUp) {
         output.system.push(wakeUp)
       }
 
       // Project-scoped recall: top-N relevant memories for this project.
-      const ctx = icmCapture(["recall-project", "--limit", "5"])
+      const ctx = icmCapture(["recall-project", "--project", project, "--limit", "5"], directory)
       if (ctx) {
         output.system.push(ctx)
         console.error(

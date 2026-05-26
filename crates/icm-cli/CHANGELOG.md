@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.10.50](https://github.com/rtk-ai/icm/compare/icm-v0.10.49...icm-v0.10.50) (2026-05-23)
+
+
+### Features
+
+* **init:** default cli mode writes to global per-tool paths; --per-project for cwd ([20666db](https://github.com/rtk-ai/icm/commit/20666db02c9c7ecf5c3d39436d6f50600c6d576b))
+* **init:** gate every mode by detect_tool and record the install manifest ([55233a7](https://github.com/rtk-ai/icm/commit/55233a7e85dc95d8e346d17e7515b13a21eddd90))
+* **init:** scaffold install manifest module ([1073e48](https://github.com/rtk-ai/icm/commit/1073e48ad01e1d7b98c5842f67119b8721737fa1))
+* **uninstall:** --scan-dir, process detection, --purge-data guard ([ebf1b67](https://github.com/rtk-ai/icm/commit/ebf1b6781e2e7c1776b2fbfda971ec41ec83dc82))
+* **uninstall:** catalog every location cmd_init may have touched ([c9cee09](https://github.com/rtk-ai/icm/commit/c9cee09d421d3cb985eac8be3002dab5c3f43dde))
+* **uninstall:** discovery + --check / --dry-run / --audit modes ([48b4207](https://github.com/rtk-ai/icm/commit/48b4207945868d24b764f74917de9bcf44b75bfd))
+* **uninstall:** first-class `icm uninstall` with backups, dry-run, audit, check ([2b7b6a2](https://github.com/rtk-ai/icm/commit/2b7b6a2905e6b5da7526edccb9f8ebc73f3e8f09))
+* **uninstall:** integration tests, audit-mode purge wording, dead-code cleanup ([62b040d](https://github.com/rtk-ai/icm/commit/62b040d7e86acab759091eaa8ff609757b16ccbc))
+* **uninstall:** scaffold uninstall subcommand and clap surface ([e259fb9](https://github.com/rtk-ai/icm/commit/e259fb993f778a59918dfd91db0ff2c8d00c6e62))
+* **uninstall:** strippers, timestamped backups, mutation phase ([72b71a7](https://github.com/rtk-ai/icm/commit/72b71a7cc2bf2718f0ab06833044c8c7b94f25af))
+
+
+### Bug Fixes
+
+* **extraction:** default summarizer to auto, fall back to fastembed ([cd6f24d](https://github.com/rtk-ai/icm/commit/cd6f24dbbb52e7a13d06d01e2539b26a04b811d4))
+* **extraction:** defer fastembed extraction off the per-tool-call hot path ([ebeda6d](https://github.com/rtk-ai/icm/commit/ebeda6dca6999ae13c7fc61e52c97885a5fdce1c))
+* **extraction:** defer fastembed extraction off the per-tool-call hot path ([f82c25f](https://github.com/rtk-ai/icm/commit/f82c25f3efe25e47f349403df9897445debc66ba)), closes [#239](https://github.com/rtk-ai/icm/issues/239)
+* **init:** create parent dir before writing settings.json hooks ([4b2e5e4](https://github.com/rtk-ai/icm/commit/4b2e5e4337e59c9501a369f30b41892c855b07c6))
+* **init:** gate by detect_tool, install manifest, global paths by default ([004c8cd](https://github.com/rtk-ai/icm/commit/004c8cd163ed26ee1375ff502e1150db3237675d))
+* **uninstall:** cross-platform tests (Windows path separators, macOS data dirs) ([0a476b0](https://github.com/rtk-ai/icm/commit/0a476b0b02c6532533ced83865ff9d9101949487))
+* **uninstall:** default backup path under data_dir, scope process detection, README polish ([cff4abf](https://github.com/rtk-ai/icm/commit/cff4abfb2fbbc8393e3b9b2f6f38d4eaab6defae))
+* **uninstall:** refuse to mutate symlinks (target would be modified without backup) ([e415faf](https://github.com/rtk-ai/icm/commit/e415fafee9f8fb8a2569f97c3402c04771102cd8))
+* **uninstall:** use unwrap_or instead of unwrap_or_else in backup test ([f2a261a](https://github.com/rtk-ai/icm/commit/f2a261a0c2b74f48372e679629eb3cc089121991))
+
 ## [0.10.49](https://github.com/rtk-ai/icm/compare/icm-v0.10.48...icm-v0.10.49) (2026-05-11)
 
 

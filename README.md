@@ -92,8 +92,9 @@ it end-to-end: facts seeded through ICM are recalled with 100% accuracy
 by Claude Code, Gemini CLI, Copilot CLI, Cursor Agent, and Aider —
 **98% cross-agent efficiency** on the standard test.
 
-If you want isolation (per-project, per-tool, etc.) pass `--db <path>`
-or set `ICM_DB_PATH`; each path is an independent corpus.
+If you want isolation (per-project, per-tool, etc.) pass `--db <path>`,
+set `ICM_DB`, or use `icm init --per-project` to create a project-local
+database under `.icm/`; each path is an independent corpus.
 
 ## Install
 
@@ -116,9 +117,17 @@ Re-run the install command to upgrade to the latest release. To pin a version, p
 ## Setup
 
 ```bash
-# Auto-detect and configure all supported tools
+# Auto-detect and configure all supported tools (global database)
 icm init
+
+# Per-project database (stores memories in .icm/memories.db)
+icm init --per-project
 ```
+
+`--per-project` creates a project-local `.icm/config.toml` at the git
+root, so all `icm` commands run from within the project automatically
+use an isolated database. Combine with global `icm init` — global
+settings (tools, hooks) are unaffected; only the database is scoped.
 
 Configures **17 tools** in one command ([full integration guide](docs/integrations.md)):
 
@@ -427,11 +436,24 @@ Changing the model automatically re-creates the vector index (existing embedding
 
 Single SQLite file. No external services, no network dependency.
 
+Default (global) database location:
+
 ```
 ~/Library/Application Support/dev.icm.icm/memories.db                    # macOS
 ~/.local/share/dev.icm.icm/memories.db                                   # Linux
 C:\Users\<user>\AppData\Local\icm\icm\data\memories.db                   # Windows
 ```
+
+Per-project database (created by `icm init --per-project`):
+
+```
+<project-root>/.icm/memories.db
+```
+
+ICM auto-detects a project-local `.icm/config.toml` from the current
+working directory. A relative `[store].path` is resolved against the
+git root, so all `icm` commands within the project tree use the
+scoped database without needing `--db` on every invocation.
 
 ### Configuration
 

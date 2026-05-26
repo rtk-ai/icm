@@ -5,11 +5,22 @@
 #   Linux:   ~/.config/icm/config.toml
 #   Windows: C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml
 # Or override with: ICM_CONFIG=/path/to/config.toml
+#
+# Database path resolution (highest priority first):
+#   1. --db CLI flag
+#   2. ICM_DB environment variable
+#   3. [store].path in this config file
+#   4. <project-root>/.icm/config.toml [store].path (auto-detected via git root)
+#   5. <project-root>/.icm/memories.db (auto-detected via git root)
+#   6. Platform default data directory (see src/main.rs default_db_path)
 
 [store]
 # SQLite database path (default: platform data dir).
 # Uncomment to use a custom location:
 # path = "/custom/path/to/memories.db"
+#
+# For per-project databases, set ICM_DB or create a .icm/config.toml
+# at your project root via `icm init --per-project`.
 
 [memory]
 default_importance = "medium"

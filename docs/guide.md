@@ -27,8 +27,25 @@ Re-running the install command upgrades an existing installation in place.
 ### 2. Setup
 
 ```bash
+# Global setup — one database for all projects
 icm init
+
+# Per-project setup — isolated database per project
+icm init --per-project
 ```
+
+`--per-project` creates `.icm/config.toml` at the project's git root. All `icm` commands within that project tree automatically use the project-local database, without needing `--db` on every invocation. The database path is resolved hierarchically:
+
+| Priority | Source | Example |
+|----------|--------|---------|
+| 1 | `--db` CLI flag | `icm --db /tmp/test.db store ...` |
+| 2 | `ICM_DB` env var | `ICM_DB=/tmp/test.db icm recall ...` |
+| 3 | Global config | `~/.config/icm/config.toml [store].path` |
+| 4 | `.icm/config.toml` | `<project>/.icm/config.toml [store].path` |
+| 5 | `.icm/memories.db` | Auto-detected at git root (if file exists) |
+| 6 | Platform default | `~/.local/share/icm/memories.db` |
+
+Run `icm config` to see the active resolution chain with source tracing.
 
 This auto-detects your AI tools and configures the MCP server. Supports 14 tools: Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Gemini, Zed, Amp, Amazon Q, Cline, Roo Code, Kilo Code, Codex CLI, OpenCode.
 

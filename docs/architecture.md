@@ -402,6 +402,66 @@ Pattern-based scoring. Each sentence gets a score from keyword matches:
 
 Sentences below threshold are dropped. Dedup via Jaccard similarity (>0.6 = skip).
 
+## Database Path Resolution
+
+ICM determines the active SQLite database path through a 6-level hierarchical resolution chain. Each level overrides the ones below it:
+
+```
+Priority 1: --db CLI flag (highest)
+Priority 2: ICM_DB environment variable
+Priority 3: Global config [store].path (~/.config/icm/config.toml)
+Priority 4: Project-local .icm/config.toml [store].path (detected via git root)
+Priority 5: Project-local .icm/memories.db (auto-detected at git root, file must exist)
+Priority 6: Default platform data directory (lowest)
+```
+
+### Resolution flow
+
+`resolve_db_path()` is called at startup (before `open_store()`):
+
+```
+resolve_db_path(cli_db, cfg)
+  ├─ cli_db present?            → return it        (level 1)
+  ├─ $ICM_DB set?               → return it        (level 2)
+  ├─ cfg.store.path set?        → return it        (level 3)
+  ├─ detect_project_root() ok?
+  │   ├─ .icm/config.toml has [store].path? → return it (level 4)
+  │   └─ .icm/memories.db exists?           → return it (level 5)
+  └─ default_db_path()          → return it        (level 6)
+```
+
+`detect_project_root()` shells out to `git rev-parse --show-toplevel`. If the current directory is not inside a git repository, levels 4-5 are skipped.
+
+### Per-project database
+
+`icm init --per-project` creates `<git-root>/.icm/config.toml`:
+
+```toml
+[store]
+path = "memories.db"
+```
+
+A relative path is resolved against the git root. On subsequent invocations, the resolver picks up level 4 and uses the project-local database. All `icm` commands within that project tree then use the scoped database without needing `--db` on every call.
+
+Combine with global `icm init` — global settings (tools, hooks) are unaffected; only the database is scoped.
+
+### Config display
+
+`icm config` shows the full resolution chain with source tracing:
+
+```
+[store]
+ resolved = /home/user/project/.icm/memories.db
+ path (config) = memories.db
+ ICM_DB (env) = (not set)
+
+[project]
+ root = /home/user/project
+ .icm/ exists
+ .icm/config.toml [store].path = memories.db
+ .icm/memories.db exists
+```
+
 ## Build
 
 ```bash

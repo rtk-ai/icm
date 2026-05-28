@@ -1574,11 +1574,7 @@ fn main() -> Result<()> {
             let exit_code = if result.is_ok() { 0 } else { 1 };
             let note = result.as_ref().err().map(|e| {
                 let s = e.to_string();
-                if s.len() > 200 {
-                    s[..200].to_string()
-                } else {
-                    s
-                }
+                truncate_at_char_boundary(&s, 200).to_string()
             });
             let _ = store.record_hook_event(&icm_store::HookEventInsert {
                 event: event_name.to_string(),
@@ -2630,11 +2626,7 @@ fn cmd_hook_post(
         // Cap to 8 KB to keep the queue reasonable. LLM extraction works
         // fine on the most recent slice; very long outputs are rare and
         // their tail is what matters most for auto-context anyway.
-        let capped = if tool_output.len() > 8192 {
-            &tool_output[tool_output.len() - 8192..]
-        } else {
-            tool_output
-        };
+        let capped = truncate_tail_at_char_boundary(tool_output, 8192);
         match store.enqueue_pending_extraction(&project, tool_name, capped) {
             Ok(_) => {
                 eprintln!(
@@ -2931,23 +2923,10 @@ fn extract_from_hook_transcript(
         return Ok(());
     }
 
-    // Truncate to last 4000 bytes to keep extraction reasonable.
-    //
-    // The original raw byte slice `&assistant_text[len-4000..]` panics
-    // when the cut-point lands inside a multibyte UTF-8 char (Cyrillic
-    // 2B, CJK 3B, emoji 4B). Find the nearest UTF-8 char boundary at or
-    // after `len-4000` instead. Result is at most 4000 bytes long; we
-    // accept losing a few leading bytes to char-align rather than
-    // panicking on multilingual transcripts.
-    let truncated: &str = if assistant_text.len() > 4000 {
-        let mut start = assistant_text.len() - 4000;
-        while start < assistant_text.len() && !assistant_text.is_char_boundary(start) {
-            start += 1;
-        }
-        &assistant_text[start..]
-    } else {
-        &assistant_text
-    };
+    // Truncate to last 4000 bytes to keep extraction reasonable. The bare
+    // tail slice `&assistant_text[len-4000..]` panics when the cut lands
+    // inside a multibyte UTF-8 char; the helper char-aligns instead.
+    let truncated: &str = truncate_tail_at_char_boundary(&assistant_text, 4000);
 
     // Audit R7: if the byte truncation cut the transcript mid-fence
     // (the opening ```lang line lives in the dropped prefix), the
@@ -3016,6 +2995,24 @@ pub(crate) fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Keep the last `max_bytes` bytes of `s`, advancing the start to the nearest
+/// following UTF-8 char boundary so the slice never splits a multi-byte char.
+/// Result length is always `<= max_bytes`. Never panics — bare
+/// `&s[s.len() - max_bytes..]` does when the cut lands inside a multi-byte char
+/// (Cyrillic=2B, CJK=3B, emoji=4B). See issue #110.
+pub(crate) fn truncate_tail_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk forwards from `len - max_bytes` until we land on a char boundary.
+    // `is_char_boundary(len)` is always true, so this terminates.
+    let mut start = s.len() - max_bytes;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
 }
 
 /// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
@@ -3330,7 +3327,7 @@ fn cmd_extract_patterns(
         );
         println!(
             "    Summary: {}",
-            &cluster.representative_summary[..cluster.representative_summary.len().min(120)]
+            truncate_at_char_boundary(&cluster.representative_summary, 120)
         );
     }
 
@@ -5637,11 +5634,7 @@ fn cmd_extract_enqueue(store: &SqliteStore, project: &str, text: Option<String>)
     // Cap to 8 KB — same bound as the PostToolUse async path. Long tool
     // outputs are rare and their trailing slice carries the freshest
     // context.
-    let capped = if trimmed.len() > 8192 {
-        &trimmed[trimmed.len() - 8192..]
-    } else {
-        trimmed
-    };
+    let capped = truncate_tail_at_char_boundary(trimmed, 8192);
 
     let id = store.enqueue_pending_extraction(project, "extract", capped)?;
     eprintln!("[icm] enqueued raw text for deferred extraction (id={id})");
@@ -6524,7 +6517,7 @@ fn run_claude_session(
     let json: Value = serde_json::from_str(stdout.trim()).with_context(|| {
         format!(
             "failed to parse claude JSON: {}",
-            &stdout[..stdout.len().min(200)]
+            truncate_at_char_boundary(&stdout, 200)
         )
     })?;
 
@@ -7437,7 +7430,7 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        format!("{}...", truncate_at_char_boundary(s, max.saturating_sub(3)))
     }
 }
 
@@ -7526,7 +7519,7 @@ fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
 
 #[cfg(test)]
 mod truncate_tests {
-    use super::truncate_at_char_boundary;
+    use super::{truncate_at_char_boundary, truncate_tail_at_char_boundary};
 
     #[test]
     fn ascii_short_is_unchanged() {
@@ -7585,6 +7578,34 @@ mod truncate_tests {
         let s = "\u{1F600}rest"; // first char is 4 bytes
         let out = truncate_at_char_boundary(s, 2);
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn tail_ascii_short_is_unchanged() {
+        assert_eq!(truncate_tail_at_char_boundary("hello", 200), "hello");
+    }
+
+    /// Regression: the multibyte arrow '→' (3 bytes) crashed the hook
+    /// transcript fallback (`&text[len - 2000..]`) when the cut landed
+    /// inside it. Keeping the tail must drop a few leading bytes to
+    /// char-align rather than panic.
+    #[test]
+    fn tail_multibyte_never_panics_and_cuts_at_char_boundary() {
+        let s = "\u{2192}".repeat(800); // 800 × 3 bytes = 2400 bytes
+        let out = truncate_tail_at_char_boundary(&s, 2000);
+        assert!(out.len() <= 2000);
+        assert!(s.is_char_boundary(s.len() - out.len()));
+        assert!(out.chars().all(|c| c == '\u{2192}'));
+    }
+
+    /// Mixed ASCII + arrows, the realistic transcript shape that paniced.
+    #[test]
+    fn tail_mixed_ascii_arrows_never_panics() {
+        let s = "etape A \u{2192} etape B \u{2192} fin ".repeat(300);
+        let out = truncate_tail_at_char_boundary(&s, 2000);
+        assert!(out.len() <= 2000);
+        assert!(out.is_char_boundary(0));
+        assert!(out.is_char_boundary(out.len()));
     }
 }
 

@@ -95,11 +95,7 @@ pub fn extract_and_store_with_embedder(
 
     // Fallback: store truncated raw text as low-importance memory
     if stored == 0 && store_raw && text.len() >= 50 {
-        let raw = if text.len() > 2000 {
-            &text[text.len() - 2000..]
-        } else {
-            text
-        };
+        let raw = crate::truncate_tail_at_char_boundary(text, 2000);
         let mem = Memory::new(
             format!("context-{project}"),
             raw.to_string(),

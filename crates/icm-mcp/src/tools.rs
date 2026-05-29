@@ -1187,7 +1187,7 @@ fn tool_recall(
 
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
-        if let Ok(query_emb) = emb.embed(query) {
+        if let Ok(query_emb) = emb.embed_query(query) {
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored_results = results;
                 scored_results.retain(|(m, _)| project_filter(m));

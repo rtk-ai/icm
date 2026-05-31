@@ -359,6 +359,30 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             ON hook_events(ts);
         CREATE INDEX IF NOT EXISTS idx_hook_events_event
             ON hook_events(event);
+
+        -- Auto-captured 'code areas' the agent worked in during a
+        -- session. Populated by the PostToolUse hook
+        -- (`icm hook post`) whenever the upstream tool call is an
+        -- Edit / Write / MultiEdit / NotebookEdit. Same project +
+        -- file_path increments `touch_count` rather than creating a
+        -- duplicate row, so the table grows in file count not in
+        -- edit count. See issue #196.
+        CREATE TABLE IF NOT EXISTS code_areas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            description TEXT,
+            session_id TEXT,
+            tool_name TEXT,
+            touch_count INTEGER NOT NULL DEFAULT 1,
+            first_touched_at TEXT NOT NULL,
+            last_touched_at TEXT NOT NULL,
+            UNIQUE(project, file_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_code_areas_project
+            ON code_areas(project);
+        CREATE INDEX IF NOT EXISTS idx_code_areas_last_touched
+            ON code_areas(last_touched_at);
         ",
     )
     .map_err(db_err)?;

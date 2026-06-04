@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 icm-core = { path = "../icm-core" }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 sqlite-vec = { workspace = true }
 zerocopy = { workspace = true }
 serde_json = { workspace = true }
@@ -14,6 +14,21 @@ tracing = { workspace = true }
 lru = { workspace = true }
 sha2 = { workspace = true }
 ulid = { workspace = true }
+
+# Optional libSQL/Turso backend. With `--features turso` the store runs over the
+# async libsql client (local file, remote sqld/Turso server, or embedded
+# replica); without it, behaviour is exactly upstream rusqlite.
+libsql = { workspace = true, optional = true }
+libsql-ffi = { workspace = true, optional = true }
+once_cell = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+# Exactly one backend. Default is rusqlite (unchanged upstream); for libSQL/Turso
+# build with `--no-default-features --features turso`.
+default = ["backend-rusqlite"]
+backend-rusqlite = ["dep:rusqlite"]
+turso = ["dep:libsql", "dep:libsql-ffi", "dep:once_cell", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"

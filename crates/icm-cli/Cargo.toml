@@ -13,9 +13,13 @@ name = "icm"
 path = "src/main.rs"
 
 [features]
-default = ["embeddings", "tui"]
+default = ["embeddings", "tui", "backend-rusqlite"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
 tui = ["dep:ratatui", "dep:crossterm"]
+backend-rusqlite = ["icm-store/backend-rusqlite", "icm-mcp/backend-rusqlite"]
+# Opt-in libSQL/Turso backend: build with
+# `--no-default-features --features turso,embeddings,tui`.
+turso = ["icm-store/turso", "icm-mcp/turso"]
 web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess", "dep:getrandom"]
 # `openssl` is not used directly in our source code, but it gets pulled
 # transitively via reqwest / hyper-tls / etc. (depending on the active
@@ -30,8 +34,8 @@ vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
 icm-core = { path = "../icm-core" }
-icm-store = { path = "../icm-store" }
-icm-mcp = { path = "../icm-mcp" }
+icm-store = { path = "../icm-store", default-features = false }
+icm-mcp = { path = "../icm-mcp", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }

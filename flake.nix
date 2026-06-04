@@ -28,6 +28,13 @@
             # includes libsql) — no vendor hash to maintain on every dep bump.
             cargoLock.lockFile = ./Cargo.lock;
 
+            # The libSQL/Turso backend is opt-in; the default build is rusqlite.
+            # Build the binary with the turso backend (mutually exclusive with the
+            # default rusqlite backend, hence --no-default-features).
+            buildNoDefaultFeatures = true;
+            buildFeatures = [ "turso" "embeddings" "tui" ];
+            cargoBuildFlags = [ "-p" "icm-cli" ];
+
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [
               pkgs.openssl

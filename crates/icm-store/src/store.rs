@@ -2,12 +2,19 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Mutex;
+#[cfg(feature = "backend-rusqlite")]
+use std::sync::Once;
 
 use chrono::{DateTime, Utc};
 use lru::LruCache;
-// Turso fork: route the store's SQL through the libSQL-backed dbcompat shim,
-// aliased as `rusqlite` so the rest of this file stays byte-identical upstream.
+// Default backend is rusqlite (unchanged upstream). With `--features turso`, the
+// same SQL is routed through the libSQL-backed `dbcompat` shim, aliased as
+// `rusqlite` so the rest of this file is byte-identical either way.
+#[cfg(feature = "backend-rusqlite")]
+use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+#[cfg(feature = "turso")]
 use crate::dbcompat as rusqlite;
+#[cfg(feature = "turso")]
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
@@ -73,25 +80,56 @@ pub struct HookStatsRow {
 }
 
 /// Collect mapped rows into a Vec, converting rusqlite errors.
+#[cfg(feature = "backend-rusqlite")]
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> IcmResult<Vec<T>> {
+    rows.collect::<Result<Vec<T>, _>>().map_err(db_err)
+}
+#[cfg(feature = "turso")]
 fn collect_rows<T>(rows: rusqlite::MappedRows<T>) -> IcmResult<Vec<T>> {
     rows.collect::<rusqlite::Result<Vec<T>>>().map_err(db_err)
 }
 
-// Turso fork: sqlite-vec is registered inside dbcompat's Connection::open (after
-// libsql's threading init), so this is a no-op.
+/// Register sqlite-vec as a SQLite auto-extension (default rusqlite backend).
+#[cfg(feature = "backend-rusqlite")]
+static SQLITE_VEC_INIT: Once = Once::new();
+#[cfg(feature = "backend-rusqlite")]
+fn ensure_sqlite_vec() {
+    SQLITE_VEC_INIT.call_once(|| unsafe {
+        #[allow(clippy::missing_transmute_annotations)]
+        sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+// With `--features turso`, sqlite-vec is registered inside dbcompat's
+// Connection::open (after libsql's threading init), so this is a no-op.
+#[cfg(feature = "turso")]
 fn ensure_sqlite_vec() {}
 
-/// Turso fork: pick the storage backend from the environment, else a local file.
+/// Default backend: open the local SQLite file at `path`.
+#[cfg(feature = "backend-rusqlite")]
+fn open_backend(path: &Path) -> IcmResult<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| IcmError::Database(format!("cannot create db directory: {e}")))?;
+    }
+    Connection::open(path).map_err(|e| IcmError::Database(format!("cannot open database: {e}")))
+}
+
+/// `--features turso`: pick the backend from the environment, else a local file.
 ///
 /// * `TURSO_DATABASE_URL` (or `LIBSQL_URL`) + `ICM_TURSO_REPLICA` truthy → local
 ///   embedded replica at `path` syncing to the remote primary.
 /// * URL set otherwise → remote libSQL/Turso server (`sqld`/`tursodb`); every ICM
 ///   process shares it, so concurrent writes from multiple machines are
 ///   serialised by the server.
-/// * no URL → local SQLite file at `path` (default).
+/// * no URL → local SQLite file at `path`.
 ///
 /// Auth token: `TURSO_AUTH_TOKEN` (or `LIBSQL_AUTH_TOKEN`); empty for an
 /// unauthenticated local `sqld`.
+#[cfg(feature = "turso")]
 fn open_backend(path: &Path) -> IcmResult<Connection> {
     let url = std::env::var("TURSO_DATABASE_URL")
         .or_else(|_| std::env::var("LIBSQL_URL"))
@@ -129,6 +167,30 @@ fn open_backend(path: &Path) -> IcmResult<Connection> {
     }
 }
 
+/// Apply connection PRAGMAs (WAL + foreign keys + busy timeout) for a local DB.
+#[cfg(feature = "backend-rusqlite")]
+fn apply_pragmas(conn: &Connection) -> IcmResult<()> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;",
+    )
+    .map_err(db_err)
+}
+/// `--features turso`: a remote server manages journaling/locking itself, so
+/// only foreign-key enforcement is requested (best-effort); local/replica files
+/// still get the full PRAGMAs.
+#[cfg(feature = "turso")]
+fn apply_pragmas(conn: &Connection) -> IcmResult<()> {
+    if conn.is_remote() {
+        let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
+        Ok(())
+    } else {
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;",
+        )
+        .map_err(db_err)
+    }
+}
+
 /// In-process LRU cache size for hot memories. Each entry is one
 /// fully-hydrated `Memory` (incl. optional 384×f32 embedding ≈ 1.5KB),
 /// so 256 entries cap RAM at ~400KB worst case. Helps long-running
@@ -151,16 +213,7 @@ impl SqliteStore {
     pub fn with_dims(path: &Path, embedding_dims: usize) -> IcmResult<Self> {
         ensure_sqlite_vec();
         let conn = open_backend(path)?;
-        if conn.is_remote() {
-            // Remote libSQL/Turso server manages journaling/locking itself; just
-            // request foreign-key enforcement, best-effort.
-            let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
-        } else {
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;",
-            )
-            .map_err(db_err)?;
-        }
+        apply_pragmas(&conn)?;
         init_db_with_dims(&conn, embedding_dims)?;
         Ok(Self {
             conn,

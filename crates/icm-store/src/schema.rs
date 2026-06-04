@@ -1,3 +1,6 @@
+// Turso fork: alias the libSQL-backed shim as `rusqlite` so this file is
+// otherwise byte-identical to upstream.
+use crate::dbcompat as rusqlite;
 use rusqlite::Connection;
 
 use icm_core::{IcmError, IcmResult};

@@ -1,3 +1,5 @@
+#[macro_use]
+pub mod dbcompat;
 mod schema;
 mod store;
 

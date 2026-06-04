@@ -19,6 +19,10 @@ strip = true
 rusqlite = { version = "0.34", features = ["bundled", "modern_sqlite"] }
 sqlite-vec = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
+# libSQL / Turso backend (fork): remote (sqld) + embedded replica + sync.
+libsql = { version = "0.9", default-features = false, features = ["core", "replication", "remote", "sync", "tls"] }
+libsql-ffi = "0.9"
+once_cell = "1"
 
 # Embeddings (optional)
 fastembed = "4"

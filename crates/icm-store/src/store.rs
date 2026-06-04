@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use lru::LruCache;
-use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+// Turso fork: route the store's SQL through the libSQL-backed dbcompat shim,
+// aliased as `rusqlite` so the rest of this file stays byte-identical upstream.
+use crate::dbcompat as rusqlite;
+use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
@@ -70,21 +73,60 @@ pub struct HookStatsRow {
 }
 
 /// Collect mapped rows into a Vec, converting rusqlite errors.
-fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> IcmResult<Vec<T>> {
-    rows.collect::<Result<Vec<T>, _>>().map_err(db_err)
+fn collect_rows<T>(rows: rusqlite::MappedRows<T>) -> IcmResult<Vec<T>> {
+    rows.collect::<rusqlite::Result<Vec<T>>>().map_err(db_err)
 }
 
-static SQLITE_VEC_INIT: Once = Once::new();
+// Turso fork: sqlite-vec is registered inside dbcompat's Connection::open (after
+// libsql's threading init), so this is a no-op.
+fn ensure_sqlite_vec() {}
 
-fn ensure_sqlite_vec() {
-    SQLITE_VEC_INIT.call_once(|| unsafe {
-        #[allow(clippy::missing_transmute_annotations)]
-        sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-    });
+/// Turso fork: pick the storage backend from the environment, else a local file.
+///
+/// * `TURSO_DATABASE_URL` (or `LIBSQL_URL`) + `ICM_TURSO_REPLICA` truthy → local
+///   embedded replica at `path` syncing to the remote primary.
+/// * URL set otherwise → remote libSQL/Turso server (`sqld`/`tursodb`); every ICM
+///   process shares it, so concurrent writes from multiple machines are
+///   serialised by the server.
+/// * no URL → local SQLite file at `path` (default).
+///
+/// Auth token: `TURSO_AUTH_TOKEN` (or `LIBSQL_AUTH_TOKEN`); empty for an
+/// unauthenticated local `sqld`.
+fn open_backend(path: &Path) -> IcmResult<Connection> {
+    let url = std::env::var("TURSO_DATABASE_URL")
+        .or_else(|_| std::env::var("LIBSQL_URL"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let token = std::env::var("TURSO_AUTH_TOKEN")
+        .or_else(|_| std::env::var("LIBSQL_AUTH_TOKEN"))
+        .unwrap_or_default();
+    match url {
+        Some(url) => {
+            let replica = std::env::var("ICM_TURSO_REPLICA")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if replica {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                Connection::open_replica(path, url, token).map_err(|e| {
+                    IcmError::Database(format!("cannot open Turso embedded replica: {e}"))
+                })
+            } else {
+                Connection::open_remote(url, token).map_err(|e| {
+                    IcmError::Database(format!("cannot connect to libSQL/Turso server: {e}"))
+                })
+            }
+        }
+        None => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| IcmError::Database(format!("cannot create db directory: {e}")))?;
+            }
+            Connection::open(path)
+                .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))
+        }
+    }
 }
 
 /// In-process LRU cache size for hot memories. Each entry is one
@@ -108,16 +150,17 @@ impl SqliteStore {
     /// Open or create a store with a specific embedding dimension.
     pub fn with_dims(path: &Path, embedding_dims: usize) -> IcmResult<Self> {
         ensure_sqlite_vec();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| IcmError::Database(format!("cannot create db directory: {e}")))?;
+        let conn = open_backend(path)?;
+        if conn.is_remote() {
+            // Remote libSQL/Turso server manages journaling/locking itself; just
+            // request foreign-key enforcement, best-effort.
+            let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
+        } else {
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;",
+            )
+            .map_err(db_err)?;
         }
-        let conn = Connection::open(path)
-            .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;",
-        )
-        .map_err(db_err)?;
         init_db_with_dims(&conn, embedding_dims)?;
         Ok(Self {
             conn,

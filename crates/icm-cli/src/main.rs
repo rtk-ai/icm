@@ -3651,6 +3651,9 @@ icm topics                                # list all topics\n\
             ("Claude Code", "Claude Code", claude_dir.join("CLAUDE.md")),
             ("Codex", "Codex CLI", codex_dir.join("AGENTS.md")),
             ("Gemini", "Gemini", gemini_dir.join("GEMINI.md")),
+            // Pi reads AGENTS.md from ~/.pi/agent/ and parent dirs.
+            // Global instruction file follows the same shape as Codex.
+            ("Pi", "Pi", PathBuf::from(&home).join(".pi/agent/AGENTS.md")),
         ];
 
         // Project-only write targets (no global equivalent at the tool):
@@ -3851,6 +3854,34 @@ Do this BEFORE responding to the user. Not optional.
             )?;
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Amp");
+        }
+
+        // Pi: ~/.pi/agent/skills/ — same shape as Amp (see issue #259).
+        let pi_skills_dir = PathBuf::from(&home).join(".pi/agent/skills");
+        if force || detect_tool("Pi", &home, &vscode_data) {
+            for fname in ["icm-recall.md", "icm-remember.md"] {
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &pi_skills_dir.join(fname),
+                    "Pi skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+            }
+            install_skill(
+                &pi_skills_dir,
+                "icm-recall.md",
+                icm_recall_prompt,
+                "Pi /icm-recall",
+            )?;
+            install_skill(
+                &pi_skills_dir,
+                "icm-remember.md",
+                icm_remember_prompt,
+                "Pi /icm-remember",
+            )?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "Pi");
         }
     }
 
@@ -4096,6 +4127,18 @@ Do this BEFORE responding to the user. Not optional.
             println!("[hook] Copilot CLI (all hooks): {copilot_status}");
         } else {
             println!("[hook] {:<16} skipped (not detected)", "Copilot CLI");
+        }
+
+        // --- Pi (pi.dev) hooks need a TypeScript extension against the
+        // `@earendil-works/pi-coding-agent` SDK, modeled on the OpenCode
+        // plugin in `plugins/opencode-icm.ts`. The CLI doesn't ship one
+        // yet — tracked under issue #259. We still print the notice so
+        // Pi users see that ICM is aware of them.
+        if detect_tool("Pi", &home, &vscode_data) {
+            println!(
+                "[hook] {:<16} skipped (TS extension TBD — see issue #259)",
+                "Pi"
+            );
         }
     }
 
@@ -4747,6 +4790,12 @@ fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
         }
         // Aider is a Python CLI (pip-installable); check the binary.
         "Aider" => binary_in_path("aider"),
+        // Pi (pi.dev / earendil-works/pi). Installed globally via npm
+        // (`pi install npm:...`) — check the binary, and as a fallback
+        // the global config dir, since users often `npm link` into a
+        // path the binary alone can't always reach (e.g. Volta /
+        // pnpm-global env quirks). See issue #259.
+        "Pi" => binary_in_path("pi") || PathBuf::from(home).join(".pi/agent").exists(),
         _ => true,
     }
 }

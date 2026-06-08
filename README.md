@@ -120,7 +120,7 @@ Re-run the install command to upgrade to the latest release. To pin a version, p
 icm init
 ```
 
-Configures **17 tools** in one command ([full integration guide](docs/integrations.md)):
+Configures **18 tools** in one command ([full integration guide](docs/integrations.md)):
 
 | Tool | MCP | Hooks | CLI | Skills |
 |------|:---:|:-----:|:---:|:------:|
@@ -141,6 +141,7 @@ Configures **17 tools** in one command ([full integration guide](docs/integratio
 | OpenCode | JSON | TS plugin | — | — |
 | Continue.dev | `~/.continue/config.yaml` | — | — | — |
 | Aider | — | — | `.aider.conventions.md` | — |
+| Pi | — | (TS ext, TBD) | `~/.pi/agent/AGENTS.md` | `/icm-recall` `/icm-remember` |
 
 Or manually:
 

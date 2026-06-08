@@ -5145,6 +5145,14 @@ fn cmd_config() -> Result<()> {
     println!("  default_importance = {}", cfg.memory.default_importance);
     println!("  decay_rate = {}", cfg.memory.decay_rate);
     println!("  prune_threshold = {}", cfg.memory.prune_threshold);
+    println!(
+        "  auto_consolidate_enabled = {}",
+        cfg.memory.auto_consolidate_enabled
+    );
+    println!(
+        "  auto_consolidate_threshold = {}",
+        cfg.memory.auto_consolidate_threshold
+    );
     println!();
     println!("[embeddings]");
     println!("  model = {}", cfg.embeddings.model);

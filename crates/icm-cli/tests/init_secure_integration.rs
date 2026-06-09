@@ -416,3 +416,39 @@ fn pi_uninstall_strips_block_and_deletes_skills() {
         "Pi /icm-remember skill should be deleted"
     );
 }
+
+#[test]
+fn pi_per_project_drops_cwd_agents_md() {
+    // Pi (like Codex) reads AGENTS.md by walking up from cwd to $HOME.
+    // With --per-project, init should write both `~/.pi/agent/AGENTS.md`
+    // AND `cwd/AGENTS.md` so editors opened mid-tree still see the
+    // block. The same `cwd/AGENTS.md` is shared with Codex when both
+    // are detected (inject_icm_block is idempotent so no duplicate).
+    let (tmp, cwd) = make_home();
+    let out = icm_in(
+        tmp.path(),
+        &cwd,
+        "/dev/null",
+        &["init", "--mode", "cli", "--per-project", "--force"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+
+    let pi_global = tmp.path().join(".pi/agent/AGENTS.md");
+    let cwd_agents = cwd.join("AGENTS.md");
+    assert!(pi_global.exists(), "Pi global AGENTS.md must exist");
+    assert!(
+        cwd_agents.exists(),
+        "cwd AGENTS.md must be written under --per-project so Pi/Codex \
+         see the block in-tree"
+    );
+
+    // Single block, no duplicate (Codex and Pi both target the same cwd
+    // path — idempotency check).
+    let content = std::fs::read_to_string(&cwd_agents).unwrap();
+    let starts = content.matches("<!-- icm:start -->").count();
+    assert_eq!(
+        starts, 1,
+        "cwd AGENTS.md must contain exactly one icm:start marker; got \
+         {starts}\ncontent:\n{content}"
+    );
+}

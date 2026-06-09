@@ -3690,7 +3690,14 @@ icm topics                                # list all topics\n\
             if per_project {
                 let cwd_path = match *label {
                     "Claude Code" => Some(cwd.join("CLAUDE.md")),
-                    "Codex" => Some(cwd.join("AGENTS.md")),
+                    // Codex AND Pi both read AGENTS.md by walking up
+                    // from cwd to $HOME, so a single per-project
+                    // `cwd/AGENTS.md` covers both. `inject_icm_block`
+                    // is idempotent on the icm:start marker so if
+                    // both tools are detected the second pass turns
+                    // into "already configured" without duplicating
+                    // the block.
+                    "Codex" | "Pi" => Some(cwd.join("AGENTS.md")),
                     _ => None,
                 };
                 if let Some(p) = cwd_path {

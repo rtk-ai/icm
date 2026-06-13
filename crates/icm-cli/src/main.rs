@@ -141,6 +141,17 @@ enum Commands {
         /// Sort by field
         #[arg(short, long, default_value = "weight")]
         sort: SortField,
+
+        /// Output format. `human` (default) is the legacy multi-line
+        /// labelled view kept for terminal users; `toon`, `json`, and
+        /// `toml` reuse the `icm recall` serializers so external
+        /// tooling can enumerate a topic programmatically (issue #269).
+        #[arg(short = 'f', long, default_value = "human")]
+        format: ListFormat,
+
+        /// Maximum rows to return. Default: no limit.
+        #[arg(short = 'l', long)]
+        limit: Option<usize>,
     },
 
     /// Forget (delete) a memory by ID, or all memories in a topic
@@ -1031,6 +1042,38 @@ enum SortField {
     Accessed,
 }
 
+/// Output format for `icm list` (issue #269).
+///
+/// `Human` is the legacy multi-line view kept as the default to avoid
+/// breaking terminal users; `Toon`, `Json`, and `Toml` route through
+/// `recall_format::render` so the structured output matches what
+/// `icm recall --format <…>` produces for consistency.
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum ListFormat {
+    /// Legacy multi-line labelled view, for terminal reading. Default.
+    Human,
+    /// Compact TOON (header + CSV rows). Best token cost for LLM piping.
+    Toon,
+    /// `serde_json` array. Machine-readable.
+    Json,
+    /// TOML `[[memories]]` array. Config-friendly.
+    Toml,
+}
+
+impl ListFormat {
+    /// Whether this format reuses the `recall_format` renderer. `Human`
+    /// is handled inline by `cmd_list` to preserve the existing
+    /// `print_memory_detail` output verbatim.
+    fn as_recall_format(self) -> Option<recall_format::RecallFormat> {
+        match self {
+            ListFormat::Human => None,
+            ListFormat::Toon => Some(recall_format::RecallFormat::Toon),
+            ListFormat::Json => Some(recall_format::RecallFormat::Json),
+            ListFormat::Toml => Some(recall_format::RecallFormat::Toml),
+        }
+    }
+}
+
 #[derive(Clone, ValueEnum)]
 enum InitMode {
     /// MCP server plugin (Claude calls icm tools natively)
@@ -1207,7 +1250,13 @@ fn main() -> Result<()> {
                 format,
             )
         }
-        Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
+        Commands::List {
+            topic,
+            all,
+            sort,
+            format,
+            limit,
+        } => cmd_list(&store, topic.as_deref(), all, sort, format, limit),
         Commands::Forget { id, topic } => cmd_forget(&store, id.as_deref(), topic.as_deref()),
         Commands::Update {
             id,
@@ -1838,7 +1887,14 @@ fn cmd_recall(
     Ok(())
 }
 
-fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField) -> Result<()> {
+fn cmd_list(
+    store: &SqliteStore,
+    topic: Option<&str>,
+    all: bool,
+    sort: SortField,
+    format: ListFormat,
+    limit: Option<usize>,
+) -> Result<()> {
     let mut memories = if let Some(t) = topic {
         store.get_by_topic(t)?
     } else if all {
@@ -1860,13 +1916,39 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
         SortField::Accessed => memories.sort_by_key(|b| std::cmp::Reverse(b.last_accessed)),
     }
 
+    if let Some(n) = limit {
+        memories.truncate(n);
+    }
+
     if memories.is_empty() {
-        println!("{MSG_NO_MEMORIES}");
+        // Empty: keep the structured formats valid (`[]`, empty TOON
+        // header, empty TOML) so scripts can pipe straight in.
+        match format.as_recall_format() {
+            Some(f) => {
+                let rendered = recall_format::render(&[], f)?;
+                if !rendered.is_empty() {
+                    print!("{rendered}");
+                }
+            }
+            None => println!("{MSG_NO_MEMORIES}"),
+        }
         return Ok(());
     }
 
-    for mem in &memories {
-        print_memory_detail(mem, None);
+    match format.as_recall_format() {
+        Some(f) => {
+            // Reuse `recall`'s serializers. `score` is None for the
+            // list path since enumeration has no relevance score.
+            let pairs: Vec<(icm_core::Memory, Option<f32>)> =
+                memories.into_iter().map(|m| (m, None)).collect();
+            let rendered = recall_format::render(&pairs, f)?;
+            print!("{rendered}");
+        }
+        None => {
+            for mem in &memories {
+                print_memory_detail(mem, None);
+            }
+        }
     }
 
     Ok(())

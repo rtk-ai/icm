@@ -190,6 +190,15 @@ enum Commands {
         topic: Option<String>,
     },
 
+    /// Structured-facts subcommands (issue #273) — exact (entity, key,
+    /// value) lookup distinct from semantic recall. `set` on an
+    /// existing key supersedes the previous value while keeping the
+    /// history.
+    Facts {
+        #[command(subcommand)]
+        command: FactsCommands,
+    },
+
     /// Feedback subcommands — record and search prediction corrections
     Feedback {
         #[command(subcommand)]
@@ -842,6 +851,51 @@ enum MemoirCommands {
 }
 
 #[derive(Subcommand)]
+enum FactsCommands {
+    /// Set a fact: `entity.key = value`. If a row already exists for
+    /// the same `(entity, key)` and its value differs, the previous
+    /// row is marked `superseded_at = now` (history retained) and a
+    /// new active row is inserted.
+    Set {
+        /// Entity (e.g. "project:icm", "host:db-prod-1", "service:api")
+        entity: String,
+        /// Key (e.g. "gcp.project", "version", "owner")
+        key: String,
+        /// Value to set
+        value: String,
+        /// Where this fact came from (optional)
+        #[arg(short, long, default_value = "cli")]
+        source: String,
+    },
+
+    /// Get the active value for `entity.key`. Exits 1 if absent.
+    Get {
+        /// Entity to look up
+        entity: String,
+        /// Key to look up
+        key: String,
+    },
+
+    /// List active facts for an entity (optionally prefix-filtered).
+    List {
+        /// Entity to enumerate
+        entity: String,
+        /// Optional key prefix (e.g. "gcp." or "deploy.")
+        #[arg(short, long)]
+        prefix: Option<String>,
+    },
+
+    /// Show the supersession history for an `(entity, key)` slot.
+    History { entity: String, key: String },
+
+    /// Delete every row (active + history) for an `(entity, key)` slot.
+    Forget { entity: String, key: String },
+
+    /// Global facts statistics.
+    Stats,
+}
+
+#[derive(Subcommand)]
 enum FeedbackCommands {
     /// Record a prediction correction (what AI predicted vs what was correct)
     Record {
@@ -1362,6 +1416,21 @@ fn main() -> Result<()> {
             cmd_update(&store, emb_ref, &id, content, importance, keywords)
         }
         Commands::Health { topic } => cmd_health(&store, topic.as_deref()),
+        Commands::Facts { command } => match command {
+            FactsCommands::Set {
+                entity,
+                key,
+                value,
+                source,
+            } => cmd_facts_set(&store, &entity, &key, &value, &source),
+            FactsCommands::Get { entity, key } => cmd_facts_get(&store, &entity, &key),
+            FactsCommands::List { entity, prefix } => {
+                cmd_facts_list(&store, &entity, prefix.as_deref())
+            }
+            FactsCommands::History { entity, key } => cmd_facts_history(&store, &entity, &key),
+            FactsCommands::Forget { entity, key } => cmd_facts_forget(&store, &entity, &key),
+            FactsCommands::Stats => cmd_facts_stats(&store),
+        },
         Commands::Feedback { command } => match command {
             FeedbackCommands::Record {
                 topic,
@@ -3517,6 +3586,117 @@ fn cmd_stats(store: &SqliteStore) -> Result<()> {
     }
     if let Some(newest) = stats.newest_memory {
         println!("Newest:    {}", format_local(&newest, "%Y-%m-%d %H:%M"));
+    }
+    Ok(())
+}
+
+fn cmd_facts_set(
+    store: &SqliteStore,
+    entity: &str,
+    key: &str,
+    value: &str,
+    source: &str,
+) -> Result<()> {
+    use icm_core::FactsStore;
+    let prev = store.get_fact(entity, key)?;
+    let id = store.set_fact(entity, key, value, source)?;
+    match prev {
+        Some(p) if p.value == value => {
+            println!("unchanged: {entity}.{key} = {value} (id={id})");
+        }
+        Some(p) => {
+            println!(
+                "superseded: {entity}.{key}: \"{old}\" -> \"{new}\" (id={id})",
+                old = p.value,
+                new = value,
+            );
+        }
+        None => {
+            println!("set: {entity}.{key} = {value} (id={id})");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_facts_get(store: &SqliteStore, entity: &str, key: &str) -> Result<()> {
+    use icm_core::FactsStore;
+    match store.get_fact(entity, key)? {
+        Some(f) => {
+            println!("{}", f.value);
+            eprintln!(
+                "  source: {} | created: {} | id: {}",
+                f.source,
+                format_local(&f.created_at, "%Y-%m-%d %H:%M"),
+                f.id,
+            );
+            Ok(())
+        }
+        None => {
+            eprintln!("no active fact for {entity}.{key}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_facts_list(store: &SqliteStore, entity: &str, prefix: Option<&str>) -> Result<()> {
+    use icm_core::FactsStore;
+    let facts = store.list_facts(entity, prefix)?;
+    if facts.is_empty() {
+        println!("no facts for {entity}");
+        return Ok(());
+    }
+    println!("{:<32} value", "key");
+    println!("{}", "-".repeat(60));
+    for f in &facts {
+        println!("{:<32} {}", f.key, f.value);
+    }
+    Ok(())
+}
+
+fn cmd_facts_history(store: &SqliteStore, entity: &str, key: &str) -> Result<()> {
+    use icm_core::FactsStore;
+    let rows = store.history(entity, key)?;
+    if rows.is_empty() {
+        println!("no history for {entity}.{key}");
+        return Ok(());
+    }
+    println!("history of {entity}.{key} (newest first):");
+    for f in &rows {
+        let status = match f.superseded_at {
+            None => "ACTIVE".to_string(),
+            Some(ts) => format!("superseded {}", format_local(&ts, "%Y-%m-%d %H:%M")),
+        };
+        println!(
+            "  {} | {} | {} | from {} | {}",
+            f.id,
+            format_local(&f.created_at, "%Y-%m-%d %H:%M"),
+            status,
+            f.source,
+            f.value,
+        );
+    }
+    Ok(())
+}
+
+fn cmd_facts_forget(store: &SqliteStore, entity: &str, key: &str) -> Result<()> {
+    use icm_core::FactsStore;
+    let n = store.forget_fact(entity, key)?;
+    println!("forgot {n} row(s) under {entity}.{key}");
+    Ok(())
+}
+
+fn cmd_facts_stats(store: &SqliteStore) -> Result<()> {
+    use icm_core::FactsStore;
+    let s = store.facts_stats()?;
+    println!("Active facts:    {}", s.active_count);
+    println!("Total rows:      {} (history kept)", s.total_count);
+    println!("Distinct entities: {}", s.distinct_entities);
+    if !s.top_entities.is_empty() {
+        println!();
+        println!("Top entities:");
+        for (entity, n) in &s.top_entities {
+            println!("  {entity:<30} {n}");
+        }
     }
     Ok(())
 }

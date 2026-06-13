@@ -269,6 +269,30 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         .map_err(db_err)?;
     }
 
+    // Structured facts (issue #273): one row per `(entity, key,
+    // created_at)`. The unique index keyed on `(entity, key)` filtered
+    // by `superseded_at IS NULL` enforces "at most one active row
+    // per slot" at the DB layer — supersession is handled by the
+    // app via `UPDATE … SET superseded_at = …` followed by `INSERT`.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS facts (
+            id TEXT PRIMARY KEY,
+            entity TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            superseded_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity);
+        CREATE INDEX IF NOT EXISTS idx_facts_entity_key ON facts(entity, key);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_active_unique
+            ON facts(entity, key) WHERE superseded_at IS NULL;
+        ",
+    )
+    .map_err(db_err)?;
+
     // Transcripts (verbatim sessions + messages)
     conn.execute_batch(
         "

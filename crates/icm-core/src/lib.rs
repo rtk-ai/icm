@@ -2,6 +2,8 @@ pub mod auto_link;
 pub mod context_snapshot;
 pub mod embedder;
 pub mod error;
+pub mod facts;
+pub mod facts_store;
 #[cfg(feature = "embeddings")]
 pub mod fastembed_embedder;
 pub mod feedback;
@@ -25,6 +27,8 @@ pub use context_snapshot::{
 };
 pub use embedder::Embedder;
 pub use error::{IcmError, IcmResult};
+pub use facts::{Fact, FactsStats};
+pub use facts_store::FactsStore;
 #[cfg(feature = "embeddings")]
 pub use fastembed_embedder::FastEmbedder;
 pub use feedback::{Feedback, FeedbackStats};

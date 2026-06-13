@@ -445,6 +445,31 @@ enum Commands {
         no_preferences: bool,
     },
 
+    /// Print the deterministic identity/preferences snapshot (issue #271)
+    ///
+    /// Unlike `wake-up` which mixes decisions/errors/milestones into a
+    /// semantic-ish pack, this is the always-on baseline: identity +
+    /// durable preferences (+ project-context bullets when `--project`
+    /// is set). Designed to be injected at SessionStart **separately
+    /// from semantic recall** so the agent always has its baseline.
+    ///
+    /// Emits an `over_budget` consolidate hint when the snapshot is
+    /// `>=80%` of the budget AND at least one entry was dropped
+    /// (Hermes pattern: never silently drop without warning).
+    Context {
+        /// Project filter (default: auto-detect from PWD/git remote; use "-" to disable)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Approximate token budget (1 token ≈ 4 characters)
+        #[arg(short = 't', long, default_value = "1200")]
+        max_tokens: usize,
+
+        /// Output format
+        #[arg(short, long, default_value = "markdown")]
+        format: CliSnapshotFormat,
+    },
+
     /// Auto-save context for the current project (detects from PWD / git remote)
     SaveProject {
         /// Summary of what was done in this session
@@ -997,6 +1022,16 @@ impl From<CliWakeUpFormat> for WakeUpFormat {
 }
 
 #[derive(Clone, ValueEnum)]
+enum CliSnapshotFormat {
+    Markdown,
+    Plain,
+    /// JSON object with structured `sections` + `over_budget` + `dropped`
+    /// fields. Useful for downstream tools that want to render their own
+    /// hint UI instead of the in-band blockquote.
+    Json,
+}
+
+#[derive(Clone, ValueEnum)]
 enum CliImportFormat {
     Auto,
     ClaudeAi,
@@ -1488,6 +1523,11 @@ fn main() -> Result<()> {
             format,
             no_preferences,
         } => cmd_wake_up(&store, project, max_tokens, format, no_preferences),
+        Commands::Context {
+            project,
+            max_tokens,
+            format,
+        } => cmd_context(&store, project, max_tokens, format),
         Commands::SaveProject {
             content,
             importance,
@@ -3276,9 +3316,31 @@ fn build_hook_start_pack(
         }
     };
 
+    // Issue #271: prepend a deterministic identity/preferences snapshot
+    // before the semantic wake-up pack. The snapshot is always-on
+    // (independent of the user's first prompt) so the agent has its
+    // baseline identity even when the prompt doesn't trigger any
+    // semantic match. The two blocks share the same hook output but
+    // are conceptually distinct — see the issue for rationale.
+    //
+    // Budget split: ~40% to the snapshot (baseline), ~60% to the wake-up
+    // (project context + decisions). With the default max_tokens
+    // (passed in from `hook.start_max_tokens`), the snapshot lands at
+    // ~480 chars × 4 = ~120 tokens worst-case at the default 300-token
+    // budget, leaving ~180 tokens for the semantic pack.
+    let snapshot_budget = max_tokens.saturating_mul(2) / 5;
+    let wake_up_budget = max_tokens.saturating_sub(snapshot_budget).max(50);
+
+    let snap_opts = icm_core::ContextSnapshotOptions {
+        project: project_name.as_deref(),
+        max_tokens: snapshot_budget.max(80),
+        format: icm_core::SnapshotFormat::Markdown,
+    };
+    let snapshot = icm_core::build_context_snapshot(store, &snap_opts)?;
+
     let opts = icm_core::WakeUpOptions {
         project: project_name.as_deref(),
-        max_tokens,
+        max_tokens: wake_up_budget,
         format: icm_core::WakeUpFormat::Markdown,
         include_preferences: true,
     };
@@ -3289,11 +3351,24 @@ fn build_hook_start_pack(
     // session — let the user start clean. We detect the empty case via the
     // exported header constant, not substring matching the body, to stay
     // decoupled from the exact wording in `icm_core::wake_up::render()`.
-    if pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER) {
+    let wake_up_empty = pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+
+    if wake_up_empty && snapshot.is_empty() {
         return Ok(String::new());
     }
 
-    Ok(pack)
+    let mut out = String::new();
+    if !snapshot.is_empty() {
+        out.push_str(&snapshot.render(icm_core::SnapshotFormat::Markdown));
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+    if !wake_up_empty {
+        out.push_str(&pack);
+    }
+
+    Ok(out)
 }
 
 /// Extract a project name from a filesystem path (basename), treating empty
@@ -5828,6 +5903,59 @@ fn cmd_wake_up(
     Ok(())
 }
 
+/// Print the deterministic identity/preferences snapshot (issue #271).
+///
+/// Returns the rendered snapshot in the requested format. For `Json`, the
+/// full `ContextSnapshot` struct is emitted so downstream tools can react
+/// to `over_budget` / `dropped` programmatically.
+fn cmd_context(
+    store: &SqliteStore,
+    project: Option<String>,
+    max_tokens: usize,
+    format: CliSnapshotFormat,
+) -> Result<()> {
+    let detected;
+    let project_ref: Option<&str> = match project.as_deref() {
+        Some("-") => None,
+        Some(p) => Some(p),
+        None => {
+            detected = detect_project();
+            if detected.is_empty() || detected == "unknown" {
+                None
+            } else {
+                eprintln!("Project: {detected} (auto-detected; use --project - to disable)");
+                Some(detected.as_str())
+            }
+        }
+    };
+
+    let opts = icm_core::ContextSnapshotOptions {
+        project: project_ref,
+        max_tokens,
+        format: match format {
+            CliSnapshotFormat::Markdown => icm_core::SnapshotFormat::Markdown,
+            CliSnapshotFormat::Plain => icm_core::SnapshotFormat::Plain,
+            // JSON mode renders the struct directly, so the inner format
+            // is irrelevant — pick Markdown for the in-Snapshot fallback.
+            CliSnapshotFormat::Json => icm_core::SnapshotFormat::Markdown,
+        },
+    };
+
+    let snap = icm_core::build_context_snapshot(store, &opts)?;
+
+    match format {
+        CliSnapshotFormat::Json => {
+            print!("{}", serde_json::to_string_pretty(&snap)?);
+            println!();
+        }
+        CliSnapshotFormat::Markdown => {
+            print!("{}", snap.render(icm_core::SnapshotFormat::Markdown))
+        }
+        CliSnapshotFormat::Plain => print!("{}", snap.render(icm_core::SnapshotFormat::Plain)),
+    }
+    Ok(())
+}
+
 fn cmd_save_project(
     store: &SqliteStore,
     embedder: Option<&dyn icm_core::Embedder>,
@@ -7767,6 +7895,17 @@ mod hook_start_tests {
         );
     }
 
+    /// The hook pack begins with EITHER the context-snapshot header (when
+    /// the seed has preferences/project-context memories) OR the wake-up
+    /// header (when only critical/high decisions exist). Both layers are
+    /// valid SessionStart prefixes — this helper centralizes the check.
+    fn assert_pack_prefix(pack: &str) {
+        assert!(
+            pack.starts_with(icm_core::SNAPSHOT_HEADER) || pack.starts_with("# ICM Wake-up"),
+            "expected snapshot or wake-up header, got: {pack}"
+        );
+    }
+
     #[test]
     fn hook_start_pack_tolerates_malformed_stdin() {
         let store = seed_store();
@@ -7775,7 +7914,7 @@ mod hook_start_tests {
         // Either it auto-detected nothing (then all memories pass) or auto-detected a
         // real repo name — either way, must not panic and must produce valid output.
         assert!(!pack.is_empty());
-        assert!(pack.starts_with("# ICM Wake-up"));
+        assert_pack_prefix(&pack);
     }
 
     #[test]
@@ -7786,7 +7925,7 @@ mod hook_start_tests {
         // No cwd → falls back to detect_project() which will use current test
         // process PWD. We don't assert on the specific project but we do verify
         // the call doesn't fail and we get some output.
-        assert!(pack.starts_with("# ICM Wake-up"));
+        assert_pack_prefix(&pack);
     }
 
     #[test]
@@ -7857,6 +7996,53 @@ mod hook_start_tests {
         // We don't assert on which project was picked; we just require the
         // call does not panic and returns a valid, non-empty pack.
         assert!(!pack.is_empty());
+        assert_pack_prefix(&pack);
+    }
+
+    /// Issue #271: with a `preferences` memory present, the SessionStart
+    /// pack must lead with the deterministic snapshot — independent of
+    /// whether the semantic wake-up block has anything to add.
+    #[test]
+    fn hook_start_pack_prepends_context_snapshot_when_preferences_exist() {
+        let store = seed_store();
+        let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm"}"#;
+        let pack = build_hook_start_pack(&store, stdin_json, 300).unwrap();
+        assert!(
+            pack.starts_with(icm_core::SNAPSHOT_HEADER),
+            "snapshot should land first, got: {pack}",
+        );
+        assert!(
+            pack.contains("French"),
+            "preference must survive in snapshot: {pack}",
+        );
+        // The wake-up block still follows because we have a Critical
+        // decision in `decisions-icm`.
+        assert!(
+            pack.contains("# ICM Wake-up"),
+            "wake-up section dropped from concatenated pack: {pack}",
+        );
+        assert!(pack.contains("SQLite"));
+    }
+
+    /// Snapshot must NOT appear when only decisions exist (no
+    /// preferences and no project-context memories) — wake-up alone is
+    /// emitted.
+    #[test]
+    fn hook_start_pack_skips_snapshot_when_only_decisions() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "decisions-icm".into(),
+                "Use SQLite with FTS5".into(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm"}"#;
+        let pack = build_hook_start_pack(&store, stdin_json, 200).unwrap();
+        assert!(
+            !pack.starts_with(icm_core::SNAPSHOT_HEADER),
+            "snapshot header should be absent: {pack}",
+        );
         assert!(pack.starts_with("# ICM Wake-up"));
     }
 }

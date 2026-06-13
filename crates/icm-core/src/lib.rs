@@ -1,4 +1,5 @@
 pub mod auto_link;
+pub mod context_snapshot;
 pub mod embedder;
 pub mod error;
 #[cfg(feature = "embeddings")]
@@ -18,6 +19,10 @@ pub mod wake_up;
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 pub use auto_link::{add_backrefs, auto_link_memory, AutoLinkOptions};
+pub use context_snapshot::{
+    build_context_snapshot, build_context_snapshot_from_memories, ContextSnapshot,
+    ContextSnapshotOptions, SnapshotFormat, SnapshotSection, SNAPSHOT_HEADER,
+};
 pub use embedder::Embedder;
 pub use error::{IcmError, IcmResult};
 #[cfg(feature = "embeddings")]

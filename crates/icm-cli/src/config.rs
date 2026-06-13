@@ -24,6 +24,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub web: WebConfig,
     pub cloud: CloudConfig,
+    pub archive: ArchiveConfig,
 }
 
 /// Database storage settings.
@@ -126,6 +127,38 @@ impl Default for WakeUpConfig {
 #[serde(default)]
 pub struct ConsolidateConfig {
     pub summarizer: SummarizerConfig,
+}
+
+/// Session-archive settings (issue #272).
+///
+/// When `enabled = true`, the post-tool and user-prompt hooks tee a
+/// verbatim copy of each event into the `sessions`/`messages` tables.
+/// Search via `icm sessions search …` (or the existing
+/// `icm_transcript_search` MCP tool). Off by default — turn on once
+/// secret scrubbing and a retention story are validated for the
+/// project at hand.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ArchiveConfig {
+    /// Master switch for hook auto-archive.
+    pub enabled: bool,
+    /// Maximum bytes of tool output to archive per fire (truncate the
+    /// tail at a UTF-8 char boundary if exceeded). 0 = no cap.
+    /// Defaults to 32 KB — large enough for most CLI tool output,
+    /// small enough that a runaway log doesn't blow the DB out.
+    pub max_bytes_per_event: usize,
+}
+
+impl ArchiveConfig {
+    /// Resolved per-event cap. Centralized so the hook and the tests
+    /// agree.
+    pub fn effective_max_bytes(&self) -> usize {
+        if self.max_bytes_per_event == 0 {
+            32 * 1024
+        } else {
+            self.max_bytes_per_event
+        }
+    }
 }
 
 /// LLM-backed summarizer settings — applies to both `icm consolidate` and

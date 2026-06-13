@@ -1,3 +1,4 @@
+mod archive;
 mod bench_data;
 mod bench_format;
 mod bench_knowledge;
@@ -199,6 +200,15 @@ enum Commands {
     Transcript {
         #[command(subcommand)]
         command: TranscriptCommands,
+    },
+
+    /// Session archive (issue #272) — UX-friendly entry point for the
+    /// verbatim sessions/messages tables that the hook auto-archive
+    /// feeds. Internally delegates to the same store as `transcript`,
+    /// but exposes the read-only subset most agents care about.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommands,
     },
 
     /// Detect recurring patterns in a topic and optionally create memoir concepts
@@ -987,6 +997,52 @@ enum TranscriptCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum SessionsCommands {
+    /// Full-text search across archived messages (BM25)
+    Search {
+        /// Query (FTS5 syntax: `OR`, `*` prefix, `"phrase"`)
+        query: String,
+        /// Only within this session id
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Only within this project
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// List archived sessions, newest first
+    List {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Replay the full message thread of a session, chronologically
+    Show {
+        /// Session id
+        session: String,
+        /// Max messages to show
+        #[arg(short, long, default_value = "200")]
+        limit: usize,
+    },
+
+    /// Show global session-archive statistics
+    Stats,
+
+    /// Delete an archived session and all its messages
+    Forget {
+        /// Session id
+        session: String,
+    },
+}
+
 #[derive(Clone, ValueEnum)]
 enum CliImportance {
     Critical,
@@ -1373,6 +1429,28 @@ fn main() -> Result<()> {
             TranscriptCommands::Stats => cmd_transcript_stats(&store),
             TranscriptCommands::Forget { session } => cmd_transcript_forget(&store, &session),
         },
+        Commands::Sessions { command } => match command {
+            SessionsCommands::Search {
+                query,
+                session,
+                project,
+                limit,
+            } => cmd_transcript_search(
+                &store,
+                &query,
+                session.as_deref(),
+                project.as_deref(),
+                limit,
+            ),
+            SessionsCommands::List { project, limit } => {
+                cmd_transcript_list_sessions(&store, project.as_deref(), limit)
+            }
+            SessionsCommands::Show { session, limit } => {
+                cmd_transcript_show(&store, &session, limit)
+            }
+            SessionsCommands::Stats => cmd_transcript_stats(&store),
+            SessionsCommands::Forget { session } => cmd_transcript_forget(&store, &session),
+        },
         Commands::ExtractPatterns {
             topic,
             memoir,
@@ -1633,6 +1711,7 @@ fn main() -> Result<()> {
                         extract_every,
                         cfg.extraction.store_raw,
                         &cfg.extraction.summarizer,
+                        &cfg.archive,
                     )
                 }
                 HookCommands::Compact => {
@@ -1642,7 +1721,7 @@ fn main() -> Result<()> {
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
                     cmd_hook_compact(&store, emb_ref, &cfg.memory)
                 }
-                HookCommands::Prompt => cmd_hook_prompt(&store),
+                HookCommands::Prompt => cmd_hook_prompt(&store, &cfg.archive),
                 HookCommands::Start { max_tokens } => {
                     let tokens = if max_tokens > 0 {
                         max_tokens
@@ -2693,6 +2772,7 @@ fn cmd_hook_post(
     extract_every: usize,
     store_raw: bool,
     extraction_summarizer: &crate::config::SummarizerConfig,
+    archive_cfg: &crate::config::ArchiveConfig,
 ) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
         return Ok(());
@@ -2708,6 +2788,24 @@ fn cmd_hook_post(
     // Skip ICM's own tools (avoid infinite loop)
     if tool_name.starts_with("icm_") || tool_name.starts_with("mcp__icm__") {
         return Ok(());
+    }
+
+    // Session archive (issue #272): tee every tool fire into the
+    // verbatim store BEFORE the extraction counter, so the searchable
+    // archive is independent of `extract_every`. No-op when
+    // `[archive].enabled = false`.
+    if archive_cfg.enabled {
+        let tool_output_for_archive = extract_tool_output(&json).unwrap_or("");
+        if !tool_output_for_archive.is_empty() {
+            archive::record_event(
+                store,
+                archive_cfg,
+                &json,
+                icm_core::transcript::Role::Tool,
+                tool_output_for_archive,
+                Some(tool_name).filter(|s| !s.is_empty()),
+            );
+        }
     }
 
     // Track tool calls in SQLite (atomic, persists across reboots)
@@ -3140,7 +3238,7 @@ pub(crate) fn truncate_tail_at_char_boundary(s: &str, max_bytes: usize) -> &str 
 /// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
 /// Reads JSON from stdin with `user_message`, recalls relevant memories,
 /// and prints context to stdout (Claude Code appends it as system-reminder).
-fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
+fn cmd_hook_prompt(store: &SqliteStore, archive_cfg: &crate::config::ArchiveConfig) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
         return Ok(());
     };
@@ -3163,6 +3261,20 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
 
     if message.is_empty() {
         return Ok(());
+    }
+
+    // Issue #272: archive the user turn verbatim before recall runs,
+    // so a subsequent `icm sessions search` can find it regardless of
+    // whether semantic recall matched anything.
+    if archive_cfg.enabled {
+        archive::record_event(
+            store,
+            archive_cfg,
+            &json,
+            icm_core::transcript::Role::User,
+            message,
+            None,
+        );
     }
 
     // Project name (from hook cwd) is used as a hard filter on recalled

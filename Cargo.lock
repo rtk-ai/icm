@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.49"
+version = "0.10.51"
 dependencies = [
  "anyhow",
  "axum",

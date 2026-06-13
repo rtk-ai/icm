@@ -3351,8 +3351,7 @@ fn build_hook_start_pack(
     // session — let the user start clean. We detect the empty case via the
     // exported header constant, not substring matching the body, to stay
     // decoupled from the exact wording in `icm_core::wake_up::render()`.
-    let wake_up_empty =
-        pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+    let wake_up_empty = pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER);
 
     if wake_up_empty && snapshot.is_empty() {
         return Ok(String::new());
@@ -5949,7 +5948,9 @@ fn cmd_context(
             print!("{}", serde_json::to_string_pretty(&snap)?);
             println!();
         }
-        CliSnapshotFormat::Markdown => print!("{}", snap.render(icm_core::SnapshotFormat::Markdown)),
+        CliSnapshotFormat::Markdown => {
+            print!("{}", snap.render(icm_core::SnapshotFormat::Markdown))
+        }
         CliSnapshotFormat::Plain => print!("{}", snap.render(icm_core::SnapshotFormat::Plain)),
     }
     Ok(())

@@ -346,10 +346,8 @@ mod tests {
             mem("contexte-other", "Other uses Postgres", Importance::High),
         ];
         let opts_no_filter = ContextSnapshotOptions::default();
-        let snap_unfiltered = build_context_snapshot_from_memories(
-            memories.clone(),
-            &opts_no_filter,
-        );
+        let snap_unfiltered =
+            build_context_snapshot_from_memories(memories.clone(), &opts_no_filter);
         assert!(snap_unfiltered.is_empty(), "no project = no context block");
 
         let opts = ContextSnapshotOptions {
@@ -416,8 +414,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_empty_snapshot() {
-        let snap =
-            build_context_snapshot_from_memories(vec![], &ContextSnapshotOptions::default());
+        let snap = build_context_snapshot_from_memories(vec![], &ContextSnapshotOptions::default());
         assert!(snap.is_empty());
         assert_eq!(snap.dropped, 0);
         assert!(!snap.over_budget);
@@ -433,10 +430,8 @@ mod tests {
             vec![a.clone(), b.clone()],
             &ContextSnapshotOptions::default(),
         );
-        let snap2 = build_context_snapshot_from_memories(
-            vec![b, a],
-            &ContextSnapshotOptions::default(),
-        );
+        let snap2 =
+            build_context_snapshot_from_memories(vec![b, a], &ContextSnapshotOptions::default());
         assert_eq!(
             snap1.render(SnapshotFormat::Markdown),
             snap2.render(SnapshotFormat::Markdown),
@@ -519,7 +514,10 @@ mod tests {
         );
         // Sanity check: result is bounded and identity section landed.
         assert!(snap.total_chars <= snap.max_chars);
-        assert!(snap.sections.iter().any(|s| s.title.starts_with("Identity")));
+        assert!(snap
+            .sections
+            .iter()
+            .any(|s| s.title.starts_with("Identity")));
     }
 
     #[test]

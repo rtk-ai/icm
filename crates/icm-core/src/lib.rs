@@ -19,6 +19,10 @@ pub mod wake_up;
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 pub use auto_link::{add_backrefs, auto_link_memory, AutoLinkOptions};
+pub use context_snapshot::{
+    build_context_snapshot, build_context_snapshot_from_memories, ContextSnapshot,
+    ContextSnapshotOptions, SnapshotFormat, SnapshotSection, SNAPSHOT_HEADER,
+};
 pub use embedder::Embedder;
 pub use error::{IcmError, IcmResult};
 #[cfg(feature = "embeddings")]
@@ -36,10 +40,6 @@ pub use transcript_store::TranscriptStore;
 pub use wake_up::{
     build_wake_up, build_wake_up_from_memories, is_preference_topic, project_matches, WakeUpFormat,
     WakeUpOptions, EMPTY_PACK_HEADER,
-};
-pub use context_snapshot::{
-    build_context_snapshot, build_context_snapshot_from_memories, ContextSnapshot,
-    ContextSnapshotOptions, SnapshotFormat, SnapshotSection, SNAPSHOT_HEADER,
 };
 
 pub use learn::{learn_project, LearnResult};

@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.10.51](https://github.com/rtk-ai/icm/compare/icm-v0.10.50...icm-v0.10.51) (2026-06-13)
+
+
+### Features
+
+* **cli:** add `remember` subcommand ([1f31222](https://github.com/rtk-ai/icm/commit/1f31222ab1bdf34ed1c71d9f056dccd489032697))
+* **list:** add --format human|toon|json|toml and --limit (closes [#269](https://github.com/rtk-ai/icm/issues/269)) ([9f054a2](https://github.com/rtk-ai/icm/commit/9f054a2c290f1cc7ae06fbd477342bbd052cbfb6))
+* **list:** add --format json|toon|toml and --limit (closes [#269](https://github.com/rtk-ai/icm/issues/269)) ([818cfa2](https://github.com/rtk-ai/icm/commit/818cfa240e247bc374c91312b6fe2e4edb9d3465))
+
+
+### Bug Fixes
+
+* **cli:** char-align all truncation slices to prevent multibyte panic ([81f5056](https://github.com/rtk-ai/icm/commit/81f5056422761509c9568238c0ed376da7f21c7c))
+* **cli:** char-align all truncation slices to prevent multibyte panic ([7e8b34e](https://github.com/rtk-ai/icm/commit/7e8b34e98b9216cac41000f28f53b62601f1adaa))
+* **cli:** remove audit note from --db help text ([5a945dc](https://github.com/rtk-ai/icm/commit/5a945dc5c79c107f6e5c34d7d774d3bb7f7a3e02))
+* **codex:** drop unsupported updatedInput + generalize instruction template ([3189398](https://github.com/rtk-ai/icm/commit/31893980b6704b475742fe6157d83eaf407fc70a))
+* **hook:** drop unsupported updatedInput from PreToolUse response ([d6fc2eb](https://github.com/rtk-ai/icm/commit/d6fc2eb5849ffeecddc4fad3d75c849a2197e6b9)), closes [#237](https://github.com/rtk-ai/icm/issues/237)
+* **install:** make the icm instruction block file-agnostic ([4f8f397](https://github.com/rtk-ai/icm/commit/4f8f397e26c276890f7f1a6701f262915b9d0c1f)), closes [#238](https://github.com/rtk-ai/icm/issues/238)
+
 ## [0.10.50](https://github.com/rtk-ai/icm/compare/icm-v0.10.49...icm-v0.10.50) (2026-05-23)
 
 

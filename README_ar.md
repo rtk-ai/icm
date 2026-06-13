@@ -320,6 +320,59 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 راجع [config/default.toml](config/default.toml) لجميع الخيارات.
 
+## مشاريع متعددة ووكلاء متعددون
+
+صُمم ICM للحالة التي يتعاون فيها مستخدم واحد مع وكلاء متعددين عبر مشاريع متعددة. يجب أن تظل الذكريات وثيقة الصلة: فقرار من المشروع A يجب ألا يتسرب أبدًا إلى المشروع B، ووكيل `dev` لا ينبغي أن يتغذى على ما خزّنه وكيل `mentor`.
+
+### عزل المشاريع
+
+يحدد ICM نطاق الذكريات عبر **اصطلاح تسمية الموضوعات**، لا عبر عمود منفصل. الاصطلاح كالتالي:
+
+```
+{kind}-{project}              # e.g. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
+preferences                   # global, always included
+identity                      # global, always included
+```
+
+يقوم `icm_wake_up { project: "icm" }` بمطابقة **مدركة للمقاطع**: فـ `"icm"` يطابق `decisions-icm` و`errors-icm-core` و`contexte-icm` — لكنه لا يطابق أبدًا `icmp-notes` (لا توجد تطابقات إيجابية كاذبة). تُقسَّم الموضوعات على `-` و`.` و`_` و`/` و`:`. أما موضوعا التفضيلات والهوية فهما عابرَا المشاريع بالتصميم — فالإرشادات على مستوى المستخدم لا تُحذف أبدًا.
+
+كل من خطاف `UserPromptSubmit` (`icm hook prompt`) وخطاف `SessionStart` (`icm hook start`) يستنبطان المشروع من حقل `cwd` في JSON الخاص بالخطاف (`basename` لمجلد العمل). شغّل كل مشروع من مجلده الخاص ويصبح العزل تلقائيًا.
+
+### كتابة ذكريات جيدة
+
+يتطلب `icm_memory_store` من الوكيل اختيار `topic` و`content` — لا يوجد مصنِّف تلقائي. أفضل الممارسات:
+
+| الحقل | الإرشاد |
+|------|----------|
+| `topic` | `{kind}-{project}`. الأنواع: `decisions`, `errors-resolved`, `contexte`, `preferences`. |
+| `content` | حقيقة واحدة لكل تخزين. ملخص مكثف بالإنجليزية — `topic + content` هو نص التضمين. |
+| `raw_excerpt` | حرفيًا فقط (كود، رسالة خطأ دقيقة، مخرجات أمر). |
+| `keywords` | 3 إلى 5 مصطلحات لتعزيز استرجاع BM25. |
+| `importance` | `critical` لما لا يُنسى أبدًا، `high` لقرارات المشروع، `medium` افتراضيًا، `low` للزائل. |
+
+يتولى ICM الباقي: **إزالة التكرار عند تشابه 85%**، و**الربط التلقائي** بين الذكريات المتقاربة دلاليًا، و**الدمج التلقائي** فوق 10 إدخالات لكل موضوع، و**التضاؤل** الموزون بعدد مرات الوصول. حقيقة واحدة لكل استدعاء أفضل من التفريغات المُجمَّعة — فالمسترجع يُعطي الحقائق المخزنة فرديًا ترتيبًا أعلى.
+
+### أدوار متعددة الوكلاء
+
+لا يحتوي ICM بعدُ على عمود `role` من الدرجة الأولى. اليوم، تُحاكى الأدوار عبر لواحق الموضوعات بالإضافة إلى مجلدات عمل مخصصة لكل وكيل:
+
+```
+decisions-icm-dev             # dev agent: code patterns, library choices, refactors
+decisions-icm-architect       # architect: design, workflows, subtask decomposition
+decisions-icm-mentor          # mentor / BA: business goals, non-technical context
+```
+
+يعمل كل وكيل في مجلد العمل الخاص به (`~/projects/icm-dev/`، `~/projects/icm-architect/`، ...) بحيث يستنبط `icm hook prompt` و`icm hook start` مقطع مشروع مختلفًا من `cwd` ولا يستدعي إلا الذكريات المطابقة. أما التفضيلات فتبقى عامة — وهوية المستخدم تنتقل عبر جميع الأدوار.
+
+داخل الوكيل الواحد، يمكنك أيضًا تضييق الاستدعاء يدويًا:
+
+```jsonc
+// icm_memory_recall
+{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
+```
+
+حقل `role` من الدرجة الأولى (مع تصفية أصلية في wake-up والاستدعاء) مدرج في خارطة الطريق. وحتى ذلك الحين، يبقى اصطلاح لاحقة الموضوع هو النمط المدعوم.
+
 ## الاستخراج التلقائي
 
 يستخرج ICM الذكريات تلقائيًا عبر ثلاث طبقات:

@@ -320,6 +320,59 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 すべてのオプションは [config/default.toml](config/default.toml) を参照してください。
 
+## マルチプロジェクト・マルチエージェント
+
+ICM は、一人のユーザーが複数のプロジェクトにまたがって複数のエージェントと協働するケースを想定して構築されています。メモリは関連性を保つ必要があります。プロジェクト A の決定がプロジェクト B に漏れてはならず、`dev` エージェントが `mentor` エージェントの保存内容で初期化されることもあってはなりません。
+
+### プロジェクトの分離
+
+ICM はメモリを別カラムではなく **トピックの命名規則** によってスコープ化します。規則は以下の通りです。
+
+```
+{kind}-{project}              # e.g. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
+preferences                   # global, always included
+identity                      # global, always included
+```
+
+`icm_wake_up { project: "icm" }` は **セグメント単位** でマッチングを行います。`"icm"` は `decisions-icm`、`errors-icm-core`、`contexte-icm` にはマッチしますが、`icmp-notes` には決してマッチしません(誤検出なし)。トピックは `-`、`.`、`_`、`/`、`:` で分割されます。`preferences` と `identity` のトピックは設計上クロスプロジェクトです。ユーザーレベルのガイダンスが取り除かれることはありません。
+
+`UserPromptSubmit` フック (`icm hook prompt`) と `SessionStart` フック (`icm hook start`) はどちらも、フック JSON の `cwd` フィールド(作業ディレクトリの `basename`)からプロジェクトを導出します。各プロジェクトを専用のディレクトリから実行すれば、分離は自動的に行われます。
+
+### 良いメモリの書き方
+
+`icm_memory_store` ではエージェントが `topic` と `content` を選ぶ必要があります。自動分類器はありません。ベストプラクティス:
+
+| フィールド | ガイダンス |
+|------|----------|
+| `topic` | `{kind}-{project}`。種別: `decisions`、`errors-resolved`、`contexte`、`preferences`。 |
+| `content` | 1 回の保存につき 1 つの事実。密度の高い英語の要約 — `topic + content` が埋め込み対象テキストになります。 |
+| `raw_excerpt` | 逐語的なもののみ(コード、正確なエラーメッセージ、コマンド出力)。 |
+| `keywords` | BM25 検索を強化するための 3〜5 個の語。 |
+| `importance` | 絶対に忘れたくないものは `critical`、プロジェクトの決定は `high`、デフォルトは `medium`、一時的なものは `low`。 |
+
+残りは ICM が処理します。**85% 類似度での重複排除**、意味的に近いメモリ間の **自動リンク**、トピックあたり 10 件を超えた場合の **自動統合**、そしてアクセス回数で重み付けされた **減衰** です。1 呼び出しあたり 1 つの事実とするほうがバッチ投入よりも優れています。リトリーバは個別に保存された事実をより上位にランク付けします。
+
+### マルチエージェントのロール
+
+ICM にはまだ第一級の `role` カラムはありません。現状では、ロールはトピックの接尾辞とエージェントごとの作業ディレクトリでエミュレートされます。
+
+```
+decisions-icm-dev             # dev agent: code patterns, library choices, refactors
+decisions-icm-architect       # architect: design, workflows, subtask decomposition
+decisions-icm-mentor          # mentor / BA: business goals, non-technical context
+```
+
+各エージェントは自分専用の作業ディレクトリ(`~/projects/icm-dev/`、`~/projects/icm-architect/`、…)で動作します。これにより `icm hook prompt` と `icm hook start` が `cwd` から異なるプロジェクトセグメントを導出し、対応するメモリのみを呼び出します。`preferences` はグローバルのままです。ユーザーのアイデンティティはすべてのロールにまたがって引き継がれます。
+
+単一のエージェント内でも、手動で recall を絞り込めます。
+
+```jsonc
+// icm_memory_recall
+{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
+```
+
+第一級の `role` フィールド(wake-up と recall でのネイティブフィルタリング付き)はロードマップに含まれています。それまでは、トピック接尾辞の規則がサポートされるパターンです。
+
 ## 自動抽出
 
 ICMは3つのレイヤーを通じてメモリを自動的に抽出します:

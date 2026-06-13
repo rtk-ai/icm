@@ -39,12 +39,7 @@ use icm_store::SqliteStore;
     about = "Infinite Context Memory - persistent memory for LLMs"
 )]
 struct Cli {
-    /// Path to the SQLite database. Audit #185 medium: `clap`'s
-    /// `global = true` lets the same flag appear at both the parent
-    /// and subcommand level (`icm --db A stats --db B`), with the
-    /// last occurrence winning silently. We collect into a `Vec` so
-    /// we can detect that case and reject it with a clear error
-    /// instead of letting the user lose data with the wrong DB.
+    /// Path to the SQLite database (overrides config and ICM_DB env var)
     #[arg(long, global = true, action = clap::ArgAction::Append)]
     db: Vec<PathBuf>,
 
@@ -79,6 +74,25 @@ enum Commands {
         /// Raw excerpt (verbatim code, error message, etc.)
         #[arg(short, long)]
         raw: Option<String>,
+    },
+
+    /// Shorthand for `store` with positional content. Topic defaults to the
+    /// auto-detected project name (git remote or cwd).
+    Remember {
+        /// Fact to remember
+        content: String,
+
+        /// Topic/category (default: auto-detected project name)
+        #[arg(short, long)]
+        topic: Option<String>,
+
+        /// Importance level
+        #[arg(short, long, default_value = "medium")]
+        importance: CliImportance,
+
+        /// Keywords (comma-separated)
+        #[arg(short, long)]
+        keywords: Option<String>,
     },
 
     /// Search memories
@@ -127,6 +141,17 @@ enum Commands {
         /// Sort by field
         #[arg(short, long, default_value = "weight")]
         sort: SortField,
+
+        /// Output format. `human` (default) is the legacy multi-line
+        /// labelled view kept for terminal users; `toon`, `json`, and
+        /// `toml` reuse the `icm recall` serializers so external
+        /// tooling can enumerate a topic programmatically (issue #269).
+        #[arg(short = 'f', long, default_value = "human")]
+        format: ListFormat,
+
+        /// Maximum rows to return. Default: no limit.
+        #[arg(short = 'l', long)]
+        limit: Option<usize>,
     },
 
     /// Forget (delete) a memory by ID, or all memories in a topic
@@ -1017,6 +1042,38 @@ enum SortField {
     Accessed,
 }
 
+/// Output format for `icm list` (issue #269).
+///
+/// `Human` is the legacy multi-line view kept as the default to avoid
+/// breaking terminal users; `Toon`, `Json`, and `Toml` route through
+/// `recall_format::render` so the structured output matches what
+/// `icm recall --format <…>` produces for consistency.
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum ListFormat {
+    /// Legacy multi-line labelled view, for terminal reading. Default.
+    Human,
+    /// Compact TOON (header + CSV rows). Best token cost for LLM piping.
+    Toon,
+    /// `serde_json` array. Machine-readable.
+    Json,
+    /// TOML `[[memories]]` array. Config-friendly.
+    Toml,
+}
+
+impl ListFormat {
+    /// Whether this format reuses the `recall_format` renderer. `Human`
+    /// is handled inline by `cmd_list` to preserve the existing
+    /// `print_memory_detail` output verbatim.
+    fn as_recall_format(self) -> Option<recall_format::RecallFormat> {
+        match self {
+            ListFormat::Human => None,
+            ListFormat::Toon => Some(recall_format::RecallFormat::Toon),
+            ListFormat::Json => Some(recall_format::RecallFormat::Json),
+            ListFormat::Toml => Some(recall_format::RecallFormat::Toml),
+        }
+    }
+}
+
 #[derive(Clone, ValueEnum)]
 enum InitMode {
     /// MCP server plugin (Claude calls icm tools natively)
@@ -1150,6 +1207,26 @@ fn main() -> Result<()> {
                 raw,
             )
         }
+        Commands::Remember {
+            content,
+            topic,
+            importance,
+            keywords,
+        } => {
+            #[cfg(feature = "embeddings")]
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            #[cfg(not(feature = "embeddings"))]
+            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            cmd_remember(
+                &store,
+                emb_ref,
+                &cfg.memory,
+                content,
+                topic,
+                importance.into(),
+                keywords,
+            )
+        }
         Commands::Recall {
             query,
             topic,
@@ -1173,7 +1250,13 @@ fn main() -> Result<()> {
                 format,
             )
         }
-        Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
+        Commands::List {
+            topic,
+            all,
+            sort,
+            format,
+            limit,
+        } => cmd_list(&store, topic.as_deref(), all, sort, format, limit),
         Commands::Forget { id, topic } => cmd_forget(&store, id.as_deref(), topic.as_deref()),
         Commands::Update {
             id,
@@ -1540,11 +1623,7 @@ fn main() -> Result<()> {
             let exit_code = if result.is_ok() { 0 } else { 1 };
             let note = result.as_ref().err().map(|e| {
                 let s = e.to_string();
-                if s.len() > 200 {
-                    s[..200].to_string()
-                } else {
-                    s
-                }
+                truncate_at_char_boundary(&s, 200).to_string()
             });
             let _ = store.record_hook_event(&icm_store::HookEventInsert {
                 event: event_name.to_string(),
@@ -1665,6 +1744,38 @@ fn cmd_store(
     Ok(())
 }
 
+/// `remember` is `store` with a positional content arg and an auto-detected
+/// topic when `--topic` is omitted.
+#[allow(clippy::too_many_arguments)]
+fn cmd_remember(
+    store: &SqliteStore,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+    content: String,
+    topic: Option<String>,
+    importance: Importance,
+    keywords: Option<String>,
+) -> Result<()> {
+    if content.trim().is_empty() {
+        anyhow::bail!("content cannot be empty - provide something to remember");
+    }
+    let resolved_topic = topic.unwrap_or_else(|| {
+        let project = detect_project();
+        eprintln!("Project: {project}");
+        project
+    });
+    cmd_store(
+        store,
+        embedder,
+        memory_cfg,
+        resolved_topic,
+        content,
+        importance,
+        keywords,
+        None,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_recall(
     store: &SqliteStore,
@@ -1776,7 +1887,14 @@ fn cmd_recall(
     Ok(())
 }
 
-fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField) -> Result<()> {
+fn cmd_list(
+    store: &SqliteStore,
+    topic: Option<&str>,
+    all: bool,
+    sort: SortField,
+    format: ListFormat,
+    limit: Option<usize>,
+) -> Result<()> {
     let mut memories = if let Some(t) = topic {
         store.get_by_topic(t)?
     } else if all {
@@ -1798,13 +1916,39 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
         SortField::Accessed => memories.sort_by_key(|b| std::cmp::Reverse(b.last_accessed)),
     }
 
+    if let Some(n) = limit {
+        memories.truncate(n);
+    }
+
     if memories.is_empty() {
-        println!("{MSG_NO_MEMORIES}");
+        // Empty: keep the structured formats valid (`[]`, empty TOON
+        // header, empty TOML) so scripts can pipe straight in.
+        match format.as_recall_format() {
+            Some(f) => {
+                let rendered = recall_format::render(&[], f)?;
+                if !rendered.is_empty() {
+                    print!("{rendered}");
+                }
+            }
+            None => println!("{MSG_NO_MEMORIES}"),
+        }
         return Ok(());
     }
 
-    for mem in &memories {
-        print_memory_detail(mem, None);
+    match format.as_recall_format() {
+        Some(f) => {
+            // Reuse `recall`'s serializers. `score` is None for the
+            // list path since enumeration has no relevance score.
+            let pairs: Vec<(icm_core::Memory, Option<f32>)> =
+                memories.into_iter().map(|m| (m, None)).collect();
+            let rendered = recall_format::render(&pairs, f)?;
+            print!("{rendered}");
+        }
+        None => {
+            for mem in &memories {
+                print_memory_detail(mem, None);
+            }
+        }
     }
 
     Ok(())
@@ -2279,18 +2423,19 @@ fn cmd_hook_pre() -> Result<()> {
         return Ok(());
     }
 
-    // Auto-allow: output hook response JSON
-    let tool_input = json
-        .get("tool_input")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
+    // Auto-allow: output hook response JSON.
+    //
+    // `updatedInput` is intentionally omitted — we are not rewriting the
+    // tool input, only granting permission. Including it as a passthrough
+    // worked on early Claude Code builds but codex-cli 0.130.0 rejects
+    // the response with "PreToolUse hook returned unsupported
+    // updatedInput" (issue #237), and the Claude Code spec lists the
+    // field as optional. Omitting it is forward-compatible.
     let response = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "permissionDecisionReason": "ICM auto-allow",
-            "updatedInput": tool_input
+            "permissionDecisionReason": "ICM auto-allow"
         }
     });
 
@@ -2563,11 +2708,7 @@ fn cmd_hook_post(
         // Cap to 8 KB to keep the queue reasonable. LLM extraction works
         // fine on the most recent slice; very long outputs are rare and
         // their tail is what matters most for auto-context anyway.
-        let capped = if tool_output.len() > 8192 {
-            &tool_output[tool_output.len() - 8192..]
-        } else {
-            tool_output
-        };
+        let capped = truncate_tail_at_char_boundary(tool_output, 8192);
         match store.enqueue_pending_extraction(&project, tool_name, capped) {
             Ok(_) => {
                 eprintln!(
@@ -2864,23 +3005,10 @@ fn extract_from_hook_transcript(
         return Ok(());
     }
 
-    // Truncate to last 4000 bytes to keep extraction reasonable.
-    //
-    // The original raw byte slice `&assistant_text[len-4000..]` panics
-    // when the cut-point lands inside a multibyte UTF-8 char (Cyrillic
-    // 2B, CJK 3B, emoji 4B). Find the nearest UTF-8 char boundary at or
-    // after `len-4000` instead. Result is at most 4000 bytes long; we
-    // accept losing a few leading bytes to char-align rather than
-    // panicking on multilingual transcripts.
-    let truncated: &str = if assistant_text.len() > 4000 {
-        let mut start = assistant_text.len() - 4000;
-        while start < assistant_text.len() && !assistant_text.is_char_boundary(start) {
-            start += 1;
-        }
-        &assistant_text[start..]
-    } else {
-        &assistant_text
-    };
+    // Truncate to last 4000 bytes to keep extraction reasonable. The bare
+    // tail slice `&assistant_text[len-4000..]` panics when the cut lands
+    // inside a multibyte UTF-8 char; the helper char-aligns instead.
+    let truncated: &str = truncate_tail_at_char_boundary(&assistant_text, 4000);
 
     // Audit R7: if the byte truncation cut the transcript mid-fence
     // (the opening ```lang line lives in the dropped prefix), the
@@ -2949,6 +3077,24 @@ pub(crate) fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Keep the last `max_bytes` bytes of `s`, advancing the start to the nearest
+/// following UTF-8 char boundary so the slice never splits a multi-byte char.
+/// Result length is always `<= max_bytes`. Never panics — bare
+/// `&s[s.len() - max_bytes..]` does when the cut lands inside a multi-byte char
+/// (Cyrillic=2B, CJK=3B, emoji=4B). See issue #110.
+pub(crate) fn truncate_tail_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk forwards from `len - max_bytes` until we land on a char boundary.
+    // `is_char_boundary(len)` is always true, so this terminates.
+    let mut start = s.len() - max_bytes;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
 }
 
 /// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
@@ -3263,7 +3409,7 @@ fn cmd_extract_patterns(
         );
         println!(
             "    Summary: {}",
-            &cluster.representative_summary[..cluster.representative_summary.len().min(120)]
+            truncate_at_char_boundary(&cluster.representative_summary, 120)
         );
     }
 
@@ -3570,7 +3716,7 @@ You MUST call `icm store` when ANY of the following happens:\n\
 \n\
 Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
-Do NOT store: trivial details, info already in CLAUDE.md, ephemeral state (build logs, git status).\n\
+Do NOT store: trivial details, info already in this file, ephemeral state (build logs, git status).\n\
 \n\
 ### Other commands\n\
 ```bash\n\
@@ -3676,7 +3822,7 @@ Store the following in ICM memory: $ARGUMENTS
 
 Run:
 ```bash
-icm store -t \"note\" -c \"$ARGUMENTS\"
+icm remember \"$ARGUMENTS\"
 ```
 ";
 
@@ -5570,11 +5716,7 @@ fn cmd_extract_enqueue(store: &SqliteStore, project: &str, text: Option<String>)
     // Cap to 8 KB — same bound as the PostToolUse async path. Long tool
     // outputs are rare and their trailing slice carries the freshest
     // context.
-    let capped = if trimmed.len() > 8192 {
-        &trimmed[trimmed.len() - 8192..]
-    } else {
-        trimmed
-    };
+    let capped = truncate_tail_at_char_boundary(trimmed, 8192);
 
     let id = store.enqueue_pending_extraction(project, "extract", capped)?;
     eprintln!("[icm] enqueued raw text for deferred extraction (id={id})");
@@ -6457,7 +6599,7 @@ fn run_claude_session(
     let json: Value = serde_json::from_str(stdout.trim()).with_context(|| {
         format!(
             "failed to parse claude JSON: {}",
-            &stdout[..stdout.len().min(200)]
+            truncate_at_char_boundary(&stdout, 200)
         )
     })?;
 
@@ -7370,7 +7512,7 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        format!("{}...", truncate_at_char_boundary(s, max.saturating_sub(3)))
     }
 }
 
@@ -7459,7 +7601,7 @@ fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
 
 #[cfg(test)]
 mod truncate_tests {
-    use super::truncate_at_char_boundary;
+    use super::{truncate_at_char_boundary, truncate_tail_at_char_boundary};
 
     #[test]
     fn ascii_short_is_unchanged() {
@@ -7518,6 +7660,34 @@ mod truncate_tests {
         let s = "\u{1F600}rest"; // first char is 4 bytes
         let out = truncate_at_char_boundary(s, 2);
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn tail_ascii_short_is_unchanged() {
+        assert_eq!(truncate_tail_at_char_boundary("hello", 200), "hello");
+    }
+
+    /// Regression: the multibyte arrow '→' (3 bytes) crashed the hook
+    /// transcript fallback (`&text[len - 2000..]`) when the cut landed
+    /// inside it. Keeping the tail must drop a few leading bytes to
+    /// char-align rather than panic.
+    #[test]
+    fn tail_multibyte_never_panics_and_cuts_at_char_boundary() {
+        let s = "\u{2192}".repeat(800); // 800 × 3 bytes = 2400 bytes
+        let out = truncate_tail_at_char_boundary(&s, 2000);
+        assert!(out.len() <= 2000);
+        assert!(s.is_char_boundary(s.len() - out.len()));
+        assert!(out.chars().all(|c| c == '\u{2192}'));
+    }
+
+    /// Mixed ASCII + arrows, the realistic transcript shape that paniced.
+    #[test]
+    fn tail_mixed_ascii_arrows_never_panics() {
+        let s = "etape A \u{2192} etape B \u{2192} fin ".repeat(300);
+        let out = truncate_tail_at_char_boundary(&s, 2000);
+        assert!(out.len() <= 2000);
+        assert!(out.is_char_boundary(0));
+        assert!(out.is_char_boundary(out.len()));
     }
 }
 
@@ -8816,5 +8986,104 @@ mod hook_payload_tests {
             !out.is_empty(),
             "expected non-empty Write content, got {out:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod cmd_remember_tests {
+    //! Parse `icm remember ...` through clap so a broken variant
+    //! (wrong positional, swapped fields, dropped default) fails here
+    //! rather than only at runtime.
+    use super::*;
+
+    /// Positional content, default topic None, default importance medium.
+    #[test]
+    fn parses_positional_content_with_defaults() {
+        let cli = Cli::try_parse_from(["icm", "remember", "some fact"]).unwrap();
+        let Commands::Remember {
+            content,
+            topic,
+            importance,
+            keywords,
+        } = cli.command
+        else {
+            panic!("expected Commands::Remember");
+        };
+        assert_eq!(content, "some fact");
+        assert_eq!(topic, None);
+        assert!(matches!(importance, CliImportance::Medium));
+        assert_eq!(keywords, None);
+    }
+
+    /// `--topic` and `--importance` overrides land on the Remember variant.
+    #[test]
+    fn parses_topic_and_importance_overrides() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "remember",
+            "critical deployment constraint",
+            "--topic",
+            "preferences",
+            "--importance",
+            "high",
+        ])
+        .unwrap();
+        let Commands::Remember {
+            content,
+            topic,
+            importance,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Commands::Remember");
+        };
+        assert_eq!(content, "critical deployment constraint");
+        assert_eq!(topic.as_deref(), Some("preferences"));
+        assert!(matches!(importance, CliImportance::High));
+    }
+
+    /// Missing positional content is a parse error.
+    #[test]
+    fn missing_content_is_a_parse_error() {
+        assert!(Cli::try_parse_from(["icm", "remember"]).is_err());
+    }
+
+    /// `remember` appends; prior memories under the same topic stay intact.
+    #[test]
+    fn remember_appends_status_update_to_existing_memories() {
+        use icm_core::{Importance, MemoryStore};
+        use icm_store::SqliteStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let cfg = crate::config::MemoryConfig::default();
+
+        cmd_store(
+            &store,
+            None,
+            &cfg,
+            "icm".into(),
+            "TODO: wire FTS5 trigger for memory updates".into(),
+            Importance::Medium,
+            None,
+            None,
+        )
+        .unwrap();
+
+        cmd_remember(
+            &store,
+            None,
+            &cfg,
+            "FTS5 trigger now syncs on update; closes the recall gap".into(),
+            Some("icm".into()),
+            Importance::Medium,
+            None,
+        )
+        .unwrap();
+
+        let memories = store.get_by_topic("icm").unwrap();
+        assert_eq!(memories.len(), 2, "remember appends, never overwrites");
+        assert!(memories.iter().any(|m| m.summary.contains("TODO")));
+        assert!(memories
+            .iter()
+            .any(|m| m.summary.contains("closes the recall gap")));
     }
 }

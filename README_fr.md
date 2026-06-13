@@ -320,6 +320,59 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 Voir [config/default.toml](config/default.toml) pour toutes les options.
 
+## Multi-projet & multi-agent
+
+ICM est conçu pour le cas où un seul utilisateur collabore avec de nombreux agents sur de nombreux projets. Les souvenirs doivent rester pertinents : une décision du projet A ne doit jamais déborder sur le projet B, et un agent `dev` ne doit pas être hydraté avec ce qu'un agent `mentor` a stocké.
+
+### Isolation par projet
+
+ICM cloisonne les souvenirs par **convention de nommage des topics**, et non par une colonne séparée. La convention :
+
+```
+{kind}-{project}              # ex. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
+preferences                   # global, toujours inclus
+identity                      # global, toujours inclus
+```
+
+`icm_wake_up { project: "icm" }` effectue une correspondance **sensible aux segments** : `"icm"` correspond à `decisions-icm`, `errors-icm-core`, `contexte-icm` — mais jamais à `icmp-notes` (zéro faux positif). Les topics sont découpés sur `-`, `.`, `_`, `/`, `:`. Les topics de préférences et d'identité sont inter-projets par conception — les directives au niveau utilisateur ne sont jamais filtrées.
+
+Le hook `UserPromptSubmit` (`icm hook prompt`) et le hook `SessionStart` (`icm hook start`) déduisent tous deux le projet à partir du champ `cwd` du JSON du hook (`basename` du répertoire de travail). Lance chaque projet depuis son propre répertoire et l'isolation est automatique.
+
+### Bien rédiger ses souvenirs
+
+`icm_memory_store` exige que l'agent choisisse `topic` et `content` — il n'y a pas de classifieur automatique. Bonnes pratiques :
+
+| Champ | Conseil |
+|------|----------|
+| `topic` | `{kind}-{project}`. Kinds : `decisions`, `errors-resolved`, `contexte`, `preferences`. |
+| `content` | Un fait par stockage. Résumé dense en anglais — `topic + content` sert de texte d'embedding. |
+| `raw_excerpt` | Verbatim uniquement (code, message d'erreur exact, sortie de commande). |
+| `keywords` | 3 à 5 termes pour booster la recherche BM25. |
+| `importance` | `critical` pour ne jamais oublier, `high` pour les décisions de projet, `medium` par défaut, `low` pour l'éphémère. |
+
+ICM s'occupe du reste : **déduplication à 85 % de similarité**, **liaison automatique** entre souvenirs sémantiquement proches, **consolidation automatique** au-delà de 10 entrées par topic, et **decay** pondéré par le nombre d'accès. Un fait par appel bat les dumps groupés — le retriever classe mieux les faits stockés individuellement.
+
+### Rôles multi-agent
+
+ICM ne dispose pas encore d'une colonne `role` de premier plan. Aujourd'hui, les rôles sont émulés via des suffixes de topic associés à des répertoires de travail propres à chaque agent :
+
+```
+decisions-icm-dev             # agent dev : patterns de code, choix de bibliothèques, refactos
+decisions-icm-architect       # architecte : conception, workflows, décomposition en sous-tâches
+decisions-icm-mentor          # mentor / BA : objectifs métier, contexte non technique
+```
+
+Chaque agent s'exécute dans son propre répertoire de travail (`~/projects/icm-dev/`, `~/projects/icm-architect/`, ...) afin que `icm hook prompt` et `icm hook start` déduisent un segment de projet différent depuis `cwd` et ne rappellent que les souvenirs correspondants. Les préférences restent globales — l'identité de l'utilisateur traverse tous les rôles.
+
+À l'intérieur d'un même agent, tu peux aussi restreindre le recall manuellement :
+
+```jsonc
+// icm_memory_recall
+{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
+```
+
+Un champ `role` de premier plan (avec filtrage natif dans le wake-up et le recall) figure sur la roadmap. D'ici là, la convention de suffixe de topic est le pattern supporté.
+
 ## Auto-extraction
 
 ICM extrait des souvenirs automatiquement via trois couches :

@@ -338,6 +338,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cachedir"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4703f3937077db8fa35bee3c8789343c1aec2585f0146f09d658d4ccc0e8d873"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "cassowary"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1367,6 +1376,7 @@ dependencies = [
 name = "icm-core"
 version = "0.10.34"
 dependencies = [
+ "cachedir",
  "chrono",
  "directories",
  "fastembed",
@@ -1374,6 +1384,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+ "tracing",
  "ulid",
 ]
 

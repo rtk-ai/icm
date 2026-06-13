@@ -320,6 +320,59 @@ C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Window
 
 모든 옵션은 [config/default.toml](config/default.toml)을 참조하세요.
 
+## 멀티 프로젝트 & 멀티 에이전트
+
+ICM은 한 명의 사용자가 여러 프로젝트에 걸쳐 다수의 에이전트와 협업하는 경우를 위해 만들어졌습니다. 메모리는 항상 관련성을 유지해야 합니다: 프로젝트 A의 결정이 프로젝트 B로 절대 새어 들어가서는 안 되고, `dev` 에이전트가 `mentor` 에이전트가 저장한 내용으로 hydrate되어서도 안 됩니다.
+
+### 프로젝트 격리
+
+ICM은 별도의 컬럼이 아니라 **topic 명명 규칙**으로 메모리를 스코프합니다. 규칙은 다음과 같습니다:
+
+```
+{kind}-{project}              # e.g. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
+preferences                   # global, always included
+identity                      # global, always included
+```
+
+`icm_wake_up { project: "icm" }`은 **세그먼트 인식(segment-aware)** 매칭을 수행합니다: `"icm"`은 `decisions-icm`, `errors-icm-core`, `contexte-icm`과 매칭되지만 `icmp-notes`와는 절대 매칭되지 않습니다(거짓 양성 없음). 토픽은 `-`, `.`, `_`, `/`, `:` 단위로 분할됩니다. 선호(preferences)와 정체성(identity) 토픽은 설계상 프로젝트 간 공유됩니다 — 사용자 수준의 가이드는 결코 제거되지 않습니다.
+
+`UserPromptSubmit` 훅(`icm hook prompt`)과 `SessionStart` 훅(`icm hook start`)은 모두 훅 JSON의 `cwd` 필드(작업 디렉토리의 `basename`)에서 프로젝트를 도출합니다. 각 프로젝트를 자체 디렉토리에서 실행하면 격리는 자동으로 이루어집니다.
+
+### 좋은 메모리 작성하기
+
+`icm_memory_store`는 에이전트가 `topic`과 `content`를 직접 선택하도록 요구합니다 — 자동 분류기는 없습니다. 모범 사례:
+
+| 필드 | 가이드 |
+|------|----------|
+| `topic` | `{kind}-{project}`. 종류: `decisions`, `errors-resolved`, `contexte`, `preferences`. |
+| `content` | 한 번의 store에 하나의 사실. 밀도 있는 영문 요약 — `topic + content`가 임베딩 텍스트가 됩니다. |
+| `raw_excerpt` | 원문 그대로일 때만 사용(코드, 정확한 에러 메시지, 명령어 출력). |
+| `keywords` | BM25 검색을 강화하기 위한 3–5개의 용어. |
+| `importance` | 절대 잊지 말아야 할 것은 `critical`, 프로젝트 결정은 `high`, 기본값은 `medium`, 일시적인 것은 `low`. |
+
+나머지는 ICM이 처리합니다: **85% 유사도에서 dedup**, 의미적으로 가까운 메모리 간 **자동 링크(auto-link)**, 토픽당 10개 항목을 초과할 때 **자동 통합(auto-consolidation)**, 그리고 접근 횟수에 가중치가 부여된 **decay**. 일괄 덤프보다 호출당 하나의 사실이 낫습니다 — retriever는 개별적으로 저장된 사실을 더 높게 랭킹합니다.
+
+### 멀티 에이전트 역할
+
+ICM은 아직 일급 `role` 컬럼을 가지고 있지 않습니다. 현재로서는, 토픽 접미사와 에이전트별 작업 디렉토리를 조합해 역할을 에뮬레이트합니다:
+
+```
+decisions-icm-dev             # dev agent: code patterns, library choices, refactors
+decisions-icm-architect       # architect: design, workflows, subtask decomposition
+decisions-icm-mentor          # mentor / BA: business goals, non-technical context
+```
+
+각 에이전트는 자체 작업 디렉토리(`~/projects/icm-dev/`, `~/projects/icm-architect/`, ...)에서 실행되어, `icm hook prompt`와 `icm hook start`가 `cwd`에서 서로 다른 프로젝트 세그먼트를 도출하고 매칭되는 메모리만 recall하도록 합니다. 선호(preferences)는 글로벌하게 유지됩니다 — 사용자 정체성은 모든 역할에 걸쳐 이어집니다.
+
+단일 에이전트 내에서도 recall을 수동으로 좁힐 수 있습니다:
+
+```jsonc
+// icm_memory_recall
+{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
+```
+
+일급 `role` 필드(wake-up과 recall에서 네이티브 필터링 지원)는 로드맵에 있습니다. 그때까지는 토픽 접미사 규칙이 지원되는 패턴입니다.
+
 ## 자동 추출
 
 ICM은 세 가지 레이어를 통해 메모리를 자동으로 추출합니다:

@@ -2483,6 +2483,27 @@ impl TranscriptStore for SqliteStore {
         Ok(row)
     }
 
+    fn ensure_session(
+        &self,
+        id: &str,
+        agent: &str,
+        project: Option<&str>,
+        metadata: Option<&str>,
+    ) -> IcmResult<String> {
+        let conn = &self.conn;
+        let now = chrono::Utc::now().to_rfc3339();
+        // INSERT OR IGNORE keeps the first row stable across re-fires.
+        // The `id` is the host agent's session id (Claude Code, Codex,
+        // Gemini, etc.) so repeated hook posts route to the same row.
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, agent, project, started_at, updated_at, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, agent, project, now, now, metadata.unwrap_or("{}")],
+        )
+        .map_err(db_err)?;
+        Ok(id.to_string())
+    }
+
     fn list_sessions(&self, project: Option<&str>, limit: usize) -> IcmResult<Vec<Session>> {
         let conn = &self.conn;
         match project {
@@ -6072,6 +6093,89 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello world");
         assert_eq!(msgs[0].role, Role::User);
+    }
+
+    /// Issue #272 perf invariant: FTS5 search across a few thousand
+    /// archived messages must stay sub-second. The bench keeps the
+    /// budget loose so CI noise doesn't flake; the goal is a regression
+    /// bell, not microbenchmarking.
+    #[test]
+    fn perf_session_archive_search_2k_messages() {
+        let store = test_store();
+        let sid = store
+            .ensure_session("perf-sess", "claude-code", Some("icm"), None)
+            .unwrap();
+        for i in 0..2_000 {
+            // Sprinkle the keyword into ~1% of messages so search
+            // returns something but doesn't degenerate to a full scan.
+            let body = if i % 100 == 0 {
+                format!("turbofish needle hit {i}")
+            } else {
+                format!("filler payload number {i}")
+            };
+            store
+                .record_message(&sid, Role::User, &body, None, None, None)
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        let hits = store
+            .search_transcripts("turbofish", None, None, 50)
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            hits.len() >= 10,
+            "expected at least 10 hits, got {}",
+            hits.len()
+        );
+        assert!(
+            elapsed.as_millis() < 1500,
+            "search across 2k archived messages took {}ms (budget 1500ms)",
+            elapsed.as_millis(),
+        );
+    }
+
+    /// Issue #272: `ensure_session` must be idempotent so repeated
+    /// hook fires keyed by the same external `session_id` land under
+    /// one row, not N.
+    #[test]
+    fn test_ensure_session_is_idempotent() {
+        let store = test_store();
+        let external_id = "claude-sess-abc-123";
+        let id1 = store
+            .ensure_session(external_id, "claude-code", Some("icm"), None)
+            .unwrap();
+        assert_eq!(id1, external_id);
+
+        // Re-call with the same id — must NOT create a new row.
+        let id2 = store
+            .ensure_session(external_id, "claude-code", Some("icm"), None)
+            .unwrap();
+        assert_eq!(id2, external_id);
+
+        let sessions = store.list_sessions(Some("icm"), 10).unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "ensure_session must be idempotent, got: {sessions:?}",
+        );
+        assert_eq!(sessions[0].id, external_id);
+
+        // Recording into the same id works.
+        store
+            .record_message(external_id, Role::User, "first turn", None, None, None)
+            .unwrap();
+        store
+            .record_message(
+                external_id,
+                Role::Tool,
+                "tool out",
+                Some("bash"),
+                None,
+                None,
+            )
+            .unwrap();
+        let msgs = store.list_session_messages(external_id, 10, 0).unwrap();
+        assert_eq!(msgs.len(), 2);
     }
 
     #[test]

@@ -15,6 +15,20 @@ pub trait TranscriptStore {
         metadata: Option<&str>,
     ) -> IcmResult<String>;
 
+    /// Idempotent variant: ensure a session exists with the supplied
+    /// explicit `id` (typically the host agent's own session id). If
+    /// the row already exists, return its id unchanged; otherwise
+    /// insert a new row keyed by `id`. Used by hook auto-archive so
+    /// repeated hook fires within the same agent session land under
+    /// the same row (issue #272).
+    fn ensure_session(
+        &self,
+        id: &str,
+        agent: &str,
+        project: Option<&str>,
+        metadata: Option<&str>,
+    ) -> IcmResult<String>;
+
     /// Fetch a session by id.
     fn get_session(&self, id: &str) -> IcmResult<Option<Session>>;
 

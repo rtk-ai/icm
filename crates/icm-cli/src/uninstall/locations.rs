@@ -406,6 +406,26 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
         purge_data_only: false,
     });
 
+    // --- Pi (pi.dev / earendil-works/pi) — issue #259 ---
+    specs.push(LocationSpec {
+        label: "Pi AGENTS.md",
+        path: d.home.join(".pi/agent/AGENTS.md"),
+        kind: K::MarkdownBlock,
+        purge_data_only: false,
+    });
+    specs.push(LocationSpec {
+        label: "Pi /icm-recall",
+        path: d.home.join(".pi/agent/skills/icm-recall.md"),
+        kind: K::OwnedFile,
+        purge_data_only: false,
+    });
+    specs.push(LocationSpec {
+        label: "Pi /icm-remember",
+        path: d.home.join(".pi/agent/skills/icm-remember.md"),
+        kind: K::OwnedFile,
+        purge_data_only: false,
+    });
+
     // --- Amazon Q ---
     specs.push(LocationSpec {
         label: "Amazon Q MCP",
@@ -533,6 +553,9 @@ mod tests {
             "Amp MCP",
             "Amp /icm-recall",
             "Amp /icm-remember",
+            "Pi AGENTS.md",
+            "Pi /icm-recall",
+            "Pi /icm-remember",
             "Amazon Q MCP",
             "Continue.dev",
             "CLAUDE.md (cwd)",

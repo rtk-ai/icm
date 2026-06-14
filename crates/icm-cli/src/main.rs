@@ -49,6 +49,19 @@ struct Cli {
     #[arg(long, global = true)]
     no_embeddings: bool,
 
+    /// Open the database in read-only mode (issue #263).
+    ///
+    /// Read-like commands (`recall`, `list`, `stats`, `topics`, `health`)
+    /// work against an existing DB in environments where the
+    /// filesystem cannot be written to (sandboxed CI, Codex
+    /// scheduled read-only automations). Auto-decay and
+    /// `last_accessed` / `access_count` bookkeeping are skipped.
+    /// Write commands (`store`, `update`, `forget`, `decay`, `prune`,
+    /// `consolidate`, etc.) error out clearly. Also enabled via
+    /// `ICM_READONLY=1`.
+    #[arg(long, global = true)]
+    read_only: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -1292,6 +1305,35 @@ fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<SqliteStore>
     SqliteStore::with_dims(&path, embedding_dims).context("failed to open database")
 }
 
+/// Open the store in read-only mode (issue #263). Resolves the path
+/// the same way as [`open_store`] and rejects with a helpful message
+/// if the DB doesn't exist yet — read-only mode cannot bootstrap a
+/// fresh DB.
+fn open_store_readonly(db: Option<PathBuf>) -> Result<SqliteStore> {
+    let path = db.unwrap_or_else(default_db_path);
+    SqliteStore::open_readonly(&path).with_context(|| {
+        format!(
+            "failed to open database read-only at {} \
+             (--read-only requires the DB to already exist)",
+            path.display()
+        )
+    })
+}
+
+/// True when the user asked for read-only mode either via the CLI
+/// flag or the `ICM_READONLY` env var (any non-empty / non-"0" value
+/// counts). Centralized so the env-var test mirrors what we document
+/// in the flag's help text.
+fn read_only_requested(cli_flag: bool) -> bool {
+    if cli_flag {
+        return true;
+    }
+    match std::env::var("ICM_READONLY") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
+}
+
 /// Resolve the embedding dimension to open the store with.
 ///
 /// Rules (issue #267):
@@ -1405,7 +1447,11 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    let store = open_store(cli_db, embedding_dims)?;
+    let store = if read_only_requested(cli.read_only) {
+        open_store_readonly(cli_db)?
+    } else {
+        open_store(cli_db, embedding_dims)?
+    };
 
     match command {
         Commands::Store {
@@ -8917,6 +8963,64 @@ mod inject_settings_hook_tests {
             cfg["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap(),
             "Bash"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_only_requested_tests {
+    use super::read_only_requested;
+
+    /// Use a private mutex so the env-var manipulation in these tests
+    /// doesn't race with itself when cargo runs them in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env<F: FnOnce()>(value: Option<&str>, body: F) {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("ICM_READONLY").ok();
+        match value {
+            Some(v) => std::env::set_var("ICM_READONLY", v),
+            None => std::env::remove_var("ICM_READONLY"),
+        }
+        body();
+        match prev {
+            Some(v) => std::env::set_var("ICM_READONLY", v),
+            None => std::env::remove_var("ICM_READONLY"),
+        }
+    }
+
+    #[test]
+    fn cli_flag_true_wins_alone() {
+        with_env(None, || {
+            assert!(read_only_requested(true));
+        });
+    }
+
+    #[test]
+    fn env_var_set_to_one_enables() {
+        with_env(Some("1"), || {
+            assert!(read_only_requested(false));
+        });
+    }
+
+    #[test]
+    fn env_var_set_to_zero_disables() {
+        with_env(Some("0"), || {
+            assert!(!read_only_requested(false));
+        });
+    }
+
+    #[test]
+    fn env_var_empty_disables() {
+        with_env(Some(""), || {
+            assert!(!read_only_requested(false));
+        });
+    }
+
+    #[test]
+    fn no_flag_no_env_means_writable() {
+        with_env(None, || {
+            assert!(!read_only_requested(false));
+        });
     }
 }
 

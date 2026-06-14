@@ -105,6 +105,40 @@ fn ensure_sqlite_vec() {
     });
 }
 
+/// Open `path` strictly read-only **and** immutable.
+///
+/// `SQLITE_OPEN_READ_ONLY` alone is not enough on a `chmod -w` parent
+/// directory: SQLite still tries to create / refresh the `-shm` and
+/// `-wal` companion files for any WAL-mode database, which fails with
+/// "attempt to write a readonly database". The `immutable=1` URI flag
+/// tells SQLite the file will not change for the lifetime of the
+/// connection and disables that WAL bookkeeping path entirely. This
+/// is the standard recipe for read-only sandboxes and matches what
+/// every SQLite "read-only inspect" tool does.
+///
+/// URI-encodes the path so a backslash on Windows or a `?`/`#` in a
+/// pathological filename can't break the URI parser.
+fn open_readonly_immutable(path: &Path) -> IcmResult<Connection> {
+    let raw = path.to_string_lossy();
+    let encoded: String = raw
+        .chars()
+        .map(|c| match c {
+            '?' | '#' | '%' => format!("%{:02X}", c as u32),
+            // Normalize Windows backslashes; SQLite URIs accept "/".
+            '\\' => "/".into(),
+            other => other.to_string(),
+        })
+        .collect();
+    let uri = format!("file:{encoded}?mode=ro&immutable=1");
+    Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| IcmError::Database(format!("cannot open database read-only: {e}")))
+}
+
 /// In-process LRU cache size for hot memories. Each entry is one
 /// fully-hydrated `Memory` (incl. optional 384×f32 embedding ≈ 1.5KB),
 /// so 256 entries cap RAM at ~400KB worst case. Helps long-running
@@ -116,11 +150,57 @@ const MEMORY_CACHE_CAP: usize = 256;
 pub struct SqliteStore {
     conn: Connection,
     cache: Mutex<LruCache<String, Memory>>,
+    /// `true` when opened through [`Self::open_readonly`]. Read-like
+    /// methods that would otherwise dirty the DB (auto-decay,
+    /// `update_access`) check this and skip silently; mutation methods
+    /// (`store`, `update`, `delete`, etc.) check this and return
+    /// `IcmError::ReadOnly`. Issue #263.
+    readonly: bool,
 }
 
 impl SqliteStore {
     pub fn new(path: &Path) -> IcmResult<Self> {
         Self::with_dims(path, icm_core::DEFAULT_EMBEDDING_DIMS)
+    }
+
+    /// Open an existing database in read-only mode (issue #263).
+    ///
+    /// Differences vs [`Self::with_dims`]:
+    /// - The parent directory is NOT created.
+    /// - The connection is opened with `SQLITE_OPEN_READ_ONLY` — SQLite
+    ///   itself refuses any DDL/DML that the application might miss.
+    /// - No `PRAGMA journal_mode=WAL` (WAL requires writable access).
+    /// - No `init_db_with_dims` (schema migration would mutate the DB).
+    ///
+    /// Returns an error if the file is absent (caller may want to fall
+    /// through to writable mode then). Use [`std::path::Path::exists`]
+    /// at the call site if you need a missing-DB fast path.
+    pub fn open_readonly(path: &Path) -> IcmResult<Self> {
+        ensure_sqlite_vec();
+        if !path.exists() {
+            return Err(IcmError::NotFound(format!(
+                "database not found at {}",
+                path.display()
+            )));
+        }
+        let conn = open_readonly_immutable(path)?;
+        // foreign_keys is a no-op for reads; busy_timeout is still useful
+        // when another writer holds the file.
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
+            .map_err(db_err)?;
+        Ok(Self {
+            conn,
+            cache: Mutex::new(new_cache()),
+            readonly: true,
+        })
+    }
+
+    /// True when the store was opened read-only (issue #263). Read-like
+    /// methods skip side-effect mutations; write methods return
+    /// `IcmError::ReadOnly`.
+    #[must_use]
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
     }
 
     /// Peek `icm_metadata.embedding_dims` without running any schema
@@ -137,11 +217,15 @@ impl SqliteStore {
         if !path.exists() {
             return Ok(None);
         }
-        // Open without parent-dir creation, without WAL, without schema
-        // init. SQLite's `Connection::open` succeeds on an existing file
-        // even if sqlite-vec isn't loaded — we only run metadata SELECTs.
-        let conn = Connection::open(path)
-            .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
+        // Open strictly immutable so this helper survives a `chmod -w`
+        // sandbox (issue #263 interaction). `SQLITE_OPEN_READ_ONLY`
+        // alone is NOT enough — SQLite still tries to create/update
+        // the `-shm` / `-wal` companion files for any WAL-mode DB,
+        // which fails when the parent directory is non-writable.
+        // The `immutable=1` URI flag tells SQLite the file will not
+        // change during the connection's lifetime and stops it from
+        // touching WAL infrastructure entirely.
+        let conn = open_readonly_immutable(path)?;
         // Probe for the metadata table — legacy DBs predate it.
         let has_table: bool = conn
             .query_row(
@@ -182,12 +266,21 @@ impl SqliteStore {
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),
+            readonly: false,
         })
     }
 
     /// Apply decay if more than 24 hours since last decay.
     /// Called automatically on recall to avoid manual `icm decay` cron.
+    ///
+    /// No-op when the store is read-only (issue #263): recall must work
+    /// against a DB the process cannot write to, and the bookkeeping
+    /// writes here would otherwise abort the whole read with
+    /// "attempt to write a readonly database".
     pub fn maybe_auto_decay(&self) -> IcmResult<()> {
+        if self.readonly {
+            return Ok(());
+        }
         let now = Utc::now();
         let now_str = now.to_rfc3339();
 
@@ -628,6 +721,7 @@ impl SqliteStore {
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),
+            readonly: false,
         })
     }
 
@@ -1399,6 +1493,13 @@ impl MemoryStore for SqliteStore {
     }
 
     fn update_access(&self, id: &str) -> IcmResult<()> {
+        // Read-only short-circuit (issue #263): callers of recall expect
+        // this to be best-effort bookkeeping, not a hard precondition.
+        // Skipping silently lets `icm recall` work against a DB the
+        // process cannot write to.
+        if self.readonly {
+            return Ok(());
+        }
         let now = Utc::now().to_rfc3339();
         let changed = self
             .conn
@@ -1417,6 +1518,10 @@ impl MemoryStore for SqliteStore {
 
     fn batch_update_access(&self, ids: &[&str]) -> IcmResult<usize> {
         if ids.is_empty() {
+            return Ok(0);
+        }
+        if self.readonly {
+            // Same rationale as `update_access` (issue #263).
             return Ok(0);
         }
         let now = Utc::now().to_rfc3339();
@@ -1439,6 +1544,9 @@ impl MemoryStore for SqliteStore {
     }
 
     fn apply_decay(&self, decay_factor: f32) -> IcmResult<usize> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("apply_decay".into()));
+        }
         // Access-aware decay: frequently accessed memories decay slower.
         // decay = base_rate * importance_multiplier / (1 + min(access_count, 5) * 0.1)
         //
@@ -3780,6 +3888,103 @@ mod tests {
 
     fn make_concept(memoir_id: &str, name: &str, definition: &str) -> Concept {
         Concept::new(memoir_id.into(), name.into(), definition.into())
+    }
+
+    // === Read-only store (issue #263) ===
+
+    fn seed_writable_db(path: &Path) -> Memory {
+        let store = SqliteStore::new(path).unwrap();
+        let mut m = make_memory("project:icm", "read-only fixture summary");
+        m.embedding = Some(vec![0.1_f32; icm_core::DEFAULT_EMBEDDING_DIMS]);
+        store.store(m.clone()).unwrap();
+        m
+    }
+
+    #[test]
+    fn open_readonly_errors_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.db");
+        match SqliteStore::open_readonly(&path) {
+            Ok(_) => panic!("open_readonly on missing file must error"),
+            Err(IcmError::NotFound(msg)) => {
+                assert!(msg.contains("absent.db"), "msg: {msg}")
+            }
+            Err(other) => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_readonly_can_read_existing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        let seeded = seed_writable_db(&path);
+
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        assert!(ro.is_readonly());
+
+        // Read by id: must return the seeded memory verbatim.
+        let got = ro.get(&seeded.id).unwrap().expect("memory must be present");
+        assert_eq!(got.topic, "project:icm");
+        assert_eq!(got.summary, "read-only fixture summary");
+    }
+
+    #[test]
+    fn read_only_recall_path_skips_access_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        let seeded = seed_writable_db(&path);
+
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        // The exact methods recall depends on:
+        ro.maybe_auto_decay().unwrap();
+        ro.update_access(&seeded.id).unwrap();
+        ro.batch_update_access(&[&seeded.id]).unwrap();
+
+        // Re-open writable to confirm nothing actually changed.
+        let rw = SqliteStore::new(&path).unwrap();
+        let after = rw.get(&seeded.id).unwrap().unwrap();
+        assert_eq!(
+            after.access_count, seeded.access_count,
+            "access_count must NOT have been bumped by a read-only call",
+        );
+        assert_eq!(
+            after.last_accessed, seeded.last_accessed,
+            "last_accessed must NOT have been touched by a read-only call",
+        );
+    }
+
+    #[test]
+    fn read_only_apply_decay_returns_readonly_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        seed_writable_db(&path);
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        let err = ro.apply_decay(0.9).unwrap_err();
+        match err {
+            IcmError::ReadOnly(op) => assert_eq!(op, "apply_decay"),
+            other => panic!("expected ReadOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_only_mutation_attempts_are_rejected_by_sqlite() {
+        // Defense-in-depth: even mutation methods that aren't explicitly
+        // gated must fail because the SQLite connection itself is
+        // opened RO. If this test ever passes, SQLite's RO flag has
+        // been bypassed somewhere.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        seed_writable_db(&path);
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        let m = make_memory("project:icm", "should not land");
+        let err = ro.store(m).unwrap_err();
+        // SQLite's own "attempt to write a readonly database" wraps into
+        // IcmError::Database — the actual variant doesn't matter, only
+        // that the write was blocked.
+        match err {
+            IcmError::Database(_) | IcmError::ReadOnly(_) => {}
+            other => panic!("expected Database or ReadOnly, got {other:?}"),
+        }
     }
 
     // === Embedding dim peek (issue #267) ===

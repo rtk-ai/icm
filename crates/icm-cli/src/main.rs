@@ -27,9 +27,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    build_wake_up, format_local, is_preference_topic, keyword_matches, project_matches,
-    topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir,
-    MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
+    build_wake_up, find_similar_memory, format_local, is_preference_topic, keyword_matches,
+    project_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance,
+    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions,
+    DEDUP_SIMILARITY_THRESHOLD, MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -1946,6 +1947,46 @@ fn cmd_store(
         match emb.embed(&memory.embed_text()) {
             Ok(vec) => memory.embedding = Some(vec),
             Err(e) => eprintln!("warning: embedding failed: {e}"),
+        }
+    }
+
+    // Dedup: if a very similar memory already exists in the same topic, update it instead
+    if let Some(ref emb) = memory.embedding {
+        if let Ok(Some((existing, score))) = find_similar_memory(
+            store,
+            &memory.embed_text(),
+            emb,
+            &topic,
+            DEDUP_SIMILARITY_THRESHOLD,
+        ) {
+            let updated = Memory {
+                id: existing.id.clone(),
+                created_at: existing.created_at,
+                updated_at: chrono::Utc::now(),
+                last_accessed: existing.last_accessed,
+                access_count: existing.access_count,
+                weight: 1.0,
+                topic: existing.topic.clone(),
+                summary: memory.summary.clone(),
+                raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
+                keywords: if memory.keywords.is_empty() {
+                    existing.keywords
+                } else {
+                    memory.keywords.clone()
+                },
+                embedding: memory.embedding.clone(),
+                importance,
+                source: existing.source,
+                related_ids: existing.related_ids,
+                scope: existing.scope,
+            };
+            store.update(&updated)?;
+            println!(
+                "Updated existing memory (similarity {score:.2}): {}",
+                updated.id
+            );
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+            return Ok(());
         }
     }
 

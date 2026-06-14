@@ -2169,7 +2169,7 @@ fn cmd_recall(
 
     // Try hybrid search if embedder is available; fall back to FTS / keywords.
     let scored: Option<Vec<(Memory, f32)>> = embedder
-        .and_then(|emb| emb.embed(query).ok())
+        .and_then(|emb| emb.embed_query(query).ok())
         .and_then(|query_emb| store.search_hybrid(query, &query_emb, limit).ok());
 
     let (mut results, has_score): (Vec<(Memory, Option<f32>)>, bool) = match scored {

@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use clap::ValueEnum;
-use icm_core::Memory;
+use icm_core::{format_local, Memory};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -108,12 +108,12 @@ fn render_detail(results: &[(Memory, Option<f32>)]) -> String {
         let _ = writeln!(
             &mut out,
             "  created:    {}",
-            m.created_at.format("%Y-%m-%d %H:%M")
+            format_local(&m.created_at, "%Y-%m-%d %H:%M")
         );
         let _ = writeln!(
             &mut out,
             "  accessed:   {} (x{})",
-            m.last_accessed.format("%Y-%m-%d %H:%M"),
+            format_local(&m.last_accessed, "%Y-%m-%d %H:%M"),
             m.access_count
         );
         let _ = writeln!(&mut out, "  summary:    {}", m.summary);
@@ -260,6 +260,42 @@ mod tests {
         let s = render_json(&fixture()).unwrap();
         assert!(s.contains("\"score\""));
         assert!(s.contains("\"id\": \"01HZZ0\""));
+    }
+
+    /// Regression for issue #254: the `--format detail` path used to
+    /// call `m.created_at.format(...)` directly on the `DateTime<Utc>`,
+    /// printing UTC timestamps even when the user's `TZ` shifted the
+    /// local clock. The fix routes through `icm_core::format_local` so
+    /// the displayed string matches `icm list` / `icm stats`.
+    #[test]
+    fn detail_renders_timestamps_in_local_timezone() {
+        use chrono::{Local, TimeZone, Utc};
+        let mut m = Memory::new("topic-tz".into(), "tz fixture".into(), Importance::High);
+        m.id = "01HZZTZ".into();
+        m.created_at = Utc.with_ymd_and_hms(2026, 5, 10, 12, 34, 0).unwrap();
+        m.last_accessed = m.created_at;
+
+        let s = render_detail(&[(m.clone(), None)]);
+
+        let expected_created = m
+            .created_at
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let expected_accessed = m
+            .last_accessed
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+
+        assert!(
+            s.contains(&format!("created:    {expected_created}")),
+            "expected local-formatted created, output was:\n{s}",
+        );
+        assert!(
+            s.contains(&format!("accessed:   {expected_accessed} (x0)")),
+            "expected local-formatted accessed, output was:\n{s}",
+        );
     }
 
     #[test]

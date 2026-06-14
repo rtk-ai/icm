@@ -190,8 +190,7 @@ impl Embedder for FastEmbedder {
                 .embed(texts.to_vec(), None)
                 .map_err(|e| IcmError::Embedding(e.to_string()))
         } else {
-            let prefixed: Vec<String> =
-                texts.iter().map(|t| format!("{passage}{t}")).collect();
+            let prefixed: Vec<String> = texts.iter().map(|t| format!("{passage}{t}")).collect();
             model
                 .embed(prefixed, None)
                 .map_err(|e| IcmError::Embedding(e.to_string()))

@@ -1292,6 +1292,45 @@ fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<SqliteStore>
     SqliteStore::with_dims(&path, embedding_dims).context("failed to open database")
 }
 
+/// Resolve the embedding dimension to open the store with.
+///
+/// Rules (issue #267):
+/// 1. An embedder is loaded → use its native dimension.
+/// 2. No embedder AND an existing DB has stored dims → use stored dims.
+///    This is the safe path: `--no-embeddings` (or a missing model) must
+///    not trigger the schema-init "stored != requested" branch that
+///    DROPs `vec_memories` and NULL-s every `memories.embedding`.
+/// 3. No embedder AND no existing DB → fall back to
+///    `DEFAULT_EMBEDDING_DIMS` (fresh install, nothing to lose).
+fn resolve_embedding_dims(
+    embedder: Option<&dyn icm_core::Embedder>,
+    cli_db: Option<&PathBuf>,
+    _cfg: &crate::config::Config,
+) -> usize {
+    if let Some(e) = embedder {
+        return e.dimensions();
+    }
+    let path = cli_db.cloned().unwrap_or_else(default_db_path);
+    match SqliteStore::read_stored_embedding_dims(&path) {
+        Ok(Some(dims)) => dims,
+        // No DB or no metadata row → fresh install path; default is safe.
+        Ok(None) => icm_core::DEFAULT_EMBEDDING_DIMS,
+        // Treat read failure as "don't know" and refuse to clobber: keep
+        // the default but trace a warning. Schema init will then refuse
+        // to migrate (its own dim check still runs), so worst-case the
+        // run errors loudly instead of silently dropping data.
+        Err(e) => {
+            tracing::warn!(
+                "could not peek stored embedding dims at {} ({}); \
+                 falling back to DEFAULT_EMBEDDING_DIMS",
+                path.display(),
+                e,
+            );
+            icm_core::DEFAULT_EMBEDDING_DIMS
+        }
+    }
+}
+
 #[cfg(feature = "embeddings")]
 fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
     Some(icm_core::FastEmbedder::with_model(model))
@@ -1327,13 +1366,11 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let embedding_dims = embedder
-        .as_ref()
-        .map(|e| {
-            use icm_core::Embedder;
-            e.dimensions()
-        })
-        .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
+    let embedding_dims = resolve_embedding_dims(
+        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
+        cli.db.first(),
+        &cfg,
+    );
     // Audit #185 medium: reject `--db A ... --db B` (or with `=`)
     // instead of silently letting the last occurrence win. Clap
     // alone doesn't catch the parent+subcommand split case (the

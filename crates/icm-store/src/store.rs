@@ -123,6 +123,48 @@ impl SqliteStore {
         Self::with_dims(path, icm_core::DEFAULT_EMBEDDING_DIMS)
     }
 
+    /// Peek `icm_metadata.embedding_dims` without running any schema
+    /// migration. Returns `Ok(None)` when the DB file is absent, the
+    /// metadata table doesn't exist (legacy DB), or the row is missing.
+    ///
+    /// Use this *before* calling [`Self::with_dims`] when running in a
+    /// mode that must not trigger a destructive vector recreate — most
+    /// notably the `--no-embeddings` path (issue #267): if the caller
+    /// has no embedder loaded, `with_dims` would otherwise fall back to
+    /// `DEFAULT_EMBEDDING_DIMS`, mismatch the stored value, and silently
+    /// DROP `vec_memories` while NULL-ing every `memories.embedding`.
+    pub fn read_stored_embedding_dims(path: &Path) -> IcmResult<Option<usize>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        // Open without parent-dir creation, without WAL, without schema
+        // init. SQLite's `Connection::open` succeeds on an existing file
+        // even if sqlite-vec isn't loaded — we only run metadata SELECTs.
+        let conn = Connection::open(path)
+            .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
+        // Probe for the metadata table — legacy DBs predate it.
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'icm_metadata'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if !has_table {
+            return Ok(None);
+        }
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(row.and_then(|s| s.parse().ok()))
+    }
+
     /// Open or create a store with a specific embedding dimension.
     pub fn with_dims(path: &Path, embedding_dims: usize) -> IcmResult<Self> {
         ensure_sqlite_vec();
@@ -3738,6 +3780,108 @@ mod tests {
 
     fn make_concept(memoir_id: &str, name: &str, definition: &str) -> Concept {
         Concept::new(memoir_id.into(), name.into(), definition.into())
+    }
+
+    // === Embedding dim peek (issue #267) ===
+
+    /// `read_stored_embedding_dims` must NOT trigger schema init: it is
+    /// called from the CLI *before* `with_dims` precisely to avoid the
+    /// destructive recreate path when running in `--no-embeddings`
+    /// against a DB that was populated with a non-default dim.
+    #[test]
+    fn read_stored_dims_returns_none_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.db");
+        assert_eq!(
+            SqliteStore::read_stored_embedding_dims(&path).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn read_stored_dims_returns_none_for_legacy_db_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        // Plain SQLite file with no icm_metadata table — pretends to be a
+        // pre-metadata legacy DB.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE foo (id TEXT)", []).unwrap();
+        drop(conn);
+        assert_eq!(
+            SqliteStore::read_stored_embedding_dims(&path).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn read_stored_dims_returns_stored_value_for_populated_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("populated.db");
+        // Build a DB at 1024 dims (representative of multilingual-e5-large).
+        let store = SqliteStore::with_dims(&path, 1024).unwrap();
+        drop(store);
+
+        assert_eq!(
+            SqliteStore::read_stored_embedding_dims(&path).unwrap(),
+            Some(1024),
+            "should return the stored dim, not the default 384",
+        );
+    }
+
+    /// Issue #267 regression: opening the store at the *stored* dim
+    /// (the path the CLI now takes when no embedder is loaded) must
+    /// leave `vec_memories` and the `embedding` blobs intact. Before
+    /// the fix the CLI passed `DEFAULT_EMBEDDING_DIMS` instead and the
+    /// `stored != requested` branch of `init_db_with_dims` would
+    /// silently DROP `vec_memories` + NULL out every embedding.
+    #[test]
+    fn opening_at_stored_dims_preserves_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preserve.db");
+
+        // First open: build the DB at 1024 dims and seed a memory with a
+        // matching embedding.
+        {
+            let store = SqliteStore::with_dims(&path, 1024).unwrap();
+            let mut mem = make_memory("topic-1024", "user prefers e5-large");
+            mem.embedding = Some(vec![0.5_f32; 1024]);
+            store.store(mem.clone()).unwrap();
+        }
+
+        // CLI-side resolution: peek the stored dims, then reopen at
+        // exactly that value (the fix path).
+        let stored = SqliteStore::read_stored_embedding_dims(&path)
+            .unwrap()
+            .expect("stored dim must be readable on populated DB");
+        assert_eq!(stored, 1024);
+
+        let store = SqliteStore::with_dims(&path, stored).unwrap();
+        // Vec table still exists with the original dim.
+        let dim_str: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dim_str, "1024");
+
+        // The seeded memory's embedding still has the original 1024
+        // floats — the destructive migration did NOT run.
+        let kept_bytes: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT length(embedding) FROM memories WHERE topic = 'topic-1024'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kept_bytes,
+            Some(1024 * 4),
+            "embedding blob must NOT have been NULLed by the open path",
+        );
     }
 
     // === MemoryStore tests ===

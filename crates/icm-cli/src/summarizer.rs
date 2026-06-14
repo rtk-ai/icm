@@ -230,22 +230,92 @@ impl Summarizer for OllamaSummarizer {
         "ollama"
     }
     fn summarize(&self, req: &SummarizeRequest<'_>) -> Result<String> {
-        let model = req.model.unwrap_or("qwen2.5:0.5b");
+        // Pre-#253 this fell back to a hardcoded `"qwen2.5:0.5b"` when
+        // no model was configured, which masked the real failure mode:
+        // the user thinks their `[extraction.summarizer] model =
+        // "qwen3:8b"` is picked up but actually a totally different
+        // small model is running silently. Refuse instead — the caller
+        // (extract-pending / consolidate) gets a clear error pointing
+        // to the missing config.
+        let model = req.model.ok_or_else(|| {
+            anyhow::anyhow!(
+                "ollama provider needs a model — set \
+                 `[extraction.summarizer] model = \"qwen3:8b\"` (or your \
+                 preferred Ollama model) in your config, or pass \
+                 `--model <name>` on the command line"
+            )
+        })?;
         let url = format!("{}/api/generate", self.host.trim_end_matches('/'));
-        let body = serde_json::json!({
+        // Thinking-family models (qwen3, deepseek-r1, granite-think,
+        // etc.) emit a `<think>…</think>` block that consumes the
+        // `num_predict` budget. With our default 400-token budget the
+        // visible response after `</think>` is empty, surfacing as
+        // "provider returned empty output" (issue #253). Sending
+        // `"think": false` switches the model to direct-answer mode
+        // and is silently ignored by Ollama on non-thinking models,
+        // so the option is safe to set unconditionally on models we
+        // recognize as thinking — and on every model when the user
+        // hasn't opted into thinking mode (default).
+        let suppress_think = is_thinking_model(model);
+        let mut body = serde_json::json!({
             "model": model,
             "prompt": req.prompt,
             "stream": false,
             "options": { "num_predict": req.max_tokens },
         });
+        if suppress_think {
+            body["think"] = serde_json::Value::Bool(false);
+        }
         let resp: OllamaResponse = ureq::post(&url)
             .timeout(req.timeout)
             .send_json(body)
-            .with_context(|| format!("ollama request to {url} failed"))?
+            .with_context(|| format!("ollama request to {url} failed (model={model})"))?
             .into_json()
-            .context("decoding ollama response")?;
-        Ok(trim_response(resp.response))
+            .with_context(|| {
+                format!(
+                    "decoding ollama response (model={model}, host={})",
+                    self.host
+                )
+            })?;
+        let trimmed = trim_response(resp.response);
+        if trimmed.is_empty() {
+            // The caller already prints "provider returned empty
+            // output" but doesn't know which model was used; surface
+            // it on stderr so the OpenCode plugin / cron path leaves
+            // a debuggable trail.
+            eprintln!(
+                "[icm summarizer] ollama returned empty response (model={model}, \
+                 num_predict={}, thinking_suppressed={suppress_think}) — \
+                 if the model is a thinking family (qwen3/deepseek-r1/…), \
+                 increase `extraction.summarizer.max_tokens` or pick a \
+                 non-thinking model",
+                req.max_tokens,
+            );
+        }
+        Ok(trimmed)
     }
+}
+
+/// Heuristic match for Ollama "thinking" models that emit a
+/// `<think>…</think>` block by default. Surfacing these to the API
+/// with `"think": false` matches the official Ollama recommendation
+/// and is what users expect when they ask for a one-shot summary.
+///
+/// Pattern matches "model[:tag]" — only the family prefix matters; the
+/// tag (size, quantization) is ignored.
+fn is_thinking_model(model: &str) -> bool {
+    let family = model.split(':').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        family.as_str(),
+        "qwen3"
+            | "qwen3-coder"
+            | "deepseek-r1"
+            | "deepseek-r1-distill"
+            | "granite3-think"
+            | "phi4-reasoning"
+            | "smollm3"
+    ) || family.starts_with("qwen3-")
+        || family.starts_with("deepseek-r1-")
 }
 
 fn trim_response(s: String) -> String {
@@ -321,6 +391,34 @@ mod tests {
         assert_eq!(ProviderKind::parse("none").unwrap(), ProviderKind::None);
         assert_eq!(ProviderKind::parse("off").unwrap(), ProviderKind::None);
         assert!(ProviderKind::parse("bogus").is_err());
+    }
+
+    #[test]
+    fn is_thinking_model_matches_qwen3_family() {
+        // Issue #253: qwen3 is the most common thinking model on
+        // Ollama and the one the issue reports as failing silently.
+        assert!(is_thinking_model("qwen3:8b"));
+        assert!(is_thinking_model("qwen3:14b"));
+        assert!(is_thinking_model("qwen3-coder:7b"));
+        assert!(is_thinking_model("QWEN3:30b-instruct"));
+    }
+
+    #[test]
+    fn is_thinking_model_matches_other_thinking_families() {
+        assert!(is_thinking_model("deepseek-r1:1.5b"));
+        assert!(is_thinking_model("deepseek-r1-distill-qwen:14b"));
+        assert!(is_thinking_model("granite3-think:8b"));
+        assert!(is_thinking_model("phi4-reasoning:14b"));
+        assert!(is_thinking_model("smollm3"));
+    }
+
+    #[test]
+    fn is_thinking_model_skips_non_thinking_families() {
+        assert!(!is_thinking_model("qwen2.5:0.5b"));
+        assert!(!is_thinking_model("llama3.2"));
+        assert!(!is_thinking_model("mistral:7b"));
+        assert!(!is_thinking_model("gemma3:4b"));
+        assert!(!is_thinking_model(""));
     }
 
     #[test]

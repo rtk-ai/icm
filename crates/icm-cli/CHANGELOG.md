@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.10.52](https://github.com/rtk-ai/icm/compare/icm-v0.10.51...icm-v0.10.52) (2026-06-14)
+
+
+### Features
+
+* **facts:** structured (entity, key, value) layer with supersession (closes [#273](https://github.com/rtk-ai/icm/issues/273)) ([#279](https://github.com/rtk-ai/icm/issues/279)) ([cc43fb5](https://github.com/rtk-ai/icm/commit/cc43fb58e60f11042cca8a6d11b1b8efaa2e42f1))
+* **hook:** always-on bounded context snapshot (closes [#271](https://github.com/rtk-ai/icm/issues/271)) ([#277](https://github.com/rtk-ai/icm/issues/277)) ([7fe90b1](https://github.com/rtk-ai/icm/commit/7fe90b14000bdad5d9c6898478fa3f0b5b917899))
+* **hook:** auto-archive sessions + icm sessions command (closes [#272](https://github.com/rtk-ai/icm/issues/272)) ([#278](https://github.com/rtk-ai/icm/issues/278)) ([1268476](https://github.com/rtk-ai/icm/commit/1268476c7a9c34cf8f9e6621d667c923251267b0))
+* **hook:** auto-capture code areas the agent edits (closes [#196](https://github.com/rtk-ai/icm/issues/196)) ([#261](https://github.com/rtk-ai/icm/issues/261)) ([2ed9547](https://github.com/rtk-ai/icm/commit/2ed954787737c35a0c1905f1f223bb793d536dfc))
+* **init:** add `/remember-session` skill for session checkpointing ([#251](https://github.com/rtk-ai/icm/issues/251)) ([d2edca3](https://github.com/rtk-ai/icm/commit/d2edca3488e45671f42202243025b09af6e1512f))
+* **init:** support Pi (pi.dev) harness out of the box ([#265](https://github.com/rtk-ai/icm/issues/265)) ([e2e4079](https://github.com/rtk-ai/icm/commit/e2e4079b52f3dcf5af6a16ec1d1d9d084603b43e))
+* **store:** --read-only mode for read-like commands in sandboxed environments (closes [#263](https://github.com/rtk-ai/icm/issues/263)) ([#282](https://github.com/rtk-ai/icm/issues/282)) ([4c73f40](https://github.com/rtk-ai/icm/commit/4c73f40332d0120999a6af08e653fa84546445f4))
+
+
+### Bug Fixes
+
+* **config:** display auto_consolidate_enabled and auto_consolidate_threshold ([#264](https://github.com/rtk-ai/icm/issues/264)) ([6f33604](https://github.com/rtk-ai/icm/commit/6f3360412ec0748e75ec89a441506f0a5bfee7cc))
+* **display:** render recall --format detail and tui timestamps in local timezone (closes [#254](https://github.com/rtk-ai/icm/issues/254)) ([#283](https://github.com/rtk-ai/icm/issues/283)) ([8c00775](https://github.com/rtk-ai/icm/commit/8c0077529daf86bc54af75e058d1fa3fceed7eca))
+* **embeddings:** apply e5 query/passage instruction prefixes ([#260](https://github.com/rtk-ai/icm/issues/260)) ([1903915](https://github.com/rtk-ai/icm/commit/1903915f0be3aab3f70a006963815ec5664e27b6))
+* **init:** /recall skill uses icm wake-up when called with no args ([#250](https://github.com/rtk-ai/icm/issues/250)) ([842b5d1](https://github.com/rtk-ai/icm/commit/842b5d1615bc8970a157d3a546c390720567b1ca))
+* **store:** preserve stored embedding dims when no embedder is loaded (closes [#267](https://github.com/rtk-ai/icm/issues/267)) ([#281](https://github.com/rtk-ai/icm/issues/281)) ([fbbc423](https://github.com/rtk-ai/icm/commit/fbbc4239d99cda6b440052fe05c3f27dcd2ba6cf))
+* **summarizer:** suppress thinking-mode reasoning on Ollama + clearer empty errors (closes [#253](https://github.com/rtk-ai/icm/issues/253)) ([#284](https://github.com/rtk-ai/icm/issues/284)) ([ae13e8e](https://github.com/rtk-ai/icm/commit/ae13e8e89f88b0b5d86cd3268c7000afaefd8818))
+
 ## [0.10.51](https://github.com/rtk-ai/icm/compare/icm-v0.10.50...icm-v0.10.51) (2026-06-13)
 
 

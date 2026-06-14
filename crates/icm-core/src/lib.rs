@@ -1,6 +1,9 @@
 pub mod auto_link;
+pub mod context_snapshot;
 pub mod embedder;
 pub mod error;
+pub mod facts;
+pub mod facts_store;
 #[cfg(feature = "embeddings")]
 pub mod fastembed_embedder;
 pub mod feedback;
@@ -18,8 +21,14 @@ pub mod wake_up;
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 pub use auto_link::{add_backrefs, auto_link_memory, AutoLinkOptions};
+pub use context_snapshot::{
+    build_context_snapshot, build_context_snapshot_from_memories, ContextSnapshot,
+    ContextSnapshotOptions, SnapshotFormat, SnapshotSection, SNAPSHOT_HEADER,
+};
 pub use embedder::Embedder;
 pub use error::{IcmError, IcmResult};
+pub use facts::{Fact, FactsStats};
+pub use facts_store::FactsStore;
 #[cfg(feature = "embeddings")]
 pub use fastembed_embedder::FastEmbedder;
 pub use feedback::{Feedback, FeedbackStats};
@@ -29,7 +38,7 @@ pub use memoir_store::MemoirStore;
 pub use memory::{
     Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
 };
-pub use store::MemoryStore;
+pub use store::{find_similar_memory, MemoryStore, DEDUP_SIMILARITY_THRESHOLD};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;
 pub use wake_up::{

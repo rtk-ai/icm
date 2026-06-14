@@ -306,7 +306,7 @@ Om het downloaden van het embedding-model volledig over te slaan, gebruik een va
 icm --no-embeddings serve          # CLI-vlag
 ICM_NO_EMBEDDINGS=1 icm serve     # Omgevingsvariabele
 ```
-Of stel `enabled = false` in in uw configuratiebestand. ICM valt terug op FTS5-trefwoordzoeken (werkt nog steeds, maar zonder semantische matching).
+Of stel `enabled = false` in uw configuratiebestand. ICM valt terug op FTS5-trefwoordzoeken (werkt nog steeds, maar zonder semantische matching).
 
 Het wijzigen van het model maakt de vectorindex automatisch opnieuw aan (bestaande embeddings worden gewist en kunnen opnieuw worden gegenereerd met `icm_memory_embed_all`).
 

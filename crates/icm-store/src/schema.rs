@@ -269,6 +269,30 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         .map_err(db_err)?;
     }
 
+    // Structured facts (issue #273): one row per `(entity, key,
+    // created_at)`. The unique index keyed on `(entity, key)` filtered
+    // by `superseded_at IS NULL` enforces "at most one active row
+    // per slot" at the DB layer — supersession is handled by the
+    // app via `UPDATE … SET superseded_at = …` followed by `INSERT`.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS facts (
+            id TEXT PRIMARY KEY,
+            entity TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            superseded_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity);
+        CREATE INDEX IF NOT EXISTS idx_facts_entity_key ON facts(entity, key);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_active_unique
+            ON facts(entity, key) WHERE superseded_at IS NULL;
+        ",
+    )
+    .map_err(db_err)?;
+
     // Transcripts (verbatim sessions + messages)
     conn.execute_batch(
         "
@@ -335,6 +359,30 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             ON hook_events(ts);
         CREATE INDEX IF NOT EXISTS idx_hook_events_event
             ON hook_events(event);
+
+        -- Auto-captured 'code areas' the agent worked in during a
+        -- session. Populated by the PostToolUse hook
+        -- (`icm hook post`) whenever the upstream tool call is an
+        -- Edit / Write / MultiEdit / NotebookEdit. Same project +
+        -- file_path increments `touch_count` rather than creating a
+        -- duplicate row, so the table grows in file count not in
+        -- edit count. See issue #196.
+        CREATE TABLE IF NOT EXISTS code_areas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            description TEXT,
+            session_id TEXT,
+            tool_name TEXT,
+            touch_count INTEGER NOT NULL DEFAULT 1,
+            first_touched_at TEXT NOT NULL,
+            last_touched_at TEXT NOT NULL,
+            UNIQUE(project, file_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_code_areas_project
+            ON code_areas(project);
+        CREATE INDEX IF NOT EXISTS idx_code_areas_last_touched
+            ON code_areas(last_touched_at);
         ",
     )
     .map_err(db_err)?;

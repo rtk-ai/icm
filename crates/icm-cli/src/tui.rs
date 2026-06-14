@@ -27,7 +27,8 @@ use ratatui::{
 };
 
 use icm_core::{
-    FeedbackStore, Importance, MemoirStore, Memory, MemoryStore, StoreStats, TopicHealth,
+    format_local, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore, StoreStats,
+    TopicHealth,
 };
 use icm_store::SqliteStore;
 
@@ -739,12 +740,12 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     let oldest = app
         .stats
         .oldest_memory
-        .map(|d| d.format("%Y-%m-%d").to_string())
+        .map(|d| format_local(&d, "%Y-%m-%d"))
         .unwrap_or_else(|| "—".into());
     let newest = app
         .stats
         .newest_memory
-        .map(|d| d.format("%Y-%m-%d").to_string())
+        .map(|d| format_local(&d, "%Y-%m-%d"))
         .unwrap_or_else(|| "—".into());
 
     let memoir_count = app.memoirs.len();
@@ -986,7 +987,7 @@ fn draw_health(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let last_access = h
                 .last_accessed
-                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .map(|d| format_local(&d, "%Y-%m-%d %H:%M"))
                 .unwrap_or_else(|| "—".into());
 
             Row::new(vec![
@@ -1342,15 +1343,15 @@ fn topic_detail_text(h: &TopicHealth) -> Vec<Line<'static>> {
 
     let oldest = h
         .oldest
-        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .map(|d| format_local(&d, "%Y-%m-%d %H:%M"))
         .unwrap_or_else(|| "—".into());
     let newest = h
         .newest
-        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .map(|d| format_local(&d, "%Y-%m-%d %H:%M"))
         .unwrap_or_else(|| "—".into());
     let last_access = h
         .last_accessed
-        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .map(|d| format_local(&d, "%Y-%m-%d %H:%M"))
         .unwrap_or_else(|| "—".into());
 
     vec![
@@ -1430,15 +1431,15 @@ fn memory_detail_text(m: &Memory) -> Vec<Line<'static>> {
         ]),
         Line::from(vec![
             Span::styled("  Created:     ", Style::default().fg(Color::DarkGray)),
-            Span::raw(m.created_at.format("%Y-%m-%d %H:%M").to_string()),
+            Span::raw(format_local(&m.created_at, "%Y-%m-%d %H:%M")),
         ]),
         Line::from(vec![
             Span::styled("  Updated:     ", Style::default().fg(Color::DarkGray)),
-            Span::raw(m.updated_at.format("%Y-%m-%d %H:%M").to_string()),
+            Span::raw(format_local(&m.updated_at, "%Y-%m-%d %H:%M")),
         ]),
         Line::from(vec![
             Span::styled("  Accessed:    ", Style::default().fg(Color::DarkGray)),
-            Span::raw(m.last_accessed.format("%Y-%m-%d %H:%M").to_string()),
+            Span::raw(format_local(&m.last_accessed, "%Y-%m-%d %H:%M")),
         ]),
         Line::from(vec![
             Span::styled("  Keywords:    ", Style::default().fg(Color::Cyan)),

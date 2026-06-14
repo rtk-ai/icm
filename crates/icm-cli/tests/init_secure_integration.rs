@@ -274,3 +274,181 @@ fn list_user_writes(home: &Path) -> Vec<std::path::PathBuf> {
     walk(home, &mut acc);
     acc
 }
+
+// ── Pi harness (issue #259) ───────────────────────────────────────────
+
+#[test]
+fn pi_skipped_when_undetected_no_binary_no_dir() {
+    let (tmp, cwd) = make_home();
+    let out = icm_in(
+        tmp.path(),
+        &cwd,
+        "/dev/null",
+        &["init", "--mode", "standard"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+
+    let agents_md = tmp.path().join(".pi/agent/AGENTS.md");
+    let recall = tmp.path().join(".pi/agent/skills/icm-recall.md");
+    let remember = tmp.path().join(".pi/agent/skills/icm-remember.md");
+    assert!(
+        !agents_md.exists(),
+        "Pi AGENTS.md must NOT be written when undetected"
+    );
+    assert!(
+        !recall.exists(),
+        "Pi /icm-recall must NOT be written when undetected"
+    );
+    assert!(
+        !remember.exists(),
+        "Pi /icm-remember must NOT be written when undetected"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[cli] Pi               skipped"),
+        "cli skip line missing for Pi: {stdout}"
+    );
+    assert!(
+        stdout.contains("[skill] Pi               skipped"),
+        "skill skip line missing for Pi: {stdout}"
+    );
+}
+
+#[test]
+fn pi_writes_files_when_force_bypasses_detect() {
+    let (tmp, cwd) = make_home();
+    let out = icm_in(
+        tmp.path(),
+        &cwd,
+        "/dev/null",
+        &["init", "--mode", "standard", "--force"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let agents_md = tmp.path().join(".pi/agent/AGENTS.md");
+    let recall = tmp.path().join(".pi/agent/skills/icm-recall.md");
+    let remember = tmp.path().join(".pi/agent/skills/icm-remember.md");
+    assert!(agents_md.exists(), "{} missing", agents_md.display());
+    assert!(recall.exists(), "{} missing", recall.display());
+    assert!(remember.exists(), "{} missing", remember.display());
+
+    // AGENTS.md must carry the icm:start/icm:end block.
+    let content = std::fs::read_to_string(&agents_md).unwrap();
+    assert!(
+        content.contains("<!-- icm:start -->") && content.contains("<!-- icm:end -->"),
+        "Pi AGENTS.md missing block delimiters; got: {content}"
+    );
+
+    // Hook is intentionally TBD — confirm the skip notice still fires.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[hook] Pi               skipped (TS extension TBD"),
+        "hook skip-with-TBD line missing for Pi: {stdout}"
+    );
+}
+
+#[test]
+fn pi_detected_via_dir_presence_without_binary_in_path() {
+    let (tmp, cwd) = make_home();
+    // Create the dir but NOT the binary — detection should still pass.
+    std::fs::create_dir_all(tmp.path().join(".pi/agent")).unwrap();
+
+    let out = icm_in(
+        tmp.path(),
+        &cwd,
+        "/dev/null",
+        &["init", "--mode", "standard"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+
+    let agents_md = tmp.path().join(".pi/agent/AGENTS.md");
+    let recall = tmp.path().join(".pi/agent/skills/icm-recall.md");
+    let remember = tmp.path().join(".pi/agent/skills/icm-remember.md");
+    assert!(
+        agents_md.exists(),
+        "Pi AGENTS.md should be written via dir-presence detection"
+    );
+    assert!(recall.exists());
+    assert!(remember.exists());
+}
+
+#[test]
+fn pi_uninstall_strips_block_and_deletes_skills() {
+    let (tmp, cwd) = make_home();
+    // Seed via --force.
+    let _ = icm_in(
+        tmp.path(),
+        &cwd,
+        "/dev/null",
+        &["init", "--mode", "standard", "--force"],
+    );
+    let agents_md = tmp.path().join(".pi/agent/AGENTS.md");
+    let recall = tmp.path().join(".pi/agent/skills/icm-recall.md");
+    let remember = tmp.path().join(".pi/agent/skills/icm-remember.md");
+    assert!(agents_md.exists() && recall.exists() && remember.exists());
+
+    // Round-trip via `icm uninstall -y`.
+    let out = icm_in(tmp.path(), &cwd, "/dev/null", &["uninstall", "-y"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // AGENTS.md only held the icm block → uninstall deletes it.
+    assert!(
+        !agents_md.exists(),
+        "Pi AGENTS.md should be removed when it held only the icm block"
+    );
+    // Skills are OwnedFile → deleted whole.
+    assert!(!recall.exists(), "Pi /icm-recall skill should be deleted");
+    assert!(
+        !remember.exists(),
+        "Pi /icm-remember skill should be deleted"
+    );
+}
+
+#[test]
+fn pi_per_project_drops_cwd_agents_md() {
+    // Pi (like Codex) reads AGENTS.md by walking up from cwd to $HOME.
+    // With --per-project, init should write both `~/.pi/agent/AGENTS.md`
+    // AND `cwd/AGENTS.md` so editors opened mid-tree still see the
+    // block. The same `cwd/AGENTS.md` is shared with Codex when both
+    // are detected (inject_icm_block is idempotent so no duplicate).
+    let (tmp, cwd) = make_home();
+    let out = icm_in(
+        tmp.path(),
+        &cwd,
+        "/dev/null",
+        &["init", "--mode", "cli", "--per-project", "--force"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+
+    let pi_global = tmp.path().join(".pi/agent/AGENTS.md");
+    let cwd_agents = cwd.join("AGENTS.md");
+    assert!(pi_global.exists(), "Pi global AGENTS.md must exist");
+    assert!(
+        cwd_agents.exists(),
+        "cwd AGENTS.md must be written under --per-project so Pi/Codex \
+         see the block in-tree"
+    );
+
+    // Single block, no duplicate (Codex and Pi both target the same cwd
+    // path — idempotency check).
+    let content = std::fs::read_to_string(&cwd_agents).unwrap();
+    let starts = content.matches("<!-- icm:start -->").count();
+    assert_eq!(
+        starts, 1,
+        "cwd AGENTS.md must contain exactly one icm:start marker; got \
+         {starts}\ncontent:\n{content}"
+    );
+}

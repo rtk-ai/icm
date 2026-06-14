@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
 use icm_core::{
-    Concept, ConceptLink, Embedder, Feedback, FeedbackStats, FeedbackStore, IcmError, IcmResult,
-    Importance, Label, Memoir, MemoirStats, MemoirStore, Memory, MemorySource, MemoryStore,
-    Message, PatternCluster, Relation, Role, Session, StoreStats, TopicHealth, TranscriptHit,
-    TranscriptStats, TranscriptStore,
+    Concept, ConceptLink, Embedder, Fact, FactsStats, FactsStore, Feedback, FeedbackStats,
+    FeedbackStore, IcmError, IcmResult, Importance, Label, Memoir, MemoirStats, MemoirStore,
+    Memory, MemorySource, MemoryStore, Message, PatternCluster, Relation, Role, Session,
+    StoreStats, TopicHealth, TranscriptHit, TranscriptStats, TranscriptStore,
 };
 
 use crate::schema::init_db_with_dims;
@@ -57,6 +57,24 @@ pub struct HookEventInsert {
     pub note: Option<String>,
 }
 
+/// One row of the `code_areas` table. A code area is a file the agent
+/// touched during a session; the same `(project, file_path)` increments
+/// `touch_count` on each re-touch rather than producing a duplicate row.
+/// Populated by `cmd_hook_post` whenever it sees an Edit / Write /
+/// MultiEdit / NotebookEdit tool call. See issue #196.
+#[derive(Debug, Clone)]
+pub struct CodeArea {
+    pub id: i64,
+    pub project: String,
+    pub file_path: String,
+    pub description: Option<String>,
+    pub session_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub touch_count: i64,
+    pub first_touched_at: DateTime<Utc>,
+    pub last_touched_at: DateTime<Utc>,
+}
+
 /// Aggregate counts/percentiles for a slice of hook history. Returned by
 /// `SqliteStore::hook_stats`.
 #[derive(Debug, Clone, Default)]
@@ -87,6 +105,40 @@ fn ensure_sqlite_vec() {
     });
 }
 
+/// Open `path` strictly read-only **and** immutable.
+///
+/// `SQLITE_OPEN_READ_ONLY` alone is not enough on a `chmod -w` parent
+/// directory: SQLite still tries to create / refresh the `-shm` and
+/// `-wal` companion files for any WAL-mode database, which fails with
+/// "attempt to write a readonly database". The `immutable=1` URI flag
+/// tells SQLite the file will not change for the lifetime of the
+/// connection and disables that WAL bookkeeping path entirely. This
+/// is the standard recipe for read-only sandboxes and matches what
+/// every SQLite "read-only inspect" tool does.
+///
+/// URI-encodes the path so a backslash on Windows or a `?`/`#` in a
+/// pathological filename can't break the URI parser.
+fn open_readonly_immutable(path: &Path) -> IcmResult<Connection> {
+    let raw = path.to_string_lossy();
+    let encoded: String = raw
+        .chars()
+        .map(|c| match c {
+            '?' | '#' | '%' => format!("%{:02X}", c as u32),
+            // Normalize Windows backslashes; SQLite URIs accept "/".
+            '\\' => "/".into(),
+            other => other.to_string(),
+        })
+        .collect();
+    let uri = format!("file:{encoded}?mode=ro&immutable=1");
+    Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| IcmError::Database(format!("cannot open database read-only: {e}")))
+}
+
 /// In-process LRU cache size for hot memories. Each entry is one
 /// fully-hydrated `Memory` (incl. optional 384×f32 embedding ≈ 1.5KB),
 /// so 256 entries cap RAM at ~400KB worst case. Helps long-running
@@ -98,11 +150,103 @@ const MEMORY_CACHE_CAP: usize = 256;
 pub struct SqliteStore {
     conn: Connection,
     cache: Mutex<LruCache<String, Memory>>,
+    /// `true` when opened through [`Self::open_readonly`]. Read-like
+    /// methods that would otherwise dirty the DB (auto-decay,
+    /// `update_access`) check this and skip silently; mutation methods
+    /// (`store`, `update`, `delete`, etc.) check this and return
+    /// `IcmError::ReadOnly`. Issue #263.
+    readonly: bool,
 }
 
 impl SqliteStore {
     pub fn new(path: &Path) -> IcmResult<Self> {
         Self::with_dims(path, icm_core::DEFAULT_EMBEDDING_DIMS)
+    }
+
+    /// Open an existing database in read-only mode (issue #263).
+    ///
+    /// Differences vs [`Self::with_dims`]:
+    /// - The parent directory is NOT created.
+    /// - The connection is opened with `SQLITE_OPEN_READ_ONLY` — SQLite
+    ///   itself refuses any DDL/DML that the application might miss.
+    /// - No `PRAGMA journal_mode=WAL` (WAL requires writable access).
+    /// - No `init_db_with_dims` (schema migration would mutate the DB).
+    ///
+    /// Returns an error if the file is absent (caller may want to fall
+    /// through to writable mode then). Use [`std::path::Path::exists`]
+    /// at the call site if you need a missing-DB fast path.
+    pub fn open_readonly(path: &Path) -> IcmResult<Self> {
+        ensure_sqlite_vec();
+        if !path.exists() {
+            return Err(IcmError::NotFound(format!(
+                "database not found at {}",
+                path.display()
+            )));
+        }
+        let conn = open_readonly_immutable(path)?;
+        // foreign_keys is a no-op for reads; busy_timeout is still useful
+        // when another writer holds the file.
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
+            .map_err(db_err)?;
+        Ok(Self {
+            conn,
+            cache: Mutex::new(new_cache()),
+            readonly: true,
+        })
+    }
+
+    /// True when the store was opened read-only (issue #263). Read-like
+    /// methods skip side-effect mutations; write methods return
+    /// `IcmError::ReadOnly`.
+    #[must_use]
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// Peek `icm_metadata.embedding_dims` without running any schema
+    /// migration. Returns `Ok(None)` when the DB file is absent, the
+    /// metadata table doesn't exist (legacy DB), or the row is missing.
+    ///
+    /// Use this *before* calling [`Self::with_dims`] when running in a
+    /// mode that must not trigger a destructive vector recreate — most
+    /// notably the `--no-embeddings` path (issue #267): if the caller
+    /// has no embedder loaded, `with_dims` would otherwise fall back to
+    /// `DEFAULT_EMBEDDING_DIMS`, mismatch the stored value, and silently
+    /// DROP `vec_memories` while NULL-ing every `memories.embedding`.
+    pub fn read_stored_embedding_dims(path: &Path) -> IcmResult<Option<usize>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        // Open strictly immutable so this helper survives a `chmod -w`
+        // sandbox (issue #263 interaction). `SQLITE_OPEN_READ_ONLY`
+        // alone is NOT enough — SQLite still tries to create/update
+        // the `-shm` / `-wal` companion files for any WAL-mode DB,
+        // which fails when the parent directory is non-writable.
+        // The `immutable=1` URI flag tells SQLite the file will not
+        // change during the connection's lifetime and stops it from
+        // touching WAL infrastructure entirely.
+        let conn = open_readonly_immutable(path)?;
+        // Probe for the metadata table — legacy DBs predate it.
+        let has_table: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'icm_metadata'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if !has_table {
+            return Ok(None);
+        }
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(row.and_then(|s| s.parse().ok()))
     }
 
     /// Open or create a store with a specific embedding dimension.
@@ -122,12 +266,21 @@ impl SqliteStore {
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),
+            readonly: false,
         })
     }
 
     /// Apply decay if more than 24 hours since last decay.
     /// Called automatically on recall to avoid manual `icm decay` cron.
+    ///
+    /// No-op when the store is read-only (issue #263): recall must work
+    /// against a DB the process cannot write to, and the bookkeeping
+    /// writes here would otherwise abort the whole read with
+    /// "attempt to write a readonly database".
     pub fn maybe_auto_decay(&self) -> IcmResult<()> {
+        if self.readonly {
+            return Ok(());
+        }
         let now = Utc::now();
         let now_str = now.to_rfc3339();
 
@@ -252,6 +405,120 @@ impl SqliteStore {
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM pending_extractions", [], |r| r.get(0))
+            .map_err(db_err)?;
+        Ok(n as usize)
+    }
+
+    // ── Code areas (auto-captured file edits — issue #196) ────────────
+    //
+    // `cmd_hook_post` calls `upsert_code_area` whenever the upstream
+    // tool was Edit / Write / MultiEdit / NotebookEdit. Same project +
+    // file_path => touch_count++ via ON CONFLICT.
+
+    /// Insert or refresh a row for `(project, file_path)`. On conflict
+    /// bumps `touch_count`, updates `last_touched_at`, refreshes
+    /// `session_id` / `tool_name`, and only overwrites `description` if
+    /// the caller passes `Some` (so the most recent meaningful hint
+    /// wins without clobbering an existing one with `None`).
+    pub fn upsert_code_area(
+        &self,
+        project: &str,
+        file_path: &str,
+        description: Option<&str>,
+        session_id: Option<&str>,
+        tool_name: Option<&str>,
+    ) -> IcmResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO code_areas (project, file_path, description,
+                    session_id, tool_name, touch_count,
+                    first_touched_at, last_touched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)
+                 ON CONFLICT(project, file_path) DO UPDATE SET
+                    touch_count = touch_count + 1,
+                    last_touched_at = excluded.last_touched_at,
+                    session_id = COALESCE(excluded.session_id, session_id),
+                    tool_name = COALESCE(excluded.tool_name, tool_name),
+                    description = COALESCE(excluded.description, description)",
+                rusqlite::params![project, file_path, description, session_id, tool_name, now],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// List code areas, optionally filtered by project / file_path /
+    /// since timestamp. `limit` caps the result count (use `usize::MAX`
+    /// to disable). Ordered by `last_touched_at DESC` so the freshest
+    /// edits come first.
+    pub fn list_code_areas(
+        &self,
+        project: Option<&str>,
+        in_file: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> IcmResult<Vec<CodeArea>> {
+        let mut sql = String::from(
+            "SELECT id, project, file_path, description, session_id, tool_name,
+                    touch_count, first_touched_at, last_touched_at
+             FROM code_areas
+             WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(p) = project {
+            sql.push_str(" AND project = ?");
+            params.push(Box::new(p.to_string()));
+        }
+        if let Some(f) = in_file {
+            // Match either an exact file_path or a path that ends with
+            // the provided fragment so users can pass a short suffix.
+            sql.push_str(" AND (file_path = ? OR file_path LIKE ?)");
+            params.push(Box::new(f.to_string()));
+            params.push(Box::new(format!("%/{f}")));
+        }
+        if let Some(t) = since {
+            sql.push_str(" AND last_touched_at >= ?");
+            params.push(Box::new(t.to_rfc3339()));
+        }
+        sql.push_str(" ORDER BY last_touched_at DESC LIMIT ?");
+        params.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params
+            .iter()
+            .map(|p| p.as_ref() as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let first: String = row.get(7)?;
+                let last: String = row.get(8)?;
+                Ok(CodeArea {
+                    id: row.get(0)?,
+                    project: row.get(1)?,
+                    file_path: row.get(2)?,
+                    description: row.get(3)?,
+                    session_id: row.get(4)?,
+                    tool_name: row.get(5)?,
+                    touch_count: row.get(6)?,
+                    first_touched_at: DateTime::parse_from_rfc3339(&first)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    last_touched_at: DateTime::parse_from_rfc3339(&last)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Total rows in `code_areas`. Cheap; used by stats / doctor.
+    pub fn code_area_count(&self) -> IcmResult<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM code_areas", [], |r| r.get(0))
             .map_err(db_err)?;
         Ok(n as usize)
     }
@@ -454,6 +721,7 @@ impl SqliteStore {
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),
+            readonly: false,
         })
     }
 
@@ -1225,6 +1493,13 @@ impl MemoryStore for SqliteStore {
     }
 
     fn update_access(&self, id: &str) -> IcmResult<()> {
+        // Read-only short-circuit (issue #263): callers of recall expect
+        // this to be best-effort bookkeeping, not a hard precondition.
+        // Skipping silently lets `icm recall` work against a DB the
+        // process cannot write to.
+        if self.readonly {
+            return Ok(());
+        }
         let now = Utc::now().to_rfc3339();
         let changed = self
             .conn
@@ -1243,6 +1518,10 @@ impl MemoryStore for SqliteStore {
 
     fn batch_update_access(&self, ids: &[&str]) -> IcmResult<usize> {
         if ids.is_empty() {
+            return Ok(0);
+        }
+        if self.readonly {
+            // Same rationale as `update_access` (issue #263).
             return Ok(0);
         }
         let now = Utc::now().to_rfc3339();
@@ -1265,6 +1544,9 @@ impl MemoryStore for SqliteStore {
     }
 
     fn apply_decay(&self, decay_factor: f32) -> IcmResult<usize> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("apply_decay".into()));
+        }
         // Access-aware decay: frequently accessed memories decay slower.
         // decay = base_rate * importance_multiplier / (1 + min(access_count, 5) * 0.1)
         //
@@ -2399,6 +2681,215 @@ impl FeedbackStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// Structured facts (issue #273)
+// ---------------------------------------------------------------------------
+
+fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
+    let created_at: String = row.get("created_at")?;
+    let superseded_at: Option<String> = row.get("superseded_at")?;
+    Ok(Fact {
+        id: row.get("id")?,
+        entity: row.get("entity")?,
+        key: row.get("key")?,
+        value: row.get("value")?,
+        source: row.get("source")?,
+        created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now()),
+        superseded_at: superseded_at.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|d| d.with_timezone(&chrono::Utc))
+        }),
+    })
+}
+
+impl FactsStore for SqliteStore {
+    fn set_fact(&self, entity: &str, key: &str, value: &str, source: &str) -> IcmResult<String> {
+        if entity.is_empty() || key.is_empty() {
+            return Err(IcmError::InvalidInput(
+                "entity and key must be non-empty".into(),
+            ));
+        }
+        let conn = &self.conn;
+        // Active row lookup
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id, value FROM facts
+                 WHERE entity = ?1 AND key = ?2 AND superseded_at IS NULL",
+                params![entity, key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+
+        if let Some((id, current_value)) = existing {
+            if current_value == value {
+                // No-op: same value re-asserted.
+                return Ok(id);
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE facts SET superseded_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )
+            .map_err(db_err)?;
+        }
+
+        let new = Fact::new(
+            entity.to_string(),
+            key.to_string(),
+            value.to_string(),
+            source.to_string(),
+        );
+        conn.execute(
+            "INSERT INTO facts (id, entity, key, value, source, created_at, superseded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                new.id,
+                new.entity,
+                new.key,
+                new.value,
+                new.source,
+                new.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(new.id)
+    }
+
+    fn get_fact(&self, entity: &str, key: &str) -> IcmResult<Option<Fact>> {
+        let conn = &self.conn;
+        let row = conn
+            .query_row(
+                "SELECT id, entity, key, value, source, created_at, superseded_at
+                 FROM facts
+                 WHERE entity = ?1 AND key = ?2 AND superseded_at IS NULL",
+                params![entity, key],
+                row_to_fact,
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(db_err(other)),
+            })?;
+        Ok(row)
+    }
+
+    fn list_facts(&self, entity: &str, key_prefix: Option<&str>) -> IcmResult<Vec<Fact>> {
+        let conn = &self.conn;
+        let rows = match key_prefix {
+            Some(prefix) if !prefix.is_empty() => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, entity, key, value, source, created_at, superseded_at
+                         FROM facts
+                         WHERE entity = ?1 AND key LIKE ?2 AND superseded_at IS NULL
+                         ORDER BY key ASC",
+                    )
+                    .map_err(db_err)?;
+                let pattern = format!("{prefix}%");
+                let rows = stmt
+                    .query_map(params![entity, pattern], row_to_fact)
+                    .map_err(db_err)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(db_err)?
+            }
+            _ => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, entity, key, value, source, created_at, superseded_at
+                         FROM facts
+                         WHERE entity = ?1 AND superseded_at IS NULL
+                         ORDER BY key ASC",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map(params![entity], row_to_fact)
+                    .map_err(db_err)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(db_err)?
+            }
+        };
+        Ok(rows)
+    }
+
+    fn history(&self, entity: &str, key: &str) -> IcmResult<Vec<Fact>> {
+        let conn = &self.conn;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, entity, key, value, source, created_at, superseded_at
+                 FROM facts
+                 WHERE entity = ?1 AND key = ?2
+                 ORDER BY created_at DESC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![entity, key], row_to_fact)
+            .map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+    }
+
+    fn forget_fact(&self, entity: &str, key: &str) -> IcmResult<usize> {
+        let conn = &self.conn;
+        let n = conn
+            .execute(
+                "DELETE FROM facts WHERE entity = ?1 AND key = ?2",
+                params![entity, key],
+            )
+            .map_err(db_err)?;
+        Ok(n)
+    }
+
+    fn facts_stats(&self) -> IcmResult<FactsStats> {
+        let conn = &self.conn;
+        let active_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM facts WHERE superseded_at IS NULL",
+                [],
+                |r| r.get::<_, i64>(0).map(|v| v as usize),
+            )
+            .map_err(db_err)?;
+        let total_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM facts", [], |r| {
+                r.get::<_, i64>(0).map(|v| v as usize)
+            })
+            .map_err(db_err)?;
+        let distinct_entities: usize = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT entity) FROM facts WHERE superseded_at IS NULL",
+                [],
+                |r| r.get::<_, i64>(0).map(|v| v as usize),
+            )
+            .map_err(db_err)?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT entity, COUNT(*) as n FROM facts
+                 WHERE superseded_at IS NULL
+                 GROUP BY entity
+                 ORDER BY n DESC
+                 LIMIT 10",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let entity: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((entity, n as usize))
+            })
+            .map_err(db_err)?;
+        let top_entities: Vec<(String, usize)> =
+            rows.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+
+        Ok(FactsStats {
+            active_count,
+            total_count,
+            distinct_entities,
+            top_entities,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Transcripts (verbatim sessions + messages)
 // ---------------------------------------------------------------------------
 
@@ -2481,6 +2972,27 @@ impl TranscriptStore for SqliteStore {
                 other => Err(db_err(other)),
             })?;
         Ok(row)
+    }
+
+    fn ensure_session(
+        &self,
+        id: &str,
+        agent: &str,
+        project: Option<&str>,
+        metadata: Option<&str>,
+    ) -> IcmResult<String> {
+        let conn = &self.conn;
+        let now = chrono::Utc::now().to_rfc3339();
+        // INSERT OR IGNORE keeps the first row stable across re-fires.
+        // The `id` is the host agent's session id (Claude Code, Codex,
+        // Gemini, etc.) so repeated hook posts route to the same row.
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, agent, project, started_at, updated_at, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, agent, project, now, now, metadata.unwrap_or("{}")],
+        )
+        .map_err(db_err)?;
+        Ok(id.to_string())
     }
 
     fn list_sessions(&self, project: Option<&str>, limit: usize) -> IcmResult<Vec<Session>> {
@@ -3376,6 +3888,205 @@ mod tests {
 
     fn make_concept(memoir_id: &str, name: &str, definition: &str) -> Concept {
         Concept::new(memoir_id.into(), name.into(), definition.into())
+    }
+
+    // === Read-only store (issue #263) ===
+
+    fn seed_writable_db(path: &Path) -> Memory {
+        let store = SqliteStore::new(path).unwrap();
+        let mut m = make_memory("project:icm", "read-only fixture summary");
+        m.embedding = Some(vec![0.1_f32; icm_core::DEFAULT_EMBEDDING_DIMS]);
+        store.store(m.clone()).unwrap();
+        m
+    }
+
+    #[test]
+    fn open_readonly_errors_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.db");
+        match SqliteStore::open_readonly(&path) {
+            Ok(_) => panic!("open_readonly on missing file must error"),
+            Err(IcmError::NotFound(msg)) => {
+                assert!(msg.contains("absent.db"), "msg: {msg}")
+            }
+            Err(other) => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_readonly_can_read_existing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        let seeded = seed_writable_db(&path);
+
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        assert!(ro.is_readonly());
+
+        // Read by id: must return the seeded memory verbatim.
+        let got = ro.get(&seeded.id).unwrap().expect("memory must be present");
+        assert_eq!(got.topic, "project:icm");
+        assert_eq!(got.summary, "read-only fixture summary");
+    }
+
+    #[test]
+    fn read_only_recall_path_skips_access_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        let seeded = seed_writable_db(&path);
+
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        // The exact methods recall depends on:
+        ro.maybe_auto_decay().unwrap();
+        ro.update_access(&seeded.id).unwrap();
+        ro.batch_update_access(&[&seeded.id]).unwrap();
+
+        // Re-open writable to confirm nothing actually changed.
+        let rw = SqliteStore::new(&path).unwrap();
+        let after = rw.get(&seeded.id).unwrap().unwrap();
+        assert_eq!(
+            after.access_count, seeded.access_count,
+            "access_count must NOT have been bumped by a read-only call",
+        );
+        assert_eq!(
+            after.last_accessed, seeded.last_accessed,
+            "last_accessed must NOT have been touched by a read-only call",
+        );
+    }
+
+    #[test]
+    fn read_only_apply_decay_returns_readonly_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        seed_writable_db(&path);
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        let err = ro.apply_decay(0.9).unwrap_err();
+        match err {
+            IcmError::ReadOnly(op) => assert_eq!(op, "apply_decay"),
+            other => panic!("expected ReadOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_only_mutation_attempts_are_rejected_by_sqlite() {
+        // Defense-in-depth: even mutation methods that aren't explicitly
+        // gated must fail because the SQLite connection itself is
+        // opened RO. If this test ever passes, SQLite's RO flag has
+        // been bypassed somewhere.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        seed_writable_db(&path);
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        let m = make_memory("project:icm", "should not land");
+        let err = ro.store(m).unwrap_err();
+        // SQLite's own "attempt to write a readonly database" wraps into
+        // IcmError::Database — the actual variant doesn't matter, only
+        // that the write was blocked.
+        match err {
+            IcmError::Database(_) | IcmError::ReadOnly(_) => {}
+            other => panic!("expected Database or ReadOnly, got {other:?}"),
+        }
+    }
+
+    // === Embedding dim peek (issue #267) ===
+
+    /// `read_stored_embedding_dims` must NOT trigger schema init: it is
+    /// called from the CLI *before* `with_dims` precisely to avoid the
+    /// destructive recreate path when running in `--no-embeddings`
+    /// against a DB that was populated with a non-default dim.
+    #[test]
+    fn read_stored_dims_returns_none_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.db");
+        assert_eq!(
+            SqliteStore::read_stored_embedding_dims(&path).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn read_stored_dims_returns_none_for_legacy_db_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        // Plain SQLite file with no icm_metadata table — pretends to be a
+        // pre-metadata legacy DB.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE foo (id TEXT)", []).unwrap();
+        drop(conn);
+        assert_eq!(
+            SqliteStore::read_stored_embedding_dims(&path).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn read_stored_dims_returns_stored_value_for_populated_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("populated.db");
+        // Build a DB at 1024 dims (representative of multilingual-e5-large).
+        let store = SqliteStore::with_dims(&path, 1024).unwrap();
+        drop(store);
+
+        assert_eq!(
+            SqliteStore::read_stored_embedding_dims(&path).unwrap(),
+            Some(1024),
+            "should return the stored dim, not the default 384",
+        );
+    }
+
+    /// Issue #267 regression: opening the store at the *stored* dim
+    /// (the path the CLI now takes when no embedder is loaded) must
+    /// leave `vec_memories` and the `embedding` blobs intact. Before
+    /// the fix the CLI passed `DEFAULT_EMBEDDING_DIMS` instead and the
+    /// `stored != requested` branch of `init_db_with_dims` would
+    /// silently DROP `vec_memories` + NULL out every embedding.
+    #[test]
+    fn opening_at_stored_dims_preserves_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preserve.db");
+
+        // First open: build the DB at 1024 dims and seed a memory with a
+        // matching embedding.
+        {
+            let store = SqliteStore::with_dims(&path, 1024).unwrap();
+            let mut mem = make_memory("topic-1024", "user prefers e5-large");
+            mem.embedding = Some(vec![0.5_f32; 1024]);
+            store.store(mem.clone()).unwrap();
+        }
+
+        // CLI-side resolution: peek the stored dims, then reopen at
+        // exactly that value (the fix path).
+        let stored = SqliteStore::read_stored_embedding_dims(&path)
+            .unwrap()
+            .expect("stored dim must be readable on populated DB");
+        assert_eq!(stored, 1024);
+
+        let store = SqliteStore::with_dims(&path, stored).unwrap();
+        // Vec table still exists with the original dim.
+        let dim_str: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dim_str, "1024");
+
+        // The seeded memory's embedding still has the original 1024
+        // floats — the destructive migration did NOT run.
+        let kept_bytes: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT length(embedding) FROM memories WHERE topic = 'topic-1024'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kept_bytes,
+            Some(1024 * 4),
+            "embedding blob must NOT have been NULLed by the open path",
+        );
     }
 
     // === MemoryStore tests ===
@@ -6074,6 +6785,250 @@ mod tests {
         assert_eq!(msgs[0].role, Role::User);
     }
 
+    /// Issue #272 perf invariant: FTS5 search across a few thousand
+    /// archived messages must stay sub-second. The bench keeps the
+    /// budget loose so CI noise doesn't flake; the goal is a regression
+    /// bell, not microbenchmarking.
+    #[test]
+    fn perf_session_archive_search_2k_messages() {
+        let store = test_store();
+        let sid = store
+            .ensure_session("perf-sess", "claude-code", Some("icm"), None)
+            .unwrap();
+        for i in 0..2_000 {
+            // Sprinkle the keyword into ~1% of messages so search
+            // returns something but doesn't degenerate to a full scan.
+            let body = if i % 100 == 0 {
+                format!("turbofish needle hit {i}")
+            } else {
+                format!("filler payload number {i}")
+            };
+            store
+                .record_message(&sid, Role::User, &body, None, None, None)
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        let hits = store
+            .search_transcripts("turbofish", None, None, 50)
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            hits.len() >= 10,
+            "expected at least 10 hits, got {}",
+            hits.len()
+        );
+        assert!(
+            elapsed.as_millis() < 1500,
+            "search across 2k archived messages took {}ms (budget 1500ms)",
+            elapsed.as_millis(),
+        );
+    }
+
+    // === FactsStore tests (issue #273) ===
+
+    #[test]
+    fn test_facts_set_and_get_roundtrip() {
+        let store = test_store();
+        let id = store
+            .set_fact("project:icm", "gcp.project", "rtk-ai-labs-01", "cli")
+            .unwrap();
+        assert!(!id.is_empty());
+
+        let f = store
+            .get_fact("project:icm", "gcp.project")
+            .unwrap()
+            .expect("active fact must exist");
+        assert_eq!(f.value, "rtk-ai-labs-01");
+        assert_eq!(f.source, "cli");
+        assert!(f.is_active());
+    }
+
+    #[test]
+    fn test_facts_set_same_value_is_noop() {
+        let store = test_store();
+        let id1 = store.set_fact("e", "k", "v", "src").unwrap();
+        let id2 = store.set_fact("e", "k", "v", "src2").unwrap();
+        assert_eq!(id1, id2, "same value re-asserted must NOT create a new row");
+        let history = store.history("e", "k").unwrap();
+        assert_eq!(history.len(), 1);
+        // Source is NOT updated by the no-op (intentional: avoids
+        // creating noise just because the same fact was re-asserted
+        // from a different surface).
+        assert_eq!(history[0].source, "src");
+    }
+
+    #[test]
+    fn test_facts_supersede_keeps_history() {
+        let store = test_store();
+        let id1 = store
+            .set_fact("project:icm", "version", "0.10.51", "release-please")
+            .unwrap();
+        let id2 = store
+            .set_fact("project:icm", "version", "0.10.52", "release-please")
+            .unwrap();
+        assert_ne!(id1, id2);
+
+        let active = store
+            .get_fact("project:icm", "version")
+            .unwrap()
+            .expect("active fact must exist after supersession");
+        assert_eq!(active.value, "0.10.52");
+        assert!(active.is_active());
+
+        let history = store.history("project:icm", "version").unwrap();
+        assert_eq!(history.len(), 2);
+        // History returned newest-first.
+        assert_eq!(history[0].value, "0.10.52");
+        assert!(history[0].is_active());
+        assert_eq!(history[1].value, "0.10.51");
+        assert!(!history[1].is_active(), "older row must be superseded");
+    }
+
+    #[test]
+    fn test_facts_list_by_entity_alpha_sorted() {
+        let store = test_store();
+        store
+            .set_fact("host:db", "owner", "ops-team", "cli")
+            .unwrap();
+        store
+            .set_fact("host:db", "deploy.region", "europe-west1", "cli")
+            .unwrap();
+        store.set_fact("host:db", "cpu.cores", "16", "cli").unwrap();
+        store
+            .set_fact("host:web", "owner", "ui-team", "cli")
+            .unwrap();
+
+        let all = store.list_facts("host:db", None).unwrap();
+        let keys: Vec<&str> = all.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, vec!["cpu.cores", "deploy.region", "owner"]);
+        // Other entity NOT included.
+        assert!(all.iter().all(|f| f.entity == "host:db"));
+    }
+
+    #[test]
+    fn test_facts_list_prefix_filter() {
+        let store = test_store();
+        store
+            .set_fact("svc:api", "deploy.region", "europe-west1", "cli")
+            .unwrap();
+        store
+            .set_fact("svc:api", "deploy.replicas", "3", "cli")
+            .unwrap();
+        store
+            .set_fact("svc:api", "owner", "platform-team", "cli")
+            .unwrap();
+
+        let deploys = store.list_facts("svc:api", Some("deploy.")).unwrap();
+        assert_eq!(deploys.len(), 2);
+        assert!(deploys.iter().all(|f| f.key.starts_with("deploy.")));
+    }
+
+    #[test]
+    fn test_facts_forget_drops_history_too() {
+        let store = test_store();
+        store.set_fact("e", "k", "v1", "cli").unwrap();
+        store.set_fact("e", "k", "v2", "cli").unwrap();
+        let n = store.forget_fact("e", "k").unwrap();
+        assert_eq!(n, 2, "must delete both active and superseded rows");
+        assert!(store.get_fact("e", "k").unwrap().is_none());
+        assert!(store.history("e", "k").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_facts_stats_breakdown() {
+        let store = test_store();
+        store.set_fact("e1", "a", "1", "cli").unwrap();
+        store.set_fact("e1", "b", "2", "cli").unwrap();
+        store.set_fact("e2", "a", "3", "cli").unwrap();
+        // Supersede e1.a — history grows, active stays the same.
+        store.set_fact("e1", "a", "1-bis", "cli").unwrap();
+
+        let stats = store.facts_stats().unwrap();
+        assert_eq!(stats.active_count, 3, "3 active slots");
+        assert_eq!(stats.total_count, 4, "4 rows including superseded");
+        assert_eq!(stats.distinct_entities, 2);
+        let top: Vec<&str> = stats.top_entities.iter().map(|(e, _)| e.as_str()).collect();
+        assert!(top.contains(&"e1") && top.contains(&"e2"));
+    }
+
+    #[test]
+    fn test_facts_rejects_empty_entity_or_key() {
+        let store = test_store();
+        assert!(store.set_fact("", "k", "v", "cli").is_err());
+        assert!(store.set_fact("e", "", "v", "cli").is_err());
+    }
+
+    /// Issue #273 perf invariant: primary-key lookup must stay
+    /// sub-millisecond even at 10k facts. Loose budget so CI runners
+    /// don't flake.
+    #[test]
+    fn perf_facts_get_at_10k_under_5ms() {
+        let store = test_store();
+        for i in 0..10_000 {
+            let entity = format!("entity:{}", i % 100);
+            let key = format!("key.{i}");
+            store
+                .set_fact(&entity, &key, &format!("val-{i}"), "bench")
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let _ = store.get_fact("entity:42", "key.42").unwrap();
+        }
+        let elapsed = start.elapsed();
+        let per_lookup_us = elapsed.as_micros() / 1_000;
+        // 5ms / lookup in debug mode — generous; release is well
+        // under 1ms.
+        assert!(
+            per_lookup_us < 5_000,
+            "facts.get averaged {per_lookup_us}us / lookup over 1k iters (budget 5000us)",
+        );
+    }
+
+    /// Issue #272: `ensure_session` must be idempotent so repeated
+    /// hook fires keyed by the same external `session_id` land under
+    /// one row, not N.
+    #[test]
+    fn test_ensure_session_is_idempotent() {
+        let store = test_store();
+        let external_id = "claude-sess-abc-123";
+        let id1 = store
+            .ensure_session(external_id, "claude-code", Some("icm"), None)
+            .unwrap();
+        assert_eq!(id1, external_id);
+
+        // Re-call with the same id — must NOT create a new row.
+        let id2 = store
+            .ensure_session(external_id, "claude-code", Some("icm"), None)
+            .unwrap();
+        assert_eq!(id2, external_id);
+
+        let sessions = store.list_sessions(Some("icm"), 10).unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "ensure_session must be idempotent, got: {sessions:?}",
+        );
+        assert_eq!(sessions[0].id, external_id);
+
+        // Recording into the same id works.
+        store
+            .record_message(external_id, Role::User, "first turn", None, None, None)
+            .unwrap();
+        store
+            .record_message(
+                external_id,
+                Role::Tool,
+                "tool out",
+                Some("bash"),
+                None,
+                None,
+            )
+            .unwrap();
+        let msgs = store.list_session_messages(external_id, 10, 0).unwrap();
+        assert_eq!(msgs.len(), 2);
+    }
+
     #[test]
     fn test_transcript_record_into_missing_session_fails() {
         let store = test_store();
@@ -6323,5 +7278,145 @@ mod tests {
         let n = store.prune_hook_events(&past).unwrap();
         assert_eq!(n, 0);
         assert_eq!(store.hook_event_count().unwrap(), 1);
+    }
+
+    // ── code_areas (issue #196) ────────────────────────────────────────
+
+    #[test]
+    fn test_upsert_code_area_inserts_then_increments_touch_count() {
+        let store = test_store();
+        store
+            .upsert_code_area("proj", "src/foo.rs", None, Some("s1"), Some("Edit"))
+            .unwrap();
+        let after_first = store.list_code_areas(None, None, None, 10).unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].touch_count, 1);
+        assert_eq!(after_first[0].project, "proj");
+        assert_eq!(after_first[0].file_path, "src/foo.rs");
+
+        // Same path again — touch_count++ and last_touched_at updates.
+        let first_touched_at = after_first[0].first_touched_at;
+        store
+            .upsert_code_area("proj", "src/foo.rs", None, Some("s2"), Some("Write"))
+            .unwrap();
+        let after_second = store.list_code_areas(None, None, None, 10).unwrap();
+        assert_eq!(after_second.len(), 1, "no duplicate row on re-touch");
+        assert_eq!(after_second[0].touch_count, 2);
+        // first_touched_at is preserved across re-touches.
+        assert_eq!(after_second[0].first_touched_at, first_touched_at);
+        // session_id / tool_name are refreshed to the latest.
+        assert_eq!(after_second[0].session_id.as_deref(), Some("s2"));
+        assert_eq!(after_second[0].tool_name.as_deref(), Some("Write"));
+    }
+
+    #[test]
+    fn test_upsert_code_area_preserves_existing_description_when_passed_none() {
+        let store = test_store();
+        store
+            .upsert_code_area("proj", "f.rs", Some("initial note"), None, None)
+            .unwrap();
+        store
+            .upsert_code_area("proj", "f.rs", None, None, None)
+            .unwrap();
+        let rows = store.list_code_areas(None, None, None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].description.as_deref(), Some("initial note"));
+    }
+
+    #[test]
+    fn test_upsert_code_area_overwrites_description_when_passed_some() {
+        let store = test_store();
+        store
+            .upsert_code_area("proj", "f.rs", Some("v1"), None, None)
+            .unwrap();
+        store
+            .upsert_code_area("proj", "f.rs", Some("v2"), None, None)
+            .unwrap();
+        let rows = store.list_code_areas(None, None, None, 10).unwrap();
+        assert_eq!(rows[0].description.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn test_list_code_areas_filters_by_project_and_path_suffix() {
+        let store = test_store();
+        store
+            .upsert_code_area("alpha", "src/a.rs", None, None, None)
+            .unwrap();
+        store
+            .upsert_code_area("alpha", "src/b.rs", None, None, None)
+            .unwrap();
+        store
+            .upsert_code_area("beta", "src/a.rs", None, None, None)
+            .unwrap();
+
+        let only_alpha = store
+            .list_code_areas(Some("alpha"), None, None, 10)
+            .unwrap();
+        assert_eq!(only_alpha.len(), 2);
+
+        // Suffix match catches both alpha/src/a.rs and beta/src/a.rs.
+        let any_a = store
+            .list_code_areas(None, Some("src/a.rs"), None, 10)
+            .unwrap();
+        assert_eq!(any_a.len(), 2);
+        for r in &any_a {
+            assert!(r.file_path.ends_with("src/a.rs"));
+        }
+
+        // Project + path combine.
+        let alpha_a = store
+            .list_code_areas(Some("alpha"), Some("src/a.rs"), None, 10)
+            .unwrap();
+        assert_eq!(alpha_a.len(), 1);
+        assert_eq!(alpha_a[0].project, "alpha");
+    }
+
+    #[test]
+    fn test_list_code_areas_filters_by_since_timestamp() {
+        let store = test_store();
+        store
+            .upsert_code_area("p", "old.rs", None, None, None)
+            .unwrap();
+        // Cutoff one hour ahead skips everything we just inserted.
+        let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
+        let after = store.list_code_areas(None, None, Some(cutoff), 10).unwrap();
+        assert!(after.is_empty());
+        // Cutoff one hour behind keeps the row.
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let after = store.list_code_areas(None, None, Some(past), 10).unwrap();
+        assert_eq!(after.len(), 1);
+    }
+
+    #[test]
+    fn test_list_code_areas_orders_by_last_touched_desc() {
+        let store = test_store();
+        store
+            .upsert_code_area("p", "first.rs", None, None, None)
+            .unwrap();
+        // Sleep so the second insert lands at a strictly later second.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        store
+            .upsert_code_area("p", "second.rs", None, None, None)
+            .unwrap();
+        let rows = store.list_code_areas(None, None, None, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].file_path, "second.rs");
+        assert_eq!(rows[1].file_path, "first.rs");
+    }
+
+    #[test]
+    fn test_code_area_count_matches_unique_paths() {
+        let store = test_store();
+        assert_eq!(store.code_area_count().unwrap(), 0);
+        store
+            .upsert_code_area("p", "f.rs", None, None, None)
+            .unwrap();
+        store
+            .upsert_code_area("p", "f.rs", None, None, None)
+            .unwrap(); // re-touch
+        store
+            .upsert_code_area("p", "g.rs", None, None, None)
+            .unwrap();
+        assert_eq!(store.code_area_count().unwrap(), 2);
     }
 }

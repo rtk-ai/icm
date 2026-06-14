@@ -2,10 +2,11 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
-    add_backrefs, auto_link_memory, build_wake_up, format_local, is_preference_topic,
-    keyword_matches, project_matches, topic_matches, AutoLinkOptions, Concept, ConceptLink,
-    Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation,
-    WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
+    add_backrefs, auto_link_memory, build_wake_up, find_similar_memory, format_local,
+    is_preference_topic, keyword_matches, project_matches, topic_matches, AutoLinkOptions, Concept,
+    ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
+    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, DEDUP_SIMILARITY_THRESHOLD,
+    MSG_NO_MEMORIES,
 };
 use icm_store::SqliteStore;
 
@@ -13,9 +14,6 @@ use crate::protocol::ToolResult;
 
 /// Default threshold for auto-consolidation (can be overridden by config).
 const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
-
-/// Similarity score above which a new memory is considered a duplicate of an existing one.
-const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.85;
 
 /// Maximum allowed length for topic names. Must stay <= the store
 /// layer's `MAX_TOPIC_BYTES` so the MCP-level rejection happens
@@ -998,49 +996,50 @@ fn tool_store(
 
     // Dedup check: if a very similar memory exists in the same topic, update it instead
     if let Some(ref query_emb) = embed_vec {
-        if let Ok(similar) = store.search_hybrid(&embed_text, query_emb, 1) {
-            if let Some((existing, score)) = similar.first() {
-                if *score > DEDUP_SIMILARITY_THRESHOLD && existing.topic == topic {
-                    // Very similar content in same topic — update instead of duplicate
-                    let updated = Memory {
-                        id: existing.id.clone(),
-                        created_at: existing.created_at,
-                        last_accessed: existing.last_accessed,
-                        access_count: existing.access_count,
-                        weight: 1.0, // Reset weight on update
-                        topic: existing.topic.clone(),
-                        summary: content.to_string(),
-                        raw_excerpt: get_str(args, "raw_excerpt")
-                            .map(|r| r.into())
-                            .or_else(|| existing.raw_excerpt.clone()),
-                        keywords: {
-                            let kw = parse_keywords(args);
-                            if kw.is_empty() {
-                                existing.keywords.clone()
-                            } else {
-                                kw
-                            }
-                        },
-                        embedding: Some(query_emb.clone()),
-                        importance,
-                        source: existing.source.clone(),
-                        related_ids: existing.related_ids.clone(),
-                        updated_at: Utc::now(),
-                        scope: existing.scope,
-                    };
-                    if let Err(e) = store.update(&updated) {
-                        return ToolResult::error(format!("failed to update: {e}"));
-                    }
-                    return if compact {
-                        ToolResult::text(format!("ok:{}", updated.id))
+        if let Ok(Some((existing, score))) = find_similar_memory(
+            store,
+            &embed_text,
+            query_emb,
+            topic,
+            DEDUP_SIMILARITY_THRESHOLD,
+        ) {
+            let updated = Memory {
+                id: existing.id.clone(),
+                created_at: existing.created_at,
+                last_accessed: existing.last_accessed,
+                access_count: existing.access_count,
+                weight: 1.0,
+                topic: existing.topic.clone(),
+                summary: content.to_string(),
+                raw_excerpt: get_str(args, "raw_excerpt")
+                    .map(|r| r.into())
+                    .or_else(|| existing.raw_excerpt.clone()),
+                keywords: {
+                    let kw = parse_keywords(args);
+                    if kw.is_empty() {
+                        existing.keywords.clone()
                     } else {
-                        ToolResult::text(format!(
-                            "Updated existing memory (similarity {score:.2}): {}",
-                            updated.id
-                        ))
-                    };
-                }
+                        kw
+                    }
+                },
+                embedding: Some(query_emb.clone()),
+                importance,
+                source: existing.source.clone(),
+                related_ids: existing.related_ids.clone(),
+                updated_at: Utc::now(),
+                scope: existing.scope,
+            };
+            if let Err(e) = store.update(&updated) {
+                return ToolResult::error(format!("failed to update: {e}"));
             }
+            return if compact {
+                ToolResult::text(format!("ok:{}", updated.id))
+            } else {
+                ToolResult::text(format!(
+                    "Updated existing memory (similarity {score:.2}): {}",
+                    updated.id
+                ))
+            };
         }
     }
 
@@ -1188,7 +1187,7 @@ fn tool_recall(
 
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
-        if let Ok(query_emb) = emb.embed(query) {
+        if let Ok(query_emb) = emb.embed_query(query) {
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored_results = results;
                 scored_results.retain(|(m, _)| project_filter(m));

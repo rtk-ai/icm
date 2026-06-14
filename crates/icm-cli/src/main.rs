@@ -372,6 +372,38 @@ enum Commands {
     /// signal (0 = clean). See issue #229.
     Uninstall(uninstall::UninstallOpts),
 
+    /// List files the agent has worked in during recent sessions.
+    ///
+    /// Rows are populated automatically by the PostToolUse hook
+    /// (`icm hook post`) whenever Claude Code / Codex / Gemini /
+    /// Copilot calls Edit / Write / MultiEdit / NotebookEdit on a
+    /// file. Same `(project, file_path)` increments `touch_count`
+    /// instead of duplicating rows. See issue #196.
+    CodeAreas {
+        /// Filter to a single path (exact match, or a suffix like
+        /// `src/foo.rs` to match any project rooted above it).
+        #[arg(long, value_name = "PATH")]
+        in_file: Option<String>,
+
+        /// Limit to a specific project. Default: all projects.
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Only show files touched since this ISO-8601 timestamp
+        /// (e.g. `2026-05-01T00:00:00Z`).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Maximum rows to return.
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Output format. `table` is the default human view; `json`
+        /// emits one JSON array per stdout line for scripts.
+        #[arg(long, default_value = "table")]
+        format: CodeAreasFormat,
+    },
+
     /// Run performance benchmark on in-memory store
     Bench {
         /// Number of memories to seed
@@ -1219,6 +1251,14 @@ impl ListFormat {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum CodeAreasFormat {
+    /// Human-readable aligned table (default).
+    Table,
+    /// JSON array — one row per file. Machine-friendly.
+    Json,
+}
+
 #[derive(Clone, ValueEnum)]
 enum InitMode {
     /// MCP server plugin (Claude calls icm tools natively)
@@ -1632,6 +1672,20 @@ fn main() -> Result<()> {
         } => cmd_init(mode, force, per_project),
         Commands::Doctor => cmd_doctor(),
         Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
+        Commands::CodeAreas {
+            in_file,
+            project,
+            since,
+            limit,
+            format,
+        } => cmd_code_areas(
+            &store,
+            in_file.as_deref(),
+            project.as_deref(),
+            since.as_deref(),
+            limit,
+            format,
+        ),
         Commands::Extract {
             project,
             text,
@@ -2820,6 +2874,42 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
     None
 }
 
+/// Extract `tool_input.file_path` from a PostToolUse JSON payload, in
+/// the shapes ICM has observed across Claude Code 1.x / 2.x, Codex,
+/// and Gemini. Returns `None` when the field is absent, empty, or the
+/// payload is structured differently. Used by the code-areas
+/// auto-capture (issue #196) — never call from a path where the
+/// absence of the field should be an error.
+fn extract_tool_input_file_path(json: &Value) -> Option<String> {
+    fn nonempty(v: &Value) -> Option<String> {
+        v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+    }
+
+    // Claude Code 2.x: `tool_input.file_path`.
+    if let Some(s) = json.get("tool_input").and_then(|t| t.get("file_path")) {
+        if let Some(s) = nonempty(s) {
+            return Some(s);
+        }
+    }
+    // Claude Code 1.x legacy and some Codex variants: top-level.
+    if let Some(s) = json.get("file_path") {
+        if let Some(s) = nonempty(s) {
+            return Some(s);
+        }
+    }
+    // Some MCP servers nest the input under `arguments`.
+    if let Some(s) = json
+        .get("tool_input")
+        .and_then(|t| t.get("arguments"))
+        .and_then(|a| a.get("file_path"))
+    {
+        if let Some(s) = nonempty(s) {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// PostToolUse hook: auto-extract context every N tool calls.
 /// Reads JSON from stdin. Runs extraction asynchronously.
 ///
@@ -2873,6 +2963,27 @@ fn cmd_hook_post(
                 icm_core::transcript::Role::Tool,
                 tool_output_for_archive,
                 Some(tool_name).filter(|s| !s.is_empty()),
+            );
+        }
+    }
+
+    // ── Code areas auto-capture (issue #196) ─────────────────────────
+    // Independent of the extract counter: every Edit/Write tool call
+    // gets one row in `code_areas` (touch_count++ on re-touch).
+    // Failure is non-fatal — never block the hook on stats inserts.
+    if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+        if let Some(file_path) = extract_tool_input_file_path(&json) {
+            let project = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "project".to_string());
+            let session_id = json.get("session_id").and_then(|v| v.as_str());
+            let _ = store.upsert_code_area(
+                &project,
+                &file_path,
+                None, // description left empty in MVP; #165 will wire LLM summaries later
+                session_id,
+                Some(tool_name),
             );
         }
     }
@@ -3559,6 +3670,79 @@ fn project_from_path(path: &str) -> Option<String> {
     p.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .filter(|s| !s.is_empty() && s != "/")
+}
+
+/// `icm code-areas`: list files auto-recorded by the PostToolUse hook
+/// when the agent edited them. See issue #196 for the design discussion.
+fn cmd_code_areas(
+    store: &SqliteStore,
+    in_file: Option<&str>,
+    project: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+    format: CodeAreasFormat,
+) -> Result<()> {
+    let since_dt = match since {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .with_context(|| format!("--since must be ISO-8601 (got `{s}`)"))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let rows = store.list_code_areas(project, in_file, since_dt, limit)?;
+    if rows.is_empty() {
+        match format {
+            CodeAreasFormat::Json => println!("[]"),
+            CodeAreasFormat::Table => println!("No code areas captured yet."),
+        }
+        return Ok(());
+    }
+    match format {
+        CodeAreasFormat::Json => {
+            let json = serde_json::to_string_pretty(
+                &rows
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.id,
+                            "project": c.project,
+                            "file_path": c.file_path,
+                            "description": c.description,
+                            "session_id": c.session_id,
+                            "tool_name": c.tool_name,
+                            "touch_count": c.touch_count,
+                            "first_touched_at": c.first_touched_at.to_rfc3339(),
+                            "last_touched_at": c.last_touched_at.to_rfc3339(),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            println!("{json}");
+        }
+        CodeAreasFormat::Table => {
+            println!(
+                "{:<20} {:<6} {:<20} Path",
+                "Project", "Hits", "Last touched"
+            );
+            println!("{}", "-".repeat(80));
+            for r in &rows {
+                let proj = if r.project.len() > 20 {
+                    format!("{}…", &r.project[..19])
+                } else {
+                    r.project.clone()
+                };
+                println!(
+                    "{:<20} {:<6} {:<20} {}",
+                    proj,
+                    r.touch_count,
+                    r.last_touched_at.format("%Y-%m-%d %H:%M:%S"),
+                    r.file_path,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_topics(store: &SqliteStore) -> Result<()> {

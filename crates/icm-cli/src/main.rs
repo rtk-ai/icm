@@ -3097,9 +3097,7 @@ fn cmd_hook_post(
     // Failure is non-fatal — never block the hook on stats inserts.
     if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
         if let Some(file_path) = extract_tool_input_file_path(&json) {
-            let project = std::env::current_dir()
-                .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            let project = project_from_cwd_json(&json)
                 .unwrap_or_else(|| "project".to_string());
             let session_id = json.get("session_id").and_then(|v| v.as_str());
             let _ = store.upsert_code_area(
@@ -3136,7 +3134,8 @@ fn cmd_hook_post(
         return Ok(());
     }
 
-    let project = detect_project();
+    let project = project_from_cwd_json(&json)
+        .unwrap_or_else(|| "project".to_string());
 
     // Async path: enqueue raw output and return without loading the
     // embedder. The worker (`icm extract-pending` / SessionEnd fork) will
@@ -3770,16 +3769,15 @@ fn build_hook_start_pack(
 }
 
 /// Extract a project name from a git remote URL.
-/// Handles both HTTPS ("https://github.com/user/repo.git") and
-/// SSH ("git@github.com:user/repo.git") formats.
+/// Handles HTTPS ("https://github.com/user/repo.git"),
+/// slash-SSH ("git@github.com:user/repo.git"), and
+/// colon-only SSH ("git@host:repo.git") formats.
 fn repo_name_from_url(url: &str) -> Option<String> {
-    let name = url
-        .rsplit('/')
-        .next()
-        .unwrap_or(url)
-        .trim_end_matches(".git")
-        .to_string();
-    if name.is_empty() { None } else { Some(name) }
+    // rsplit('/') always yields ≥1 element; split on ':' afterwards to
+    // handle SCP-style SSH URLs that have no slash before the repo name.
+    let after_slash = url.rsplit('/').next().unwrap_or(url);
+    let name = after_slash.rsplit(':').next().unwrap_or(after_slash).trim_end_matches(".git");
+    if name.is_empty() { None } else { Some(name.to_string()) }
 }
 
 /// Extract a project name from a filesystem path (basename), treating empty
@@ -3812,8 +3810,9 @@ fn project_from_path(path: &str) -> Option<String> {
         .output()
     {
         if out.status.success() {
-            let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let common_path = std::path::Path::new(&common);
+            let raw = out.stdout;
+            let common = std::str::from_utf8(&raw).unwrap_or("").trim();
+            let common_path = std::path::Path::new(common);
             if common_path.is_absolute() {
                 if let Some(name) = common_path.parent().and_then(|r| r.file_name()) {
                     return Some(name.to_string_lossy().to_string());
@@ -3823,9 +3822,7 @@ fn project_from_path(path: &str) -> Option<String> {
     }
 
     // Fallback: basename of the path itself
-    p.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty() && s != "/")
+    p.file_name().map(|n| n.to_string_lossy().to_string())
 }
 
 /// Extract the project name from the `cwd` field of a hook JSON payload.
@@ -6563,25 +6560,12 @@ fn cmd_recall_context(store: &SqliteStore, query: &str, limit: usize) -> Result<
 /// Detect the current project name from PWD and git remote.
 /// Returns the best project identifier for topic matching.
 fn detect_project() -> String {
-    // Try git remote first (most unique identifier)
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-    {
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if let Some(name) = repo_name_from_url(&url) {
-            return name;
-        }
-    }
-
-    // Fallback: basename of current directory
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(name) = cwd.file_name() {
-            return name.to_string_lossy().to_string();
-        }
-    }
-
-    "unknown".to_string()
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return "unknown".to_string(),
+    };
+    let path_str = cwd.to_string_lossy();
+    project_from_path(&path_str).unwrap_or_else(|| "unknown".to_string())
 }
 
 fn cmd_recall_project(store: &SqliteStore, limit: usize) -> Result<()> {
@@ -8647,6 +8631,15 @@ mod hook_start_tests {
             project_from_path(dir.path().to_str().unwrap()),
             Some("sshproject".into())
         );
+    }
+
+    #[test]
+    fn repo_name_from_url_handles_scp_ssh_without_slash() {
+        // git@host:repo.git — no slash between host and repo name
+        assert_eq!(repo_name_from_url("git@host:repo.git"), Some("repo".into()));
+        assert_eq!(repo_name_from_url("git@github.com:user/repo.git"), Some("repo".into()));
+        assert_eq!(repo_name_from_url("https://github.com/user/repo.git"), Some("repo".into()));
+        assert_eq!(repo_name_from_url(""), None);
     }
 
     /// Creates a git repo named "mainproject" with a worktree at "w1".

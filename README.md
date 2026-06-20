@@ -127,7 +127,7 @@ Configures **18 tools** in one command ([full integration guide](docs/integratio
 | Claude Code | `~/.claude.json` | 5 hooks | `CLAUDE.md` | `/recall` `/remember` |
 | Claude Desktop | JSON | — | — | — |
 | Gemini CLI | `~/.gemini/settings.json` | 5 hooks | `GEMINI.md` | — |
-| Codex CLI | `~/.codex/config.toml` | 4 hooks | `AGENTS.md` | — |
+| Codex CLI | `~/.codex/config.toml` | 3 hooks (PostToolUse opt-in, see #288) | `AGENTS.md` | — |
 | Copilot CLI | `~/.copilot/mcp-config.json` | 4 hooks | `.github/copilot-instructions.md` | — |
 | Cursor | `~/.cursor/mcp.json` | — | — | `.mdc` rule |
 | Windsurf | JSON | — | `.windsurfrules` | — |
@@ -191,7 +191,7 @@ Installs auto-extraction and auto-recall hooks for all supported tools:
 |------|:-----------:|:-------:|:--------:|:-------:|:------------:|--------|
 | Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
 | Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
-| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.codex/hooks.json` |
+| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post`¹ | — | `icm hook prompt` | `~/.codex/hooks.json` |
 | Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
 | OpenCode | session start | — | tool extract | compaction | — | `~/.config/opencode/plugins/icm.ts` |
 
@@ -204,6 +204,8 @@ Installs auto-extraction and auto-recall hooks for all supported tools:
 | `icm hook post` | Extract facts from tool output every N calls (auto-extraction) |
 | `icm hook compact` | Extract memories from transcript before context compression |
 | `icm hook prompt` | Inject recalled context at the start of each user prompt |
+
+¹ **Codex CLI PostToolUse is off by default.** Codex fires PostToolUse on every shell command — a session generates ~14k events / 24h, which floods the store with tool-output bloat (issue #288). Opt in with `icm init --with-codex-post-hook` if you want it; tune `[extraction]` first (`extract_every`, `min_score`, `store_raw = false`). MCP + `AGENTS.md` alone still let Codex save via the `icm_memory_store` tool.
 
 ## CLI vs MCP
 

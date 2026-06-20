@@ -375,6 +375,18 @@ enum Commands {
         /// doesn't pollute every project tree.
         #[arg(long)]
         per_project: bool,
+
+        /// Install the Codex CLI PostToolUse hook (`icm hook post`).
+        /// Off by default since Codex fires PostToolUse on every shell
+        /// command — a reasonable session generates ~14k events / 24h
+        /// (issue #288) and the auto-extracted memories are mostly
+        /// tool-output bloat (paths, patch snippets, help text). With
+        /// MCP + AGENTS.md alone, Codex still stores via the
+        /// `icm_memory_store` MCP tool. Opt in if you want PostToolUse
+        /// extraction on Codex anyway; tune `[extraction]` first
+        /// (`extract_every`, `min_score`, `store_raw=false`).
+        #[arg(long)]
+        with_codex_post_hook: bool,
     },
 
     /// Diagnose ICM integration: check hook binary paths in Claude Code settings
@@ -669,7 +681,8 @@ enum Commands {
         token: Option<String>,
     },
 
-    /// Claude Code hook handlers (read JSON from stdin, output hook response)
+    /// Hook handlers shared across Claude Code, Codex, Gemini, and
+    /// Copilot (read JSON from stdin, output hook response).
     Hook {
         #[command(subcommand)]
         command: HookCommands,
@@ -1774,7 +1787,8 @@ fn main() -> Result<()> {
             mode,
             force,
             per_project,
-        } => cmd_init(mode, force, per_project),
+            with_codex_post_hook,
+        } => cmd_init(mode, force, per_project, with_codex_post_hook),
         Commands::Doctor => cmd_doctor(),
         Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
         Commands::CodeAreas {
@@ -4175,7 +4189,12 @@ pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     cmd.contains(&format!("{pattern}.exe"))
 }
 
-fn cmd_init(mode: InitMode, force: bool, per_project: bool) -> Result<()> {
+fn cmd_init(
+    mode: InitMode,
+    force: bool,
+    per_project: bool,
+    with_codex_post_hook: bool,
+) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
     let home = home_dir_str()?;
@@ -4937,14 +4956,28 @@ Do this BEFORE responding to the user. Not optional.
             )?;
             println!("[hook] Codex CLI PreToolUse (auto-allow): {status}");
 
-            let status = inject_codex_hook(
-                &codex_hooks_path,
-                "PostToolUse",
-                &format!("{} hook post", icm_bin_str),
-                None,
-                detect,
-            )?;
-            println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+            // Codex CLI PostToolUse is opt-in (issue #288): Codex
+            // fires this on every shell command, so the default
+            // install used to flood the store with ~14k events/24h
+            // of tool-output bloat. MCP + AGENTS.md alone is enough
+            // for `icm_memory_store` to land curated facts via the
+            // model. Users who want the extraction-on-every-tool
+            // behavior can pass `--with-codex-post-hook`.
+            if with_codex_post_hook {
+                let status = inject_codex_hook(
+                    &codex_hooks_path,
+                    "PostToolUse",
+                    &format!("{} hook post", icm_bin_str),
+                    None,
+                    detect,
+                )?;
+                println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+            } else {
+                println!(
+                    "[hook] Codex CLI PostToolUse: skipped (off by default; \
+                     pass --with-codex-post-hook to opt in — see issue #288)"
+                );
+            }
 
             let status = inject_codex_hook(
                 &codex_hooks_path,

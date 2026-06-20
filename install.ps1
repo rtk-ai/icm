@@ -20,10 +20,46 @@ $Repo = "rtk-ai/icm"
 $BinaryName = "icm"
 
 function Get-Arch {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-    switch ($arch) {
+    # Resolution order:
+    #   1. $env:PROCESSOR_ARCHITECTURE  — set on every Windows since
+    #      forever; cheapest and survives the PowerShell-5 +
+    #      old-.NET-Framework path where `RuntimeInformation`
+    #      sometimes stringifies to "" inside switch comparisons
+    #      (issue #289 report).
+    #   2. RuntimeInformation.OSArchitecture, explicitly ToString()'d
+    #      so the switch comparison sees a string, not an enum value
+    #      that needs implicit conversion.
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if (-not $arch) {
+        try {
+            $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        } catch {
+            $arch = ""
+        }
+    }
+    # WOW64: 32-bit PowerShell on 64-bit Windows exposes
+    # PROCESSOR_ARCHITECTURE=x86 plus PROCESSOR_ARCHITEW6432=AMD64.
+    # Honor the latter so the user still installs the native binary.
+    if ($arch -eq "x86" -and $env:PROCESSOR_ARCHITEW6432) {
+        $arch = $env:PROCESSOR_ARCHITEW6432
+    }
+    switch ($arch.ToUpperInvariant()) {
+        "AMD64" { return "x86_64" }
         "X64"   { return "x86_64" }
-        default { throw "Unsupported architecture: $arch. Only x86_64 is supported on Windows." }
+        "ARM64" {
+            throw ("ARM64 Windows isn't pre-built yet. Build from source: " +
+                   "https://github.com/$Repo#install (cargo install --path crates/icm-cli).")
+        }
+        ""      {
+            throw ("Could not detect CPU architecture (PROCESSOR_ARCHITECTURE and " +
+                   "RuntimeInformation.OSArchitecture both empty). Open an issue at " +
+                   "https://github.com/$Repo/issues with the output of `$PSVersionTable` " +
+                   "so we can investigate.")
+        }
+        default {
+            throw ("Unsupported architecture: '$arch'. Only x86_64 is pre-built on Windows. " +
+                   "Build from source: cargo install --path crates/icm-cli.")
+        }
     }
 }
 

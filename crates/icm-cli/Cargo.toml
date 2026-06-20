@@ -13,10 +13,15 @@ name = "icm"
 path = "src/main.rs"
 
 [features]
-default = ["embeddings", "tui"]
+default = ["embeddings", "tui", "http-api"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
 tui = ["dep:ratatui", "dep:crossterm"]
-web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess", "dep:getrandom"]
+# Persistent local HTTP server (`icm serve --http`) reusing the warm
+# store + embedder. Lightweight: just axum + tokio. Issue #290.
+http-api = ["dep:axum", "dep:tokio"]
+# Full web dashboard (SvelteKit SPA + auth). Pulls everything `http-api`
+# does plus the embedded-assets stack.
+web = ["http-api", "dep:tower-http", "dep:rust-embed", "dep:mime_guess", "dep:getrandom"]
 # `openssl` is not used directly in our source code, but it gets pulled
 # transitively via reqwest / hyper-tls / etc. (depending on the active
 # feature set). On cross-builds (e.g. aarch64-unknown-linux-gnu) the

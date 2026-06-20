@@ -218,6 +218,31 @@ ICM can be used via CLI (`icm` commands) or MCP server (`icm serve`). Both acces
 | **Auto-extraction** | Yes (hooks trigger `icm extract`) | Yes (MCP tools call store) |
 | **Best for** | Power users, token savings | Universal compatibility |
 
+## HTTP API (warm model)
+
+```bash
+# Persistent local server — embedding model loads once, stays warm.
+icm serve --http 127.0.0.1:11435 --db ~/.local/share/icm/memories.db &
+
+curl -s -X POST 127.0.0.1:11435/store \
+  -H 'content-type: application/json' \
+  -d '{"topic":"t","content":"hello world","keywords":"x"}'
+
+# TOON by default (lowest token cost on LLM-side reads).
+curl -s -X POST 127.0.0.1:11435/recall \
+  -H 'content-type: application/json' \
+  -d '{"query":"hello","topic":"t","limit":5}'
+
+# JSON variant: ?format=json or Accept: application/json
+curl -s -X POST '127.0.0.1:11435/recall?format=json' \
+  -H 'content-type: application/json' \
+  -d '{"query":"hello","topic":"t"}'
+```
+
+Endpoints: `POST /store`, `POST /recall`, `POST /consolidate`, `GET /stats`, `GET /topics`, `GET /health`. Optional `--token <T>` enables `Authorization: Bearer <T>` on every request (health stays open as a liveness probe). Bound to whatever address you pass; `127.0.0.1:<port>` keeps the server localhost-only.
+
+Saves ~9 s per call vs one-shot CLI (model reload) — any scripting language can hit semantic recall with plain `curl`. Requires the `http-api` feature (enabled by default). Issue [#290](https://github.com/rtk-ai/icm/issues/290).
+
 ## Dashboard
 
 ```bash

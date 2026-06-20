@@ -2,10 +2,13 @@ mod archive;
 mod bench_data;
 mod bench_format;
 mod bench_knowledge;
+
 pub mod cloud;
 mod config;
 mod extract;
 mod extract_semantic;
+#[cfg(feature = "http-api")]
+mod http_api;
 mod import;
 mod install_manifest;
 #[cfg(test)]
@@ -646,6 +649,24 @@ enum Commands {
         #[cfg(feature = "web")]
         #[arg(long)]
         expose: bool,
+
+        /// Run a persistent local HTTP API on the given address instead
+        /// of the MCP stdio server. The embedding model and SQLite
+        /// store load ONCE and stay warm across requests (~9 s saved
+        /// per call vs. one-shot CLI). Default bind is what you pass;
+        /// `127.0.0.1:<port>` keeps the server localhost-only.
+        /// Endpoints: POST /recall, POST /store, POST /consolidate,
+        /// GET /stats, GET /topics, GET /health. Issue #290.
+        #[cfg(feature = "http-api")]
+        #[arg(long, value_name = "ADDR")]
+        http: Option<std::net::SocketAddr>,
+
+        /// Require `Authorization: Bearer <TOKEN>` on every HTTP
+        /// request (only meaningful with `--http`). Absent token =
+        /// open localhost API.
+        #[cfg(feature = "http-api")]
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
     },
 
     /// Claude Code hook handlers (read JSON from stdin, output hook response)
@@ -1860,6 +1881,10 @@ fn main() -> Result<()> {
             compact,
             #[cfg(feature = "web")]
             expose,
+            #[cfg(feature = "http-api")]
+            http,
+            #[cfg(feature = "http-api")]
+            token,
         } => {
             #[cfg(feature = "web")]
             if expose {
@@ -1871,6 +1896,15 @@ fn main() -> Result<()> {
                     cfg.web.username.clone(),
                     password,
                 );
+            }
+            // HTTP API path (issue #290): warm store + embedder behind
+            // an axum server. Routes to a different transport from
+            // stdio, so it's an `if let`, not an `else if expose`.
+            #[cfg(feature = "http-api")]
+            if let Some(addr) = http {
+                let boxed_emb: Option<Box<dyn icm_core::Embedder + Send + Sync>> =
+                    embedder.map(|e| Box::new(e) as Box<dyn icm_core::Embedder + Send + Sync>);
+                return http_api::run_http_server(store, boxed_emb, addr, token);
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);

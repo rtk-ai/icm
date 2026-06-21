@@ -4490,6 +4490,9 @@ Do NOT store: trivial details, info already in this file, ephemeral state (build
 \n\
 ### Other commands\n\
 ```bash\n\
+icm forget <id>                          # remove a memory by ID\n\
+icm list --all                           # list all memories\n\
+icm list --topic <name>                  # list memories in a topic\n\
 icm update <id> -c \"updated content\"     # edit memory in-place\n\
 icm health                                # topic hygiene audit\n\
 icm topics                                # list all topics\n\

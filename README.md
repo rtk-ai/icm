@@ -127,7 +127,7 @@ Configures **18 tools** in one command ([full integration guide](docs/integratio
 | Claude Code | `~/.claude.json` | 5 hooks | `CLAUDE.md` | `/recall` `/remember` |
 | Claude Desktop | JSON | — | — | — |
 | Gemini CLI | `~/.gemini/settings.json` | 5 hooks | `GEMINI.md` | — |
-| Codex CLI | `~/.codex/config.toml` | 4 hooks | `AGENTS.md` | — |
+| Codex CLI | `~/.codex/config.toml` | 3 hooks (PostToolUse opt-in, see #288) | `AGENTS.md` | — |
 | Copilot CLI | `~/.copilot/mcp-config.json` | 4 hooks | `.github/copilot-instructions.md` | — |
 | Cursor | `~/.cursor/mcp.json` | — | — | `.mdc` rule |
 | Windsurf | JSON | — | `.windsurfrules` | — |
@@ -191,7 +191,7 @@ Installs auto-extraction and auto-recall hooks for all supported tools:
 |------|:-----------:|:-------:|:--------:|:-------:|:------------:|--------|
 | Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
 | Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
-| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.codex/hooks.json` |
+| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post`¹ | — | `icm hook prompt` | `~/.codex/hooks.json` |
 | Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
 | OpenCode | session start | — | tool extract | compaction | — | `~/.config/opencode/plugins/icm.ts` |
 
@@ -205,6 +205,8 @@ Installs auto-extraction and auto-recall hooks for all supported tools:
 | `icm hook compact` | Extract memories from transcript before context compression |
 | `icm hook prompt` | Inject recalled context at the start of each user prompt |
 
+¹ **Codex CLI PostToolUse is off by default.** Codex fires PostToolUse on every shell command — a session generates ~14k events / 24h, which floods the store with tool-output bloat (issue #288). Opt in with `icm init --with-codex-post-hook` if you want it; tune `[extraction]` first (`extract_every`, `min_score`, `store_raw = false`). MCP + `AGENTS.md` alone still let Codex save via the `icm_memory_store` tool.
+
 ## CLI vs MCP
 
 ICM can be used via CLI (`icm` commands) or MCP server (`icm serve`). Both access the same database.
@@ -217,6 +219,31 @@ ICM can be used via CLI (`icm` commands) or MCP server (`icm serve`). Both acces
 | **Works with** | Claude Code, Gemini, Codex, Copilot, OpenCode (via hooks) | All 17 MCP-compatible tools |
 | **Auto-extraction** | Yes (hooks trigger `icm extract`) | Yes (MCP tools call store) |
 | **Best for** | Power users, token savings | Universal compatibility |
+
+## HTTP API (warm model)
+
+```bash
+# Persistent local server — embedding model loads once, stays warm.
+icm serve --http 127.0.0.1:11435 --db ~/.local/share/icm/memories.db &
+
+curl -s -X POST 127.0.0.1:11435/store \
+  -H 'content-type: application/json' \
+  -d '{"topic":"t","content":"hello world","keywords":"x"}'
+
+# TOON by default (lowest token cost on LLM-side reads).
+curl -s -X POST 127.0.0.1:11435/recall \
+  -H 'content-type: application/json' \
+  -d '{"query":"hello","topic":"t","limit":5}'
+
+# JSON variant: ?format=json or Accept: application/json
+curl -s -X POST '127.0.0.1:11435/recall?format=json' \
+  -H 'content-type: application/json' \
+  -d '{"query":"hello","topic":"t"}'
+```
+
+Endpoints: `POST /store`, `POST /recall`, `POST /consolidate`, `GET /stats`, `GET /topics`, `GET /health`. Optional `--token <T>` enables `Authorization: Bearer <T>` on every request (health stays open as a liveness probe). Bound to whatever address you pass; `127.0.0.1:<port>` keeps the server localhost-only.
+
+Saves ~9 s per call vs one-shot CLI (model reload) — any scripting language can hit semantic recall with plain `curl`. Requires the `http-api` feature (enabled by default). Issue [#290](https://github.com/rtk-ai/icm/issues/290).
 
 ## Dashboard
 

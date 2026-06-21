@@ -146,6 +146,8 @@ icm init --mode mcp
 ```bash
 icm init --mode mcp     # TOML config
 icm init --mode cli     # Injects into AGENTS.md
+icm init --mode hook    # SessionStart + PreToolUse + UserPromptSubmit
+                        # (PostToolUse opt-in, see below)
 ```
 
 **Config:** `~/.codex/config.toml`
@@ -155,6 +157,24 @@ icm init --mode cli     # Injects into AGENTS.md
 command = "/path/to/icm"
 args = ["serve"]
 ```
+
+**Hooks:** `~/.codex/hooks.json` — the `hook` mode installs three hooks
+by default: SessionStart, PreToolUse (auto-allow `icm` commands),
+and UserPromptSubmit (recall injection).
+
+**PostToolUse is opt-in** (issue #288): Codex fires PostToolUse on
+every shell command, which generates ~14k events / 24h and floods
+the store with tool-output bloat (paths, patch fragments, help
+text, generic `note` entries). MCP + `AGENTS.md` alone are enough
+for `icm_memory_store` to land curated facts via the model. If
+you want PostToolUse extraction on Codex anyway, opt in with:
+
+```bash
+icm init --mode hook --with-codex-post-hook
+```
+
+…and tune `[extraction]` first (`extract_every`, `min_score`,
+`store_raw = false`) so the auto-extracted memories stay useful.
 
 **Instructions:** `AGENTS.md` in project root.
 
@@ -234,7 +254,7 @@ icm init --mode mcp
 | `mcp` | Configures MCP server in each tool's config | All 14 tools |
 | `cli` | Injects ICM instructions into instruction files | Claude Code, Codex, Gemini, Copilot, Windsurf |
 | `skill` | Creates slash commands and rule files | Claude Code, Cursor, Roo Code, Amp |
-| `hook` | Installs hooks/plugins for automatic extraction | Claude Code (4 hooks), OpenCode (JS plugin) |
+| `hook` | Installs hooks/plugins for automatic extraction | Claude Code (5 hooks), Gemini CLI (5 hooks), Codex CLI (3 hooks; PostToolUse opt-in, #288), Copilot CLI (4 hooks), OpenCode (TS plugin) |
 
 ## Manual Setup
 

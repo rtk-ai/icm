@@ -2,10 +2,13 @@ mod archive;
 mod bench_data;
 mod bench_format;
 mod bench_knowledge;
+
 pub mod cloud;
 mod config;
 mod extract;
 mod extract_semantic;
+#[cfg(feature = "http-api")]
+mod http_api;
 mod import;
 mod install_manifest;
 #[cfg(test)]
@@ -372,6 +375,18 @@ enum Commands {
         /// doesn't pollute every project tree.
         #[arg(long)]
         per_project: bool,
+
+        /// Install the Codex CLI PostToolUse hook (`icm hook post`).
+        /// Off by default since Codex fires PostToolUse on every shell
+        /// command — a reasonable session generates ~14k events / 24h
+        /// (issue #288) and the auto-extracted memories are mostly
+        /// tool-output bloat (paths, patch snippets, help text). With
+        /// MCP + AGENTS.md alone, Codex still stores via the
+        /// `icm_memory_store` MCP tool. Opt in if you want PostToolUse
+        /// extraction on Codex anyway; tune `[extraction]` first
+        /// (`extract_every`, `min_score`, `store_raw=false`).
+        #[arg(long)]
+        with_codex_post_hook: bool,
     },
 
     /// Diagnose ICM integration: check hook binary paths in Claude Code settings
@@ -646,9 +661,28 @@ enum Commands {
         #[cfg(feature = "web")]
         #[arg(long)]
         expose: bool,
+
+        /// Run a persistent local HTTP API on the given address instead
+        /// of the MCP stdio server. The embedding model and SQLite
+        /// store load ONCE and stay warm across requests (~9 s saved
+        /// per call vs. one-shot CLI). Default bind is what you pass;
+        /// `127.0.0.1:<port>` keeps the server localhost-only.
+        /// Endpoints: POST /recall, POST /store, POST /consolidate,
+        /// GET /stats, GET /topics, GET /health. Issue #290.
+        #[cfg(feature = "http-api")]
+        #[arg(long, value_name = "ADDR")]
+        http: Option<std::net::SocketAddr>,
+
+        /// Require `Authorization: Bearer <TOKEN>` on every HTTP
+        /// request (only meaningful with `--http`). Absent token =
+        /// open localhost API.
+        #[cfg(feature = "http-api")]
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
     },
 
-    /// Claude Code hook handlers (read JSON from stdin, output hook response)
+    /// Hook handlers shared across Claude Code, Codex, Gemini, and
+    /// Copilot (read JSON from stdin, output hook response).
     Hook {
         #[command(subcommand)]
         command: HookCommands,
@@ -1753,7 +1787,8 @@ fn main() -> Result<()> {
             mode,
             force,
             per_project,
-        } => cmd_init(mode, force, per_project),
+            with_codex_post_hook,
+        } => cmd_init(mode, force, per_project, with_codex_post_hook),
         Commands::Doctor => cmd_doctor(),
         Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
         Commands::CodeAreas {
@@ -1860,6 +1895,10 @@ fn main() -> Result<()> {
             compact,
             #[cfg(feature = "web")]
             expose,
+            #[cfg(feature = "http-api")]
+            http,
+            #[cfg(feature = "http-api")]
+            token,
         } => {
             #[cfg(feature = "web")]
             if expose {
@@ -1871,6 +1910,15 @@ fn main() -> Result<()> {
                     cfg.web.username.clone(),
                     password,
                 );
+            }
+            // HTTP API path (issue #290): warm store + embedder behind
+            // an axum server. Routes to a different transport from
+            // stdio, so it's an `if let`, not an `else if expose`.
+            #[cfg(feature = "http-api")]
+            if let Some(addr) = http {
+                let boxed_emb: Option<Box<dyn icm_core::Embedder + Send + Sync>> =
+                    embedder.map(|e| Box::new(e) as Box<dyn icm_core::Embedder + Send + Sync>);
+                return http_api::run_http_server(store, boxed_emb, addr, token);
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -4141,7 +4189,12 @@ pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     cmd.contains(&format!("{pattern}.exe"))
 }
 
-fn cmd_init(mode: InitMode, force: bool, per_project: bool) -> Result<()> {
+fn cmd_init(
+    mode: InitMode,
+    force: bool,
+    per_project: bool,
+    with_codex_post_hook: bool,
+) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
     let home = home_dir_str()?;
@@ -4903,14 +4956,28 @@ Do this BEFORE responding to the user. Not optional.
             )?;
             println!("[hook] Codex CLI PreToolUse (auto-allow): {status}");
 
-            let status = inject_codex_hook(
-                &codex_hooks_path,
-                "PostToolUse",
-                &format!("{} hook post", icm_bin_str),
-                None,
-                detect,
-            )?;
-            println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+            // Codex CLI PostToolUse is opt-in (issue #288): Codex
+            // fires this on every shell command, so the default
+            // install used to flood the store with ~14k events/24h
+            // of tool-output bloat. MCP + AGENTS.md alone is enough
+            // for `icm_memory_store` to land curated facts via the
+            // model. Users who want the extraction-on-every-tool
+            // behavior can pass `--with-codex-post-hook`.
+            if with_codex_post_hook {
+                let status = inject_codex_hook(
+                    &codex_hooks_path,
+                    "PostToolUse",
+                    &format!("{} hook post", icm_bin_str),
+                    None,
+                    detect,
+                )?;
+                println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+            } else {
+                println!(
+                    "[hook] Codex CLI PostToolUse: skipped (off by default; \
+                     pass --with-codex-post-hook to opt in — see issue #288)"
+                );
+            }
 
             let status = inject_codex_hook(
                 &codex_hooks_path,

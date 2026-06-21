@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.53](https://github.com/rtk-ai/icm/compare/icm-v0.10.52...icm-v0.10.53) (2026-06-21)
+
+
+### Features
+
+* **serve:** persistent local HTTP API with warm model + TOON-first responses (closes [#290](https://github.com/rtk-ai/icm/issues/290)) ([#291](https://github.com/rtk-ai/icm/issues/291)) ([fd8acd6](https://github.com/rtk-ai/icm/commit/fd8acd60dfa5a166be65c4822ec0719976d80e1f))
+
+
+### Bug Fixes
+
+* **init:** Codex PostToolUse is opt-in to avoid 14k-event-per-day noise (closes [#288](https://github.com/rtk-ai/icm/issues/288)) ([#293](https://github.com/rtk-ai/icm/issues/293)) ([7224cdf](https://github.com/rtk-ai/icm/commit/7224cdf61419e261ba6b8a518f8f8ef228af2832))
+
 ## [0.10.52](https://github.com/rtk-ai/icm/compare/icm-v0.10.51...icm-v0.10.52) (2026-06-14)
 
 

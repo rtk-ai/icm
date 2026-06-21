@@ -3097,8 +3097,7 @@ fn cmd_hook_post(
     // Failure is non-fatal — never block the hook on stats inserts.
     if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
         if let Some(file_path) = extract_tool_input_file_path(&json) {
-            let project = project_from_cwd_json(&json)
-                .unwrap_or_else(|| "project".to_string());
+            let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
             let session_id = json.get("session_id").and_then(|v| v.as_str());
             let _ = store.upsert_code_area(
                 &project,
@@ -3134,8 +3133,7 @@ fn cmd_hook_post(
         return Ok(());
     }
 
-    let project = project_from_cwd_json(&json)
-        .unwrap_or_else(|| "project".to_string());
+    let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
 
     // Async path: enqueue raw output and return without loading the
     // embedder. The worker (`icm extract-pending` / SessionEnd fork) will
@@ -3465,8 +3463,7 @@ fn extract_from_hook_transcript(
         truncated
     };
 
-    let project = project_from_cwd_json(&json)
-        .unwrap_or_else(|| "project".to_string());
+    let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
 
     // Hook path is the prompt-injection surface: any assistant message in
     // the transcript can be crafted to trigger decision/error keywords and
@@ -3776,8 +3773,16 @@ fn repo_name_from_url(url: &str) -> Option<String> {
     // rsplit('/') always yields ≥1 element; split on ':' afterwards to
     // handle SCP-style SSH URLs that have no slash before the repo name.
     let after_slash = url.rsplit('/').next().unwrap_or(url);
-    let name = after_slash.rsplit(':').next().unwrap_or(after_slash).trim_end_matches(".git");
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    let name = after_slash
+        .rsplit(':')
+        .next()
+        .unwrap_or(after_slash)
+        .trim_end_matches(".git");
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Extract a project name from a filesystem path (basename), treating empty
@@ -8603,7 +8608,12 @@ mod hook_start_tests {
             .output()
             .unwrap();
         std::process::Command::new("git")
-            .args(["remote", "add", "origin", "https://github.com/user/myproject.git"])
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/user/myproject.git",
+            ])
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -8623,7 +8633,12 @@ mod hook_start_tests {
             .output()
             .unwrap();
         std::process::Command::new("git")
-            .args(["remote", "add", "origin", "git@github.com:user/sshproject.git"])
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:user/sshproject.git",
+            ])
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -8637,8 +8652,14 @@ mod hook_start_tests {
     fn repo_name_from_url_handles_scp_ssh_without_slash() {
         // git@host:repo.git — no slash between host and repo name
         assert_eq!(repo_name_from_url("git@host:repo.git"), Some("repo".into()));
-        assert_eq!(repo_name_from_url("git@github.com:user/repo.git"), Some("repo".into()));
-        assert_eq!(repo_name_from_url("https://github.com/user/repo.git"), Some("repo".into()));
+        assert_eq!(
+            repo_name_from_url("git@github.com:user/repo.git"),
+            Some("repo".into())
+        );
+        assert_eq!(
+            repo_name_from_url("https://github.com/user/repo.git"),
+            Some("repo".into())
+        );
         assert_eq!(repo_name_from_url(""), None);
     }
 

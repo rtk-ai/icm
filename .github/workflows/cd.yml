@@ -209,6 +209,14 @@ jobs:
 
           git push origin "$BRANCH"
 
+          # Ensure the 'automated' label exists before referencing it: a missing
+          # label makes `gh pr create --label` fail and aborts the back-merge PR
+          # ("could not add label: 'automated' not found"). Idempotent.
+          gh label create automated \
+            --color ededed \
+            --description "Automated PR (back-merge / release tooling)" \
+            2>/dev/null || true
+
           gh pr create \
             --base develop \
             --head "$BRANCH" \

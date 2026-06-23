@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.56](https://github.com/rtk-ai/icm/compare/icm-v0.10.55...icm-v0.10.56) (2026-06-23)
+
+
+### Features
+
+* **store:** add opt-in pluggable OpenSearch backend ([#301](https://github.com/rtk-ai/icm/issues/301)) ([0f03cab](https://github.com/rtk-ai/icm/commit/0f03cab8a830fc9fd2ed84d01b03e2b94e1c1bc0))
+* **store:** opt-in pluggable OpenSearch backend ([#301](https://github.com/rtk-ai/icm/issues/301)) ([9722daa](https://github.com/rtk-ai/icm/commit/9722daaf1ad8b2d5f47292660f27855608884f9e))
+
 ## [0.10.55](https://github.com/rtk-ai/icm/compare/icm-v0.10.54...icm-v0.10.55) (2026-06-23)
 
 

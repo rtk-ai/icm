@@ -4,12 +4,16 @@ version = "0.10.34"
 edition = "2021"
 
 [features]
-default = []
+default = ["backend-sqlite"]
 embeddings = ["icm-core/embeddings"]
+# Storage backend selection is driven by the binary crate (icm-cli); these
+# pass-through features let `cargo test -p icm-mcp` pick one directly.
+backend-sqlite = ["icm-store/backend-sqlite"]
+postgres = ["icm-store/postgres"]
 
 [dependencies]
 icm-core = { path = "../icm-core" }
-icm-store = { path = "../icm-store" }
+icm-store = { path = "../icm-store", default-features = false }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,0 +1,37 @@
+# Concurrent multi-writer test: 20 independent pods each store one unique
+# memory into the shared PostgreSQL store at the same time. With a
+# node-local SQLite file this is impossible; here all writes land in one
+# database with no lost rows.
+#
+# `image:` is a placeholder — substitute your pushed image, e.g.
+#   sed "s|__ICM_IMAGE__|$ACR.azurecr.io/icm-postgres:test|" icm-writer-job.yaml | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: icm-writer
+  labels: { app: icm-writer }
+spec:
+  completions: 20
+  parallelism: 20
+  completionMode: Indexed
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: { app: icm-writer }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: __ICM_IMAGE__
+          envFrom:
+            - secretRef: { name: icm-pg }
+          # JOB_COMPLETION_INDEX is injected by Kubernetes for Indexed
+          # jobs and makes every pod's content unique (so dedup keeps all
+          # 20 rows rather than collapsing them).
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              icm store --no-embeddings
+              -t concurrency
+              -c "memory #${JOB_COMPLETION_INDEX} written by an independent ICM replica on Kubernetes"
+              -i medium

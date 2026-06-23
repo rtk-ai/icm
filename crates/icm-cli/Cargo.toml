@@ -13,9 +13,16 @@ name = "icm"
 path = "src/main.rs"
 
 [features]
-default = ["embeddings", "tui", "http-api"]
+default = ["embeddings", "tui", "http-api", "backend-sqlite"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
 tui = ["dep:ratatui", "dep:crossterm"]
+# Storage backend selection (issue #301). Exactly one must be active.
+# Default = in-process SQLite (single binary, zero external services).
+# The opt-in PostgreSQL backend lets several `icm` processes / Kubernetes
+# replicas share one memory store; build it with
+# `--no-default-features --features "postgres,embeddings,tui,http-api"`.
+backend-sqlite = ["icm-store/backend-sqlite", "icm-mcp/backend-sqlite"]
+postgres = ["icm-store/postgres", "icm-mcp/postgres"]
 # Persistent local HTTP server (`icm serve --http`) reusing the warm
 # store + embedder. Lightweight: just axum + tokio. Issue #290.
 http-api = ["dep:axum", "dep:tokio"]
@@ -35,8 +42,8 @@ vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
 icm-core = { path = "../icm-core" }
-icm-store = { path = "../icm-store" }
-icm-mcp = { path = "../icm-mcp" }
+icm-store = { path = "../icm-store", default-features = false }
+icm-mcp = { path = "../icm-mcp", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }

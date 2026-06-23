@@ -3,17 +3,44 @@ name = "icm-store"
 version = "0.10.34"
 edition = "2021"
 
+[features]
+# The default build is byte-for-byte the same as before: the in-process
+# SQLite backend, bundled, zero external services. This preserves the
+# "single binary, zero dependencies" promise (issue #301).
+default = ["backend-sqlite"]
+
+# In-process SQLite backend (rusqlite + sqlite-vec). The only built-in
+# backend; always the default.
+backend-sqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:zerocopy"]
+
+# Opt-in network-accessible PostgreSQL backend (issue #301). Lets several
+# ICM processes / Kubernetes replicas share one memory store, which a
+# node-local SQLite file cannot do. Mutually exclusive with
+# `backend-sqlite` (see the `compile_error!` guard in `lib.rs`); build
+# with `--no-default-features --features postgres`.
+postgres = ["dep:postgres", "dep:pgvector"]
+
 [dependencies]
 icm-core = { path = "../icm-core" }
-rusqlite = { workspace = true }
-sqlite-vec = { workspace = true }
-zerocopy = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 lru = { workspace = true }
 sha2 = { workspace = true }
 ulid = { workspace = true }
+
+# SQLite backend (default). Optional so the `postgres` backend can be
+# built without pulling in rusqlite / sqlite-vec.
+rusqlite = { workspace = true, optional = true }
+sqlite-vec = { workspace = true, optional = true }
+zerocopy = { workspace = true, optional = true }
+
+# PostgreSQL backend (opt-in). The blocking `postgres` client matches the
+# store's synchronous trait surface exactly, so no async runtime or
+# sync-over-async bridge is needed. `pgvector` adds the `vector` column
+# type binding used for embedding KNN search.
+postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+pgvector = { version = "0.4", features = ["postgres"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

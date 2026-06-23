@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use tracing::{debug, error};
 
 use icm_core::Embedder;
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 use crate::protocol::{JsonRpcMessage, JsonRpcResponse};
 use crate::tools;
@@ -22,7 +22,7 @@ const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
 
 /// Run the MCP server on stdio. Blocks until stdin is closed.
 pub fn run_server(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn Embedder>,
     compact: bool,
 ) -> anyhow::Result<()> {
@@ -146,7 +146,7 @@ fn handle_tools_list(id: Value, has_embedder: bool) -> JsonRpcResponse {
 fn handle_tools_call(
     id: Value,
     params: &Option<Value>,
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn Embedder>,
     compact: bool,
     calls_since_store: &mut u32,

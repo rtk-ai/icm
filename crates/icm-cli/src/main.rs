@@ -1412,8 +1412,35 @@ fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
     Some(icm_core::FastEmbedder::with_model(model))
 }
 
+/// Placeholder embedder for builds without the `embeddings` feature.
+///
+/// It is never instantiated (`init_embedder` always returns `None` and the
+/// runtime guards on `embeddings_enabled`), but giving the no-embeddings
+/// build a concrete `Embedder` type lets the many
+/// `embedder.as_ref().map(|e| e as &dyn Embedder)` call sites compile
+/// without per-site `#[cfg]` gates.
 #[cfg(not(feature = "embeddings"))]
-fn init_embedder(_model: &str) -> Option<()> {
+struct DisabledEmbedder;
+
+#[cfg(not(feature = "embeddings"))]
+impl icm_core::Embedder for DisabledEmbedder {
+    fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
+        Err(icm_core::IcmError::Embedding(
+            "this build was compiled without the `embeddings` feature".into(),
+        ))
+    }
+    fn embed_batch(&self, _texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+        Err(icm_core::IcmError::Embedding(
+            "this build was compiled without the `embeddings` feature".into(),
+        ))
+    }
+    fn dimensions(&self) -> usize {
+        icm_core::DEFAULT_EMBEDDING_DIMS
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn init_embedder(_model: &str) -> Option<DisabledEmbedder> {
     None
 }
 
@@ -1468,6 +1495,8 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
+    // `db_path` is consumed only by embeddings-gated commands (e.g. `embed`).
+    #[cfg_attr(not(feature = "embeddings"), allow(unused_variables))]
     let db_path = cli_db.clone().unwrap_or_else(default_db_path);
 
     // `icm uninstall` must NOT open the SQLite store: a default

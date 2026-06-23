@@ -1,0 +1,57 @@
+# Ephemeral PostgreSQL (with pgvector) for validating the ICM PostgreSQL
+# backend on Kubernetes. Storage is an emptyDir — this is a test fixture,
+# not a production database.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: icm-pg
+  labels: { app: icm-postgres }
+stringData:
+  POSTGRES_USER: icm
+  POSTGRES_PASSWORD: icm
+  POSTGRES_DB: icm
+  # Connection string consumed by the icm pods.
+  ICM_POSTGRES_URL: postgres://icm:icm@icm-postgres:5432/icm
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: icm-postgres
+  labels: { app: icm-postgres }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: icm-postgres }
+  template:
+    metadata:
+      labels: { app: icm-postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          envFrom:
+            - secretRef: { name: icm-pg }
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "icm"]
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: icm-postgres
+  labels: { app: icm-postgres }
+spec:
+  selector: { app: icm-postgres }
+  ports:
+    - port: 5432
+      targetPort: 5432

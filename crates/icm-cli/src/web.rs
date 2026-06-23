@@ -16,7 +16,7 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
 use icm_core::{FeedbackStore, MemoirStore, MemoryStore};
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 use crate::config::WebConfig;
 use crate::truncate_at_char_boundary;
@@ -35,7 +35,7 @@ struct WebAssets;
 
 #[derive(Clone)]
 pub struct AppState {
-    store: Arc<Mutex<SqliteStore>>,
+    store: Arc<Mutex<Store>>,
     username: String,
     password: String,
 }
@@ -222,7 +222,7 @@ fn spa_router() -> Router<AppState> {
 
 #[tokio::main]
 pub async fn run_web_server(
-    store: SqliteStore,
+    store: Store,
     host: &str,
     port: u16,
     username: String,

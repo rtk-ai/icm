@@ -11,7 +11,7 @@
 
 use icm_core::transcript::Role;
 use icm_core::TranscriptStore;
-use icm_store::SqliteStore;
+use icm_store::Store;
 use serde_json::Value;
 
 use crate::config::ArchiveConfig;
@@ -75,7 +75,7 @@ pub fn agent_label_from_env() -> String {
 /// never breaks the hook chain — the curated `Memory` path is the
 /// agent's source of truth; the archive is fallback fidelity.
 pub fn record_event(
-    store: &SqliteStore,
+    store: &Store,
     cfg: &ArchiveConfig,
     json: &Value,
     role: Role,
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn record_event_is_noop_when_disabled() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let cfg = ArchiveConfig::default(); // enabled = false
         let v: Value = serde_json::from_str(r#"{"session_id":"s1","cwd":"/tmp"}"#).unwrap();
         record_event(&store, &cfg, &v, Role::User, "hello", None);
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn record_event_skips_when_no_session_id() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let cfg = ArchiveConfig {
             enabled: true,
             max_bytes_per_event: 0,
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn record_event_persists_under_external_id() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let cfg = ArchiveConfig {
             enabled: true,
             max_bytes_per_event: 0,
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn record_event_truncates_at_byte_cap() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let cfg = ArchiveConfig {
             enabled: true,
             max_bytes_per_event: 16,

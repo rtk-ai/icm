@@ -30,7 +30,7 @@ use icm_core::{
     format_local, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore, StoreStats,
     TopicHealth,
 };
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -92,7 +92,7 @@ struct App {
 }
 
 impl App {
-    fn new(store: &SqliteStore, db_path: Option<&str>) -> Result<Self> {
+    fn new(store: &Store, db_path: Option<&str>) -> Result<Self> {
         let stats = store.stats()?;
         let topics = store.list_topics()?;
         let health = Self::load_health(store, &topics)?;
@@ -139,7 +139,7 @@ impl App {
         Ok(app)
     }
 
-    fn load_health(store: &SqliteStore, topics: &[(String, usize)]) -> Result<Vec<TopicHealth>> {
+    fn load_health(store: &Store, topics: &[(String, usize)]) -> Result<Vec<TopicHealth>> {
         let mut health = Vec::new();
         for (topic, _) in topics {
             if let Ok(h) = store.topic_health(topic) {
@@ -149,7 +149,7 @@ impl App {
         Ok(health)
     }
 
-    fn load_memoirs(store: &SqliteStore) -> Result<Vec<(String, String, usize, usize)>> {
+    fn load_memoirs(store: &Store) -> Result<Vec<(String, String, usize, usize)>> {
         let memoirs = store.list_memoirs()?;
         let mut result = Vec::new();
         for m in memoirs {
@@ -164,7 +164,7 @@ impl App {
         Ok(result)
     }
 
-    fn refresh(&mut self, store: &SqliteStore, db_path: Option<&str>) {
+    fn refresh(&mut self, store: &Store, db_path: Option<&str>) {
         if let Ok(s) = store.stats() {
             self.stats = s;
         }
@@ -185,7 +185,7 @@ impl App {
         self.last_refresh = Instant::now();
     }
 
-    fn load_topic_memories(&mut self, store: &SqliteStore) {
+    fn load_topic_memories(&mut self, store: &Store) {
         if let Some(idx) = self.topic_state.selected() {
             if let Some((topic, _)) = self.topics.get(idx) {
                 if let Ok(mut mems) = store.get_by_topic(topic) {
@@ -256,7 +256,7 @@ fn is_actionable_key(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-pub fn run_dashboard(store: &SqliteStore, db_path: Option<&str>) -> Result<()> {
+pub fn run_dashboard(store: &Store, db_path: Option<&str>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -281,7 +281,7 @@ pub fn run_dashboard(store: &SqliteStore, db_path: Option<&str>) -> Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    store: &SqliteStore,
+    store: &Store,
     db_path: Option<&str>,
 ) -> Result<()> {
     loop {
@@ -528,7 +528,7 @@ fn run_loop(
 }
 
 /// Execute a confirmed action
-fn execute_confirm(app: &mut App, store: &SqliteStore, db_path: Option<&str>) {
+fn execute_confirm(app: &mut App, store: &Store, db_path: Option<&str>) {
     let confirm = app.confirm.clone();
     app.confirm = Confirm::None;
 

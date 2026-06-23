@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 
 use icm_core::{Memory, MemorySource, MemoryStore};
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 use crate::extract;
 
@@ -430,7 +430,7 @@ fn exchanges_to_text(exchanges: &[Exchange]) -> String {
 // ── Main import command ──────────────────────────────────────────────────
 
 pub fn cmd_import(
-    store: &SqliteStore,
+    store: &Store,
     path: PathBuf,
     format: Option<ImportFormat>,
     project: String,
@@ -708,14 +708,14 @@ mod tests {
         let path = dir.path().join("session.jsonl");
         std::fs::write(&path, line).unwrap();
 
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         // Pre-fix this panicked with "byte index 500 is not a char boundary".
         cmd_import(&store, path, None, "test".into(), false).unwrap();
     }
 
     #[test]
     fn test_import_roundtrip() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let jsonl = concat!(
             r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"We decided to use SQLite instead of Postgres because we need zero external dependencies. Sarah agreed with the decision."}]}}"#,
             "\n",

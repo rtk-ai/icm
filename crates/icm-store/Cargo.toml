@@ -20,6 +20,15 @@ backend-sqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:zerocopy"]
 # with `--no-default-features --features postgres`.
 postgres = ["dep:postgres", "dep:pgvector"]
 
+# Opt-in network-accessible OpenSearch backend (issue #301). A
+# search-native shared store: BM25 full-text + `knn_vector` HNSW vector
+# search in one engine, so horizontally-scaled replicas share memory.
+# Talks to the OpenSearch REST API over the blocking `ureq` client, so —
+# like the PostgreSQL backend — there is no async runtime. Mutually
+# exclusive with the other backends; build with
+# `--no-default-features --features opensearch`.
+opensearch = ["dep:ureq", "dep:base64"]
+
 [dependencies]
 icm-core = { path = "../icm-core" }
 serde_json = { workspace = true }
@@ -41,6 +50,12 @@ zerocopy = { workspace = true, optional = true }
 # type binding used for embedding KNN search.
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 pgvector = { version = "0.4", features = ["postgres"], optional = true }
+
+# OpenSearch backend (opt-in). Blocking HTTP client + JSON bodies hit the
+# OpenSearch REST API directly — no async runtime, matching the store's
+# synchronous trait surface. `base64` encodes optional basic-auth creds.
+ureq = { version = "2", features = ["json", "tls"], optional = true }
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

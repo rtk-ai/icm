@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.55](https://github.com/rtk-ai/icm/compare/icm-v0.10.54...icm-v0.10.55) (2026-06-23)
+
+
+### Features
+
+* **store:** add opt-in pluggable PostgreSQL backend ([#301](https://github.com/rtk-ai/icm/issues/301)) ([9d3426b](https://github.com/rtk-ai/icm/commit/9d3426bdb8cb7855728e92341294bff537645c62))
+* **store:** opt-in pluggable PostgreSQL backend ([#301](https://github.com/rtk-ai/icm/issues/301)) ([f5325b5](https://github.com/rtk-ai/icm/commit/f5325b5d0dff3c074a9b8697aca952e57eea4b3c))
+
+
+### Bug Fixes
+
+* **cli:** compile the postgres backend without the embeddings feature ([6f7dff1](https://github.com/rtk-ai/icm/commit/6f7dff15979b1cda50bddcf46e40b9862f9d5847))
+
 ## [0.10.54](https://github.com/rtk-ai/icm/compare/icm-v0.10.53...icm-v0.10.54) (2026-06-21)
 
 

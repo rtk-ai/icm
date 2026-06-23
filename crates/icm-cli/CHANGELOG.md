@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.54](https://github.com/rtk-ai/icm/compare/icm-v0.10.53...icm-v0.10.54) (2026-06-21)
+
+
+### Features
+
+* **init:** Add `icm forget` and `icm list` to `icm_block` ([#252](https://github.com/rtk-ai/icm/issues/252)) ([b698ee6](https://github.com/rtk-ai/icm/commit/b698ee6517c17fae51d2c88902bfe22596ac3958))
+
+
+### Bug Fixes
+
+* **project:** resolve worktree directory name as main repo project ([#235](https://github.com/rtk-ai/icm/issues/235)) ([01e0c91](https://github.com/rtk-ai/icm/commit/01e0c91ca23d94434f615944603c23f31eb2a740))
+
 ## [0.10.53](https://github.com/rtk-ai/icm/compare/icm-v0.10.52...icm-v0.10.53) (2026-06-21)
 
 

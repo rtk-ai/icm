@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use icm_core::{is_preference_topic, project_matches, Embedder, Importance, Memory, MemoryStore};
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 use crate::extract_semantic::{AnchorKind, SemanticScorer};
 
@@ -21,7 +21,7 @@ type ScoredFact = (String, String, Importance, Option<AnchorKind>);
 
 /// Extract key facts from text and store them in ICM.
 /// Returns the number of facts stored.
-pub fn extract_and_store(store: &SqliteStore, text: &str, project: &str) -> Result<usize> {
+pub fn extract_and_store(store: &Store, text: &str, project: &str) -> Result<usize> {
     extract_and_store_with_opts(store, text, project, false, Importance::Critical)
 }
 
@@ -39,7 +39,7 @@ pub fn extract_and_store(store: &SqliteStore, text: &str, project: &str) -> Resu
 /// This variant uses the English-only keyword scorer. For multilingual
 /// content prefer [`extract_and_store_with_embedder`].
 pub fn extract_and_store_with_opts(
-    store: &SqliteStore,
+    store: &Store,
     text: &str,
     project: &str,
     store_raw: bool,
@@ -63,7 +63,7 @@ pub fn extract_and_store_with_opts(
 /// scorer's anchor-build call fails — better to extract English facts
 /// only than to extract nothing at all.
 pub fn extract_and_store_with_embedder(
-    store: &SqliteStore,
+    store: &Store,
     text: &str,
     project: &str,
     store_raw: bool,
@@ -191,7 +191,7 @@ fn cap_importance(value: Importance, cap: Importance) -> Importance {
 /// other projects bleed into the recalled context. The hard filter here
 /// prevents cross-project leakage.
 pub fn recall_context(
-    store: &SqliteStore,
+    store: &Store,
     query: &str,
     project: Option<&str>,
     limit: usize,
@@ -1484,7 +1484,7 @@ mod tests {
 
     #[test]
     fn test_store_raw_fallback() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let text = "Just some random conversation text that has no particular keywords but is still somewhat meaningful context about the ongoing work session";
         let stored =
             extract_and_store_with_opts(&store, text, "test", true, Importance::Critical).unwrap();
@@ -1493,14 +1493,14 @@ mod tests {
 
     #[test]
     fn test_recall_context_empty_store() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let ctx = recall_context(&store, "anything", None, 5).unwrap();
         assert!(ctx.is_empty());
     }
 
     #[test]
     fn test_extract_and_recall_roundtrip() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let text = "The project uses Pratt precedence climbing algorithm for parsing expressions. \
                      Welford's online algorithm provides streaming mean and variance computation. \
                      The matrix determinant uses recursive cofactor expansion along the first row.";
@@ -1516,7 +1516,7 @@ mod tests {
     fn test_recall_context_filters_other_projects() {
         // Two projects' memories share search terms; the project filter must
         // strip the cross-project hits from FTS results.
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
 
         let mem_a = Memory::new(
             "context-projecta".to_string(),
@@ -1541,7 +1541,7 @@ mod tests {
 
     #[test]
     fn test_recall_context_keeps_preferences_when_filtering() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
 
         let project_mem = Memory::new(
             "context-myapp".to_string(),
@@ -1579,7 +1579,7 @@ mod tests {
         // pure word-order shuffles and minor filler additions
         // (intersection ≥ 7/9 ≈ 0.78 between any pair) to keep
         // the test deterministic across platforms.
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let paraphrases = [
             "Patrick prefers Rust over Go for systems work",
             "Patrick really prefers Rust over Go for systems work",
@@ -1617,7 +1617,7 @@ mod tests {
         // different project — those are cross-project lessons. The
         // pre-fix project filter stripped the memory and the
         // weight-sorted fallback returned other irrelevant memories.
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         store
             .store(Memory::new(
                 "context-projecta".to_string(),
@@ -1653,7 +1653,7 @@ mod tests {
         // out `context-projecta` memories sorted by weight. The
         // pre-fix code returned the top-5 by weight regardless of
         // query relevance, polluting every irrelevant prompt.
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for i in 0..5 {
             store
                 .store(Memory::new(
@@ -1683,7 +1683,7 @@ mod tests {
         // the always-on identity layer and the last-ditch fallback
         // surfaces them by weight. Without this, every irrelevant
         // prompt would lose the user's coding rules.
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         store
             .store(Memory::new(
                 "context-projecta".to_string(),
@@ -1720,7 +1720,7 @@ mod tests {
     fn test_recall_context_no_project_keeps_all() {
         // When no project is specified, behavior matches the pre-filter API:
         // every matching memory is returned regardless of topic.
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
 
         store
             .store(Memory::new(

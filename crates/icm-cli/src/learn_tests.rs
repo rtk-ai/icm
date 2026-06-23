@@ -2,14 +2,14 @@
 mod tests {
     use icm_core::learn::learn_project;
     use icm_core::MemoirStore;
-    use icm_store::SqliteStore;
+    use icm_store::Store;
     use std::fs;
     use tempfile::TempDir;
 
-    fn test_store() -> (TempDir, SqliteStore) {
+    fn test_store() -> (TempDir, Store) {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let db_path = tmp.path().join("test.db");
-        let store = SqliteStore::with_dims(&db_path, 384).expect("failed to create store");
+        let store = Store::with_dims(&db_path, 384).expect("failed to create store");
         (tmp, store)
     }
 

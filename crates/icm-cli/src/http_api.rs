@@ -7,7 +7,7 @@
 //! awkward to call from non-MCP clients.
 //!
 //! This module adds an axum HTTP server (`icm serve --http
-//! 127.0.0.1:11435`) that shares ONE warm [`SqliteStore`] and ONE
+//! 127.0.0.1:11435`) that shares ONE warm [`Store`] and ONE
 //! embedder across all requests via [`Arc`]. The endpoints mirror the
 //! existing MCP tools and route through the SAME store methods so
 //! behavior stays consistent.
@@ -41,7 +41,7 @@ use icm_core::{
     is_preference_topic, keyword_matches, project_matches, topic_matches, Embedder, Importance,
     Memory, MemoryStore, MSG_NO_MEMORIES,
 };
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 use crate::recall_format::{self, RecallFormat};
 
@@ -50,14 +50,14 @@ use crate::recall_format::{self, RecallFormat};
 // ---------------------------------------------------------------------------
 
 /// Arc-shared so every axum handler reads the SAME warm store + embedder.
-/// `SqliteStore` wraps a `rusqlite::Connection`, which is `Send` but
+/// `Store` wraps a `rusqlite::Connection`, which is `Send` but
 /// not `Sync`, so the same `Arc<Mutex<…>>` pattern as the web
 /// dashboard (see `web.rs`) serializes DB access. Embedders are
 /// already `Send + Sync` (see `icm-core::embedder::Embedder`).
 /// `None` skips semantic recall — the `--no-embeddings` path.
 #[derive(Clone)]
 pub struct AppState {
-    store: Arc<Mutex<SqliteStore>>,
+    store: Arc<Mutex<Store>>,
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
@@ -165,7 +165,7 @@ pub struct ConsolidateReq {
 /// are pre-built by `cmd_serve` and handed to us as `Arc`s.
 #[tokio::main]
 pub async fn run_http_server(
-    store: SqliteStore,
+    store: Store,
     embedder: Option<Box<dyn Embedder + Send + Sync>>,
     addr: SocketAddr,
     token: Option<String>,
@@ -308,7 +308,7 @@ fn run_recall(state: &AppState, req: &RecallReq) -> Result<Vec<(Memory, Option<f
 }
 
 fn fts_fallback<F>(
-    store: &SqliteStore,
+    store: &Store,
     req: &RecallReq,
     project_filter: &F,
     limit: usize,

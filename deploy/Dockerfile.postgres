@@ -1,0 +1,17 @@
+# Build the `icm` CLI with the opt-in PostgreSQL backend (issue #301).
+# Embeddings are intentionally left out so the image stays small and needs
+# no model download — the shared-memory / multi-writer scenario this image
+# is built to demonstrate uses keyword + full-text search.
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build -p icm-cli --release \
+        --no-default-features \
+        --features "postgres,http-api"
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/icm /usr/local/bin/icm
+ENTRYPOINT ["icm"]

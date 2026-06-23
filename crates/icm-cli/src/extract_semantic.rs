@@ -636,9 +636,9 @@ mod tests {
     fn french_transcript_extracts_facts_end_to_end() {
         use crate::extract::extract_and_store_with_embedder;
         use icm_core::{FastEmbedder, Importance, MemoryStore};
-        use icm_store::SqliteStore;
+        use icm_store::Store;
 
-        let store = SqliteStore::in_memory().expect("store");
+        let store = Store::in_memory().expect("store");
         let embedder = FastEmbedder::new();
 
         let text = "Session 2026-05-04. \

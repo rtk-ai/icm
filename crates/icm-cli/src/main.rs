@@ -35,7 +35,7 @@ use icm_core::{
     Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions,
     DEDUP_SIMILARITY_THRESHOLD, MSG_NO_MEMORIES,
 };
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 #[derive(Parser)]
 #[command(
@@ -1334,18 +1334,18 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("memories.db"))
 }
 
-fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<SqliteStore> {
+fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<Store> {
     let path = db.unwrap_or_else(default_db_path);
-    SqliteStore::with_dims(&path, embedding_dims).context("failed to open database")
+    Store::with_dims(&path, embedding_dims).context("failed to open database")
 }
 
 /// Open the store in read-only mode (issue #263). Resolves the path
 /// the same way as [`open_store`] and rejects with a helpful message
 /// if the DB doesn't exist yet — read-only mode cannot bootstrap a
 /// fresh DB.
-fn open_store_readonly(db: Option<PathBuf>) -> Result<SqliteStore> {
+fn open_store_readonly(db: Option<PathBuf>) -> Result<Store> {
     let path = db.unwrap_or_else(default_db_path);
-    SqliteStore::open_readonly(&path).with_context(|| {
+    Store::open_readonly(&path).with_context(|| {
         format!(
             "failed to open database read-only at {} \
              (--read-only requires the DB to already exist)",
@@ -1387,7 +1387,7 @@ fn resolve_embedding_dims(
         return e.dimensions();
     }
     let path = cli_db.cloned().unwrap_or_else(default_db_path);
-    match SqliteStore::read_stored_embedding_dims(&path) {
+    match Store::read_stored_embedding_dims(&path) {
         Ok(Some(dims)) => dims,
         // No DB or no metadata row → fresh install path; default is safe.
         Ok(None) => icm_core::DEFAULT_EMBEDDING_DIMS,
@@ -2038,7 +2038,7 @@ fn main() -> Result<()> {
 /// every write path stays consistent. Errors are logged and swallowed
 /// — consolidation is a maintenance op, not on the critical path.
 fn maybe_auto_consolidate(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     topic: &str,
     cfg: &crate::config::MemoryConfig,
@@ -2058,7 +2058,7 @@ fn maybe_auto_consolidate(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_store(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     topic: String,
@@ -2162,7 +2162,7 @@ fn cmd_store(
 /// topic when `--topic` is omitted.
 #[allow(clippy::too_many_arguments)]
 fn cmd_remember(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     content: String,
@@ -2192,7 +2192,7 @@ fn cmd_remember(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_recall(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     query: &str,
     topic: Option<&str>,
@@ -2302,7 +2302,7 @@ fn cmd_recall(
 }
 
 fn cmd_list(
-    store: &SqliteStore,
+    store: &Store,
     topic: Option<&str>,
     all: bool,
     sort: SortField,
@@ -2368,7 +2368,7 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_forget(store: &SqliteStore, id: Option<&str>, topic: Option<&str>) -> Result<()> {
+fn cmd_forget(store: &Store, id: Option<&str>, topic: Option<&str>) -> Result<()> {
     match (id, topic) {
         (Some(_), Some(_)) => {
             // Audit #185 medium: previously the topic path silently
@@ -2406,7 +2406,7 @@ fn cmd_forget(store: &SqliteStore, id: Option<&str>, topic: Option<&str>) -> Res
 }
 
 fn cmd_update(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     id: &str,
     content: String,
@@ -2442,7 +2442,7 @@ fn cmd_update(
     Ok(())
 }
 
-fn cmd_health(store: &SqliteStore, topic_filter: Option<&str>) -> Result<()> {
+fn cmd_health(store: &Store, topic_filter: Option<&str>) -> Result<()> {
     let topics = if let Some(t) = topic_filter {
         vec![(t.to_string(), 0usize)]
     } else {
@@ -2502,7 +2502,7 @@ fn cmd_health(store: &SqliteStore, topic_filter: Option<&str>) -> Result<()> {
 }
 
 fn cmd_feedback_record(
-    store: &SqliteStore,
+    store: &Store,
     topic: String,
     context: String,
     predicted: String,
@@ -2527,7 +2527,7 @@ fn cmd_feedback_record(
 }
 
 fn cmd_feedback_search(
-    store: &SqliteStore,
+    store: &Store,
     query: &str,
     topic: Option<&str>,
     limit: usize,
@@ -2556,7 +2556,7 @@ fn cmd_feedback_search(
     Ok(())
 }
 
-fn cmd_feedback_list(store: &SqliteStore, topic: Option<&str>, limit: usize) -> Result<()> {
+fn cmd_feedback_list(store: &Store, topic: Option<&str>, limit: usize) -> Result<()> {
     let results = store.list_feedback(topic, limit)?;
     if results.is_empty() {
         match topic {
@@ -2584,7 +2584,7 @@ fn cmd_feedback_list(store: &SqliteStore, topic: Option<&str>, limit: usize) -> 
     Ok(())
 }
 
-fn cmd_feedback_stats(store: &SqliteStore) -> Result<()> {
+fn cmd_feedback_stats(store: &Store) -> Result<()> {
     let stats = store.feedback_stats()?;
     println!("Feedback total: {}", stats.total);
 
@@ -2609,7 +2609,7 @@ fn cmd_feedback_stats(store: &SqliteStore) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_transcript_start_session(
-    store: &SqliteStore,
+    store: &Store,
     agent: &str,
     project: Option<&str>,
     metadata: Option<&str>,
@@ -2621,7 +2621,7 @@ fn cmd_transcript_start_session(
 }
 
 fn cmd_transcript_record(
-    store: &SqliteStore,
+    store: &Store,
     session: &str,
     role: &str,
     content: &str,
@@ -2638,7 +2638,7 @@ fn cmd_transcript_record(
 }
 
 fn cmd_transcript_search(
-    store: &SqliteStore,
+    store: &Store,
     query: &str,
     session: Option<&str>,
     project: Option<&str>,
@@ -2677,11 +2677,7 @@ fn cmd_transcript_search(
     Ok(())
 }
 
-fn cmd_transcript_list_sessions(
-    store: &SqliteStore,
-    project: Option<&str>,
-    limit: usize,
-) -> Result<()> {
+fn cmd_transcript_list_sessions(store: &Store, project: Option<&str>, limit: usize) -> Result<()> {
     use icm_core::TranscriptStore;
     let sessions = store.list_sessions(project, limit)?;
     if sessions.is_empty() {
@@ -2708,7 +2704,7 @@ fn cmd_transcript_list_sessions(
     Ok(())
 }
 
-fn cmd_transcript_show(store: &SqliteStore, session: &str, limit: usize) -> Result<()> {
+fn cmd_transcript_show(store: &Store, session: &str, limit: usize) -> Result<()> {
     use icm_core::TranscriptStore;
     let meta = store.get_session(session)?;
     let meta = match meta {
@@ -2746,7 +2742,7 @@ fn cmd_transcript_show(store: &SqliteStore, session: &str, limit: usize) -> Resu
     Ok(())
 }
 
-fn cmd_transcript_stats(store: &SqliteStore) -> Result<()> {
+fn cmd_transcript_stats(store: &Store) -> Result<()> {
     use icm_core::TranscriptStore;
     let s = store.transcript_stats()?;
     println!("Sessions:      {}", s.total_sessions);
@@ -2790,7 +2786,7 @@ fn cmd_transcript_stats(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_transcript_forget(store: &SqliteStore, session: &str) -> Result<()> {
+fn cmd_transcript_forget(store: &Store, session: &str) -> Result<()> {
     use icm_core::TranscriptStore;
     store.forget_session(session)?;
     println!("Deleted session {session}");
@@ -3097,7 +3093,7 @@ fn extract_tool_input_file_path(json: &Value) -> Option<String> {
 ///    fastembed semantic-scoring extractor — multilingual, but pays
 ///    a ~3.7s model-load cost per process.
 fn cmd_hook_post(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     extract_every: usize,
@@ -3236,7 +3232,7 @@ fn cmd_hook_post(
 
 /// PreCompact hook (Layer 1): extract memories from transcript before context compression.
 fn cmd_hook_compact(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
 ) -> Result<()> {
@@ -3250,7 +3246,7 @@ fn cmd_hook_compact(
 /// (Claude Code does not log SessionEnd attachments in its session
 /// JSONL, so this DB-side log is the source of truth).
 fn cmd_hook_log(
-    store: &SqliteStore,
+    store: &Store,
     limit: usize,
     event: Option<&str>,
     prune_older_than: Option<&str>,
@@ -3290,7 +3286,7 @@ fn cmd_hook_log(
 /// `icm hook-stats` — aggregate `hook_events` over a lookback window.
 /// Reports per-event count, error rate, and latency p50/p99 so users can
 /// confirm the async path stays under its budget.
-fn cmd_hook_stats(store: &SqliteStore, since_hours: u64) -> Result<()> {
+fn cmd_hook_stats(store: &Store, since_hours: u64) -> Result<()> {
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(since_hours as i64);
     let rows = store.hook_stats(&cutoff.to_rfc3339())?;
     if rows.is_empty() {
@@ -3321,10 +3317,10 @@ fn cmd_hook_stats(store: &SqliteStore, since_hours: u64) -> Result<()> {
 /// that PreCompact misses (compaction does not fire on `/clear`).
 ///
 /// Same transcript-parsing logic as PreCompact — the only difference is the
-/// log prefix. SqliteStore handles its own dedup so a session that triggers
+/// log prefix. Store handles its own dedup so a session that triggers
 /// both PreCompact and SessionEnd back-to-back will not double-store facts.
 fn cmd_hook_end(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     extraction_summarizer: &crate::config::SummarizerConfig,
@@ -3389,7 +3385,7 @@ fn cmd_hook_end(
 /// Reads JSON from stdin with `transcript_path`, reads the JSONL transcript,
 /// and extracts facts from assistant messages.
 fn extract_from_hook_transcript(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     source: &str,
@@ -3578,7 +3574,7 @@ pub(crate) fn truncate_tail_at_char_boundary(s: &str, max_bytes: usize) -> &str 
 /// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
 /// Reads JSON from stdin with `user_message`, recalls relevant memories,
 /// and prints context to stdout (Claude Code appends it as system-reminder).
-fn cmd_hook_prompt(store: &SqliteStore, archive_cfg: &crate::config::ArchiveConfig) -> Result<()> {
+fn cmd_hook_prompt(store: &Store, archive_cfg: &crate::config::ArchiveConfig) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
         return Ok(());
     };
@@ -3717,7 +3713,7 @@ fn format_hook_context(ctx: &str, fmt: HookOutputFormat) -> String {
 ///
 /// Set `ICM_HOOK_DEBUG=1` in the environment to get stderr diagnostics when
 /// the hook decides to suppress output (empty store, no matching memories).
-fn cmd_hook_start(store: &SqliteStore, max_tokens: usize) -> Result<()> {
+fn cmd_hook_start(store: &Store, max_tokens: usize) -> Result<()> {
     let input = read_stdin_utf8_lossy().unwrap_or_default();
 
     let pack = build_hook_start_pack(store, &input, max_tokens)?;
@@ -3736,11 +3732,7 @@ fn cmd_hook_start(store: &SqliteStore, max_tokens: usize) -> Result<()> {
 ///
 /// Returns the pack as a String, or an empty string if there is nothing
 /// meaningful to inject (empty store, or placeholder output).
-fn build_hook_start_pack(
-    store: &SqliteStore,
-    stdin_json: &str,
-    max_tokens: usize,
-) -> Result<String> {
+fn build_hook_start_pack(store: &Store, stdin_json: &str, max_tokens: usize) -> Result<String> {
     // Tolerate missing/malformed stdin — fall back to PWD-based detection.
     let cwd: Option<String> = serde_json::from_str::<Value>(stdin_json)
         .ok()
@@ -3889,7 +3881,7 @@ fn project_from_cwd_json(json: &Value) -> Option<String> {
 /// `icm code-areas`: list files auto-recorded by the PostToolUse hook
 /// when the agent edited them. See issue #196 for the design discussion.
 fn cmd_code_areas(
-    store: &SqliteStore,
+    store: &Store,
     in_file: Option<&str>,
     project: Option<&str>,
     since: Option<&str>,
@@ -3959,7 +3951,7 @@ fn cmd_code_areas(
     Ok(())
 }
 
-fn cmd_topics(store: &SqliteStore) -> Result<()> {
+fn cmd_topics(store: &Store) -> Result<()> {
     let topics = store.list_topics()?;
     if topics.is_empty() {
         println!("No topics yet.");
@@ -3974,7 +3966,7 @@ fn cmd_topics(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(store: &SqliteStore) -> Result<()> {
+fn cmd_stats(store: &Store) -> Result<()> {
     let stats = store.stats()?;
     println!("Memories:  {}", stats.total_memories);
     println!("Topics:    {}", stats.total_topics);
@@ -3988,13 +3980,7 @@ fn cmd_stats(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_facts_set(
-    store: &SqliteStore,
-    entity: &str,
-    key: &str,
-    value: &str,
-    source: &str,
-) -> Result<()> {
+fn cmd_facts_set(store: &Store, entity: &str, key: &str, value: &str, source: &str) -> Result<()> {
     use icm_core::FactsStore;
     let prev = store.get_fact(entity, key)?;
     let id = store.set_fact(entity, key, value, source)?;
@@ -4016,7 +4002,7 @@ fn cmd_facts_set(
     Ok(())
 }
 
-fn cmd_facts_get(store: &SqliteStore, entity: &str, key: &str) -> Result<()> {
+fn cmd_facts_get(store: &Store, entity: &str, key: &str) -> Result<()> {
     use icm_core::FactsStore;
     match store.get_fact(entity, key)? {
         Some(f) => {
@@ -4036,7 +4022,7 @@ fn cmd_facts_get(store: &SqliteStore, entity: &str, key: &str) -> Result<()> {
     }
 }
 
-fn cmd_facts_list(store: &SqliteStore, entity: &str, prefix: Option<&str>) -> Result<()> {
+fn cmd_facts_list(store: &Store, entity: &str, prefix: Option<&str>) -> Result<()> {
     use icm_core::FactsStore;
     let facts = store.list_facts(entity, prefix)?;
     if facts.is_empty() {
@@ -4051,7 +4037,7 @@ fn cmd_facts_list(store: &SqliteStore, entity: &str, prefix: Option<&str>) -> Re
     Ok(())
 }
 
-fn cmd_facts_history(store: &SqliteStore, entity: &str, key: &str) -> Result<()> {
+fn cmd_facts_history(store: &Store, entity: &str, key: &str) -> Result<()> {
     use icm_core::FactsStore;
     let rows = store.history(entity, key)?;
     if rows.is_empty() {
@@ -4076,14 +4062,14 @@ fn cmd_facts_history(store: &SqliteStore, entity: &str, key: &str) -> Result<()>
     Ok(())
 }
 
-fn cmd_facts_forget(store: &SqliteStore, entity: &str, key: &str) -> Result<()> {
+fn cmd_facts_forget(store: &Store, entity: &str, key: &str) -> Result<()> {
     use icm_core::FactsStore;
     let n = store.forget_fact(entity, key)?;
     println!("forgot {n} row(s) under {entity}.{key}");
     Ok(())
 }
 
-fn cmd_facts_stats(store: &SqliteStore) -> Result<()> {
+fn cmd_facts_stats(store: &Store) -> Result<()> {
     use icm_core::FactsStore;
     let s = store.facts_stats()?;
     println!("Active facts:    {}", s.active_count);
@@ -4099,7 +4085,7 @@ fn cmd_facts_stats(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_decay(store: &SqliteStore, factor: f32) -> Result<()> {
+fn cmd_decay(store: &Store, factor: f32) -> Result<()> {
     // Audit #185 H9: `apply_decay` multiplies each memory's weight by
     // `factor`, so values >= 1 *amplify* weight instead of decaying it
     // — the opposite of the user's intent and an instant footgun.
@@ -4116,9 +4102,9 @@ fn cmd_decay(store: &SqliteStore, factor: f32) -> Result<()> {
     Ok(())
 }
 
-fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
+fn cmd_prune(store: &Store, threshold: f32, dry_run: bool) -> Result<()> {
     if dry_run {
-        // The dry-run filter MUST mirror what `SqliteStore::prune` actually
+        // The dry-run filter MUST mirror what `Store::prune` actually
         // does, otherwise `--dry-run` lies. Audit R16 caught this: the
         // store hard-protects both Critical AND High (see
         // `crates/icm-store/src/store.rs:700-718`), but the dry-run was
@@ -4148,7 +4134,7 @@ fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
 }
 
 fn cmd_extract_patterns(
-    store: &SqliteStore,
+    store: &Store,
     topic: &str,
     memoir: Option<&str>,
     min_cluster_size: usize,
@@ -6215,7 +6201,7 @@ fn cli_on_path(name: &str) -> bool {
 /// content doesn't loop forever).
 #[allow(clippy::too_many_arguments)]
 fn cmd_extract_pending(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     cfg: &config::SummarizerConfig,
     limit: usize,
@@ -6430,7 +6416,7 @@ fn health_consolidate_tip() -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_consolidate(
-    store: &SqliteStore,
+    store: &Store,
     topic: &str,
     keep_originals: bool,
     cfg: &config::SummarizerConfig,
@@ -6533,7 +6519,7 @@ fn cmd_consolidate(
 }
 
 fn cmd_extract(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     project: &str,
     text: Option<String>,
@@ -6592,7 +6578,7 @@ fn cmd_extract(
 /// CPU/RAM spikes reported in issue #239. Enqueuing instead costs ~50ms
 /// and never loads the model; `icm extract-pending` drains the queue
 /// later, loading the model once for the whole batch.
-fn cmd_extract_enqueue(store: &SqliteStore, project: &str, text: Option<String>) -> Result<()> {
+fn cmd_extract_enqueue(store: &Store, project: &str, text: Option<String>) -> Result<()> {
     let input = match text {
         Some(t) => t,
         None => {
@@ -6620,7 +6606,7 @@ fn cmd_extract_enqueue(store: &SqliteStore, project: &str, text: Option<String>)
     Ok(())
 }
 
-fn cmd_recall_context(store: &SqliteStore, query: &str, limit: usize) -> Result<()> {
+fn cmd_recall_context(store: &Store, query: &str, limit: usize) -> Result<()> {
     // Explicit `recall-context` CLI invocation: no implicit project filter,
     // the user passed the query they want.
     let ctx = extract::recall_context(store, query, None, limit)?;
@@ -6643,7 +6629,7 @@ fn detect_project() -> String {
     project_from_path(&path_str).unwrap_or_else(|| "unknown".to_string())
 }
 
-fn cmd_recall_project(store: &SqliteStore, limit: usize) -> Result<()> {
+fn cmd_recall_project(store: &Store, limit: usize) -> Result<()> {
     let project = detect_project();
     eprintln!("Project: {project}");
 
@@ -6666,7 +6652,7 @@ fn cmd_recall_project(store: &SqliteStore, limit: usize) -> Result<()> {
 /// project, ranks by importance × recency × weight, and truncates to fit the
 /// token budget.
 fn cmd_wake_up(
-    store: &SqliteStore,
+    store: &Store,
     project: Option<String>,
     max_tokens: usize,
     format: CliWakeUpFormat,
@@ -6708,7 +6694,7 @@ fn cmd_wake_up(
 /// full `ContextSnapshot` struct is emitted so downstream tools can react
 /// to `over_budget` / `dropped` programmatically.
 fn cmd_context(
-    store: &SqliteStore,
+    store: &Store,
     project: Option<String>,
     max_tokens: usize,
     format: CliSnapshotFormat,
@@ -6756,7 +6742,7 @@ fn cmd_context(
 }
 
 fn cmd_save_project(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     content: &str,
@@ -6782,7 +6768,7 @@ fn cmd_save_project(
 
 #[cfg(feature = "embeddings")]
 fn cmd_embed(
-    store: &SqliteStore,
+    store: &Store,
     embedder: &dyn icm_core::Embedder,
     topic: Option<&str>,
     force: bool,
@@ -6896,7 +6882,7 @@ fn cmd_bench(count: usize) -> Result<()> {
     ];
 
     // --- Seed without embeddings ---
-    let store_plain = SqliteStore::in_memory()?;
+    let store_plain = Store::in_memory()?;
     let t0 = Instant::now();
     for i in 0..count {
         let topic = topics[i % topics.len()].to_string();
@@ -6916,7 +6902,7 @@ fn cmd_bench(count: usize) -> Result<()> {
     let store_plain_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // --- Seed with embeddings ---
-    let store_vec = SqliteStore::in_memory()?;
+    let store_vec = Store::in_memory()?;
     let t0 = Instant::now();
     for i in 0..count {
         let topic = topics[i % topics.len()].to_string();
@@ -7081,7 +7067,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         });
         std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let _ = SqliteStore::new(&icm_db)?;
+            let _ = Store::new(&icm_db)?;
         }
 
         // === WITHOUT ICM ===
@@ -7125,7 +7111,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         eprintln!(" done ({:.1}s)", s1_icm.duration_ms as f64 / 1000.0);
 
         {
-            let store = SqliteStore::new(&icm_db)?;
+            let store = Store::new(&icm_db)?;
             let ext1 =
                 extract::extract_and_store(&store, bench_knowledge::SOURCE_DOCUMENT, "meridian")?;
             let ext2 = extract::extract_and_store(&store, &s1_icm.response, "meridian")?;
@@ -7143,7 +7129,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         let mut scores_with: Vec<(usize, usize, f64)> = Vec::new();
         let mut responses_with: Vec<String> = Vec::new();
         for (i, q) in questions.iter().enumerate() {
-            let store = SqliteStore::new(&icm_db)?;
+            let store = Store::new(&icm_db)?;
             let ctx = extract::recall_context(&store, q.prompt, None, 15)?;
             if verbose && !ctx.is_empty() {
                 eprintln!("  [verbose] Context injected for Q{}:", i + 1);
@@ -7166,7 +7152,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
                         eprintln!("    Response: {}", truncate_words(&result.response, 200));
                     }
                     {
-                        let store = SqliteStore::new(&icm_db)?;
+                        let store = Store::new(&icm_db)?;
                         let _ = extract::extract_and_store(&store, &result.response, "meridian");
                     }
                     scores_with.push(score);
@@ -7361,13 +7347,13 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
         });
         std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let _ = SqliteStore::new(&icm_db)?;
+            let _ = Store::new(&icm_db)?;
         }
 
         let mut results_with: Vec<SessionResult> = Vec::new();
         for (i, prompt) in prompts.iter().enumerate() {
             let effective_prompt = if i > 0 {
-                let store = SqliteStore::new(&icm_db)?;
+                let store = Store::new(&icm_db)?;
                 let ctx = extract::recall_context(&store, prompt, None, 15)?;
                 if verbose && !ctx.is_empty() {
                     eprintln!("  [verbose] Context injected for session {}:", i + 1);
@@ -7389,7 +7375,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
                 Ok(result) => {
                     eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
                     {
-                        let store = SqliteStore::new(&icm_db)?;
+                        let store = Store::new(&icm_db)?;
                         let extracted =
                             extract::extract_and_store(&store, &result.response, "mathlib")?;
                         if extracted > 0 {
@@ -7924,20 +7910,20 @@ fn truncate_words(s: &str, max_chars: usize) -> String {
 // Memoir commands
 // ---------------------------------------------------------------------------
 
-fn resolve_memoir(store: &SqliteStore, name: &str) -> Result<Memoir> {
+fn resolve_memoir(store: &Store, name: &str) -> Result<Memoir> {
     store
         .get_memoir_by_name(name)?
         .ok_or_else(|| anyhow::anyhow!("memoir not found: {name}"))
 }
 
-fn cmd_memoir_create(store: &SqliteStore, name: String, description: String) -> Result<()> {
+fn cmd_memoir_create(store: &Store, name: String, description: String) -> Result<()> {
     let memoir = Memoir::new(name, description);
     let id = store.create_memoir(memoir)?;
     println!("Created memoir: {id}");
     Ok(())
 }
 
-fn cmd_memoir_list(store: &SqliteStore) -> Result<()> {
+fn cmd_memoir_list(store: &Store) -> Result<()> {
     let memoirs = store.list_memoirs()?;
     if memoirs.is_empty() {
         println!("No memoirs yet.");
@@ -7959,7 +7945,7 @@ fn cmd_memoir_list(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_memoir_show(store: &SqliteStore, name: &str) -> Result<()> {
+fn cmd_memoir_show(store: &Store, name: &str) -> Result<()> {
     let memoir = resolve_memoir(store, name)?;
     let stats = store.memoir_stats(&memoir.id)?;
 
@@ -8008,7 +7994,7 @@ fn cmd_memoir_show(store: &SqliteStore, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_memoir_delete(store: &SqliteStore, name: &str) -> Result<()> {
+fn cmd_memoir_delete(store: &Store, name: &str) -> Result<()> {
     let memoir = resolve_memoir(store, name)?;
     store.delete_memoir(&memoir.id)?;
     println!("Deleted memoir: {name}");
@@ -8016,7 +8002,7 @@ fn cmd_memoir_delete(store: &SqliteStore, name: &str) -> Result<()> {
 }
 
 fn cmd_memoir_add_concept(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     name: String,
     definition: String,
@@ -8039,7 +8025,7 @@ fn cmd_memoir_add_concept(
 }
 
 fn cmd_memoir_refine(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     concept_name: &str,
     new_definition: &str,
@@ -8060,7 +8046,7 @@ fn cmd_memoir_refine(
 }
 
 fn cmd_memoir_search(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     query: &str,
     label: Option<&str>,
@@ -8093,7 +8079,7 @@ fn cmd_memoir_search(
     Ok(())
 }
 
-fn cmd_memoir_search_all(store: &SqliteStore, query: &str, limit: usize) -> Result<()> {
+fn cmd_memoir_search_all(store: &Store, query: &str, limit: usize) -> Result<()> {
     let results = store.search_all_concepts_fts(query, limit)?;
 
     if results.is_empty() {
@@ -8124,7 +8110,7 @@ fn cmd_memoir_search_all(store: &SqliteStore, query: &str, limit: usize) -> Resu
 }
 
 fn cmd_memoir_link(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     from_name: &str,
     to_name: &str,
@@ -8146,7 +8132,7 @@ fn cmd_memoir_link(
 }
 
 fn cmd_memoir_inspect(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     concept_name: &str,
     depth: usize,
@@ -8185,7 +8171,7 @@ fn cmd_memoir_inspect(
 
 // confidence_color and confidence_bar are now methods on Concept in icm-core
 
-fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Result<()> {
+fn cmd_memoir_export(store: &Store, memoir_name: &str, format: &str) -> Result<()> {
     let memoir = resolve_memoir(store, memoir_name)?;
     let concepts = store.list_concepts(&memoir.id)?;
 
@@ -8361,7 +8347,7 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
     Ok(())
 }
 
-fn cmd_memoir_distill(store: &SqliteStore, from_topic: &str, into_name: &str) -> Result<()> {
+fn cmd_memoir_distill(store: &Store, from_topic: &str, into_name: &str) -> Result<()> {
     let memoir = resolve_memoir(store, into_name)?;
     let memories = store.get_by_topic(from_topic)?;
 
@@ -8447,7 +8433,7 @@ fn truncate(s: &str, max: usize) -> String {
 // Cloud commands
 // ---------------------------------------------------------------------------
 
-fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
+fn cmd_cloud(command: CloudCommands, store: &Store) -> Result<()> {
     use icm_core::Scope;
 
     match command {
@@ -8623,8 +8609,8 @@ mod hook_start_tests {
     use super::*;
     use icm_core::Importance;
 
-    fn seed_store() -> SqliteStore {
-        let store = SqliteStore::in_memory().unwrap();
+    fn seed_store() -> Store {
+        let store = Store::in_memory().unwrap();
         store
             .store(Memory::new(
                 "decisions-icm".into(),
@@ -8787,7 +8773,7 @@ mod hook_start_tests {
 
     #[test]
     fn hook_start_pack_empty_on_empty_store() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm"}"#;
         let pack = build_hook_start_pack(&store, stdin_json, 200).unwrap();
         assert!(
@@ -8831,7 +8817,7 @@ mod hook_start_tests {
 
     #[test]
     fn hook_start_pack_respects_token_budget() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for i in 0..50 {
             store
                 .store(Memory::new(
@@ -8855,7 +8841,7 @@ mod hook_start_tests {
 
     #[test]
     fn hook_start_pack_skips_placeholder_output() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         // Only low-importance noise — wake-up would return the "(no critical
         // memories yet ...)" placeholder, which cmd_hook_start should suppress.
         store
@@ -8930,7 +8916,7 @@ mod hook_start_tests {
     /// emitted.
     #[test]
     fn hook_start_pack_skips_snapshot_when_only_decisions() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         store
             .store(Memory::new(
                 "decisions-icm".into(),
@@ -9497,14 +9483,14 @@ mod is_icm_command_tests {
 mod cmd_forget_tests {
     use super::*;
     use icm_core::{Importance, Memory};
-    use icm_store::SqliteStore;
+    use icm_store::Store;
 
     /// Audit #185 medium: `forget <ID> -t TOPIC` used to silently nuke
     /// the whole topic and discard the id. Now we reject the
     /// ambiguous combo.
     #[test]
     fn rejects_id_and_topic_together() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let id = store
             .store(Memory::new(
                 "topic".into(),
@@ -9528,7 +9514,7 @@ mod cmd_forget_tests {
     /// with legacy empty topics can't be wiped by typo.
     #[test]
     fn rejects_empty_topic() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let err = cmd_forget(&store, None, Some("")).unwrap_err();
         assert!(
             err.to_string().contains("--topic cannot be empty"),
@@ -9538,7 +9524,7 @@ mod cmd_forget_tests {
 
     #[test]
     fn rejects_whitespace_only_topic() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let err = cmd_forget(&store, None, Some("   \t  ")).unwrap_err();
         assert!(
             err.to_string().contains("--topic cannot be empty"),
@@ -9548,7 +9534,7 @@ mod cmd_forget_tests {
 
     #[test]
     fn rejects_neither_id_nor_topic() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let err = cmd_forget(&store, None, None).unwrap_err();
         assert!(
             err.to_string().contains("required"),
@@ -9560,14 +9546,14 @@ mod cmd_forget_tests {
 #[cfg(test)]
 mod cli_contracts_tests {
     use super::*;
-    use icm_store::SqliteStore;
+    use icm_store::Store;
 
     /// Audit #185 H9: `apply_decay` multiplies weight by `factor`,
     /// so values >= 1 amplify instead of decaying. Reject at the CLI
     /// boundary so users can't shoot themselves in the foot.
     #[test]
     fn cmd_decay_rejects_factor_one_or_greater() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for &bad in &[1.0_f32, 1.5, 2.0, 100.0, f32::INFINITY] {
             let err = cmd_decay(&store, bad).unwrap_err();
             assert!(
@@ -9579,7 +9565,7 @@ mod cli_contracts_tests {
 
     #[test]
     fn cmd_decay_rejects_negative_or_nan_factor() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for &bad in &[-0.1_f32, -1.0, f32::NAN, f32::NEG_INFINITY] {
             let err = cmd_decay(&store, bad).unwrap_err();
             assert!(
@@ -9591,7 +9577,7 @@ mod cli_contracts_tests {
 
     #[test]
     fn cmd_decay_accepts_valid_factor() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for &good in &[0.0_f32, 0.5, 0.95, 0.999_999] {
             cmd_decay(&store, good).unwrap_or_else(|e| panic!("factor={good} rejected: {e}"));
         }
@@ -10216,8 +10202,8 @@ mod cmd_remember_tests {
     #[test]
     fn remember_appends_status_update_to_existing_memories() {
         use icm_core::{Importance, MemoryStore};
-        use icm_store::SqliteStore;
-        let store = SqliteStore::in_memory().unwrap();
+        use icm_store::Store;
+        let store = Store::in_memory().unwrap();
         let cfg = crate::config::MemoryConfig::default();
 
         cmd_store(
@@ -10255,25 +10241,25 @@ mod cmd_remember_tests {
 #[cfg(test)]
 mod cmd_memoir_tests {
     use super::*;
-    use icm_store::SqliteStore;
+    use icm_store::Store;
 
     #[track_caller]
-    fn store() -> SqliteStore {
-        SqliteStore::in_memory().unwrap()
+    fn store() -> Store {
+        Store::in_memory().unwrap()
     }
 
     #[track_caller]
-    fn make_memoir(store: &SqliteStore, name: &str) {
+    fn make_memoir(store: &Store, name: &str) {
         cmd_memoir_create(store, name.into(), "test memoir".into()).unwrap();
     }
 
     #[track_caller]
-    fn add_concept(store: &SqliteStore, memoir: &str, name: &str, def: &str) {
+    fn add_concept(store: &Store, memoir: &str, name: &str, def: &str) {
         cmd_memoir_add_concept(store, memoir, name.into(), def.into(), None).unwrap();
     }
 
     #[track_caller]
-    fn memoir_id(store: &SqliteStore, name: &str) -> String {
+    fn memoir_id(store: &Store, name: &str) -> String {
         store.get_memoir_by_name(name).unwrap().unwrap().id
     }
 

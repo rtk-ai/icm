@@ -10,6 +10,7 @@ embeddings = ["icm-core/embeddings"]
 # pass-through features let `cargo test -p icm-mcp` pick one directly.
 backend-sqlite = ["icm-store/backend-sqlite"]
 postgres = ["icm-store/postgres"]
+opensearch = ["icm-store/opensearch"]
 
 [dependencies]
 icm-core = { path = "../icm-core" }

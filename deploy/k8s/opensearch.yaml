@@ -1,0 +1,67 @@
+# Ephemeral single-node OpenSearch for validating the ICM OpenSearch
+# backend on Kubernetes. Security plugin disabled and storage is an
+# emptyDir — this is a test fixture, not a production cluster.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: icm-os
+  labels: { app: icm-opensearch }
+stringData:
+  # Connection string consumed by the icm pods.
+  ICM_OPENSEARCH_URL: http://icm-opensearch:9200
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: icm-opensearch
+  labels: { app: icm-opensearch }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: icm-opensearch }
+  template:
+    metadata:
+      labels: { app: icm-opensearch }
+    spec:
+      # OpenSearch needs vm.max_map_count >= 262144; raise it via an
+      # init container so the test works on default node settings.
+      initContainers:
+        - name: sysctl
+          image: busybox:1.36
+          command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+          securityContext:
+            privileged: true
+      containers:
+        - name: opensearch
+          image: opensearchproject/opensearch:2
+          env:
+            - { name: discovery.type, value: single-node }
+            - { name: DISABLE_SECURITY_PLUGIN, value: "true" }
+            - { name: DISABLE_INSTALL_DEMO_CONFIG, value: "true" }
+            - { name: OPENSEARCH_JAVA_OPTS, value: "-Xms512m -Xmx512m" }
+          ports:
+            - containerPort: 9200
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/opensearch/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: icm-opensearch
+  labels: { app: icm-opensearch }
+spec:
+  selector: { app: icm-opensearch }
+  ports:
+    - port: 9200
+      targetPort: 9200

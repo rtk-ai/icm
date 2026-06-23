@@ -1,0 +1,35 @@
+# Concurrent multi-writer test for the OpenSearch backend: 20 independent
+# pods each store one unique memory into the shared OpenSearch store at the
+# same time. With a node-local SQLite file this is impossible; here all
+# writes land in one cluster with no lost rows.
+#
+# `image:` is a placeholder — substitute your pushed image, e.g.
+#   sed "s|__ICM_IMAGE__|$ACR.azurecr.io/icm-opensearch:test|" \
+#     icm-writer-job-opensearch.yaml | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: icm-writer-os
+  labels: { app: icm-writer-os }
+spec:
+  completions: 20
+  parallelism: 20
+  completionMode: Indexed
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: { app: icm-writer-os }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: __ICM_IMAGE__
+          envFrom:
+            - secretRef: { name: icm-os }
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              icm store --no-embeddings
+              -t concurrency
+              -c "memory #${JOB_COMPLETION_INDEX} written by an independent ICM replica on Kubernetes"
+              -i medium

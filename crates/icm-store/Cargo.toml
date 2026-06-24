@@ -9,8 +9,10 @@ edition = "2021"
 # "single binary, zero dependencies" promise (issue #301).
 default = ["backend-sqlite"]
 
-# In-process SQLite backend (rusqlite + sqlite-vec). The only built-in
-# backend; always the default.
+# Storage backends are ADDITIVE (issue #301): any combination can be
+# compiled into one binary, and the active one is chosen at runtime via
+# `ICM_DB_BACKEND` (see the `Store` enum). SQLite is the lightweight
+# default; the remote backends are opt-in extra deps.
 backend-sqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:zerocopy"]
 
 # Opt-in network-accessible PostgreSQL backend (issue #301). Lets several

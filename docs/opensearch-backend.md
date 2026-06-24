@@ -30,27 +30,30 @@ error for now and stay fully available on SQLite.
 
 ## Build
 
+The **default `icm` binary already includes this backend** (backends are
+additive and selected at runtime, like SurrealDB's `Surreal<Any>`). For a
+lean image without ONNX/fastembed, build keyword + BM25 only:
+
 ```sh
 cargo build -p icm-cli --release --no-default-features \
-    --features "opensearch,embeddings,tui,http-api"
+    --features "opensearch,http-api"
 ```
-
-Drop `embeddings` for a lean container image that uses keyword + BM25
-search only.
 
 ## Configure
 
-The backend talks to the OpenSearch REST API over the blocking `ureq`
-client (no async runtime). Point it at your cluster:
+Select the backend at runtime. It talks to the OpenSearch REST API over the
+blocking `ureq` client (no async runtime):
 
 ```sh
+export ICM_DB_BACKEND=opensearch
 export ICM_OPENSEARCH_URL=http://localhost:9201
 # optional basic auth (when the security plugin is enabled):
 export ICM_OPENSEARCH_USER=admin
 export ICM_OPENSEARCH_PASSWORD=...
 ```
 
-The `--db` flag is ignored by this backend.
+With `ICM_DB_BACKEND` unset (or `sqlite`) the binary uses the local SQLite
+file. The `--db` flag is ignored by this backend.
 
 ### Local OpenSearch
 

@@ -13,14 +13,16 @@ name = "icm"
 path = "src/main.rs"
 
 [features]
-default = ["embeddings", "tui", "http-api", "backend-sqlite"]
+# The published binary carries ALL backends and picks one at runtime via
+# `ICM_DB_BACKEND` (issue #301). Backends are additive; for a lean build
+# (e.g. SQLite-only) use `--no-default-features --features
+# "embeddings,tui,http-api,backend-sqlite"`.
+default = ["embeddings", "tui", "http-api", "backend-sqlite", "postgres", "opensearch"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
 tui = ["dep:ratatui", "dep:crossterm"]
-# Storage backend selection (issue #301). Exactly one must be active.
-# Default = in-process SQLite (single binary, zero external services).
-# The opt-in PostgreSQL backend lets several `icm` processes / Kubernetes
-# replicas share one memory store; build it with
-# `--no-default-features --features "postgres,embeddings,tui,http-api"`.
+# Storage backends (additive). SQLite is in-process; postgres / opensearch
+# are network-accessible so several `icm` processes / Kubernetes replicas
+# share one memory store. The active one is selected at runtime, not here.
 backend-sqlite = ["icm-store/backend-sqlite", "icm-mcp/backend-sqlite"]
 postgres = ["icm-store/postgres", "icm-mcp/postgres"]
 opensearch = ["icm-store/opensearch", "icm-mcp/opensearch"]

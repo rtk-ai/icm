@@ -1495,8 +1495,9 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
-    // `db_path` is consumed only by embeddings-gated commands (e.g. `embed`).
-    #[cfg_attr(not(feature = "embeddings"), allow(unused_variables))]
+    // `db_path` is consumed only by some feature-gated commands (e.g. the
+    // embeddings-only `embed`), so it can be unused in lean builds.
+    #[allow(unused_variables)]
     let db_path = cli_db.clone().unwrap_or_else(default_db_path);
 
     // `icm uninstall` must NOT open the SQLite store: a default

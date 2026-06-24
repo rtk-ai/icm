@@ -42,68 +42,9 @@ use icm_core::{
     StoreStats, TopicHealth, TranscriptHit, TranscriptStats, TranscriptStore,
 };
 
-// ---------------------------------------------------------------------------
-// Shared public row types (mirrors the SQLite/PostgreSQL backends so the
-// `icm-cli` / `icm-mcp` re-exports resolve under any backend feature).
-// ---------------------------------------------------------------------------
-
-/// One row of the `hook_events` telemetry stream.
-#[derive(Debug, Clone)]
-pub struct HookEvent {
-    pub id: i64,
-    pub ts: DateTime<Utc>,
-    pub event: String,
-    pub project: Option<String>,
-    pub session_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub duration_ms: Option<i64>,
-    pub exit_code: i32,
-    pub payload_size: Option<i64>,
-    pub note: Option<String>,
-}
-
-/// Insert payload for a single hook event; `id`/`ts` are filled in here.
-#[derive(Debug, Clone, Default)]
-pub struct HookEventInsert {
-    pub event: String,
-    pub project: Option<String>,
-    pub session_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub duration_ms: Option<i64>,
-    pub exit_code: i32,
-    pub payload_size: Option<i64>,
-    pub note: Option<String>,
-}
-
-/// One aggregated row of `hook_stats`.
-#[derive(Debug, Clone)]
-pub struct HookStatsRow {
-    pub event: String,
-    pub count: i64,
-    pub error_count: i64,
-    pub avg_duration_ms: f64,
-    pub p50_duration_ms: i64,
-    pub p99_duration_ms: i64,
-}
-
-/// Row tuple from the pending-extraction queue:
-/// `(id, project, tool_name, raw_output, captured_at)`.
-pub type PendingRow = (String, String, String, String, String);
-
-/// One row of the `code_areas` collection: a file the agent touched,
-/// deduplicated on `(project, file_path)` with a `touch_count`.
-#[derive(Debug, Clone)]
-pub struct CodeArea {
-    pub id: i64,
-    pub project: String,
-    pub file_path: String,
-    pub description: Option<String>,
-    pub session_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub touch_count: i64,
-    pub first_touched_at: DateTime<Utc>,
-    pub last_touched_at: DateTime<Utc>,
-}
+// Shared public row types live in `crate::common` (issue #301) so every
+// backend can be compiled into one binary without colliding definitions.
+pub use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
 
 // ---------------------------------------------------------------------------
 // Index names

@@ -10,7 +10,8 @@ stringData:
   POSTGRES_USER: icm
   POSTGRES_PASSWORD: icm
   POSTGRES_DB: icm
-  # Connection string consumed by the icm pods.
+  # Select the backend at runtime + give it a connection string.
+  ICM_DB_BACKEND: postgres
   ICM_POSTGRES_URL: postgres://icm:icm@icm-postgres:5432/icm
 ---
 apiVersion: apps/v1

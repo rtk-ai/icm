@@ -7,7 +7,8 @@ metadata:
   name: icm-os
   labels: { app: icm-opensearch }
 stringData:
-  # Connection string consumed by the icm pods.
+  # Select the backend at runtime + give it a connection string.
+  ICM_DB_BACKEND: opensearch
   ICM_OPENSEARCH_URL: http://icm-opensearch:9200
 ---
 apiVersion: apps/v1

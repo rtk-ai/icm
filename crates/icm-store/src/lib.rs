@@ -1,40 +1,34 @@
 //! Storage backends for ICM.
 //!
-//! The store is pluggable (issue #301). Exactly one backend is selected
-//! at build time via a Cargo feature, and all expose the same public
-//! surface through the [`Store`] type alias so `icm-cli` / `icm-mcp` are
-//! backend-agnostic:
+//! The store is pluggable (issue #301) and backends are **additive**: any
+//! combination can be compiled into one binary, and the active backend is
+//! selected at **runtime** via the `ICM_DB_BACKEND` environment variable
+//! (`sqlite` (default) / `postgres` / `opensearch`). This follows the
+//! idiomatic Rust pattern (e.g. SurrealDB's `Surreal<Any>`): features only
+//! control which backends are *available*, not which one runs.
 //!
 //! - **`backend-sqlite`** (default) — in-process SQLite via `rusqlite` +
-//!   `sqlite-vec`. Single binary, zero external services. This is the
-//!   only built-in backend and is byte-for-byte unchanged from before.
-//! - **`postgres`** (opt-in) — a network-accessible PostgreSQL backend so
-//!   multiple ICM processes / Kubernetes replicas can share one memory
-//!   store. Build with `--no-default-features --features postgres`.
-//! - **`opensearch`** (opt-in) — a search-native OpenSearch backend
-//!   (BM25 + `knn_vector` HNSW) sharing memory across replicas. Build
-//!   with `--no-default-features --features opensearch`.
+//!   `sqlite-vec`. Lightweight, no external service.
+//! - **`postgres`** — network-accessible PostgreSQL (`pgvector` + FTS) so
+//!   replicas share one memory store.
+//! - **`opensearch`** — network-accessible OpenSearch (BM25 + `knn_vector`).
+//!
+//! `icm-cli` / `icm-mcp` use the [`Store`] enum, which dispatches every
+//! call to whichever backend variant is active.
 
-// Exactly one backend must be active.
-#[cfg(any(
-    all(feature = "backend-sqlite", feature = "postgres"),
-    all(feature = "backend-sqlite", feature = "opensearch"),
-    all(feature = "postgres", feature = "opensearch"),
-))]
-compile_error!(
-    "the storage backends `backend-sqlite`, `postgres` and `opensearch` are \
-     mutually exclusive; build a remote backend with `--no-default-features \
-     --features <postgres|opensearch>`"
-);
+// At least one backend must be compiled in.
 #[cfg(not(any(
     feature = "backend-sqlite",
     feature = "postgres",
     feature = "opensearch"
 )))]
 compile_error!(
-    "a storage backend must be selected: enable `backend-sqlite` (default), \
-     `postgres`, or `opensearch`"
+    "at least one storage backend must be enabled: `backend-sqlite` (default), \
+     `postgres`, and/or `opensearch`"
 );
+
+mod backend;
+mod common;
 
 #[cfg(feature = "backend-sqlite")]
 mod schema;
@@ -47,27 +41,16 @@ mod postgres;
 #[cfg(feature = "opensearch")]
 mod opensearch;
 
-#[cfg(feature = "backend-sqlite")]
-pub use store::{HookEvent, HookEventInsert, HookStatsRow, PendingRow, SqliteStore};
+// Shared row types (backend-agnostic).
+pub use common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
 
-/// The active storage backend. `icm-cli` and `icm-mcp` use this alias
-/// everywhere instead of a concrete type, so swapping backends is a
-/// build-feature change with no call-site churn.
-#[cfg(feature = "backend-sqlite")]
-pub type Store = SqliteStore;
+// The runtime-dispatched store and the backend selector.
+pub use backend::{BackendKind, Store};
 
-#[cfg(feature = "postgres")]
-pub use postgres::{HookEvent, HookEventInsert, HookStatsRow, PendingRow, PostgresStore};
-
-/// The active storage backend (PostgreSQL build). See the `backend-sqlite`
-/// variant above.
-#[cfg(feature = "postgres")]
-pub type Store = PostgresStore;
-
+// Concrete backend types, exposed for direct use / tests.
 #[cfg(feature = "opensearch")]
-pub use opensearch::{HookEvent, HookEventInsert, HookStatsRow, OpenSearchStore, PendingRow};
-
-/// The active storage backend (OpenSearch build). See the `backend-sqlite`
-/// variant above.
-#[cfg(feature = "opensearch")]
-pub type Store = OpenSearchStore;
+pub use opensearch::OpenSearchStore;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresStore;
+#[cfg(feature = "backend-sqlite")]
+pub use store::SqliteStore;

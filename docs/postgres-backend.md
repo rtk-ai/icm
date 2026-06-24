@@ -43,25 +43,24 @@ PostgreSQL Flexible Server (with `vector` allow-listed) both work.
 
 ## Build
 
-```sh
-cargo build -p icm-cli --release \
-    --no-default-features \
-    --features "postgres,embeddings,tui,http-api"
-```
-
-`postgres` and `backend-sqlite` are mutually exclusive; `--no-default-features`
-drops the default SQLite backend so only PostgreSQL is compiled in.
+The **default `icm` binary already includes this backend** (backends are
+additive and selected at runtime, like SurrealDB's `Surreal<Any>`). Nothing
+to build — just configure it. For a lean SQLite-only binary, build with
+`--no-default-features --features "embeddings,tui,http-api,backend-sqlite"`.
 
 ## Configure
 
-The connection string comes from the environment:
+Select the backend at runtime and give it a connection string:
 
 ```sh
+export ICM_DB_BACKEND=postgres
 export ICM_POSTGRES_URL="postgres://user:pass@host:5432/icm"
-# DATABASE_URL is accepted as a fallback.
+# DATABASE_URL is accepted as a fallback for the URL.
 ```
 
-The `--db` flag (a SQLite file path) is ignored by this backend.
+With `ICM_DB_BACKEND` unset (or `sqlite`) the binary uses the local SQLite
+file as before. The `--db` flag (a SQLite file path) is ignored by this
+backend.
 
 The schema — including the `vector(N)` embedding column whose dimension
 `N` matches your embedder — is created on first connect. The stored
@@ -76,6 +75,7 @@ docker run -d --name icm-pg \
     -e POSTGRES_PASSWORD=icm -e POSTGRES_USER=icm -e POSTGRES_DB=icm \
     -p 55432:5432 pgvector/pgvector:pg16
 
+export ICM_DB_BACKEND=postgres
 export ICM_POSTGRES_URL="postgres://icm:icm@127.0.0.1:55432/icm"
 
 icm store -t demo -c "PostgreSQL backend shares memory across replicas" -i high

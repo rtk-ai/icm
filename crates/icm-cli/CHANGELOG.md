@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.57](https://github.com/rtk-ai/icm/compare/icm-v0.10.56...icm-v0.10.57) (2026-06-24)
+
+
+### Features
+
+* **store:** runtime backend selection via ICM_DB_BACKEND ([#301](https://github.com/rtk-ai/icm/issues/301)) ([ae6c205](https://github.com/rtk-ai/icm/commit/ae6c20599be49f868d4c0f183d7758890c645d1f))
+* **store:** select storage backend at runtime via ICM_DB_BACKEND ([#301](https://github.com/rtk-ai/icm/issues/301)) ([13a3fbd](https://github.com/rtk-ai/icm/commit/13a3fbd31d8b71a97be1f6a214c47cfd0e78a6bd))
+
 ## [0.10.56](https://github.com/rtk-ai/icm/compare/icm-v0.10.55...icm-v0.10.56) (2026-06-23)
 
 

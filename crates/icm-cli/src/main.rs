@@ -44,7 +44,9 @@ use icm_store::Store;
     about = "Infinite Context Memory - persistent memory for LLMs"
 )]
 struct Cli {
-    /// Path to the SQLite database (overrides config and ICM_DB env var)
+    /// Path to the SQLite database (overrides config and ICM_DB env var).
+    /// Used by the default SQLite backend; ignored when ICM_DB_BACKEND
+    /// selects a remote backend (postgres / opensearch).
     #[arg(long, global = true, action = clap::ArgAction::Append)]
     db: Vec<PathBuf>,
 

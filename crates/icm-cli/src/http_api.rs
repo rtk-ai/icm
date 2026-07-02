@@ -22,6 +22,7 @@
 //! bind explicitly. An optional `--token` enables `Authorization:
 //! Bearer <token>` checking; absent token = open localhost API.
 
+use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +37,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use icm_mcp::protocol::{JsonRpcMessage, JsonRpcResponse};
 
 use icm_core::{
     is_preference_topic, keyword_matches, project_matches, topic_matches, Embedder, Importance,
@@ -59,6 +62,7 @@ use crate::recall_format::{self, RecallFormat};
 pub struct AppState {
     store: Arc<Mutex<Store>>,
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
+    mcp_calls_since_store: Arc<Mutex<u32>>,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
 }
@@ -156,6 +160,12 @@ pub struct ConsolidateReq {
     keep_originals: bool,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct McpQuery {
+    #[serde(default)]
+    compact: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Server entry
 // ---------------------------------------------------------------------------
@@ -173,10 +183,12 @@ pub async fn run_http_server(
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         embedder: embedder.map(Arc::from),
+        mcp_calls_since_store: Arc::new(Mutex::new(0)),
         token,
     };
 
     let app = Router::new()
+        .route("/mcp", post(handle_mcp))
         .route("/recall", post(handle_recall))
         .route("/store", post(handle_store))
         .route("/consolidate", post(handle_consolidate))
@@ -196,6 +208,36 @@ pub async fn run_http_server(
     eprintln!("[icm http] listening on http://{local}");
 
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+pub fn run_mcp_stdio_proxy(base_url: &str, token: Option<&str>, compact: bool) -> Result<()> {
+    let endpoint = mcp_proxy_endpoint(base_url, compact)?;
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        match post_mcp_json_rpc(&endpoint, token, line) {
+            Ok(Some(body)) => {
+                writeln!(stdout, "{body}")?;
+                stdout.flush()?;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let id = json_rpc_id(line);
+                let response = JsonRpcResponse::err(id, -32000, e.to_string());
+                writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+                stdout.flush()?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -229,6 +271,97 @@ async fn auth_middleware(
         )
             .into_response(),
     }
+}
+
+async fn handle_mcp(
+    State(state): State<AppState>,
+    Query(q): Query<McpQuery>,
+    Json(raw): Json<Value>,
+) -> Response {
+    let msg: JsonRpcMessage = match serde_json::from_value(raw) {
+        Ok(msg) => msg,
+        Err(e) => {
+            let response = JsonRpcResponse::err(Value::Null, -32700, format!("parse error: {e}"));
+            return Json(response).into_response();
+        }
+    };
+
+    let store = match state.store.lock() {
+        Ok(store) => store,
+        Err(_) => {
+            let id = msg.id.clone().unwrap_or(Value::Null);
+            let response = JsonRpcResponse::err(id, -32000, "store poisoned".into());
+            return Json(response).into_response();
+        }
+    };
+    let mut calls_since_store = match state.mcp_calls_since_store.lock() {
+        Ok(calls) => calls,
+        Err(_) => {
+            let id = msg.id.clone().unwrap_or(Value::Null);
+            let response = JsonRpcResponse::err(id, -32000, "MCP session state poisoned".into());
+            return Json(response).into_response();
+        }
+    };
+
+    match icm_mcp::server::handle_json_rpc_message(
+        msg,
+        &store,
+        state.embedder_ref(),
+        q.compact,
+        &mut calls_since_store,
+    ) {
+        Some(response) => Json(response).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+fn mcp_proxy_endpoint(base_url: &str, compact: bool) -> Result<String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        anyhow::bail!("--http-proxy URL must not be empty");
+    }
+    let mut endpoint = if trimmed.ends_with("/mcp") || trimmed.contains("/mcp?") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/mcp")
+    };
+    endpoint.push(if endpoint.contains('?') { '&' } else { '?' });
+    endpoint.push_str("compact=");
+    endpoint.push_str(if compact { "true" } else { "false" });
+    Ok(endpoint)
+}
+
+fn post_mcp_json_rpc(endpoint: &str, token: Option<&str>, body: &str) -> Result<Option<String>> {
+    let mut req = ureq::post(endpoint).set("content-type", "application/json");
+    if let Some(token) = token {
+        req = req.set("authorization", &format!("Bearer {token}"));
+    }
+
+    match req.send_string(body) {
+        Ok(resp) => {
+            if resp.status() == StatusCode::NO_CONTENT.as_u16() {
+                return Ok(None);
+            }
+            let body = resp.into_string()?;
+            if body.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(body))
+            }
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            anyhow::bail!("HTTP {code} from ICM daemon: {}", text.trim());
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn json_rpc_id(line: &str) -> Value {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .unwrap_or(Value::Null)
 }
 
 // ---------------------------------------------------------------------------
@@ -728,5 +861,17 @@ mod tests {
 
         assert!(parse_keywords_value(None).is_empty());
         assert!(parse_keywords_value(Some(&json!(42))).is_empty());
+    }
+
+    #[test]
+    fn mcp_proxy_endpoint_points_at_mcp_route_with_compact_flag() {
+        assert_eq!(
+            mcp_proxy_endpoint("http://127.0.0.1:11435", true).unwrap(),
+            "http://127.0.0.1:11435/mcp?compact=true"
+        );
+        assert_eq!(
+            mcp_proxy_endpoint("http://127.0.0.1:11435/mcp", false).unwrap(),
+            "http://127.0.0.1:11435/mcp?compact=false"
+        );
     }
 }

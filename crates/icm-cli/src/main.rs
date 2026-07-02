@@ -675,9 +675,15 @@ enum Commands {
         #[arg(long, value_name = "ADDR")]
         http: Option<std::net::SocketAddr>,
 
+        /// Run an MCP stdio proxy that forwards JSON-RPC to a shared
+        /// local `icm serve --http` daemon.
+        #[cfg(feature = "http-api")]
+        #[arg(long = "http-proxy", value_name = "URL")]
+        http_proxy: Option<String>,
+
         /// Require `Authorization: Bearer <TOKEN>` on every HTTP
-        /// request (only meaningful with `--http`). Absent token =
-        /// open localhost API.
+        /// request (meaningful with `--http` and `--http-proxy`).
+        /// Absent token = open localhost API.
         #[cfg(feature = "http-api")]
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
@@ -1446,6 +1452,50 @@ fn init_embedder(_model: &str) -> Option<DisabledEmbedder> {
     None
 }
 
+#[cfg(feature = "http-api")]
+#[derive(Debug, PartialEq, Eq)]
+struct HttpProxyRequest<'a> {
+    base_url: &'a str,
+    token: Option<&'a str>,
+    compact: bool,
+}
+
+#[cfg(feature = "http-api")]
+fn early_http_proxy_request<'a>(
+    command: &'a Commands,
+    cfg: &config::Config,
+) -> Result<Option<HttpProxyRequest<'a>>> {
+    let Commands::Serve {
+        compact,
+        #[cfg(feature = "web")]
+        expose,
+        http,
+        http_proxy,
+        token,
+    } = command
+    else {
+        return Ok(None);
+    };
+
+    let Some(base_url) = http_proxy.as_deref() else {
+        return Ok(None);
+    };
+
+    #[cfg(feature = "web")]
+    if *expose {
+        bail!("--http-proxy cannot be combined with --expose");
+    }
+    if http.is_some() {
+        bail!("--http-proxy cannot be combined with --http");
+    }
+
+    Ok(Some(HttpProxyRequest {
+        base_url,
+        token: token.as_deref(),
+        compact: *compact || cfg.mcp.compact,
+    }))
+}
+
 fn main() -> Result<()> {
     // Reset SIGPIPE to default so piped commands (e.g. `icm export | head`)
     // don't panic on broken pipe.
@@ -1463,19 +1513,6 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load_config()?;
-    let embeddings_enabled =
-        cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
-    #[allow(unused_variables)]
-    let embedder = if embeddings_enabled {
-        init_embedder(&cfg.embeddings.model)
-    } else {
-        None
-    };
-    let embedding_dims = resolve_embedding_dims(
-        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
-        cli.db.first(),
-        &cfg,
-    );
     // Audit #185 medium: reject `--db A ... --db B` (or with `=`)
     // instead of silently letting the last occurrence win. Clap
     // alone doesn't catch the parent+subcommand split case (the
@@ -1496,24 +1533,49 @@ fn main() -> Result<()> {
             anyhow::bail!("--db can only be specified once; got {db_count} occurrences");
         }
     }
-    let cli_db: Option<PathBuf> = cli.db.into_iter().next();
-    // `db_path` is consumed only by some feature-gated commands (e.g. the
-    // embeddings-only `embed`), so it can be unused in lean builds.
-    #[allow(unused_variables)]
-    let db_path = cli_db.clone().unwrap_or_else(default_db_path);
+
+    let Cli {
+        db,
+        no_embeddings,
+        read_only,
+        command,
+    } = cli;
+
+    #[cfg(feature = "http-api")]
+    if let Some(request) = early_http_proxy_request(&command, &cfg)? {
+        return http_api::run_mcp_stdio_proxy(request.base_url, request.token, request.compact);
+    }
 
     // `icm uninstall` must NOT open the SQLite store: a default
     // `open_store` call would recreate the DB directory and WAL/SHM files
     // immediately after `--purge-data` removed them, leaving the user's
     // data dir non-empty even though the run reported success. Dispatch
     // it before `open_store` runs.
-    let command = cli.command;
     if let Commands::Uninstall(opts) = command {
         let code = uninstall::run(opts)?;
         std::process::exit(code);
     }
 
-    let store = if read_only_requested(cli.read_only) {
+    let embeddings_enabled =
+        cfg.embeddings.enabled && !no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
+    #[allow(unused_variables)]
+    let embedder = if embeddings_enabled {
+        init_embedder(&cfg.embeddings.model)
+    } else {
+        None
+    };
+    let embedding_dims = resolve_embedding_dims(
+        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
+        db.first(),
+        &cfg,
+    );
+    let cli_db: Option<PathBuf> = db.into_iter().next();
+    // `db_path` is consumed only by some feature-gated commands (e.g. the
+    // embeddings-only `embed`), so it can be unused in lean builds.
+    #[allow(unused_variables)]
+    let db_path = cli_db.clone().unwrap_or_else(default_db_path);
+
+    let store = if read_only_requested(read_only) {
         open_store_readonly(cli_db)?
     } else {
         open_store(cli_db, embedding_dims)?
@@ -1929,6 +1991,8 @@ fn main() -> Result<()> {
             expose,
             #[cfg(feature = "http-api")]
             http,
+            #[cfg(feature = "http-api")]
+                http_proxy: _,
             #[cfg(feature = "http-api")]
             token,
         } => {
@@ -9661,6 +9725,55 @@ mod cli_contracts_tests {
         assert!(tip.contains("--summarizer-provider"));
         assert!(tip.contains("provider=none"));
         assert!(tip.contains("--keep-originals"));
+    }
+
+    #[cfg(feature = "http-api")]
+    #[test]
+    fn serve_accepts_http_proxy_url_for_stdio_mcp() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "serve",
+            "--http-proxy",
+            "http://127.0.0.1:11435",
+            "--token",
+            "secret",
+        ])
+        .unwrap();
+
+        let Commands::Serve {
+            compact,
+            http_proxy,
+            token,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert!(!compact);
+        assert_eq!(http_proxy.as_deref(), Some("http://127.0.0.1:11435"));
+        assert_eq!(token.as_deref(), Some("secret"));
+    }
+
+    #[cfg(feature = "http-api")]
+    #[test]
+    fn http_proxy_request_is_resolved_before_store_and_embedder_setup() {
+        let mut cfg = config::Config::default();
+        cfg.mcp.compact = true;
+        let command = Commands::Serve {
+            compact: false,
+            #[cfg(feature = "web")]
+            expose: false,
+            http: None,
+            http_proxy: Some("http://127.0.0.1:11435".into()),
+            token: None,
+        };
+
+        let request = early_http_proxy_request(&command, &cfg).unwrap().unwrap();
+
+        assert_eq!(request.base_url, "http://127.0.0.1:11435");
+        assert_eq!(request.token, None);
+        assert!(request.compact);
     }
 }
 

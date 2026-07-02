@@ -241,9 +241,23 @@ curl -s -X POST '127.0.0.1:11435/recall?format=json' \
   -d '{"query":"hello","topic":"t"}'
 ```
 
-Endpoints: `POST /store`, `POST /recall`, `POST /consolidate`, `GET /stats`, `GET /topics`, `GET /health`. Optional `--token <T>` enables `Authorization: Bearer <T>` on every request (health stays open as a liveness probe). Bound to whatever address you pass; `127.0.0.1:<port>` keeps the server localhost-only.
+Endpoints: `POST /store`, `POST /recall`, `POST /consolidate`, `POST /mcp`, `GET /stats`, `GET /topics`, `GET /health`. Optional `--token <T>` enables `Authorization: Bearer <T>` on every request (health stays open as a liveness probe). Bound to whatever address you pass; `127.0.0.1:<port>` keeps the server localhost-only.
 
 Saves ~9 s per call vs one-shot CLI (model reload) — any scripting language can hit semantic recall with plain `curl`. Requires the `http-api` feature (enabled by default). Issue [#290](https://github.com/rtk-ai/icm/issues/290).
+
+### Shared MCP daemon for multiple clients
+
+Standard MCP stdio launches one `icm serve` process per AI client. If several clients use semantic recall, each process can load its own embedding model. For multi-client setups, run one HTTP daemon and configure each MCP client to use the lightweight stdio proxy:
+
+```bash
+# Terminal/session manager: one warm model for the machine.
+icm serve --http 127.0.0.1:11435 --db ~/.local/share/icm/memories.db
+
+# MCP client command:
+icm serve --http-proxy http://127.0.0.1:11435
+```
+
+If the daemon uses `--token <T>`, add the same token to each proxy command: `icm serve --http-proxy http://127.0.0.1:11435 --token <T>`. Memory-constrained machines can also use `icm --no-embeddings serve` for keyword/FTS-only MCP.
 
 ## Dashboard
 

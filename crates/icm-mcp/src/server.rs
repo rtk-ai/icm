@@ -96,6 +96,29 @@ pub fn run_server(
     Ok(())
 }
 
+pub fn handle_json_rpc_message(
+    msg: JsonRpcMessage,
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    compact: bool,
+    calls_since_store: &mut u32,
+) -> Option<JsonRpcResponse> {
+    let method = msg.method.as_deref().unwrap_or("");
+    debug!("MCP request: {method}");
+
+    let id = msg.id?;
+
+    Some(match method {
+        "initialize" => handle_initialize(id),
+        "ping" => JsonRpcResponse::ok(id, json!({})),
+        "tools/list" => handle_tools_list(id, embedder.is_some()),
+        "tools/call" => {
+            handle_tools_call(id, &msg.params, store, embedder, compact, calls_since_store)
+        }
+        other => JsonRpcResponse::method_not_found(id, other),
+    })
+}
+
 fn write_response(stdout: &mut io::Stdout, resp: &JsonRpcResponse) -> anyhow::Result<()> {
     let json = serde_json::to_string(resp)?;
     writeln!(stdout, "{json}")?;

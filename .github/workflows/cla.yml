@@ -1,0 +1,55 @@
+name: CLA Assistant
+
+# CLA Assistant Lite (contributor-assistant/github-action): manages Contributor
+# License Agreement signatures via PR comments, storing them in a JSON file on
+# a dedicated branch of this repo — no external service.
+#
+# Setup required once by a maintainer:
+#   1. Create a Personal Access Token (classic) with `repo` scope, or a
+#      fine-grained token with Contents + Pull requests write on this repo.
+#   2. Add it as a repository secret named `PERSONAL_ACCESS_TOKEN`.
+# The action creates the `cla-signatures` branch and the signatures file on
+# first run. Without the secret the job fails closed (PRs stay unsigned).
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    name: CLA Assistant
+    runs-on: ubuntu-latest
+    # Only run on the sign phrase, the recreate command, or PR open/sync — not
+    # on every unrelated issue comment.
+    if: >-
+      (github.event_name == 'issue_comment' &&
+        (github.event.comment.body == 'recreate-cla' ||
+         github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'))
+      || github.event_name == 'pull_request_target'
+    steps:
+      - name: CLA Assistant Lite
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        with:
+          path-to-signatures: signatures/version1/cla.json
+          path-to-document: https://github.com/rtk-ai/icm/blob/main/CLA.md
+          # Dedicated branch keeps signature commits off main/develop.
+          branch: cla-signatures
+          # Bots (release-please, dependabot, back-merge automation) never sign.
+          allowlist: '*[bot]'
+          custom-notsigned-prcomment: >-
+            Thank you for your contribution! Before we can merge it, please read
+            our [Contributor License Agreement](https://github.com/rtk-ai/icm/blob/main/CLA.md)
+            and sign it by posting the following as a new comment on this PR:
+          custom-pr-sign-comment: I have read the CLA Document and I hereby sign the CLA
+          custom-allsigned-prcomment: All contributors have signed the CLA. ✅

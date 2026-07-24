@@ -13,6 +13,11 @@ mod import;
 mod install_manifest;
 #[cfg(test)]
 mod learn_tests;
+// First-launch onnxruntime resolution for the load-dynamic embeddings build
+// (issue #345). Only the dynamic build needs a runtime downloaded at execution
+// time; the static build links onnxruntime in.
+#[cfg(feature = "embeddings-dynamic")]
+mod ort_runtime;
 mod recall_format;
 mod summarizer;
 #[cfg(feature = "tui")]
@@ -772,6 +777,15 @@ enum Commands {
         since_hours: u64,
     },
 
+    /// Manage the semantic-search runtime (onnxruntime).
+    ///
+    /// Keyword search works with no runtime. Semantic (vector) search needs
+    /// onnxruntime; the load-dynamic build downloads it on demand (issue #345).
+    Embeddings {
+        #[command(subcommand)]
+        action: EmbeddingsAction,
+    },
+
     /// Launch interactive TUI dashboard
     #[cfg(feature = "tui")]
     Dashboard,
@@ -780,6 +794,14 @@ enum Commands {
     #[cfg(feature = "tui")]
     #[command(hide = true)]
     Tui,
+}
+
+#[derive(Subcommand)]
+enum EmbeddingsAction {
+    /// Show whether the onnxruntime runtime is installed.
+    Status,
+    /// Download the onnxruntime runtime to enable semantic (vector) search.
+    Download,
 }
 
 #[derive(Subcommand)]
@@ -1516,6 +1538,35 @@ fn init_embedder(_model: &str) -> Option<DisabledEmbedder> {
     None
 }
 
+/// `icm embeddings status|download` — manage the semantic-search runtime.
+/// Behavior depends on how this binary was built (issue #345).
+fn cmd_embeddings(action: &EmbeddingsAction) -> Result<()> {
+    match action {
+        EmbeddingsAction::Status => {
+            #[cfg(feature = "embeddings-dynamic")]
+            ort_runtime::cmd_status();
+            #[cfg(all(feature = "embeddings", not(feature = "embeddings-dynamic")))]
+            println!(
+                "onnxruntime is statically linked into this build — semantic search is \
+                 always available."
+            );
+            #[cfg(not(feature = "embeddings"))]
+            println!("This build was compiled without embeddings (keyword-only search).");
+        }
+        EmbeddingsAction::Download => {
+            #[cfg(feature = "embeddings-dynamic")]
+            {
+                ort_runtime::cmd_download()?;
+            }
+            #[cfg(all(feature = "embeddings", not(feature = "embeddings-dynamic")))]
+            println!("Nothing to download: onnxruntime is statically linked into this build.");
+            #[cfg(not(feature = "embeddings"))]
+            println!("This build was compiled without embeddings; nothing to download.");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Reset SIGPIPE to default so piped commands (e.g. `icm export | head`)
     // don't panic on broken pipe.
@@ -1535,6 +1586,24 @@ fn main() -> Result<()> {
     let cfg = config::load_config()?;
     let embeddings_enabled =
         cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
+    // Load-dynamic build (issue #345): resolve the onnxruntime runtime. Activate
+    // a previously-downloaded copy (always), and offer a one-time interactive
+    // download on first use — but never in `serve`/`hook`/`embeddings` or when
+    // stdin/stderr aren't a terminal (piped/CI), where we silently keep
+    // keyword-only. If no runtime is available, drop to keyword-only so there
+    // are no per-operation "embedding failed" warnings.
+    #[cfg(feature = "embeddings-dynamic")]
+    let embeddings_enabled = embeddings_enabled
+        // The `embeddings` command manages the runtime itself; skip activation
+        // and any prompt here so `status` reports the pristine environment.
+        && !matches!(cli.command, Commands::Embeddings { .. })
+        && {
+            use std::io::IsTerminal;
+            let interactive = !matches!(cli.command, Commands::Serve { .. } | Commands::Hook { .. })
+                && std::io::stdin().is_terminal()
+                && std::io::stderr().is_terminal();
+            ort_runtime::ensure_for_run(interactive)
+        };
     #[allow(unused_variables)]
     let embedder = if embeddings_enabled {
         init_embedder(&cfg.embeddings.model)
@@ -1602,6 +1671,11 @@ fn main() -> Result<()> {
     } = &command
     {
         return cmd_hook_disable(*dry_run);
+    }
+    // `icm embeddings status|download` manages the onnxruntime runtime and needs
+    // neither the store nor the DB — dispatch before `open_store`.
+    if let Commands::Embeddings { action } = &command {
+        return cmd_embeddings(action);
     }
 
     let store = if read_only_requested(cli.read_only) {
@@ -1933,6 +2007,9 @@ fn main() -> Result<()> {
         Commands::Doctor => cmd_doctor(&db_path),
         Commands::Repair { dry_run } => cmd_repair(&db_path, dry_run),
         Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
+        // `icm embeddings` is dispatched before `open_store` above; this arm
+        // exists only for match exhaustiveness and is unreachable.
+        Commands::Embeddings { .. } => unreachable!("dispatched before open_store"),
         Commands::CodeAreas {
             in_file,
             project,

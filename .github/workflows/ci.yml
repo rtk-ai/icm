@@ -103,8 +103,11 @@ jobs:
         run: >-
           cargo build -p icm-cli --no-default-features
           --features "embeddings-dynamic,backend-sqlite,tui,http-api"
-      - name: Unit-test the dylib pre-flight
-        run: cargo test -p icm-core --features embeddings-dynamic
+      - name: Unit-test the dylib pre-flight + ort_runtime helpers
+        run: |
+          cargo test -p icm-core --features embeddings-dynamic
+          cargo test -p icm-cli --no-default-features \
+            --features "embeddings-dynamic,backend-sqlite,tui,http-api" ort_runtime
       - name: Graceful degradation when onnxruntime is absent
         # Force the missing-runtime path deterministically. The store must still
         # succeed (keyword-only) and the process must exit 0, not abort.
@@ -117,6 +120,24 @@ jobs:
           "$bin" --no-embeddings --db "$db" recall delta | grep -qi delta \
             && echo "OK: degraded to keyword-only without crashing" \
             || { echo "FAIL: memory not stored / recall failed"; exit 1; }
+      - name: Opt-in download + semantic search (onnxruntime 1.20.1 ↔ ort ABI)
+        # The highest-risk regression: the pinned onnxruntime must load under the
+        # `ort` version fastembed uses, or ort's version assertion aborts. Prove
+        # it end-to-end — download the runtime, then embed with a small model and
+        # confirm a purely semantic recall (query shares no keywords with the
+        # stored text, so a keyword hit is impossible).
+        run: |
+          bin=target/debug/icm
+          "$bin" embeddings download
+          "$bin" embeddings status | grep -qi "installed" \
+            || { echo "FAIL: runtime not reported installed"; exit 1; }
+          cfg="$RUNNER_TEMP/icm.toml"
+          printf '[embeddings]\nmodel = "Qdrant/all-MiniLM-L6-v2-onnx"\n' > "$cfg"
+          db="$RUNNER_TEMP/sem.db"
+          ICM_CONFIG="$cfg" "$bin" --db "$db" store -t t -c "the quick brown fox jumps over the lazy dog"
+          ICM_CONFIG="$cfg" "$bin" --db "$db" recall "a fast animal leaping above a sleepy canine" | grep -qi fox \
+            && echo "OK: downloaded onnxruntime loads under ort and embeds" \
+            || { echo "FAIL: semantic search did not work with the downloaded runtime"; exit 1; }
 
   security:
     name: security scan

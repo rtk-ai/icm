@@ -5,7 +5,12 @@ edition = "2021"
 
 [features]
 default = ["backend-sqlite"]
+# Code-level embeddings; a backend variant must be selected (issue #345). The
+# binary crate (icm-cli) selects one, which unifies onto icm-core; these
+# pass-throughs let `cargo {build,test} -p icm-mcp` pick one directly too.
 embeddings = ["icm-core/embeddings"]
+embeddings-static = ["embeddings", "icm-core/embeddings-static"]
+embeddings-dynamic = ["embeddings", "icm-core/embeddings-dynamic"]
 # Storage backend selection is driven by the binary crate (icm-cli); these
 # pass-through features let `cargo test -p icm-mcp` pick one directly.
 backend-sqlite = ["icm-store/backend-sqlite"]

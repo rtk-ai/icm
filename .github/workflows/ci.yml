@@ -86,6 +86,38 @@ jobs:
             echo "FAIL: binary is dynamically linked"; ldd "$bin"; exit 1
           fi
 
+  # Validates the load-dynamic embeddings variant (issue #345): it must build
+  # WITHOUT onnxruntime (so homebrew-core's network-less sandbox can build it
+  # with embeddings), and at runtime degrade to keyword-only search — never
+  # crash — when the onnxruntime lib is absent. The release profile is
+  # `panic = "abort"`, so this exercises the dlopen pre-flight, not catch_unwind.
+  embeddings-dynamic:
+    name: load-dynamic embeddings
+    needs: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build load-dynamic variant (no build-time onnxruntime)
+        run: >-
+          cargo build -p icm-cli --no-default-features
+          --features "embeddings-dynamic,backend-sqlite,tui,http-api"
+      - name: Unit-test the dylib pre-flight
+        run: cargo test -p icm-core --features embeddings-dynamic
+      - name: Graceful degradation when onnxruntime is absent
+        # Force the missing-runtime path deterministically. The store must still
+        # succeed (keyword-only) and the process must exit 0, not abort.
+        env:
+          ORT_DYLIB_PATH: /nonexistent/libonnxruntime.so
+        run: |
+          bin=target/debug/icm
+          db="$RUNNER_TEMP/dyn.db"
+          "$bin" --db "$db" store -t t -c "ci dynamic graceful delta"
+          "$bin" --no-embeddings --db "$db" recall delta | grep -qi delta \
+            && echo "OK: degraded to keyword-only without crashing" \
+            || { echo "FAIL: memory not stored / recall failed"; exit 1; }
+
   security:
     name: security scan
     needs: clippy

@@ -5,7 +5,16 @@ edition = "2021"
 
 [features]
 default = []
-embeddings = ["fastembed", "directories", "cachedir"]
+# `embeddings` = the embedder code + model download (hf-hub). It does NOT pick
+# an ort backend by itself; a consumer selects exactly one of the two below
+# (issue #345). This keeps every `#[cfg(feature = "embeddings")]` unchanged.
+embeddings = ["fastembed", "directories", "cachedir", "fastembed/hf-hub-native-tls"]
+# Static onnxruntime downloaded at build time (default; needs network at build).
+embeddings-static = ["embeddings", "fastembed/ort-download-binaries"]
+# onnxruntime loaded dynamically at runtime — builds with NO network, so the
+# binary is homebrew-core-buildable with embeddings (the runtime lib is resolved
+# at first use). See issue #345.
+embeddings-dynamic = ["embeddings", "fastembed/ort-load-dynamic"]
 
 [dependencies]
 chrono = { workspace = true }
@@ -18,3 +27,8 @@ fastembed = { workspace = true, optional = true }
 directories = { workspace = true, optional = true }
 cachedir = { workspace = true, optional = true }
 tracing = { workspace = true }
+
+# Unix-only: used by the load-dynamic embeddings build to pre-flight the
+# onnxruntime dylib (dlopen) before ort initializes. See issue #345.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

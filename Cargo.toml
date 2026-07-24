@@ -21,7 +21,10 @@ sqlite-vec = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
 
 # Embeddings (optional)
-fastembed = "4"
+# default-features off so each member selects its own ort backend
+# (ort-download-binaries for the static default build, ort-load-dynamic for the
+# homebrew-core-buildable variant — issue #345). hf-hub is re-added per-feature.
+fastembed = { version = "4", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

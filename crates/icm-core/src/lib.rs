@@ -1,3 +1,17 @@
+// The `embeddings` feature carries only the embedder code + model download; an
+// onnxruntime backend must be selected explicitly (issue #345). Enabling bare
+// `embeddings` would build `fastembed` with no ort backend — a confusing link
+// error or a runtime with no way to load onnxruntime — so fail loudly here.
+#[cfg(all(
+    feature = "embeddings",
+    not(any(feature = "embeddings-static", feature = "embeddings-dynamic"))
+))]
+compile_error!(
+    "the `embeddings` feature needs an onnxruntime backend: enable \
+     `embeddings-static` (build-time download) or `embeddings-dynamic` \
+     (runtime load-dynamic), not bare `embeddings`. See issue #345."
+);
+
 pub mod auto_link;
 pub mod context_snapshot;
 pub mod embedder;

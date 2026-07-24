@@ -25,6 +25,38 @@ fn cache_dir() -> PathBuf {
         })
 }
 
+/// Best-effort check that the onnxruntime shared library is loadable, mirroring
+/// how `ort`'s load-dynamic backend resolves it: `ORT_DYLIB_PATH` if set, else
+/// the platform default name. Used only by the load-dynamic build (issue #345)
+/// to avoid ort's panic-on-missing-runtime under `panic = "abort"`.
+#[cfg(all(unix, feature = "embeddings-dynamic"))]
+fn onnxruntime_dylib_available() -> bool {
+    use std::ffi::CString;
+    let default_name = if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+    let name = match std::env::var("ORT_DYLIB_PATH") {
+        Ok(p) if !p.is_empty() => p,
+        _ => default_name.to_string(),
+    };
+    let Ok(cname) = CString::new(name) else {
+        return false;
+    };
+    // SAFETY: `cname` is a valid NUL-terminated C string for the duration of the
+    // call; the returned handle is only tested for null and immediately closed.
+    unsafe {
+        let handle = libc::dlopen(cname.as_ptr(), libc::RTLD_LAZY);
+        if handle.is_null() {
+            false
+        } else {
+            libc::dlclose(handle);
+            true
+        }
+    }
+}
+
 pub struct FastEmbedder {
     model: OnceLock<TextEmbedding>,
     init_lock: Mutex<()>,
@@ -112,6 +144,22 @@ impl FastEmbedder {
         std::fs::create_dir_all(&cache)
             .and_then(|()| cachedir::ensure_tag(&cache))
             .unwrap_or_else(|e| tracing::warn!("could not tag cache dir: {e}"));
+        // With the load-dynamic ort backend (issue #345) onnxruntime is resolved
+        // at runtime. If it's absent, ort *panics* inside init — and since the
+        // release profile is `panic = "abort"`, that would kill the process
+        // rather than unwind (so catch_unwind can't help). Pre-flight the dylib
+        // instead: if it can't be dlopen'd, return a clean error (→ keyword-only
+        // search) before ort ever initializes. Static builds link onnxruntime
+        // in, so this check is compiled out there.
+        #[cfg(all(unix, feature = "embeddings-dynamic"))]
+        if !onnxruntime_dylib_available() {
+            return Err(IcmError::Embedding(
+                "onnxruntime runtime not found for this load-dynamic build; \
+                 install onnxruntime (or set ORT_DYLIB_PATH), or run with \
+                 --no-embeddings for keyword-only search"
+                    .to_string(),
+            ));
+        }
         let model = TextEmbedding::try_new(
             InitOptions::new(emb_model)
                 .with_show_download_progress(true)
@@ -235,6 +283,28 @@ mod tests {
                 ("", ""),
                 "expected no instruction prefix for {model}"
             );
+        }
+    }
+
+    // The load-dynamic pre-flight (issue #345) must report a bogus dylib path as
+    // unavailable — this is what lets a load-dynamic build return a clean error
+    // (→ keyword-only) instead of ort aborting under `panic = "abort"`. Run with
+    // `cargo test -p icm-core --features embeddings-dynamic`.
+    #[cfg(all(unix, feature = "embeddings-dynamic"))]
+    #[test]
+    fn missing_onnxruntime_dylib_is_reported_unavailable() {
+        let prev = std::env::var("ORT_DYLIB_PATH").ok();
+        std::env::set_var(
+            "ORT_DYLIB_PATH",
+            "/nonexistent/icm-test/libonnxruntime-does-not-exist.so",
+        );
+        assert!(
+            !onnxruntime_dylib_available(),
+            "a non-existent ORT_DYLIB_PATH must be detected as unavailable"
+        );
+        match prev {
+            Some(v) => std::env::set_var("ORT_DYLIB_PATH", v),
+            None => std::env::remove_var("ORT_DYLIB_PATH"),
         }
     }
 }

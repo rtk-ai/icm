@@ -17,8 +17,17 @@ path = "src/main.rs"
 # `ICM_DB_BACKEND` (issue #301). Backends are additive; for a lean build
 # (e.g. SQLite-only) use `--no-default-features --features
 # "embeddings,tui,http-api,backend-sqlite"`.
-default = ["embeddings", "tui", "http-api", "backend-sqlite", "postgres", "opensearch"]
+default = ["embeddings-static", "tui", "http-api", "backend-sqlite", "postgres", "opensearch"]
+# Code-level embeddings (no ort backend); pick a variant below. Kept as a
+# feature so all `#[cfg(feature = "embeddings")]` code stays unchanged.
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
+# Default: static onnxruntime (unchanged behavior). The published binaries and
+# install.sh/tap use this.
+embeddings-static = ["embeddings", "icm-core/embeddings-static"]
+# load-dynamic variant (issue #345): compiles with no build-time onnxruntime,
+# so `brew install` (homebrew-core) can build it with embeddings. Used as
+# `--no-default-features --features "embeddings-dynamic,backend-sqlite,tui,http-api"`.
+embeddings-dynamic = ["embeddings", "icm-core/embeddings-dynamic"]
 tui = ["dep:ratatui", "dep:crossterm"]
 # Storage backends (additive). SQLite is in-process; postgres / opensearch
 # are network-accessible so several `icm` processes / Kubernetes replicas

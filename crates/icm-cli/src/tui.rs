@@ -256,8 +256,52 @@ fn is_actionable_key(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+/// Best-effort terminal restoration — disable raw mode, leave the alternate
+/// screen, show the cursor. Errors are ignored: this only ever runs on an
+/// error/panic path where there's nothing more useful to do than try. Safe
+/// to call more than once (each step is idempotent when already undone).
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), crossterm::cursor::Show);
+}
+
+/// Restores the terminal when dropped — covers every early-`?` return below
+/// (e.g. `App::new` failing on a DB error, the exact scenario the audit
+/// reproduced), which is normal unwinding and unaffected by `panic = "abort"`.
+struct TerminalRestoreGuard;
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 pub fn run_dashboard(store: &Store, db_path: Option<&str>) -> Result<()> {
+    // Audit finding: nothing in icm-cli ever restored the terminal on a
+    // panic or an early error return. Two distinct mechanisms are needed:
+    //
+    // 1. A panic hook, because the release profile is `panic = "abort"` —
+    //    the process aborts before any unwinding (and thus any `Drop`)
+    //    would run. A panic hook DOES run before the abort, so it's the
+    //    only way to restore the shell after an actual panic (e.g. the
+    //    overlay underflow bugs fixed above, or any future one).
+    // 2. The `TerminalRestoreGuard` below, because a plain `Result::Err`
+    //    propagated via `?` (e.g. `App::new` failing on a DB error — the
+    //    scenario the audit reproduced) is normal unwinding, not a panic;
+    //    the panic hook never fires for it, but `Drop` does.
+    //
+    // `run_dashboard` is always the terminal arm of `main`'s dispatch (the
+    // process exits right after), so the previous panic hook is
+    // deliberately not restored — there's nothing left in-process to run
+    // under it.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous_hook(info);
+    }));
+
     enable_raw_mode()?;
+    let _guard = TerminalRestoreGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -270,12 +314,9 @@ pub fn run_dashboard(store: &Store, db_path: Option<&str>) -> Result<()> {
     if let Ok(cfg) = crate::config::load_config() {
         app.summarizer_cfg = cfg.consolidate.summarizer;
     }
-    let result = run_loop(&mut terminal, &mut app, store, db_path);
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    run_loop(&mut terminal, &mut app, store, db_path)
+    // `_guard` drops here (or at any earlier `?` above), restoring the
+    // terminal exactly once on every path.
 }
 
 fn run_loop(
@@ -1094,12 +1135,18 @@ fn draw_memoirs(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_search_overlay(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let overlay_height = (area.height / 2).max(10);
+    // Audit finding: on a terminal shorter than ~14 rows, `y + height`
+    // exceeded `area.height` — out-of-buffer render that panics inside
+    // ratatui (and with no panic hook anywhere in icm-cli, left the
+    // terminal stuck in raw mode / alternate screen). `.intersection`
+    // clips the overlay to what actually fits instead of overflowing it.
     let overlay = Rect {
         x: area.width / 6,
         y: area.height / 4,
         width: area.width * 2 / 3,
         height: overlay_height,
-    };
+    }
+    .intersection(area);
 
     f.render_widget(Clear, overlay);
 
@@ -1150,14 +1197,21 @@ fn draw_search_overlay(f: &mut Frame, app: &mut App) {
 
 fn draw_help_overlay(f: &mut Frame) {
     let area = f.area();
-    let w = 60u16.min(area.width - 4);
-    let h = 29u16.min(area.height - 4);
+    // Audit finding: `area.width - 4` / `area.height - 4` underflowed
+    // (u16 panic) on a terminal narrower/shorter than 4 cells, and even
+    // when that held, `(area.width - w) / 2` could still overflow the
+    // frame on a small-but->4 terminal. `saturating_sub` avoids the
+    // arithmetic panic; `.intersection` clips the final rect to the
+    // frame regardless.
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 29u16.min(area.height.saturating_sub(4));
     let overlay = Rect {
-        x: (area.width - w) / 2,
-        y: (area.height - h) / 2,
+        x: area.width.saturating_sub(w) / 2,
+        y: area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
-    };
+    }
+    .intersection(area);
 
     f.render_widget(Clear, overlay);
 
@@ -1216,14 +1270,18 @@ fn draw_help_overlay(f: &mut Frame) {
 
 fn draw_confirm_overlay(f: &mut Frame, app: &App) {
     let area = f.area();
-    let w = 60u16.min(area.width - 4);
-    let h = 7u16;
+    // Audit finding: same underflow class as draw_help_overlay — `h` was
+    // a fixed 7 with no clamp to `area.height`, so a terminal shorter than
+    // 7 rows panicked on `area.height - h`.
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 7u16.min(area.height);
     let overlay = Rect {
-        x: (area.width - w) / 2,
-        y: (area.height - h) / 2,
+        x: area.width.saturating_sub(w) / 2,
+        y: area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
-    };
+    }
+    .intersection(area);
 
     f.render_widget(Clear, overlay);
 
@@ -1550,5 +1608,46 @@ mod tests {
     #[test]
     fn is_actionable_key_accepts_repeat() {
         assert!(is_actionable_key(KeyEventKind::Repeat));
+    }
+
+    /// Audit regression: the three overlay-drawing functions computed their
+    /// centered `Rect` with raw `area.width - N` / `area.height - N`
+    /// subtraction (panics on underflow below N cells) and, even where that
+    /// held, could still produce a rect extending past the frame on a small
+    /// terminal (panics inside ratatui's buffer indexing). A 3x3 terminal is
+    /// smaller than every hardcoded margin/height in all three functions.
+    #[test]
+    fn overlays_do_not_panic_on_a_tiny_terminal() {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(3, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let store = Store::in_memory().unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        // draw_confirm_overlay early-returns on Confirm::None (App::new's
+        // default) — set a real variant so the Rect computation actually
+        // runs and the underflow bug would actually be exercised.
+        app.confirm = Confirm::PruneStale;
+
+        terminal.draw(draw_help_overlay).unwrap();
+        terminal.draw(|f| draw_confirm_overlay(f, &app)).unwrap();
+        terminal.draw(|f| draw_search_overlay(f, &mut app)).unwrap();
+    }
+
+    /// Same as above but at 0x0 — the degenerate extreme (`area.width - 4`
+    /// underflows immediately with no room to spare at all).
+    #[test]
+    fn overlays_do_not_panic_on_a_zero_sized_terminal() {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(0, 0);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let store = Store::in_memory().unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        app.confirm = Confirm::PruneStale;
+
+        terminal.draw(draw_help_overlay).unwrap();
+        terminal.draw(|f| draw_confirm_overlay(f, &app)).unwrap();
+        terminal.draw(|f| draw_search_overlay(f, &mut app)).unwrap();
     }
 }

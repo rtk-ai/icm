@@ -1079,41 +1079,49 @@ const MAX_TOPIC_BYTES: usize = 256;
 ///   `MAX_SUMMARY_BYTES` — see the constant docs for rationale.
 fn validate_and_normalize(mut memory: Memory) -> IcmResult<Memory> {
     memory.topic = memory.topic.trim().to_string();
+    validate_fields(&memory.topic, &memory.summary)?;
+    Ok(memory)
+}
 
-    if memory.topic.is_empty() {
+/// The borrowed core of [`validate_and_normalize`], shared with `update()`
+/// (audit finding: the update path previously bypassed every size/content
+/// check, so oversized or NUL-carrying payloads could enter the store by
+/// storing small then updating big).
+fn validate_fields(topic: &str, summary: &str) -> IcmResult<()> {
+    if topic.is_empty() {
         return Err(IcmError::InvalidInput("topic cannot be empty".into()));
     }
-    if memory.summary.trim().is_empty() {
+    if summary.trim().is_empty() {
         return Err(IcmError::InvalidInput("summary cannot be empty".into()));
     }
-    if memory.topic.contains('\0') {
+    if topic.contains('\0') {
         return Err(IcmError::InvalidInput(
             "topic must not contain NUL bytes".into(),
         ));
     }
-    if memory.summary.contains('\0') {
+    if summary.contains('\0') {
         return Err(IcmError::InvalidInput(
             "summary must not contain NUL bytes".into(),
         ));
     }
-    if memory.topic.contains(['\n', '\r', '\t']) {
+    if topic.contains(['\n', '\r', '\t']) {
         return Err(IcmError::InvalidInput(
             "topic must not contain newline / CR / tab characters".into(),
         ));
     }
-    if memory.topic.len() > MAX_TOPIC_BYTES {
+    if topic.len() > MAX_TOPIC_BYTES {
         return Err(IcmError::InvalidInput(format!(
             "topic exceeds {} bytes",
             MAX_TOPIC_BYTES
         )));
     }
-    if memory.summary.len() > MAX_SUMMARY_BYTES {
+    if summary.len() > MAX_SUMMARY_BYTES {
         return Err(IcmError::InvalidInput(format!(
             "summary exceeds {} bytes",
             MAX_SUMMARY_BYTES
         )));
     }
-    Ok(memory)
+    Ok(())
 }
 
 /// Local total order on `Importance` (Critical > High > Medium > Low).
@@ -1348,6 +1356,11 @@ impl MemoryStore for SqliteStore {
     }
 
     fn update(&self, memory: &Memory) -> IcmResult<()> {
+        // Same constraints as `store()` — without this, oversized or
+        // NUL-carrying payloads could bypass validation by storing small
+        // then updating big (audit finding).
+        validate_fields(&memory.topic, &memory.summary)?;
+
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_json = serde_json::to_string(&memory.related_ids)?;
         let st = source_type(&memory.source);
@@ -1359,72 +1372,113 @@ impl MemoryStore for SqliteStore {
         // would otherwise reflect stale state.
         let hash = summary_hash(&memory.topic, &memory.summary);
 
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE memories SET
-                 updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
-                 topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
-                 importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
-                 embedding = ?14, summary_hash = ?15
-                 WHERE id = ?1",
-                params![
-                    memory.id,
-                    memory.updated_at.to_rfc3339(),
-                    memory.last_accessed.to_rfc3339(),
-                    memory.access_count,
-                    memory.weight,
-                    memory.topic,
-                    memory.summary,
-                    memory.raw_excerpt,
-                    keywords_json,
-                    memory.importance.to_string(),
-                    st,
-                    sd,
-                    related_json,
-                    emb_blob,
-                    hash,
-                ],
-            )
+        // memories + vec_memories must move together: a failure between the
+        // row update and the vector sync would leave a memory invisible to
+        // (or stale in) vector search (audit finding — same pattern as
+        // `store()` / `consolidate_topic`).
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
-        if changed == 0 {
-            return Err(IcmError::NotFound(memory.id.clone()));
-        }
-
-        // Sync vec_memories: always delete old, re-insert if embedding exists
-        let _ = self.conn.execute(
-            "DELETE FROM vec_memories WHERE memory_id = ?1",
-            params![memory.id],
-        );
-        if let Some(ref blob) = emb_blob {
-            self.conn
+        let result: IcmResult<()> = (|| {
+            let changed = self
+                .conn
                 .execute(
-                    "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
-                    params![memory.id, blob],
+                    "UPDATE memories SET
+                     updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
+                     topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
+                     importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
+                     embedding = ?14, summary_hash = ?15
+                     WHERE id = ?1",
+                    params![
+                        memory.id,
+                        memory.updated_at.to_rfc3339(),
+                        memory.last_accessed.to_rfc3339(),
+                        memory.access_count,
+                        memory.weight,
+                        memory.topic,
+                        memory.summary,
+                        memory.raw_excerpt,
+                        keywords_json,
+                        memory.importance.to_string(),
+                        st,
+                        sd,
+                        related_json,
+                        emb_blob,
+                        hash,
+                    ],
                 )
                 .map_err(db_err)?;
-        }
 
-        self.cache_invalidate(&memory.id);
-        Ok(())
+            if changed == 0 {
+                return Err(IcmError::NotFound(memory.id.clone()));
+            }
+
+            // Sync vec_memories: always delete old, re-insert if embedding exists
+            self.conn
+                .execute(
+                    "DELETE FROM vec_memories WHERE memory_id = ?1",
+                    params![memory.id],
+                )
+                .map_err(db_err)?;
+            if let Some(ref blob) = emb_blob {
+                self.conn
+                    .execute(
+                        "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
+                        params![memory.id, blob],
+                    )
+                    .map_err(db_err)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                self.cache_invalidate(&memory.id);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     fn delete(&self, id: &str) -> IcmResult<()> {
-        let _ = self
-            .conn
-            .execute("DELETE FROM vec_memories WHERE memory_id = ?1", params![id]);
-
-        let changed = self
-            .conn
-            .execute("DELETE FROM memories WHERE id = ?1", params![id])
+        // Both deletes in one transaction so a failure can't strand an
+        // orphaned vector or a memory whose vector is gone (audit finding).
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
-        if changed == 0 {
-            return Err(IcmError::NotFound(id.to_string()));
+        let result: IcmResult<()> = (|| {
+            self.conn
+                .execute("DELETE FROM vec_memories WHERE memory_id = ?1", params![id])
+                .map_err(db_err)?;
+
+            let changed = self
+                .conn
+                .execute("DELETE FROM memories WHERE id = ?1", params![id])
+                .map_err(db_err)?;
+
+            if changed == 0 {
+                return Err(IcmError::NotFound(id.to_string()));
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                self.cache_invalidate(id);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
         }
-        self.cache_invalidate(id);
-        Ok(())
     }
 
     fn search_by_keywords(&self, keywords: &[&str], limit: usize) -> IcmResult<Vec<Memory>> {
@@ -1728,26 +1782,45 @@ impl MemoryStore for SqliteStore {
     }
 
     fn prune(&self, weight_threshold: f32) -> IcmResult<usize> {
-        // Never prune critical or high importance memories
-        let _ = self.conn.execute(
-            "DELETE FROM vec_memories WHERE memory_id IN (
-                SELECT id FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')
-            )",
-            params![weight_threshold],
-        );
+        // Never prune critical or high importance memories. Both deletes in
+        // one transaction, and the vec_memories error is propagated instead
+        // of swallowed — a partial prune would leave orphaned vectors that
+        // keep matching KNN search for rows that no longer exist (audit
+        // finding).
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(db_err)?;
 
-        let changed = self
-            .conn
-            .execute(
-                "DELETE FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')",
+        let result: IcmResult<usize> = (|| {
+            self.conn.execute(
+                "DELETE FROM vec_memories WHERE memory_id IN (
+                    SELECT id FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')
+                )",
                 params![weight_threshold],
             )
             .map_err(db_err)?;
 
-        if changed > 0 {
-            self.cache_clear();
+            self.conn
+                .execute(
+                    "DELETE FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')",
+                    params![weight_threshold],
+                )
+                .map_err(db_err)
+        })();
+
+        match result {
+            Ok(changed) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                if changed > 0 {
+                    self.cache_clear();
+                }
+                Ok(changed)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
         }
-        Ok(changed)
     }
 
     fn get_by_topic(&self, topic: &str) -> IcmResult<Vec<Memory>> {
@@ -1793,14 +1866,23 @@ impl MemoryStore for SqliteStore {
     }
 
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()> {
+        // The consolidated memory goes through the same validation as any
+        // other write — MCP `icm_memory_consolidate` passes a caller-provided
+        // summary that previously bypassed every size/content check.
+        let consolidated = validate_and_normalize(consolidated)?;
+
         self.conn
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
+        // `critical` memories are never deleted — same contract as
+        // `apply_decay` and `prune`. Consolidation replaces the expendable
+        // tail of a topic, not its "never forget" entries (audit finding:
+        // this DELETE previously wiped critical memories too).
         // Clean vec_memories for entries about to be deleted
         if let Err(e) = self.conn.execute(
             "DELETE FROM vec_memories WHERE memory_id IN (
-                SELECT id FROM memories WHERE topic = ?1
+                SELECT id FROM memories WHERE topic = ?1 AND importance != 'critical'
             )",
             params![topic],
         ) {
@@ -1809,10 +1891,10 @@ impl MemoryStore for SqliteStore {
             return Err(IcmError::Database(e.to_string()));
         }
 
-        if let Err(e) = self
-            .conn
-            .execute("DELETE FROM memories WHERE topic = ?1", params![topic])
-        {
+        if let Err(e) = self.conn.execute(
+            "DELETE FROM memories WHERE topic = ?1 AND importance != 'critical'",
+            params![topic],
+        ) {
             tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after memories delete failed");
             let _ = self.conn.execute_batch("ROLLBACK;");
             return Err(IcmError::Database(e.to_string()));
@@ -3174,6 +3256,22 @@ impl TranscriptStore for SqliteStore {
         tokens: Option<i64>,
         metadata: Option<&str>,
     ) -> IcmResult<String> {
+        /// Cap on a single transcript message. Unlike memory writes (which
+        /// reject oversized input), transcripts are best-effort logs — a
+        /// multi-MB tool dump is truncated rather than lost entirely. The
+        /// MCP `icm_transcript_record` path previously had no bound at all
+        /// (audit finding).
+        const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+        let content = if content.len() > MAX_MESSAGE_BYTES {
+            let mut cut = MAX_MESSAGE_BYTES;
+            while !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            &content[..cut]
+        } else {
+            content
+        };
+
         let msg = Message::new(
             session_id.to_string(),
             role,
@@ -3582,7 +3680,12 @@ impl SqliteStore {
         }
 
         let mut memories = self.get_by_topic(topic)?;
-        if memories.is_empty() {
+        // `critical` memories are exempt from consolidation (consolidate_topic
+        // won't delete them), so they neither count toward the threshold nor
+        // feed the rollup summary — otherwise a topic holding >= threshold
+        // criticals would re-consolidate on every store, churning forever.
+        memories.retain(|m| !matches!(m.importance, Importance::Critical));
+        if memories.is_empty() || memories.len() < threshold {
             return Ok(false);
         }
 
@@ -3599,7 +3702,17 @@ impl SqliteStore {
             .take(3)
             .map(|m| m.summary.as_str())
             .collect();
-        let consolidated_summary = top_summaries.join(" | ");
+        let mut consolidated_summary = top_summaries.join(" | ");
+        // Three max-size summaries joined can exceed MAX_SUMMARY_BYTES, and
+        // consolidate_topic now validates its input — truncate on a char
+        // boundary so the rollup can't fail its own size check.
+        if consolidated_summary.len() > MAX_SUMMARY_BYTES {
+            let mut cut = MAX_SUMMARY_BYTES;
+            while !consolidated_summary.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            consolidated_summary.truncate(cut);
+        }
 
         // Merge all unique keywords
         let mut all_keywords: Vec<String> = Vec::new();
@@ -4767,6 +4880,122 @@ mod tests {
 
         // topic-b should be untouched
         assert_eq!(store.get_by_topic("topic-b").unwrap().len(), 1);
+    }
+
+    /// Audit regression: consolidation must honor the "critical = never
+    /// forget" contract that `apply_decay` and `prune` already respect.
+    #[test]
+    fn consolidate_topic_preserves_critical_memories() {
+        let store = test_store();
+        store.store(make_memory("t", "expendable 1")).unwrap();
+        store.store(make_memory("t", "expendable 2")).unwrap();
+        store
+            .store(Memory::new(
+                "t".into(),
+                "never forget this".into(),
+                Importance::Critical,
+            ))
+            .unwrap();
+
+        store
+            .consolidate_topic("t", make_memory("t", "rollup"))
+            .unwrap();
+
+        let after = store.get_by_topic("t").unwrap();
+        let summaries: Vec<&str> = after.iter().map(|m| m.summary.as_str()).collect();
+        assert_eq!(after.len(), 2, "critical + consolidated must both survive");
+        assert!(summaries.contains(&"never forget this"));
+        assert!(summaries.contains(&"rollup"));
+        assert!(!summaries.contains(&"expendable 1"));
+    }
+
+    /// Audit regression: critical memories are exempt from consolidation, so
+    /// they must not count toward the auto-consolidate threshold — otherwise
+    /// a topic full of criticals would churn a fresh rollup on every store.
+    #[test]
+    fn auto_consolidate_ignores_critical_for_threshold() {
+        let store = test_store();
+        for i in 0..3 {
+            store
+                .store(Memory::new(
+                    "t".into(),
+                    format!("critical {i}"),
+                    Importance::Critical,
+                ))
+                .unwrap();
+        }
+        store.store(make_memory("t", "one expendable")).unwrap();
+
+        // 4 total but only 1 consolidatable — below threshold 3.
+        assert!(!store.auto_consolidate("t", 3).unwrap());
+        assert_eq!(store.get_by_topic("t").unwrap().len(), 4);
+
+        store.store(make_memory("t", "expendable 2")).unwrap();
+        store.store(make_memory("t", "expendable 3")).unwrap();
+
+        // Now 3 consolidatable — rollup fires, criticals survive.
+        assert!(store.auto_consolidate("t", 3).unwrap());
+        let after = store.get_by_topic("t").unwrap();
+        let criticals = after
+            .iter()
+            .filter(|m| matches!(m.importance, Importance::Critical))
+            .count();
+        assert_eq!(criticals, 3, "all criticals must survive the rollup");
+        assert_eq!(after.len(), 4, "3 criticals + 1 consolidated");
+    }
+
+    /// Audit regression: `update()` previously bypassed all validation, so
+    /// oversized or NUL-carrying payloads could enter via store-small-then-
+    /// update-big.
+    #[test]
+    fn update_rejects_oversized_and_nul_payloads() {
+        let store = test_store();
+        let id = store.store(make_memory("t", "small")).unwrap();
+        let mut m = store.get(&id).unwrap().unwrap();
+
+        m.summary = "x".repeat(MAX_SUMMARY_BYTES + 1);
+        assert!(matches!(store.update(&m), Err(IcmError::InvalidInput(_))));
+
+        m.summary = "has a \0 NUL".into();
+        assert!(matches!(store.update(&m), Err(IcmError::InvalidInput(_))));
+
+        // The stored row is untouched by the rejected updates.
+        assert_eq!(store.get(&id).unwrap().unwrap().summary, "small");
+    }
+
+    /// Audit regression: the MCP consolidate path passes a caller-provided
+    /// summary that previously bypassed every size check.
+    #[test]
+    fn consolidate_topic_validates_consolidated_summary() {
+        let store = test_store();
+        store.store(make_memory("t", "entry")).unwrap();
+
+        let oversized = make_memory("t", &"x".repeat(MAX_SUMMARY_BYTES + 1));
+        assert!(matches!(
+            store.consolidate_topic("t", oversized),
+            Err(IcmError::InvalidInput(_))
+        ));
+        // Originals untouched on rejection.
+        assert_eq!(store.get_by_topic("t").unwrap().len(), 1);
+    }
+
+    /// Audit regression: transcript messages had no size bound at all; they
+    /// are best-effort logs, so oversized content is truncated, not lost.
+    #[test]
+    fn record_message_truncates_oversized_content() {
+        let store = test_store();
+        let sid = store.create_session("test-agent", None, None).unwrap();
+        let big = "é".repeat(200 * 1024); // 400 KB of two-byte chars
+        store
+            .record_message(&sid, Role::User, &big, None, None, None)
+            .unwrap();
+
+        let msgs = store.list_session_messages(&sid, 10, 0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.len() <= 256 * 1024);
+        assert!(!msgs[0].content.is_empty());
+        // Truncation must respect char boundaries (no broken UTF-8).
+        assert!(msgs[0].content.chars().all(|c| c == 'é'));
     }
 
     /// Reproduces issue #44: after consolidation, recall should only return the

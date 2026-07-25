@@ -35,10 +35,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # The `web` feature is off by default and was never compiled anywhere in
-      # CI — a breakage in web.rs would ship unnoticed (audit finding).
-      - name: Check non-default `web` feature compiles
-        run: cargo clippy -p icm-cli --features web --all-targets -- -D warnings
+      # The `web` and `bench` features are off by default and would otherwise
+      # never be compiled in CI — a breakage would ship unnoticed (audit
+      # finding).
+      - name: Check non-default `web` + `bench` features compile
+        run: cargo clippy -p icm-cli --features web,bench --all-targets -- -D warnings
 
   # ─── Parallel gates (require code to compile) ───
 

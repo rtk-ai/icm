@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use icm_core::{IcmError, IcmResult};
 
@@ -135,11 +135,33 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             return Err(db_err(e));
         }
     }
-    // Ensure the partial unique index exists even on DBs that ran an old
-    // CREATE TABLE (which had no summary_hash column to index against).
+    // Migration: the index used to be `(LOWER(topic), summary_hash)`, but
+    // `summary_hash` already encodes the topic via Rust's Unicode-correct
+    // `to_lowercase()`, while SQLite's built-in `LOWER()` is ASCII-only
+    // (doesn't fold 'É' → 'é') — the composite key let two rows with an
+    // identical `summary_hash` coexist whenever their topic's SQL-LOWER()
+    // forms differed (e.g. "Décisions" vs "DÉCISIONS"), defeating dedup
+    // for accented topics (audit finding). `summary_hash` alone is
+    // sufficient. `CREATE INDEX IF NOT EXISTS` would silently keep the old
+    // definition on an already-migrated DB (same index name), so drop it
+    // first if it still has the old column list.
+    let old_index_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_topic_hash'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    if let Some(sql) = old_index_sql {
+        if sql.contains("LOWER(topic)") {
+            conn.execute_batch("DROP INDEX idx_memories_topic_hash;")
+                .map_err(db_err)?;
+        }
+    }
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_topic_hash
-            ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;",
+            ON memories(summary_hash) WHERE summary_hash IS NOT NULL;",
     )
     .map_err(db_err)?;
 
@@ -656,6 +678,43 @@ mod tests {
 
         // Re-running the migration is idempotent.
         init_db(&conn).expect("re-running migration must be a no-op");
+    }
+
+    /// Audit regression: a DB created under the old schema has the index as
+    /// `(LOWER(topic), summary_hash)`. `CREATE INDEX IF NOT EXISTS` alone
+    /// would silently keep that old (buggy, ASCII-only LOWER) definition
+    /// forever since the index NAME already exists — the migration must
+    /// detect and replace it.
+    #[test]
+    fn test_migration_replaces_old_composite_topic_hash_index() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).expect("fresh init must succeed");
+
+        // Force the DB back to the OLD index definition, as if it had been
+        // created before this fix.
+        conn.execute_batch("DROP INDEX idx_memories_topic_hash;")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX idx_memories_topic_hash
+                ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;",
+        )
+        .unwrap();
+
+        // Re-running init_db must detect and replace the old definition.
+        init_db(&conn).expect("migration must succeed");
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_topic_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !sql.contains("LOWER(topic)"),
+            "old composite index definition must be replaced, got: {sql}"
+        );
     }
 
     #[test]

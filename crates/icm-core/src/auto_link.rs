@@ -97,6 +97,15 @@ pub fn auto_link_memory<S: MemoryStore + ?Sized>(
 /// Best-effort: a failure on one back-ref is logged by the caller but does
 /// not roll back the others. The graph is allowed to be slightly asymmetric
 /// under error conditions rather than losing the whole operation.
+/// Cap on a single memory's `related_ids` from backrefs. Outgoing links
+/// from a freshly-stored memory are bounded by `AutoLinkOptions::max_links`
+/// (default 5), but nothing capped the INCOMING side: a "hub" memory that
+/// many future stores happen to resemble would otherwise accumulate
+/// backrefs forever, and dead/duplicate entries are never swept (delete/
+/// prune don't clean up related_ids pointing at them either) — audit
+/// finding. 50 is generous (10x the outgoing default) while still bounded.
+const MAX_BACKREFS: usize = 50;
+
 pub fn add_backrefs<S: MemoryStore + ?Sized>(
     store: &S,
     new_memory_id: &str,
@@ -104,8 +113,19 @@ pub fn add_backrefs<S: MemoryStore + ?Sized>(
 ) -> IcmResult<usize> {
     let mut updated = 0usize;
     for id in linked_ids {
+        // Self-reference guard (audit finding): a near-duplicate store can
+        // link a brand-new ULID to an existing memory M, then have the
+        // exact-hash dedup path collapse the "new" memory back onto M's own
+        // id before add_backrefs runs — without this check, M would end up
+        // with itself in its own related_ids.
+        if id == new_memory_id {
+            continue;
+        }
         if let Some(mut existing) = store.get(id)? {
             if existing.related_ids.iter().any(|r| r == new_memory_id) {
+                continue;
+            }
+            if existing.related_ids.len() >= MAX_BACKREFS {
                 continue;
             }
             existing.related_ids.push(new_memory_id.to_string());
@@ -406,5 +426,44 @@ mod tests {
         // No memories inserted — linked_ids point to ghosts.
         let updated = add_backrefs(&store, "01NEW", &["ghost1".into(), "ghost2".into()]).unwrap();
         assert_eq!(updated, 0);
+    }
+
+    /// Audit regression: a near-dup merge can hand `add_backrefs` a
+    /// `linked_ids` list containing the SAME id as `new_memory_id` (the
+    /// exact-hash dedup path collapses a brand-new ULID back onto an
+    /// existing memory's own id before backrefs run). Without a guard, a
+    /// memory would end up pointing at itself in its own `related_ids`.
+    #[test]
+    fn add_backrefs_never_creates_a_self_reference() {
+        let store = FakeStore::new();
+        let mem = Memory::new("t".into(), "self-ref probe".into(), Importance::Medium);
+        let id = mem.id.clone();
+        store.insert(mem, 1.0);
+
+        let updated = add_backrefs(&store, &id, std::slice::from_ref(&id)).unwrap();
+        assert_eq!(updated, 0, "a self-referential backref must not be applied");
+        let after = store.get(&id).unwrap().unwrap();
+        assert!(
+            !after.related_ids.contains(&id),
+            "memory must not end up referencing itself: {:?}",
+            after.related_ids
+        );
+    }
+
+    /// Audit regression: incoming backrefs ("hub" memories that many future
+    /// stores happen to resemble) had no cap — `related_ids` could grow
+    /// forever. `MAX_BACKREFS` bounds it.
+    #[test]
+    fn add_backrefs_stops_growing_past_the_cap() {
+        let store = FakeStore::new();
+        let mut hub = Memory::new("t".into(), "hub probe".into(), Importance::Medium);
+        hub.related_ids = (0..MAX_BACKREFS).map(|i| format!("existing-{i}")).collect();
+        let hub_id = hub.id.clone();
+        store.insert(hub, 1.0);
+
+        let updated = add_backrefs(&store, "one-more", std::slice::from_ref(&hub_id)).unwrap();
+        assert_eq!(updated, 0, "a hub already at the cap must not grow further");
+        let after = store.get(&hub_id).unwrap().unwrap();
+        assert_eq!(after.related_ids.len(), MAX_BACKREFS);
     }
 }

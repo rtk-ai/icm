@@ -419,8 +419,37 @@ impl SqliteStore {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
 
-        // Atomic check-and-update: only one caller wins the race.
-        // First, try to claim the decay slot by inserting or conditionally updating.
+        // Audit finding: this used to apply a flat 0.95 step whenever >= 1
+        // day had passed, regardless of HOW MANY days had actually passed —
+        // a machine touched once a week decayed at 0.95/week (≈0.993/day)
+        // instead of the documented 0.95/day. Read the previous timestamp
+        // first so the step can be `0.95 ^ elapsed_days` (compounded),
+        // matching the documented per-day rate regardless of gaps between
+        // calls. (The 0.95 base itself stays hardcoded here — wiring the
+        // CLI's configurable `decay_rate` through to this crate is a
+        // separate, out-of-scope change.)
+        let last_decay_at: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'last_decay_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let elapsed_days = last_decay_at
+            .as_deref()
+            .and_then(|prev| prev.parse::<DateTime<Utc>>().ok())
+            .map(|prev| (now - prev).num_seconds() as f64 / 86_400.0)
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(1.0); // first run ever: preserve the historical single-step behavior
+
+        // Atomic check-and-update: only one caller wins the race. (A narrow
+        // window between the read above and this claim could let a losing
+        // racer's `elapsed_days` be computed from a slightly stale
+        // timestamp, but only one claim ever succeeds — a day or two of
+        // imprecision in a decay RATE is harmless, not worth a stricter
+        // compare-and-swap loop.)
         let changed = self
             .conn
             .execute(
@@ -432,7 +461,8 @@ impl SqliteStore {
             .map_err(db_err)?;
 
         if changed > 0 {
-            self.apply_decay(0.95)?;
+            let factor = 0.95_f64.powf(elapsed_days) as f32;
+            self.apply_decay(factor)?;
         }
 
         Ok(())
@@ -1002,6 +1032,16 @@ const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_cou
 /// A query like `"sqlite-vec"` makes FTS5 interpret `-` as NOT and `vec` as a
 /// column name, causing "no such column: vec".
 ///
+/// Escape `%`, `_`, and the escape character itself so a keyword can be
+/// safely wrapped in a `%...%` LIKE pattern. Pair with `ESCAPE '\'` in the
+/// SQL — without it, a keyword containing `%` matches every row and `_`
+/// matches any single character (audit finding).
+fn escape_like_wildcards(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// This function strips special chars and wraps each token in double quotes.
 fn sanitize_fts_query(query: &str) -> String {
     // Limit input length to prevent abuse (UTF-8 safe truncation)
@@ -1243,9 +1283,19 @@ impl SqliteStore {
             ) = self
                 .conn
                 .query_row(
+                    // Audit finding: `summary_hash` already encodes the topic
+                    // (Rust `to_lowercase()`, full Unicode) as part of the
+                    // hash input — an additional `LOWER(topic) = LOWER(?)`
+                    // comparison here used SQLite's built-in `LOWER()`,
+                    // which is ASCII-only and does not fold e.g. 'É' → 'é'.
+                    // For an all-caps accented topic like "DÉCISIONS" that
+                    // mismatch meant this SELECT could fail to find the row
+                    // the `INSERT OR IGNORE` conflict was already about,
+                    // even though `summary_hash` alone uniquely identifies
+                    // it. `summary_hash` is sufficient on its own.
                     "SELECT id, importance, keywords, raw_excerpt FROM memories
-                     WHERE LOWER(topic) = LOWER(?1) AND summary_hash = ?2",
-                    params![memory.topic, hash],
+                     WHERE summary_hash = ?1",
+                    params![hash],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(db_err)?;
@@ -1490,10 +1540,20 @@ impl MemoryStore for SqliteStore {
         let keywords = &keywords[..keywords.len().min(50)];
         let limit = limit.min(100);
 
+        // Audit finding: a keyword containing `%` or `_` was interpolated
+        // straight into the LIKE pattern unescaped. `%` matches every row
+        // (`"100%"` as a keyword becomes the pattern `%100%%%`, which
+        // degrades to "contains 100" at best and can blow up matching);
+        // `_` matches any single character (`"snake_case"` also matches
+        // "snakeXcase"). Both are plausible keywords coming from an LLM via
+        // MCP. Escape them and declare the escape character explicitly.
         let where_parts: Vec<String> = (0..keywords.len())
             .map(|i| {
                 let p = i + 1;
-                format!("(keywords LIKE ?{p} OR summary LIKE ?{p} OR topic LIKE ?{p})")
+                format!(
+                    "(keywords LIKE ?{p} ESCAPE '\\' OR summary LIKE ?{p} ESCAPE '\\' \
+                     OR topic LIKE ?{p} ESCAPE '\\')"
+                )
             })
             .collect();
         let where_clause = where_parts.join(" OR ");
@@ -1507,7 +1567,10 @@ impl MemoryStore for SqliteStore {
 
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = keywords
             .iter()
-            .map(|k| Box::new(format!("%{k}%")) as Box<dyn rusqlite::types::ToSql>)
+            .map(|k| {
+                Box::new(format!("%{}%", escape_like_wildcards(k)))
+                    as Box<dyn rusqlite::types::ToSql>
+            })
             .collect();
         param_values.push(Box::new(limit as i64));
 
@@ -1764,10 +1827,19 @@ impl MemoryStore for SqliteStore {
         //   high:     0.5x decay (half speed)
         //   medium:   1.0x decay (normal)
         //   low:      2.0x decay (double speed)
+        // Audit finding: for `low` importance (2x multiplier) with a
+        // low-access memory, the multiplier `1.0 - (1.0-f)*mult/denom` goes
+        // NEGATIVE once `f < 0.5` — `icm decay --factor 0.4` (accepted by
+        // the CLI's own `[0.0, 1.0)` validation) drove low-importance
+        // weights negative, putting them last in every `ORDER BY weight
+        // DESC` and prunable on the next pass. `MAX(0.0, ...)` clamps the
+        // multiplier at the SQL layer so weight can never go negative
+        // regardless of the caller (CLI, MCP, or any future direct caller
+        // that bypasses the CLI's own boundary check).
         let changed = self
             .conn
             .execute(
-                "UPDATE memories SET weight = weight * (
+                "UPDATE memories SET weight = weight * MAX(0.0,
                     1.0 - (1.0 - ?1) *
                     CASE importance
                         WHEN 'high' THEN 0.5
@@ -4764,6 +4836,68 @@ mod tests {
         assert_eq!(affected, 1); // Only the non-critical one
     }
 
+    /// Audit regression: `apply_decay` must never drive weight negative.
+    /// Low importance (2x multiplier), zero access count, factor=0.4 (still
+    /// inside the CLI's own `[0.0, 1.0)` validation) makes the raw
+    /// multiplier `1.0 - (1.0-0.4)*2.0 = -0.2` — negative before the
+    /// `MAX(0.0, ...)` clamp.
+    #[test]
+    fn test_apply_decay_never_goes_negative() {
+        let store = test_store();
+        let mut low = make_memory("t", "low importance, never accessed");
+        low.importance = Importance::Low;
+        store.store(low).unwrap();
+
+        store.apply_decay(0.4).unwrap();
+
+        let mem = store.get_by_topic("t").unwrap().into_iter().next().unwrap();
+        assert!(
+            mem.weight >= 0.0,
+            "weight must never go negative, got {}",
+            mem.weight
+        );
+    }
+
+    /// Audit regression: `maybe_auto_decay` used to apply a flat 0.95 step
+    /// whenever >= 1 day had passed, regardless of how many days actually
+    /// elapsed. Simulate a 5-day gap (by backdating `last_decay_at`
+    /// directly) and assert the applied decay compounds to ~0.95^5, not a
+    /// single 0.95 step.
+    #[test]
+    fn test_maybe_auto_decay_scales_with_elapsed_days() {
+        let store = test_store();
+        let mut mem = make_memory("t", "elapsed-days probe");
+        mem.importance = Importance::Medium;
+        store.store(mem).unwrap();
+
+        let five_days_ago = (Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        store
+            .conn
+            .execute(
+                "INSERT INTO icm_metadata (key, value) VALUES ('last_decay_at', ?1)",
+                params![five_days_ago],
+            )
+            .unwrap();
+
+        store.maybe_auto_decay().unwrap();
+
+        let after = store.get_by_topic("t").unwrap().into_iter().next().unwrap();
+        // Medium importance, access_count=0 -> multiplier = factor directly.
+        let expected_single_step = 0.95_f32;
+        let expected_five_days = 0.95_f32.powi(5);
+        assert!(
+            (after.weight - expected_five_days).abs() < 0.01,
+            "expected weight ~{expected_five_days} (0.95^5) for a 5-day gap, got {}",
+            after.weight
+        );
+        assert!(
+            after.weight < expected_single_step - 0.05,
+            "a 5-day gap must decay more than a single flat 0.95 step \
+             (got {}, single-step would be {expected_single_step})",
+            after.weight
+        );
+    }
+
     #[test]
     fn test_apply_decay_caps_access_count_amplification() {
         // Audit #185 H7: the pre-fix decay formula had an uncapped
@@ -6804,6 +6938,62 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// Audit regression: an unescaped `%` keyword degenerates into a
+    /// match-everything LIKE pattern instead of matching literal `%`.
+    #[test]
+    fn test_search_by_keywords_escapes_percent_wildcard() {
+        let store = test_store();
+        // Contains the literal substring "100%" — the only row that should
+        // match a properly-escaped '100%' keyword.
+        store
+            .store(make_memory("t", "revenue grew by 100% year over year"))
+            .unwrap();
+        // Decoy: contains "100" but NOT the literal "100%". An unescaped
+        // '%' in the keyword makes the LIKE pattern `%100%%`, which SQLite
+        // collapses to `%100%` ("contains 100 anywhere") — this row would
+        // wrongly match under that bug, since it's the difference between
+        // "contains the substring 100%" and "contains 100".
+        store
+            .store(make_memory("t", "the report has exactly 100 lines total"))
+            .unwrap();
+
+        let results = store.search_by_keywords(&["100%"], 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "a literal '100%' keyword must match only rows containing that exact \
+             substring, not any row containing '100', got {} hits",
+            results.len()
+        );
+        assert!(results[0].summary.contains("100%"));
+    }
+
+    /// Audit regression: an unescaped `_` keyword matches any single
+    /// character in that position, so "snake_case" would also match
+    /// "snakeXcase" for any X.
+    #[test]
+    fn test_search_by_keywords_escapes_underscore_wildcard() {
+        let store = test_store();
+        store
+            .store(make_memory("t", "uses snake_case naming"))
+            .unwrap();
+        store
+            .store(make_memory(
+                "t",
+                "uses snakeXcase naming (not the real word)",
+            ))
+            .unwrap();
+
+        let results = store.search_by_keywords(&["snake_case"], 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "'_' in a keyword must be literal, not a single-char wildcard, got {} hits",
+            results.len()
+        );
+        assert!(results[0].summary.contains("snake_case"));
+    }
+
     #[test]
     fn test_update_nonexistent_memory() {
         let store = test_store();
@@ -7311,6 +7501,26 @@ mod tests {
         let id1 = store.store(m1).unwrap();
         let id2 = store.store(m2).unwrap();
         assert_eq!(id1, id2);
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    /// Audit regression: SQLite's built-in `LOWER()` is ASCII-only and does
+    /// not fold 'É' → 'é', while `summary_hash` uses Rust's Unicode-correct
+    /// `to_lowercase()`. Two topics that differ only in the case of an
+    /// accented letter must still dedup — this used to fail because the
+    /// (now-removed) `LOWER(topic)` index column and SELECT comparison
+    /// disagreed with the hash's own case-folding.
+    #[test]
+    fn test_dedup_normalizes_accented_case() {
+        let store = test_store();
+        let m1 = make_memory("Décisions", "on utilise Turso pour la synchro");
+        let m2 = make_memory("DÉCISIONS", "on utilise Turso pour la synchro");
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+        assert_eq!(
+            id1, id2,
+            "accented topics differing only in case must dedup to the same row"
+        );
         assert_eq!(store.count().unwrap(), 1);
     }
 

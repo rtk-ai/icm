@@ -2371,7 +2371,11 @@ fn cmd_store(
                     memory.keywords.clone()
                 },
                 embedding: memory.embedding.clone(),
-                importance,
+                // Never let a near-dup merge downgrade importance — a
+                // `--importance` omission defaults to Medium and would
+                // otherwise silently demote an existing Critical memory
+                // into decay/prune eligibility (audit finding).
+                importance: icm_core::max_importance(existing.importance, importance),
                 source: existing.source,
                 related_ids: existing.related_ids,
                 scope: existing.scope,

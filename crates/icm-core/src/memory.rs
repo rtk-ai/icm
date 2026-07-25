@@ -102,6 +102,35 @@ pub enum Importance {
     Low,
 }
 
+/// Local total order on `Importance` (Critical > High > Medium > Low).
+/// `Importance` does not implement `Ord` because the project does not want
+/// to imply a globally meaningful ordering across all uses (presentation,
+/// filtering, etc.) — this is deliberately scoped to dedup/merge decisions.
+fn importance_rank(i: Importance) -> u8 {
+    match i {
+        Importance::Critical => 4,
+        Importance::High => 3,
+        Importance::Medium => 2,
+        Importance::Low => 1,
+    }
+}
+
+/// Return the higher-priority importance. Any dedup/near-dup merge path
+/// should use this instead of blindly adopting the incoming value: a
+/// near-duplicate MCP `icm_memory_store` call defaults to `Medium` when the
+/// caller omits `importance`, and using it as-is would silently downgrade
+/// an existing `Critical` memory to `Medium` — making it eligible for decay
+/// and prune despite the "critical = never forget" contract (audit
+/// finding). "Re-store with a higher priority upgrades; it never
+/// downgrades."
+pub fn max_importance(a: Importance, b: Importance) -> Importance {
+    if importance_rank(a) >= importance_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
 impl fmt::Display for Importance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

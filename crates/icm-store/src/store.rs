@@ -1641,9 +1641,15 @@ impl MemoryStore for SqliteStore {
                 }) {
                     for row in rows.flatten() {
                         let (memory, rank) = row;
-                        // Normalize FTS rank (lower is better, typically negative)
-                        // Convert to 0..1 score where higher is better
-                        let score = 1.0 / (1.0 + rank.abs());
+                        // FTS5 bm25 rank is <= 0, MORE negative = MORE
+                        // relevant. `1.0 / (1.0 + |rank|)` inverted this: it
+                        // DECREASES as relevance increases (audit finding,
+                        // proven wrong e.g. rank=-4.83 (strong match) scored
+                        // 0.17 while rank=-0.2 (weak match) scored 0.83).
+                        // `|rank| / (1.0 + |rank|)` keeps the same bounded
+                        // [0,1) shape but is correctly monotonically
+                        // INCREASING in relevance.
+                        let score = rank.abs() / (1.0 + rank.abs());
                         fts_scores.insert(memory.id.clone(), score);
                         all_memories.insert(memory.id.clone(), memory);
                     }
@@ -5551,6 +5557,86 @@ mod tests {
         assert_eq!(results[0].0.topic, "rust");
         // Score should be > 0
         assert!(results[0].1 > 0.0);
+    }
+
+    /// Audit regression: `1.0 / (1.0 + rank.abs())` inverted FTS relevance —
+    /// a stronger bm25 match (more negative rank) scored LOWER than a weak
+    /// one. Neither memory has an embedding, which isolates the FTS
+    /// component of the hybrid score (vector side is 0.0 for both).
+    #[test]
+    fn test_search_hybrid_ranks_strong_fts_match_above_weak_one() {
+        let store = test_store();
+
+        // Strong match: the query term repeated, short document — bm25
+        // favors high term frequency in a short field.
+        store
+            .store(make_memory(
+                "t",
+                "database database database database database",
+            ))
+            .unwrap();
+        // Weak match: the query term appears once, diluted by many other
+        // unrelated terms — bm25 penalizes this relative to the strong doc.
+        store
+            .store(make_memory(
+                "t",
+                "we briefly touched on a database as one topic among many \
+                 entirely unrelated software engineering concerns discussed today",
+            ))
+            .unwrap();
+
+        let no_embedding = vec![0.0; 384];
+        let results = store.search_hybrid("database", &no_embedding, 5).unwrap();
+        assert_eq!(results.len(), 2);
+        let strong = results
+            .iter()
+            .find(|(m, _)| m.summary.starts_with("database database"))
+            .expect("strong match must be present");
+        let weak = results
+            .iter()
+            .find(|(m, _)| m.summary.starts_with("we briefly"))
+            .expect("weak match must be present");
+        assert!(
+            strong.1 > weak.1,
+            "strong FTS match ({}) must outscore weak match ({})",
+            strong.1,
+            weak.1
+        );
+    }
+
+    /// Audit regression: `find_similar_memory` used to compare
+    /// `DEDUP_SIMILARITY_THRESHOLD` (0.85) against the hybrid
+    /// `0.3*fts + 0.7*cosine` score. A memory found ONLY via the vector
+    /// side (no shared keywords, so fts=0) could score at most
+    /// `0.3*0 + 0.7*1.0 = 0.70` even for a byte-identical embedding —
+    /// always below 0.85, so semantic-only duplicates were never caught.
+    /// Switching to pure `search_by_embedding` (cosine) fixes this: an
+    /// identical embedding now scores ~1.0, comfortably above threshold,
+    /// regardless of keyword overlap.
+    #[test]
+    fn test_find_similar_memory_detects_purely_semantic_duplicate() {
+        let store = test_store();
+        let embedding = vec![0.42; 384];
+
+        let mut original = make_memory("t", "the quick brown fox jumps over the lazy dog");
+        original.embedding = Some(embedding.clone());
+        store.store(original).unwrap();
+
+        // Shares literally no keywords with the stored summary — the FTS
+        // component of the old hybrid comparison would be exactly 0.0.
+        let found = icm_core::find_similar_memory(
+            &store,
+            "a fast animal leaping above a sleepy canine",
+            &embedding,
+            "t",
+            icm_core::DEDUP_SIMILARITY_THRESHOLD,
+        )
+        .unwrap();
+        assert!(
+            found.is_some(),
+            "an identical embedding must be detected as a duplicate even with zero keyword overlap"
+        );
+        assert!(found.unwrap().1 > 0.99);
     }
 
     #[test]

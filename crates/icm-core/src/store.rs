@@ -8,14 +8,25 @@ pub const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.85;
 ///
 /// Returns the closest match and its similarity score if the score exceeds `threshold`
 /// and the match belongs to the same topic. Returns `None` otherwise.
+///
+/// Uses `search_by_embedding` (pure cosine similarity) rather than
+/// `search_hybrid`. Dedup is fundamentally a "is this the same content"
+/// question, which cosine similarity answers directly. The hybrid blend
+/// (`0.3*fts + 0.7*cosine`) is tuned for human-facing recall RANKING, not
+/// for a duplicate/not-duplicate decision — diluting an exact semantic
+/// match (cosine=1.0) with an FTS component made the 0.85 threshold nearly
+/// unreachable even for byte-identical content once the FTS side scored
+/// low (e.g. AND-joined tokens not matching), and a purely vector-side
+/// match (no shared keywords, cosine=1.0) could never exceed
+/// `0.3*0 + 0.7*1.0 = 0.70` (audit finding).
 pub fn find_similar_memory(
     store: &dyn MemoryStore,
-    embed_text: &str,
+    _embed_text: &str,
     embedding: &[f32],
     topic: &str,
     threshold: f32,
 ) -> IcmResult<Option<(Memory, f32)>> {
-    let similar = store.search_hybrid(embed_text, embedding, 1)?;
+    let similar = store.search_by_embedding(embedding, 1)?;
     Ok(similar
         .into_iter()
         .find(|(m, score)| *score > threshold && m.topic == topic))

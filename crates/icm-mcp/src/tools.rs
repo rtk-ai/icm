@@ -1082,7 +1082,11 @@ fn tool_store(
                     }
                 },
                 embedding: Some(query_emb.clone()),
-                importance,
+                // Never let a near-dup merge downgrade importance: an MCP
+                // caller that omits `importance` defaults to Medium, which
+                // would otherwise silently demote an existing Critical
+                // memory into decay/prune eligibility (audit finding).
+                importance: icm_core::max_importance(existing.importance, importance),
                 source: existing.source.clone(),
                 related_ids: existing.related_ids.clone(),
                 updated_at: Utc::now(),
@@ -1265,10 +1269,25 @@ fn tool_recall(
         }
     };
 
+    // Audit finding: filters were applied AFTER the store already truncated
+    // to `limit` — if the top-`limit` global hits all belonged to other
+    // projects/topics, filtering left nothing and recall reported "no
+    // memories" even though relevant matches existed further down the
+    // ranked list. When any filter is active, request a much larger
+    // candidate pool so filtering has enough to work with, then truncate to
+    // the caller's requested `limit` at the very end (capped — this is a
+    // memory-scoped search, not a paginated export).
+    let filters_active = project.is_some() || topic.is_some() || keyword.is_some();
+    let query_limit = if filters_active {
+        (limit * 10).min(200)
+    } else {
+        limit
+    };
+
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
         if let Ok(query_emb) = emb.embed_query(query) {
-            if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
+            if let Ok(results) = store.search_hybrid(query, &query_emb, query_limit) {
                 let mut scored_results = results;
                 scored_results.retain(|(m, _)| project_filter(m));
                 if let Some(t) = topic {
@@ -1288,9 +1307,9 @@ fn tool_recall(
                 // so a project-A primary hit can pull in a project-B
                 // neighbor via auto-linked `related_ids`. Re-apply the
                 // filters to `expanded` so the caller's scope is honored.
-                let max_neighbors = (limit / 3).max(1);
+                let max_neighbors = (query_limit / 3).max(1);
                 let mut expanded = store
-                    .expand_with_neighbors(&scored_results, max_neighbors, 0.5, limit)
+                    .expand_with_neighbors(&scored_results, max_neighbors, 0.5, query_limit)
                     .unwrap_or(scored_results);
                 expanded.retain(|(m, _)| project_filter(m));
                 if let Some(t) = topic {
@@ -1299,6 +1318,7 @@ fn tool_recall(
                 if let Some(kw) = keyword {
                     expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
                 }
+                expanded.truncate(limit);
 
                 // Batch update access counts (includes expanded neighbors)
                 let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
@@ -1314,14 +1334,14 @@ fn tool_recall(
     }
 
     // Fallback: FTS then keywords
-    let mut results = match store.search_fts(query, limit) {
+    let mut results = match store.search_fts(query, query_limit) {
         Ok(r) => r,
         Err(e) => return ToolResult::error(format!("search error: {e}")),
     };
 
     if results.is_empty() {
         let keywords: Vec<&str> = query.split_whitespace().collect();
-        results = match store.search_by_keywords(&keywords, limit) {
+        results = match store.search_by_keywords(&keywords, query_limit) {
             Ok(r) => r,
             Err(e) => return ToolResult::error(format!("search error: {e}")),
         };
@@ -1334,6 +1354,7 @@ fn tool_recall(
     if let Some(kw) = keyword {
         results.retain(|m| keyword_matches(&m.keywords, kw));
     }
+    results.truncate(limit);
 
     // Convert to scored format with a sentinel score of 1.0 (FTS fallback
     // doesn't expose a real similarity score, but we still want the graph
@@ -2601,6 +2622,160 @@ mod tests {
         assert!(
             hits <= 20,
             "limit must clamp to the schema max of 20, got {hits} hits"
+        );
+    }
+
+    /// Audit regression: filtering was previously applied AFTER the store
+    /// already truncated results to `limit` — if every one of the top-N
+    /// global hits belonged to a different topic than the requested filter,
+    /// recall reported "no memories" even though a matching memory existed
+    /// further down the ranked list. `search_by_keywords` orders by
+    /// `weight DESC`, so 5 higher-weight "noise" memories in another topic
+    /// starve out a lower-weight matching memory in the target topic when
+    /// `limit=5` and no oversampling is applied.
+    #[test]
+    fn test_recall_topic_filter_does_not_starve_on_higher_weight_noise() {
+        let store = test_store();
+
+        // 5 noise memories, default weight 1.0, in a topic the caller is
+        // NOT asking for — these would fill the entire unfiltered top-5.
+        for i in 0..5 {
+            let r = call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({
+                    "topic": "noise",
+                    "content": format!("starvation probe filler {i}"),
+                }),
+                false,
+            );
+            assert!(!r.is_error);
+        }
+
+        // The actual target: same keyword, but lower weight and a DIFFERENT
+        // topic that the caller will filter for.
+        let store_result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "target-topic", "content": "starvation probe filler needle"}),
+            false,
+        );
+        assert!(!store_result.is_error);
+        // The ID is the first whitespace-delimited token after the prefix —
+        // ULIDs never contain whitespace, but a link-count suffix
+        // (" (+N links)") could immediately follow with no other delimiter.
+        let id = store_result.content[0]
+            .text
+            .strip_prefix("Stored memory: ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+            .expect("store result must contain an id");
+        use icm_core::MemoryStore;
+        let mut m = store
+            .get(&id)
+            .unwrap()
+            .expect("just-stored memory must exist");
+        m.weight = 0.1;
+        store.update(&m).unwrap();
+
+        let recall_result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({
+                "query": "starvation probe filler",
+                "project": "",
+                "topic": "target-topic",
+                "limit": 5,
+            }),
+            false,
+        );
+        assert!(!recall_result.is_error);
+        assert!(
+            recall_result.content[0].text.contains("needle"),
+            "topic filter must not starve out a lower-weight match when \
+             higher-weight noise fills the unfiltered top-N: {}",
+            recall_result.content[0].text
+        );
+    }
+
+    /// Deterministic test-only embedder: always returns the same fixed
+    /// vector regardless of input, so any two texts are cosine-identical.
+    /// Used to force the near-dup merge path reliably without depending on
+    /// a real embedding model in unit tests.
+    struct FixedEmbedder;
+    impl Embedder for FixedEmbedder {
+        fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
+            Ok(vec![0.5; 384])
+        }
+        fn embed_batch(&self, texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.5; 384]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+    }
+
+    /// Audit regression: the near-dup merge path built the merged `Memory`
+    /// with the NEW request's `importance` verbatim. An MCP caller that
+    /// omits `importance` defaults to Medium — re-storing a near-paraphrase
+    /// of an existing Critical memory without specifying importance would
+    /// silently downgrade it to Medium, making it eligible for decay/prune
+    /// despite the "critical = never forget" contract.
+    #[test]
+    fn test_near_dup_merge_never_downgrades_importance() {
+        let store = test_store();
+        let embedder = FixedEmbedder;
+
+        let store_result = call_tool(
+            &store,
+            Some(&embedder),
+            "icm_memory_store",
+            &json!({
+                "topic": "t",
+                "content": "original critical fact",
+                "importance": "critical",
+            }),
+            false,
+        );
+        assert!(
+            !store_result.is_error,
+            "first store failed: {}",
+            store_result.content[0].text
+        );
+
+        // Re-store a "near paraphrase" (FixedEmbedder makes every text
+        // cosine-identical, so this always matches as a near-dup) WITHOUT
+        // specifying importance — defaults to Medium.
+        let update_result = call_tool(
+            &store,
+            Some(&embedder),
+            "icm_memory_store",
+            &json!({"topic": "t", "content": "original critical fact, rephrased"}),
+            false,
+        );
+        assert!(!update_result.is_error);
+        assert!(
+            update_result.content[0]
+                .text
+                .contains("Updated existing memory"),
+            "expected the near-dup merge path to trigger: {}",
+            update_result.content[0].text
+        );
+
+        use icm_core::MemoryStore;
+        let memories = store.get_by_topic("t").unwrap();
+        assert_eq!(
+            memories.len(),
+            1,
+            "near-dup should merge, not create a second row"
+        );
+        assert!(
+            matches!(memories[0].importance, icm_core::Importance::Critical),
+            "importance must not be downgraded by a near-dup merge, got {:?}",
+            memories[0].importance
         );
     }
 

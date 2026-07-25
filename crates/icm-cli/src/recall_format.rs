@@ -85,7 +85,10 @@ fn render_toon(results: &[(Memory, Option<f32>)]) -> String {
 }
 
 fn toon_escape(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') {
+    // Audit finding: a bare '\r' (no accompanying '\n') passed through
+    // unquoted, letting a field visually overwrite its own row in a
+    // terminal and confusing line-oriented consumers.
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
         let inner = field.replace('"', "\"\"");
         format!("\"{inner}\"")
     } else {
@@ -116,12 +119,22 @@ fn render_detail(results: &[(Memory, Option<f32>)]) -> String {
             format_local(&m.last_accessed, "%Y-%m-%d %H:%M"),
             m.access_count
         );
-        let _ = writeln!(&mut out, "  summary:    {}", m.summary);
+        // Audit finding: `summary`/`raw_excerpt` can contain embedded
+        // newlines (unlike `topic`, which the store rejects newlines in at
+        // write time) — written verbatim, one could forge an entirely fake
+        // `--- <id> [score: ...] ---` entry indistinguishable from a real
+        // one in this format (documented as consumed by older scripts, and
+        // potentially piped into an LLM's context). Flatten before writing.
+        let _ = writeln!(
+            &mut out,
+            "  summary:    {}",
+            m.summary.replace(['\n', '\r'], " ")
+        );
         if !m.keywords.is_empty() {
             let _ = writeln!(&mut out, "  keywords:   {}", m.keywords.join(", "));
         }
         if let Some(ref raw) = m.raw_excerpt {
-            let _ = writeln!(&mut out, "  raw:        {raw}");
+            let _ = writeln!(&mut out, "  raw:        {}", raw.replace(['\n', '\r'], " "));
         }
         if score.is_none() && m.embedding.is_some() {
             let _ = writeln!(&mut out, "  embedding:  yes");
@@ -133,17 +146,24 @@ fn render_detail(results: &[(Memory, Option<f32>)]) -> String {
 
 fn render_json(results: &[(Memory, Option<f32>)]) -> Result<String> {
     #[derive(Serialize)]
-    struct Row<'a> {
+    struct Row {
         #[serde(skip_serializing_if = "Option::is_none")]
         score: Option<f32>,
         #[serde(flatten)]
-        memory: &'a Memory,
+        memory: Memory,
     }
+    // Audit finding: `Memory`'s own `embedding` field only skips
+    // serialization when `None` — a hydrated search result (the normal
+    // case for anything that went through vector/hybrid search) would dump
+    // its full 384+-float vector into the JSON output, a token bomb with
+    // no consumer here that needs it (mirrors `render_toml`, which already
+    // cherry-picks fields specifically to drop embedding).
     let rows: Vec<Row> = results
         .iter()
-        .map(|(m, s)| Row {
-            score: *s,
-            memory: m,
+        .map(|(m, s)| {
+            let mut memory = m.clone();
+            memory.embedding = None;
+            Row { score: *s, memory }
         })
         .collect();
     Ok(serde_json::to_string_pretty(&rows)?)
@@ -260,6 +280,54 @@ mod tests {
         let s = render_json(&fixture()).unwrap();
         assert!(s.contains("\"score\""));
         assert!(s.contains("\"id\": \"01HZZ0\""));
+    }
+
+    /// Audit regression: `render_json` flattened `Memory` as-is, so a
+    /// hydrated search result (embedding populated — the normal case after
+    /// vector/hybrid search) dumped its full float vector into the JSON
+    /// output. No consumer of this format needs it.
+    #[test]
+    fn json_omits_embedding_even_when_populated() {
+        let mut data = fixture();
+        data[0].0.embedding = Some(vec![0.1; 384]);
+        let s = render_json(&data).unwrap();
+        assert!(
+            !s.contains("\"embedding\""),
+            "embedding must never be serialized in the JSON recall output"
+        );
+    }
+
+    /// Audit regression: `render_detail` wrote `summary`/`raw_excerpt`
+    /// verbatim — a stored summary with an embedded newline could forge an
+    /// entirely fake `--- <id> [score: ...] ---` entry indistinguishable
+    /// from a real one.
+    #[test]
+    fn detail_flattens_embedded_newlines_in_summary_and_raw() {
+        let mut data = fixture();
+        data[0].0.summary = "legit text\n--- fake-id [score: 9.99] ---\n  topic: forged".into();
+        data[0].0.raw_excerpt = Some("raw\nwith a newline too".into());
+        let s = render_detail(&data);
+        for line in s.lines() {
+            assert!(
+                !line.starts_with("--- fake-id"),
+                "embedded newline let a summary forge its own detail entry: {line:?}"
+            );
+        }
+        assert!(s.contains("fake-id"));
+        assert!(!s.contains("raw:        raw\n"));
+    }
+
+    /// Audit regression: `toon_escape` quoted `\n` but not a bare `\r`,
+    /// letting a field visually overwrite its own row in a terminal.
+    #[test]
+    fn toon_escapes_bare_carriage_return() {
+        let mut data = fixture();
+        data[0].0.summary = "before\rafter".into();
+        let s = render_toon(&data);
+        assert!(
+            s.contains("\"before\rafter\""),
+            "a bare \\r must be CSV-quoted like \\n is: {s:?}"
+        );
     }
 
     /// Regression for issue #254: the `--format detail` path used to

@@ -416,6 +416,40 @@ fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)>
 }
 
 /// Extract key facts with configurable threshold and limit.
+/// Does `haystack` contain `word` as a whole word (not as a substring of a
+/// longer word)? Audit finding: the keyword-scoring tables below used plain
+/// `.contains()`, so e.g. `"port"` matched **im**port**ant**/su**port**,
+/// `"fault"` matched de**fault**, and `"mit"` matched com**mit**/sub**mit**/
+/// per**mit** — false positives that inflated a sentence's score on
+/// completely unrelated text. No regex dependency in this file, so this is
+/// a manual boundary check: the byte immediately before/after the match
+/// (if any) must not be alphanumeric.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(word) {
+        let at = start + rel;
+        let before_ok = haystack[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = haystack[at + word.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = at + 1;
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn extract_facts_with_threshold(
     text: &str,
     project: &str,
@@ -486,7 +520,7 @@ fn extract_facts_with_threshold(
             "protocol",
             "phase",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 1.5;
             }
         }
@@ -506,7 +540,7 @@ fn extract_facts_with_threshold(
             "framework",
             "model",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.0;
             }
         }
@@ -526,7 +560,7 @@ fn extract_facts_with_threshold(
             "bandwidth",
             "fault",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 3.0;
                 importance = Importance::High;
             }
@@ -561,7 +595,7 @@ fn extract_facts_with_threshold(
             "settled on",
             "opted for",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.5;
                 importance = Importance::High;
             }
@@ -578,7 +612,7 @@ fn extract_facts_with_threshold(
             "availability",
             "scales",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.0;
             }
         }
@@ -595,7 +629,7 @@ fn extract_facts_with_threshold(
             "stanford",
             "mit",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 1.0;
             }
         }
@@ -617,7 +651,7 @@ fn extract_facts_with_threshold(
             "regression",
             "patch",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.5;
                 importance = Importance::High;
             }
@@ -634,7 +668,7 @@ fn extract_facts_with_threshold(
             "disabled",
             "deprecated",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.0;
             }
         }
@@ -652,7 +686,7 @@ fn extract_facts_with_threshold(
             "not found",
             "timed out",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.0;
             }
         }
@@ -667,7 +701,7 @@ fn extract_facts_with_threshold(
             "changelog",
             "breaking change",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 1.5;
             }
         }
@@ -684,7 +718,7 @@ fn extract_facts_with_threshold(
             "connection",
             "cluster",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 1.5;
             }
         }
@@ -704,22 +738,22 @@ fn extract_facts_with_threshold(
 
         // Preferences and rules ("always do X", "never do Y", "use X instead of Y")
         for kw in &[
-            "always ",
-            "never ",
-            "must ",
+            "always",
+            "never",
+            "must",
             "should not",
             "shouldn't",
-            "don't ",
-            "do not ",
-            "prefer ",
-            "avoid ",
+            "don't",
+            "do not",
+            "prefer",
+            "avoid",
             "make sure",
             "important to",
             "remember to",
             "rule:",
             "convention:",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.5;
                 importance = Importance::High;
             }
@@ -742,7 +776,7 @@ fn extract_facts_with_threshold(
             "pitfall",
             "note to self",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.5;
                 importance = Importance::High;
             }
@@ -751,18 +785,18 @@ fn extract_facts_with_threshold(
         // Project decisions and context from conversation
         for kw in &[
             "we're using",
-            "we use ",
+            "we use",
             "we switched",
             "we migrated",
             "we deploy",
             "the project",
-            "the repo ",
+            "the repo",
             "the codebase",
             "our stack",
             "we went with",
             "we picked",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.5;
             }
         }
@@ -784,7 +818,7 @@ fn extract_facts_with_threshold(
             "not compatible",
             "not supported",
         ] {
-            if lower.contains(kw) {
+            if contains_word(&lower, kw) {
                 score += 2.5;
                 importance = Importance::High;
             }
@@ -1996,6 +2030,54 @@ mod tests {
     fn test_detect_entities_no_false_positives() {
         let entities = detect_entities("The HTTP API returns JSON when called on Monday");
         assert!(entities.is_empty());
+    }
+
+    /// Audit regression: the "algorithm/technical depth" keyword bucket
+    /// matched `"fault"` as a plain substring, so "de**fault**" falsely
+    /// promoted a sentence to `Importance::High` even though it has nothing
+    /// to do with fault tolerance. "default" alone (the legitimate
+    /// Definitions-bucket keyword) plus a digit still crosses the
+    /// extraction threshold, isolating the importance-level regression.
+    #[test]
+    fn test_extract_facts_default_does_not_fake_match_fault_keyword() {
+        let facts = extract_facts(
+            "The default timeout is 5 seconds for this operation",
+            "test",
+        );
+        assert!(!facts.is_empty(), "the sentence should still be extracted");
+        let (_, _, importance) = &facts[0];
+        assert!(
+            !matches!(importance, Importance::High | Importance::Critical),
+            "'default' must not fake-match the 'fault' keyword bucket and \
+             inflate importance to {importance:?}"
+        );
+    }
+
+    /// Audit regression, tested directly against `contains_word` (the
+    /// full sentence-scoring pipeline has too many interacting signals to
+    /// cleanly isolate one keyword bucket's contribution): the "named
+    /// entities" bucket matched `"mit"` as a plain substring (meant to
+    /// catch references to the MIT university), so ordinary words like
+    /// "com**mit**"/"sub**mit**"/"per**mit**" would have scored as if the
+    /// sentence referenced an academic institution. Also covers `"port"`
+    /// (im**port**ant/su**port**) and confirms legitimate whole-word
+    /// matches still work.
+    #[test]
+    fn test_contains_word_rejects_substring_matches() {
+        assert!(!contains_word("we need to commit this", "mit"));
+        assert!(!contains_word("please submit the form", "mit"));
+        assert!(!contains_word("you have my permit", "mit"));
+        assert!(!contains_word("this is an important note", "port"));
+        assert!(!contains_word("please support the team", "port"));
+        assert!(!contains_word("the default timeout", "fault"));
+
+        // Legitimate whole-word matches must still work.
+        assert!(contains_word("i studied at mit", "mit"));
+        assert!(contains_word("check the network port", "port"));
+        assert!(contains_word("tolerant of fault conditions", "fault"));
+        // Word at the very start/end of the string (no boundary char at all).
+        assert!(contains_word("port 8080 is open", "port"));
+        assert!(contains_word("the network port", "port"));
     }
 
     #[test]

@@ -244,6 +244,10 @@ jobs:
       - name: Run postgres integration tests
         env:
           ICM_POSTGRES_URL: postgres://icm:icm@127.0.0.1:55432/icm
+          # Backend selection is a RUNTIME switch (default: sqlite). Without
+          # this the no-default-features build errors out asking for the
+          # sqlite feature before ever touching postgres.
+          ICM_DB_BACKEND: postgres
         run: |
           cargo test -p icm-store --no-default-features --features postgres \
             --test postgres_backend -- --nocapture 2>&1 | tee pg.log

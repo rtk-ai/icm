@@ -249,8 +249,11 @@ jobs:
           # sqlite feature before ever touching postgres.
           ICM_DB_BACKEND: postgres
         run: |
+          # --test-threads=1: both tests migrate the same shared database, and
+          # concurrent `CREATE EXTENSION IF NOT EXISTS vector` races in
+          # Postgres (duplicate-key on the catalog) — seen flaking in CI.
           cargo test -p icm-store --no-default-features --features postgres \
-            --test postgres_backend -- --nocapture 2>&1 | tee pg.log
+            --test postgres_backend -- --nocapture --test-threads=1 2>&1 | tee pg.log
           test "${PIPESTATUS[0]}" -eq 0 || exit 1
           # The skip guard must NOT have fired — prove the tests actually ran.
           if grep -q "skipping: ICM_POSTGRES_URL not set" pg.log; then

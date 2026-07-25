@@ -141,7 +141,13 @@ async fn auth_middleware(
             let decoded = base64_decode(b64)?;
             let s = String::from_utf8(decoded).ok()?;
             let (user, pass) = s.split_once(':')?;
-            Some(user == state.username && pass == state.password)
+            // Constant-time compare — a naive `==` leaks a timing
+            // side-channel for brute-forcing the dashboard password
+            // (audit finding).
+            Some(
+                constant_time_eq(user.as_bytes(), state.username.as_bytes())
+                    && constant_time_eq(pass.as_bytes(), state.password.as_bytes()),
+            )
         })
         .unwrap_or(false);
 
@@ -155,6 +161,15 @@ async fn auth_middleware(
         )
             .into_response()
     }
+}
+
+/// Compare two byte strings in time independent of where they first differ.
+/// Still short-circuits on length (safe: lengths aren't secret here).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Simple base64 decode (avoid pulling in a full crate).

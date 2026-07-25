@@ -754,8 +754,9 @@ enum Commands {
         http: Option<std::net::SocketAddr>,
 
         /// Require `Authorization: Bearer <TOKEN>` on every HTTP
-        /// request (only meaningful with `--http`). Absent token =
-        /// open localhost API.
+        /// request (only meaningful with `--http`). Required unless
+        /// `--http` binds a loopback address (127.0.0.1/::1) — binding
+        /// any other interface without a token is refused.
         #[cfg(feature = "http-api")]
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,

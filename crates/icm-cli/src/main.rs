@@ -9442,6 +9442,95 @@ fn truncate(s: &str, max: usize) -> String {
 // Cloud commands
 // ---------------------------------------------------------------------------
 
+/// Merge a cloud-pulled memory into an already-existing local one, instead
+/// of overwriting it outright.
+///
+/// `weight`, `access_count`, `embedding`, and `related_ids` are
+/// locally-mastered state that the cloud push side never sends (and the
+/// pull API payload may not carry at all) — a blind `store.update(&pulled)`
+/// previously reset weight to ~0.0 (immediately eligible for the next
+/// `prune`), wiped the local embedding (breaking vector search until
+/// re-embedded), and dropped `related_ids`: real data loss on the very
+/// first `icm cloud pull` against a store that already had these memories
+/// (audit finding). Only the fields genuinely meant to sync — topic,
+/// summary, raw_excerpt, keywords, importance, scope, source, timestamps —
+/// come from the cloud version.
+fn merge_pulled_memory(existing: icm_core::Memory, pulled: icm_core::Memory) -> icm_core::Memory {
+    icm_core::Memory {
+        weight: existing.weight,
+        access_count: existing.access_count,
+        embedding: existing.embedding.or(pulled.embedding),
+        related_ids: if pulled.related_ids.is_empty() {
+            existing.related_ids
+        } else {
+            pulled.related_ids
+        },
+        ..pulled
+    }
+}
+
+#[cfg(test)]
+mod merge_pulled_memory_tests {
+    use super::*;
+    use icm_core::{Importance, Memory};
+
+    fn mem_with(weight: f32, access_count: u32, embedding: Option<Vec<f32>>) -> Memory {
+        let mut m = Memory::new("t".into(), "s".into(), Importance::Medium);
+        m.weight = weight;
+        m.access_count = access_count;
+        m.embedding = embedding;
+        m
+    }
+
+    #[test]
+    fn preserves_local_weight_access_count_and_embedding() {
+        let existing = mem_with(0.73, 12, Some(vec![0.1, 0.2, 0.3]));
+        // Simulates what a cloud pull payload actually looks like: weight
+        // defaults away from what push never sent, access_count reset,
+        // embedding never round-tripped.
+        let pulled = mem_with(1.0, 0, None);
+
+        let merged = merge_pulled_memory(existing.clone(), pulled);
+        assert_eq!(merged.weight, 0.73, "must keep the local weight");
+        assert_eq!(merged.access_count, 12, "must keep the local access_count");
+        assert_eq!(
+            merged.embedding,
+            Some(vec![0.1, 0.2, 0.3]),
+            "must keep the local embedding when the pulled one is absent"
+        );
+    }
+
+    #[test]
+    fn pulled_embedding_used_only_if_local_has_none() {
+        let existing = mem_with(1.0, 0, None);
+        let pulled = mem_with(1.0, 0, Some(vec![0.9]));
+        let merged = merge_pulled_memory(existing, pulled);
+        assert_eq!(merged.embedding, Some(vec![0.9]));
+    }
+
+    #[test]
+    fn related_ids_kept_locally_unless_pulled_has_some() {
+        let mut existing = mem_with(1.0, 0, None);
+        existing.related_ids = vec!["a".into(), "b".into()];
+        let pulled = mem_with(1.0, 0, None); // empty related_ids
+
+        let merged = merge_pulled_memory(existing, pulled);
+        assert_eq!(merged.related_ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn shared_fields_come_from_the_pulled_version() {
+        let existing = mem_with(1.0, 0, None);
+        let mut pulled = mem_with(1.0, 0, None);
+        pulled.summary = "updated from cloud".into();
+        pulled.topic = "new-topic".into();
+
+        let merged = merge_pulled_memory(existing, pulled);
+        assert_eq!(merged.summary, "updated from cloud");
+        assert_eq!(merged.topic, "new-topic");
+    }
+}
+
 fn cmd_cloud(command: CloudCommands, store: &Store) -> Result<()> {
     use icm_core::Scope;
 
@@ -9505,8 +9594,8 @@ fn cmd_cloud(command: CloudCommands, store: &Store) -> Result<()> {
                 use icm_core::MemoryStore;
                 // Upsert: if memory exists locally, update it; otherwise store it
                 match store.get(&mem.id)? {
-                    Some(_) => {
-                        store.update(&mem)?;
+                    Some(existing) => {
+                        store.update(&merge_pulled_memory(existing, mem))?;
                     }
                     None => {
                         store.store(mem)?;

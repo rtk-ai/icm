@@ -169,6 +169,7 @@ jobs:
           ORT_DYLIB_PATH: C:\nonexistent\onnxruntime.dll
         run: |
           bin=target/debug/icm.exe
+          "$bin" --version  # smoke: the binary must launch (8 MiB stack, see .cargo/config.toml)
           db="$RUNNER_TEMP/dyn.db"
           "$bin" --db "$db" store -t t -c "ci dynamic graceful delta"
           "$bin" --no-embeddings --db "$db" recall delta | grep -qi delta \

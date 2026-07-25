@@ -1,0 +1,8 @@
+# Windows defaults the main-thread stack to 1 MiB, where unix reserves 8 MiB.
+# ICM's startup/embedding path has a fixed stack frame that fits comfortably in
+# 8 MiB but overflows 1 MiB (surfaced as "thread 'main' has overflowed its
+# stack" when running the CLI on Windows — issue #345). Reserve 8 MiB so the
+# Windows binary matches unix behaviour. Scoped to the MSVC target, so unix and
+# musl builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]

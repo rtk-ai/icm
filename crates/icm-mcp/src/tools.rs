@@ -1227,11 +1227,13 @@ fn tool_recall(
     // `recall_context` path (extract.rs) so MCP-side recall can't leak
     // memories from other projects. Caller can override via the explicit
     // `project` arg (empty string disables the filter); otherwise we
-    // derive it from the server's cwd.
+    // derive it from the server's cwd via the shared icm-core detection
+    // (git remote first) — the CLI hooks store under that name, so a raw
+    // cwd basename would silently miss on renamed checkouts (audit finding).
     let project_arg = get_str(args, "project");
     let cwd_project = std::env::current_dir()
         .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
+        .and_then(|p| icm_core::project::project_from_path(&p.to_string_lossy()));
     let project: Option<String> = match project_arg {
         Some("") => None,
         Some(p) => Some(p.to_string()),

@@ -32,3 +32,6 @@ tracing = { workspace = true }
 # onnxruntime dylib (dlopen) before ort initializes. See issue #345.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

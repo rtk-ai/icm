@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use serde_json::{json, Value};
 use tracing::{debug, error};
@@ -16,9 +16,41 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Number of non-store tool calls before we nudge the agent to store.
 const STORE_NUDGE_THRESHOLD: u32 = 10;
 
-/// Maximum allowed line length (10 MB). Lines exceeding this are rejected
-/// without parsing to prevent memory exhaustion.
+/// Maximum allowed line length (10 MB). The cap is enforced *while reading*
+/// (bounded `take` + `read_until`), so an oversized line is never fully
+/// buffered — previously the whole line was allocated by `lines()` before
+/// the length check ran, defeating the cap (audit finding; same class of
+/// bug as the CLI hook-stdin fix in e551c27).
 const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
+
+/// Read one `\n`-terminated line into `buf` without ever buffering more than
+/// `MAX_LINE_LEN + 1` bytes of it. Returns `Ok(None)` on EOF, `Ok(Some(true))`
+/// for a within-limit line, `Ok(Some(false))` for an oversized line (whose
+/// remainder has been drained and discarded in bounded chunks).
+fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> io::Result<Option<bool>> {
+    buf.clear();
+    let n = reader
+        .take(MAX_LINE_LEN as u64 + 1)
+        .read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok(None); // EOF
+    }
+    // Oversized iff we exhausted the read budget without hitting the newline.
+    if buf.last() != Some(&b'\n') && n == MAX_LINE_LEN + 1 {
+        // Drain the rest of the line in bounded chunks so the next read
+        // starts on a fresh line.
+        let mut scratch = Vec::with_capacity(64 * 1024);
+        loop {
+            scratch.clear();
+            let m = reader.take(1024 * 1024).read_until(b'\n', &mut scratch)?;
+            if m == 0 || scratch.last() == Some(&b'\n') {
+                break;
+            }
+        }
+        return Ok(Some(false));
+    }
+    Ok(Some(true))
+}
 
 /// Run the MCP server on stdio. Blocks until stdin is closed.
 pub fn run_server(
@@ -28,31 +60,35 @@ pub fn run_server(
     auto_consolidate: AutoConsolidate,
 ) -> anyhow::Result<()> {
     let stdin = io::stdin();
+    let mut reader = stdin.lock();
     let mut stdout = io::stdout();
     let mut calls_since_store: u32 = 0;
+    let mut buf: Vec<u8> = Vec::new();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        let within_limit = match read_capped_line(&mut reader, &mut buf) {
+            Ok(Some(ok)) => ok,
+            Ok(None) => break, // EOF
             Err(e) => {
                 error!("stdin read error: {e}");
                 break;
             }
         };
 
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.len() > MAX_LINE_LEN {
-            error!("line too long: {} bytes (max {MAX_LINE_LEN})", line.len());
+        if !within_limit {
+            error!("line too long (max {MAX_LINE_LEN} bytes)");
             let resp = JsonRpcResponse::err(
                 Value::Null,
                 -32600,
-                format!("line too long: {} bytes (max {MAX_LINE_LEN})", line.len()),
+                format!("line too long (max {MAX_LINE_LEN} bytes)"),
             );
             write_response(&mut stdout, &resp)?;
+            continue;
+        }
+
+        let line_owned = String::from_utf8_lossy(&buf);
+        let line = line_owned.trim();
+        if line.is_empty() {
             continue;
         }
 

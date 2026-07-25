@@ -26,6 +26,7 @@ pub mod learn;
 pub mod memoir;
 pub mod memoir_store;
 pub mod memory;
+pub mod project;
 pub mod store;
 pub mod transcript;
 pub mod transcript_store;

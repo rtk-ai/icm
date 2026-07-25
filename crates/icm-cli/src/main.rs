@@ -1575,7 +1575,12 @@ fn main() -> Result<()> {
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
 
+    // Logs go to stderr, never stdout: `icm serve` speaks line-framed
+    // JSON-RPC on stdout, and the default fmt writer (stdout) would let a
+    // WARN line corrupt the MCP stream (audit finding — the server logs
+    // WARNs in normal operation, e.g. embedding or auto-decay hiccups).
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing_subscriber::filter::LevelFilter::WARN.into()),
@@ -4080,70 +4085,11 @@ fn build_hook_start_pack(store: &Store, stdin_json: &str, max_tokens: usize) -> 
     Ok(out)
 }
 
-/// Extract a project name from a git remote URL.
-/// Handles HTTPS ("https://github.com/user/repo.git"),
-/// slash-SSH ("git@github.com:user/repo.git"), and
-/// colon-only SSH ("git@host:repo.git") formats.
-fn repo_name_from_url(url: &str) -> Option<String> {
-    // rsplit('/') always yields ≥1 element; split on ':' afterwards to
-    // handle SCP-style SSH URLs that have no slash before the repo name.
-    let after_slash = url.rsplit('/').next().unwrap_or(url);
-    let name = after_slash
-        .rsplit(':')
-        .next()
-        .unwrap_or(after_slash)
-        .trim_end_matches(".git");
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-/// Extract a project name from a filesystem path (basename), treating empty
-/// or root paths as "no project".
-fn project_from_path(path: &str) -> Option<String> {
-    if path.is_empty() {
-        return None;
-    }
-    let p = std::path::Path::new(path);
-
-    // Try git remote get-url origin (most unique identifier)
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(p)
-        .output()
-    {
-        if out.status.success() {
-            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if let Some(name) = repo_name_from_url(&url) {
-                return Some(name);
-            }
-        }
-    }
-
-    // For worktrees without a remote: git-common-dir returns the main repo's
-    // .git as an absolute path, so its parent basename is the real project name.
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .current_dir(p)
-        .output()
-    {
-        if out.status.success() {
-            let raw = out.stdout;
-            let common = std::str::from_utf8(&raw).unwrap_or("").trim();
-            let common_path = std::path::Path::new(common);
-            if common_path.is_absolute() {
-                if let Some(name) = common_path.parent().and_then(|r| r.file_name()) {
-                    return Some(name.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-
-    // Fallback: basename of the path itself
-    p.file_name().map(|n| n.to_string_lossy().to_string())
-}
+// Project-name detection lives in icm-core (`icm_core::project`) so the MCP
+// server derives the exact same name as the CLI hooks — a divergence here
+// meant memories stored under the git-remote name were recalled under the
+// cwd basename and silently missed (audit finding).
+use icm_core::project::project_from_path;
 
 /// Extract the project name from the `cwd` field of a hook JSON payload.
 /// Returns `None` if the field is absent or yields no project name.
@@ -9864,43 +9810,9 @@ mod hook_start_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
-    #[test]
-    fn project_from_path_extracts_basename() {
-        assert_eq!(
-            project_from_path("/Users/patrick/dev/rtk-ai/icm"),
-            Some("icm".into())
-        );
-        assert_eq!(
-            project_from_path("/tmp/my-project"),
-            Some("my-project".into())
-        );
-        assert_eq!(project_from_path(""), None);
-    }
-
-    #[test]
-    fn project_from_path_uses_git_remote_over_basename() {
-        let dir = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/user/myproject.git",
-            ])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        // tempdir basename is a random name, not "myproject" — remote must win
-        assert_eq!(
-            project_from_path(dir.path().to_str().unwrap()),
-            Some("myproject".into())
-        );
-    }
+    // project_from_path / repo_name_from_url unit tests live with the code in
+    // icm-core (`icm_core::project::tests`) since the audit moved detection
+    // there to share it with the MCP server.
 
     // Linux-only: advisory `flock` on the macOS CI runners' temp filesystem is
     // unreliable in several ways — it has both failed to refuse a second
@@ -9932,45 +9844,6 @@ mod hook_start_tests {
         assert!(third.is_some(), "acquire should succeed after release");
     }
 
-    #[test]
-    fn project_from_path_handles_ssh_remote() {
-        let dir = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:user/sshproject.git",
-            ])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert_eq!(
-            project_from_path(dir.path().to_str().unwrap()),
-            Some("sshproject".into())
-        );
-    }
-
-    #[test]
-    fn repo_name_from_url_handles_scp_ssh_without_slash() {
-        // git@host:repo.git — no slash between host and repo name
-        assert_eq!(repo_name_from_url("git@host:repo.git"), Some("repo".into()));
-        assert_eq!(
-            repo_name_from_url("git@github.com:user/repo.git"),
-            Some("repo".into())
-        );
-        assert_eq!(
-            repo_name_from_url("https://github.com/user/repo.git"),
-            Some("repo".into())
-        );
-        assert_eq!(repo_name_from_url(""), None);
-    }
-
     /// Creates a git repo named "mainproject" with a worktree at "w1".
     /// Returns `(base_tempdir, worktree_path)` — keep `base` alive for the
     /// lifetime of the test or git will clean up the underlying directory.
@@ -9997,16 +9870,6 @@ mod hook_start_tests {
             .output()
             .unwrap();
         (base, worktree)
-    }
-
-    #[test]
-    fn project_from_path_uses_main_repo_name_for_worktree() {
-        let (_base, worktree) = make_worktree();
-        // w1 basename would give "w1"; must resolve to "mainproject" instead
-        assert_eq!(
-            project_from_path(worktree.to_str().unwrap()),
-            Some("mainproject".into())
-        );
     }
 
     #[test]

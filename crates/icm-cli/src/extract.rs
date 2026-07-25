@@ -21,6 +21,7 @@ type ScoredFact = (String, String, Importance, Option<AnchorKind>);
 
 /// Extract key facts from text and store them in ICM.
 /// Returns the number of facts stored.
+#[cfg(any(test, feature = "bench"))]
 pub fn extract_and_store(store: &Store, text: &str, project: &str) -> Result<usize> {
     extract_and_store_with_opts(store, text, project, false, Importance::Critical)
 }
@@ -38,6 +39,7 @@ pub fn extract_and_store(store: &Store, text: &str, project: &str) -> Result<usi
 ///
 /// This variant uses the English-only keyword scorer. For multilingual
 /// content prefer [`extract_and_store_with_embedder`].
+#[cfg(any(test, feature = "bench"))]
 pub fn extract_and_store_with_opts(
     store: &Store,
     text: &str,

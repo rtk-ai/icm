@@ -186,7 +186,7 @@ fn handle_tools_call(
     // (audit finding).
     if tool_name != "icm_memory_store"
         && *calls_since_store >= STORE_NUDGE_THRESHOLD
-        && *calls_since_store % STORE_NUDGE_THRESHOLD == 0
+        && calls_since_store.is_multiple_of(STORE_NUDGE_THRESHOLD)
     {
         result.append_hint(&format!(
             "\n[ICM: {} tool calls since last store. \

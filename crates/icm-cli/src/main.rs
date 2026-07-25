@@ -1,6 +1,12 @@
 mod archive;
+// The bench suite embeds ~30 KB of synthetic fixtures (a full fake Rust
+// project) and ships agent-benchmark harness code; none of it belongs in the
+// production binary (audit finding). Compiled only with `--features bench`.
+#[cfg(feature = "bench")]
 mod bench_data;
+#[cfg(feature = "bench")]
 mod bench_format;
+#[cfg(feature = "bench")]
 mod bench_knowledge;
 
 pub mod cloud;
@@ -480,6 +486,7 @@ enum Commands {
     },
 
     /// Run performance benchmark on in-memory store
+    #[cfg(feature = "bench")]
     Bench {
         /// Number of memories to seed
         #[arg(short, long, default_value = "1000")]
@@ -645,6 +652,7 @@ enum Commands {
     },
 
     /// Benchmark memory recall accuracy with and without ICM
+    #[cfg(feature = "bench")]
     BenchRecall {
         /// Model to use
         #[arg(short, long, default_value = "sonnet")]
@@ -660,6 +668,7 @@ enum Commands {
     },
 
     /// Benchmark Claude Code efficiency with and without ICM
+    #[cfg(feature = "bench")]
     BenchAgent {
         /// Number of sessions per mode
         #[arg(short, long, default_value = "10")]
@@ -685,6 +694,7 @@ enum Commands {
     /// `ANTHROPIC_API_KEY` set, also calls the Anthropic `count_tokens`
     /// API for true token counts (lets you see the Opus 4.7 tokenizer
     /// inflation directly).
+    #[cfg(feature = "bench")]
     BenchFormat {
         /// Number of synthetic memories in the fixture
         #[arg(short, long, default_value = "10")]
@@ -2110,18 +2120,22 @@ fn main() -> Result<()> {
         }
         Commands::Config => cmd_config(),
         Commands::Upgrade { apply, check } => upgrade::cmd_upgrade(apply, check),
+        #[cfg(feature = "bench")]
         Commands::Bench { count } => cmd_bench(count),
+        #[cfg(feature = "bench")]
         Commands::BenchRecall {
             model,
             runs,
             verbose,
         } => cmd_bench_recall(&model, runs, verbose),
+        #[cfg(feature = "bench")]
         Commands::BenchAgent {
             sessions,
             model,
             runs,
             verbose,
         } => cmd_bench_agent(sessions, &model, runs, verbose),
+        #[cfg(feature = "bench")]
         Commands::BenchFormat {
             count,
             model,
@@ -7837,6 +7851,7 @@ fn print_memory_detail(mem: &Memory, score: Option<f32>) {
 // Benchmark
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "bench")]
 fn cmd_bench(count: usize) -> Result<()> {
     const DIMS: usize = 384;
     const SEARCH_ITERS: usize = 100;
@@ -7991,6 +8006,7 @@ impl Drop for CleanupDir {
     }
 }
 
+#[cfg(feature = "bench")]
 fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
     // Check claude is in PATH
     let check = std::process::Command::new("claude")
@@ -8236,6 +8252,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "bench")]
 fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> Result<()> {
     // Check claude is in PATH
     let check = std::process::Command::new("claude")

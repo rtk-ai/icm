@@ -331,6 +331,18 @@ pub struct PostgresStore {
     readonly: bool,
 }
 
+/// One-shot warning that auto-consolidation silently does nothing on this
+/// backend (see [`PostgresStore::auto_consolidate`]).
+fn warn_auto_consolidate_unsupported() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "auto-consolidation is not implemented on the PostgreSQL backend; \
+             topics will keep growing (auto_consolidate_enabled has no effect here)"
+        );
+    });
+}
+
 impl PostgresStore {
     fn conn(&self) -> IcmResult<MutexGuard<'_, Client>> {
         self.client.lock().map_err(|_| lock_err())
@@ -901,8 +913,12 @@ impl PostgresStore {
 
     /// Auto-consolidation is not yet implemented on the PostgreSQL
     /// backend; the call is a no-op (returns "did not consolidate") so the
-    /// normal store path is unaffected.
+    /// normal store path is unaffected. Unlike the other parity gaps (which
+    /// return `Unsupported`), this one is silent by design — but the user
+    /// deserves to know their `auto_consolidate_enabled = true` does nothing
+    /// here, so warn once per process (audit finding).
     pub fn auto_consolidate(&self, _topic: &str, _threshold: usize) -> IcmResult<bool> {
+        warn_auto_consolidate_unsupported();
         Ok(false)
     }
 
@@ -913,6 +929,7 @@ impl PostgresStore {
         _threshold: usize,
         _embedder: Option<&dyn Embedder>,
     ) -> IcmResult<bool> {
+        warn_auto_consolidate_unsupported();
         Ok(false)
     }
 

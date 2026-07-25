@@ -2,8 +2,14 @@
 //!
 //! Lookup order:
 //! 1. `$ICM_CONFIG` environment variable
-//! 2. `~/.config/icm/config.toml`
+//! 2. The platform config dir (`ProjectDirs("dev","icm","icm")`):
+//!    - Linux:   `~/.config/icm/config.toml`
+//!    - macOS:   `~/Library/Application Support/dev.icm.icm/config.toml`
+//!    - Windows: `%APPDATA%\icm\icm\config\config.toml`
 //! 3. Built-in defaults (everything is optional)
+//!
+//! (`icm config` prints the active path — the old header claimed
+//! `~/.config/icm/` everywhere, which is wrong on macOS/Windows.)
 
 use std::path::PathBuf;
 

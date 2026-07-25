@@ -41,6 +41,10 @@ http-api = ["dep:axum", "dep:tokio"]
 # Full web dashboard (SvelteKit SPA + auth). Pulls everything `http-api`
 # does plus the embedded-assets stack.
 web = ["http-api", "dep:tower-http", "dep:rust-embed", "dep:mime_guess", "dep:getrandom"]
+# Benchmark suite (`icm bench*`): ~30 KB of synthetic fixtures + an agent
+# harness that shells out to `claude`. Dev/CI tooling, not shipped in the
+# production binary (audit finding).
+bench = []
 # `openssl` is not used directly in our source code, but it gets pulled
 # transitively via reqwest / hyper-tls / etc. (depending on the active
 # feature set). On cross-builds (e.g. aarch64-unknown-linux-gnu) the

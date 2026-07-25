@@ -113,7 +113,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "properties": {
                     "topic": {
                         "type": "string",
-                        "description": "Category/namespace (e.g. 'projet-kexa', 'preferences', 'decisions-architecture', 'erreurs-resolues')"
+                        "description": "Category/namespace. Use the canonical topics from the server instructions: 'decisions-{project}', 'preferences', 'errors-resolved', 'context-{project}' — mixed-language topic names fragment the memory."
                     },
                     "content": {
                         "type": "string",
@@ -1196,7 +1196,24 @@ fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
                 output.push_str(&format!("  keywords: {}\n", mem.keywords.join(", ")));
             }
             if let Some(ref raw) = mem.raw_excerpt {
-                output.push_str(&format!("  raw: {raw}\n"));
+                // raw_excerpt can hold up to 64 KB per memory; dumping it in
+                // full for every hit floods the client LLM's context (audit
+                // finding). Cap the recall view — the full excerpt stays in
+                // the store.
+                const MAX_RAW_IN_RECALL: usize = 2048;
+                if raw.len() > MAX_RAW_IN_RECALL {
+                    let mut cut = MAX_RAW_IN_RECALL;
+                    while !raw.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    output.push_str(&format!(
+                        "  raw: {}… [truncated, {} bytes total]\n",
+                        &raw[..cut],
+                        raw.len()
+                    ));
+                } else {
+                    output.push_str(&format!("  raw: {raw}\n"));
+                }
             }
             output.push('\n');
         }
@@ -1219,7 +1236,9 @@ fn tool_recall(
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
     };
-    let limit = get_i64(args, "limit", 5).clamp(1, 100) as usize;
+    // Clamp to the schema's advertised maximum (20) — the code previously
+    // accepted up to 100, silently diverging from the published contract.
+    let limit = get_i64(args, "limit", 5).clamp(1, 20) as usize;
     let topic = get_str(args, "topic");
     let keyword = get_str(args, "keyword");
 
@@ -2513,6 +2532,74 @@ mod tests {
         );
         assert!(!recall_result.is_error);
         assert!(recall_result.content[0].text.contains("Rust"));
+    }
+
+    /// Audit regression: a 64 KB raw_excerpt was dumped in full for every
+    /// recall hit, flooding the client LLM. The recall view must cap it.
+    #[test]
+    fn test_recall_truncates_oversized_raw_excerpt() {
+        let store = test_store();
+        let big_raw = "R".repeat(10_000);
+        let store_result = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "t", "content": "excerpt cap probe", "raw_excerpt": big_raw}),
+            false,
+        );
+        assert!(!store_result.is_error);
+
+        let recall_result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "excerpt cap probe", "project": ""}),
+            false,
+        );
+        assert!(!recall_result.is_error);
+        let text = &recall_result.content[0].text;
+        assert!(
+            text.contains("[truncated, 10000 bytes total]"),
+            "expected truncation marker, got: {text}"
+        );
+        assert!(
+            text.len() < 8_000,
+            "recall output must stay far below the raw size, got {} bytes",
+            text.len()
+        );
+    }
+
+    /// Audit regression: the schema advertises limit <= 20 but the code
+    /// accepted 100 — the clamp must match the published contract.
+    #[test]
+    fn test_recall_limit_clamped_to_schema_max() {
+        let store = test_store();
+        for i in 0..30 {
+            let r = call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({"topic": "t", "content": format!("clamp probe entry number {i}")}),
+                false,
+            );
+            assert!(!r.is_error);
+        }
+        let recall_result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "clamp probe entry", "project": "", "limit": 100}),
+            false,
+        );
+        assert!(!recall_result.is_error);
+        let hits = recall_result.content[0]
+            .text
+            .matches("clamp probe entry")
+            .count();
+        assert!(
+            hits <= 20,
+            "limit must clamp to the schema max of 20, got {hits} hits"
+        );
     }
 
     #[test]

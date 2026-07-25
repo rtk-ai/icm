@@ -180,8 +180,14 @@ fn handle_tools_call(
     let mut result =
         tools::call_tool_with_config(store, embedder, tool_name, &args, compact, auto_consolidate);
 
-    // Nudge: append a store reminder if too many calls without storing
-    if *calls_since_store >= STORE_NUDGE_THRESHOLD && tool_name != "icm_memory_store" {
+    // Nudge: remind the agent to store on every THRESHOLD-th call without a
+    // store (10, 20, 30, …) — previously the hint was appended to *every*
+    // response past the threshold, a recurring token tax on the client LLM
+    // (audit finding).
+    if tool_name != "icm_memory_store"
+        && *calls_since_store >= STORE_NUDGE_THRESHOLD
+        && *calls_since_store % STORE_NUDGE_THRESHOLD == 0
+    {
         result.append_hint(&format!(
             "\n[ICM: {} tool calls since last store. \
              Consider saving important context with icm_memory_store before it is lost.]",

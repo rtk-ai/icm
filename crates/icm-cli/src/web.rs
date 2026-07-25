@@ -352,6 +352,19 @@ struct ActionResult {
     message: String,
 }
 
+/// Lock the store, recovering from a poisoned mutex. The store keeps its own
+/// consistency through SQLite transactions, so a panic in one handler must
+/// not permanently kill every subsequent request — with a plain `unwrap()`,
+/// one poisoned lock cascaded panics across all handlers for the lifetime of
+/// the process (audit finding; also the largest cluster of forbidden
+/// `unwrap()` calls in the repo).
+fn lock_store(state: &AppState) -> std::sync::MutexGuard<'_, Store> {
+    state
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // API handlers
 // ---------------------------------------------------------------------------
@@ -361,7 +374,7 @@ async fn api_health_check() -> impl IntoResponse {
 }
 
 async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let stats = match store.stats() {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -394,7 +407,7 @@ async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_topics(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.list_topics() {
         Ok(topics) => Json(
             topics
@@ -411,7 +424,7 @@ async fn api_topic_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.get_by_topic(&name) {
         Ok(memories) => Json(memories).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -422,7 +435,7 @@ async fn api_topic_health(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.topic_health(&name) {
         Ok(health) => Json(health).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -433,7 +446,7 @@ async fn api_topic_consolidate(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let memories = match store.get_by_topic(&name) {
         Ok(m) => m,
         Err(e) => {
@@ -495,7 +508,7 @@ async fn api_memories(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.list_all() {
         Ok(mut memories) => {
             memories.sort_by(|a, b| {
@@ -518,7 +531,7 @@ async fn api_memories_search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.search_fts(&params.q, params.limit) {
         Ok(memories) => Json(memories).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -529,7 +542,7 @@ async fn api_memory_delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.delete(&id) {
         Ok(_) => Json(ActionResult {
             ok: true,
@@ -545,7 +558,7 @@ async fn api_memory_delete(
 }
 
 async fn api_health_all(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let topics = match store.list_topics() {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -562,7 +575,7 @@ async fn api_health_all(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_decay(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.apply_decay(0.95) {
         Ok(n) => Json(ActionResult {
             ok: true,
@@ -576,7 +589,7 @@ async fn api_decay(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_prune(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.prune(0.1) {
         Ok(n) => Json(ActionResult {
             ok: true,
@@ -590,7 +603,7 @@ async fn api_prune(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_memoirs(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let memoirs = match store.list_memoirs() {
         Ok(m) => m,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -620,7 +633,7 @@ async fn api_memoir_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let memoir = match store.get_memoir(&id) {
         Ok(Some(m)) => m,
         Ok(None) => return (StatusCode::NOT_FOUND, "Memoir not found").into_response(),
@@ -636,4 +649,37 @@ async fn api_memoir_detail(
         "links": links,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit regression: a panic inside one handler used to poison the store
+    /// mutex, making every subsequent `lock().unwrap()` panic in cascade for
+    /// the lifetime of the process. `lock_store` must recover the guard.
+    #[test]
+    fn lock_store_recovers_from_a_poisoned_mutex() {
+        let state = AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            username: "u".into(),
+            password: "p".into(),
+        };
+
+        // Poison the mutex: panic while holding the guard on another thread.
+        let poisoner = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.store.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(state.store.is_poisoned(), "setup: mutex must be poisoned");
+
+        // The recovering lock still yields a working store.
+        let store = lock_store(&state);
+        assert!(
+            store.stats().is_ok(),
+            "store must remain usable after poison"
+        );
+    }
 }

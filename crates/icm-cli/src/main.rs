@@ -3995,8 +3995,14 @@ fn format_hook_context(ctx: &str, fmt: HookOutputFormat) -> String {
 /// store and auto-injected into the session without user confirmation.
 /// Summaries are sanitized (newlines flattened in `wake_up::sanitize_summary`)
 /// but backticks / code fences / prompt-injection markers are NOT escaped.
-/// This is acceptable because ICM memories are user-authored — the user is
-/// the only party who can influence the injected content.
+/// This pack only surfaces Critical/High memories, and hook-driven
+/// auto-extraction (untrusted: transcripts include tool output an agent
+/// didn't author) is capped at `Importance::Medium` so it can't reach here —
+/// but that cap does NOT apply to an MCP `icm_memory_store` call, which can
+/// set `importance: "critical"` directly. If an earlier prompt injection
+/// gets the agent to call that tool, the pack is not purely user-authored.
+/// Audit finding: this comment previously overclaimed "the user is the
+/// only party who can influence the injected content".
 ///
 /// Set `ICM_HOOK_DEBUG=1` in the environment to get stderr diagnostics when
 /// the hook decides to suppress output (empty store, no matching memories).

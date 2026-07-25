@@ -120,7 +120,7 @@ pub(crate) fn strip_json_hooks(value: &mut Value, field: HookCommandField) -> St
                     inner.retain(|h| {
                         h.get("command")
                             .and_then(|c| c.as_str())
-                            .map(|s| !crate::cmd_matches_icm_pattern(s, "icm hook"))
+                            .map(|s| crate::check_icm_hook_command(s).is_none())
                             .unwrap_or(true)
                     });
                     removed += before - inner.len();
@@ -140,7 +140,7 @@ pub(crate) fn strip_json_hooks(value: &mut Value, field: HookCommandField) -> St
                     entry
                         .get("bash")
                         .and_then(|b| b.as_str())
-                        .map(|s| !crate::cmd_matches_icm_pattern(s, "icm hook"))
+                        .map(|s| crate::check_icm_hook_command(s).is_none())
                         .unwrap_or(true)
                 });
                 removed += before - event_arr.len();
@@ -349,11 +349,13 @@ pub(crate) fn apply_yaml_continue(content: &str) -> String {
 // =========================================================================
 
 /// Result of `strip_markdown_block`: either a rewritten string, the
-/// signal to delete the file (block was the only content), or a no-op.
+/// signal to delete the file (block was the only content), a no-op, or an
+/// ambiguous case that needs manual review rather than a guess.
 pub(crate) enum MarkdownOutcome {
     NoOp,
     Rewrite(String),
     DeleteFile,
+    Ambiguous { reason: String },
 }
 
 pub(crate) fn strip_markdown_block(content: &str) -> MarkdownOutcome {
@@ -362,16 +364,32 @@ pub(crate) fn strip_markdown_block(content: &str) -> MarkdownOutcome {
     let Some(start) = content.find(START) else {
         return MarkdownOutcome::NoOp;
     };
-    let end = content
-        .find(END)
-        .map(|o| o + END.len())
-        .unwrap_or(content.len());
-    let before = &content[..start];
-    let after = if end <= content.len() {
-        &content[end..]
-    } else {
-        ""
+    // Audit finding: a missing (or user-edited-away) END marker used to
+    // fall back to `content.len()` — treating everything from START to the
+    // end of the file as "the block" to strip, up to and including
+    // deleting the WHOLE FILE if nothing preceded START. A marker that
+    // ended up before START (e.g. from manual editing) hit the same
+    // `end <= content.len()` path and silently duplicated content instead.
+    // Neither case can be resolved by guessing — flag it for manual review
+    // instead, matching the `Ambiguous` contract every other stripper here
+    // already uses.
+    let Some(end_marker_at) = content.find(END) else {
+        return MarkdownOutcome::Ambiguous {
+            reason: "found <!-- icm:start --> but no matching <!-- icm:end --> \
+                     (the file may have been edited by hand)"
+                .to_string(),
+        };
     };
+    if end_marker_at < start {
+        return MarkdownOutcome::Ambiguous {
+            reason: "<!-- icm:end --> appears before <!-- icm:start --> \
+                     (the file may have been edited by hand)"
+                .to_string(),
+        };
+    }
+    let end = end_marker_at + END.len();
+    let before = &content[..start];
+    let after = &content[end..];
     if before.trim().is_empty() && after.trim().is_empty() {
         return MarkdownOutcome::DeleteFile;
     }
@@ -464,6 +482,7 @@ pub(crate) fn rewrite_markdown(path: &std::path::Path) -> Result<StripResult> {
                 .with_context(|| format!("cannot delete {}", path.display()))?;
             Ok(StripResult::DeleteFile)
         }
+        MarkdownOutcome::Ambiguous { reason } => Ok(StripResult::Ambiguous { reason }),
     }
 }
 
@@ -676,12 +695,39 @@ mcpServers:
         assert!(matches!(strip_markdown_block(src), MarkdownOutcome::NoOp));
     }
 
+    /// Audit regression: a missing END marker used to fall back to
+    /// `content.len()`, treating everything after START — including the
+    /// user's own content — as part of the block to strip. Here that would
+    /// have deleted "my own notes below, please keep these" outright.
+    #[test]
+    fn strip_markdown_block_is_ambiguous_when_end_marker_is_missing() {
+        let src = "intro\n<!-- icm:start -->\nblock\nmy own notes below, please keep these\n";
+        match strip_markdown_block(src) {
+            MarkdownOutcome::Ambiguous { .. } => {}
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    /// Audit regression: an END marker appearing before START (e.g. from
+    /// manual editing) hit the same `end <= content.len()` path and
+    /// silently duplicated the in-between region into both `before` and
+    /// `after` instead of being flagged.
+    #[test]
+    fn strip_markdown_block_is_ambiguous_when_end_precedes_start() {
+        let src = "<!-- icm:end -->\nstuff\n<!-- icm:start -->\nblock\n";
+        match strip_markdown_block(src) {
+            MarkdownOutcome::Ambiguous { .. } => {}
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
     impl std::fmt::Debug for MarkdownOutcome {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 MarkdownOutcome::NoOp => write!(f, "NoOp"),
                 MarkdownOutcome::Rewrite(_) => write!(f, "Rewrite(..)"),
                 MarkdownOutcome::DeleteFile => write!(f, "DeleteFile"),
+                MarkdownOutcome::Ambiguous { reason } => write!(f, "Ambiguous({reason})"),
             }
         }
     }

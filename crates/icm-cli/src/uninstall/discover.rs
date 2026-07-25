@@ -155,7 +155,7 @@ fn scan_json(
                             };
                             for h in inner {
                                 if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
-                                    if crate::cmd_matches_icm_pattern(cmd, "icm hook") {
+                                    if crate::check_icm_hook_command(cmd).is_some() {
                                         hits.push(LocationHit {
                                             spec_label: spec.label,
                                             path: spec.path.clone(),
@@ -170,7 +170,7 @@ fn scan_json(
                         }
                         HookCommandField::BashTopLevel => {
                             if let Some(cmd) = entry.get("bash").and_then(|b| b.as_str()) {
-                                if crate::cmd_matches_icm_pattern(cmd, "icm hook") {
+                                if crate::check_icm_hook_command(cmd).is_some() {
                                     hits.push(LocationHit {
                                         spec_label: spec.label,
                                         path: spec.path.clone(),
@@ -436,6 +436,41 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Audit regression: hook detection used to accept any command
+    /// CONTAINING the substring "icm hook" — a non-ICM wrapper script that
+    /// merely mentions it (in a comment, echo, or argument to an unrelated
+    /// tool) would be wrongly flagged and stripped by `icm uninstall`. The
+    /// #342-hardened `check_icm_hook_command` requires the invoked
+    /// *binary* to actually be `icm`/`icm.exe`/`icm-post-tool*`/
+    /// `icm-pretool*`.
+    #[test]
+    fn scan_does_not_flag_a_non_icm_wrapper_that_mentions_icm_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dir_context_under(tmp.path());
+        let settings = dirs.claude_dir.join("settings.json");
+        write(
+            &settings,
+            r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{"type":"command","command":"bash -c 'echo icm hook is mentioned here; /usr/bin/my-tool run'"}] }
+    ]
+  }
+}"#,
+        );
+        let specs = build_locations(&dirs);
+        let plan = scan(&specs, false).unwrap();
+        let hook_hits: Vec<_> = plan
+            .hits
+            .iter()
+            .filter(|h| matches!(h.detail, HitDetail::JsonHook { .. }))
+            .collect();
+        assert!(
+            hook_hits.is_empty(),
+            "a wrapper script that merely mentions 'icm hook' must not be flagged: {plan:#?}"
+        );
     }
 
     #[test]

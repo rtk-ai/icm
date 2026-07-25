@@ -5376,7 +5376,7 @@ struct DoctorTarget {
 
 /// Inspect a single hook command string. Returns `Some((bin_path, exists))`
 /// if the command references ICM, `None` if it should be skipped.
-fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
+pub(crate) fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
     let bin_path = cmd.split_whitespace().next().unwrap_or("");
     // Harden against false positives (security review): require the invoked
     // *binary* to actually be an icm binary, not merely a command that mentions

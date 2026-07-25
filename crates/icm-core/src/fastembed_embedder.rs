@@ -25,23 +25,32 @@ fn cache_dir() -> PathBuf {
         })
 }
 
-/// Best-effort check that the onnxruntime shared library is loadable, mirroring
-/// how `ort`'s load-dynamic backend resolves it: `ORT_DYLIB_PATH` if set, else
-/// the platform default name. Used only by the load-dynamic build (issue #345)
-/// to avoid ort's panic-on-missing-runtime under `panic = "abort"`.
-#[cfg(all(unix, feature = "embeddings-dynamic"))]
-fn onnxruntime_dylib_available() -> bool {
-    use std::ffi::CString;
+/// Resolve the onnxruntime library name `ort`'s load-dynamic backend would use:
+/// `ORT_DYLIB_PATH` if set, else the platform default name.
+#[cfg(all(any(unix, windows), feature = "embeddings-dynamic"))]
+fn onnxruntime_lib_name() -> String {
     let default_name = if cfg!(target_os = "macos") {
         "libonnxruntime.dylib"
+    } else if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
     } else {
         "libonnxruntime.so"
     };
-    let name = match std::env::var("ORT_DYLIB_PATH") {
+    match std::env::var("ORT_DYLIB_PATH") {
         Ok(p) if !p.is_empty() => p,
         _ => default_name.to_string(),
-    };
-    let Ok(cname) = CString::new(name) else {
+    }
+}
+
+/// Best-effort check that the onnxruntime shared library is loadable, mirroring
+/// how `ort`'s load-dynamic backend resolves it. Used only by the load-dynamic
+/// build (issue #345) to avoid ort's panic-on-missing-runtime under
+/// `panic = "abort"` — we pre-flight the load and degrade to keyword-only rather
+/// than let the process abort.
+#[cfg(all(unix, feature = "embeddings-dynamic"))]
+fn onnxruntime_dylib_available() -> bool {
+    use std::ffi::CString;
+    let Ok(cname) = CString::new(onnxruntime_lib_name()) else {
         return false;
     };
     // SAFETY: `cname` is a valid NUL-terminated C string for the duration of the
@@ -55,6 +64,43 @@ fn onnxruntime_dylib_available() -> bool {
             true
         }
     }
+}
+
+/// Windows equivalent of the pre-flight, via raw `kernel32` `LoadLibraryW`
+/// (kernel32 is always linked on MSVC, so no extra crate is needed).
+#[cfg(all(windows, feature = "embeddings-dynamic"))]
+fn onnxruntime_dylib_available() -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut core::ffi::c_void;
+        fn FreeLibrary(h_lib_module: *mut core::ffi::c_void) -> i32;
+    }
+
+    let wide: Vec<u16> = OsStr::new(&onnxruntime_lib_name())
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 string for the duration of
+    // the call; the returned handle is only tested for null and immediately freed.
+    unsafe {
+        let handle = LoadLibraryW(wide.as_ptr());
+        if handle.is_null() {
+            false
+        } else {
+            FreeLibrary(handle);
+            true
+        }
+    }
+}
+
+/// On exotic platforms with no dlopen/LoadLibrary probe, don't block: let ort
+/// resolve the runtime itself (these targets are not shipped, issue #345).
+#[cfg(all(not(any(unix, windows)), feature = "embeddings-dynamic"))]
+fn onnxruntime_dylib_available() -> bool {
+    true
 }
 
 pub struct FastEmbedder {
@@ -151,7 +197,7 @@ impl FastEmbedder {
         // instead: if it can't be dlopen'd, return a clean error (→ keyword-only
         // search) before ort ever initializes. Static builds link onnxruntime
         // in, so this check is compiled out there.
-        #[cfg(all(unix, feature = "embeddings-dynamic"))]
+        #[cfg(feature = "embeddings-dynamic")]
         if !onnxruntime_dylib_available() {
             return Err(IcmError::Embedding(
                 "onnxruntime runtime not found for this load-dynamic build; \
@@ -290,14 +336,16 @@ mod tests {
     // unavailable — this is what lets a load-dynamic build return a clean error
     // (→ keyword-only) instead of ort aborting under `panic = "abort"`. Run with
     // `cargo test -p icm-core --features embeddings-dynamic`.
-    #[cfg(all(unix, feature = "embeddings-dynamic"))]
+    #[cfg(all(any(unix, windows), feature = "embeddings-dynamic"))]
     #[test]
     fn missing_onnxruntime_dylib_is_reported_unavailable() {
+        let bogus = if cfg!(windows) {
+            r"C:\nonexistent\icm-test\onnxruntime-does-not-exist.dll"
+        } else {
+            "/nonexistent/icm-test/libonnxruntime-does-not-exist.so"
+        };
         let prev = std::env::var("ORT_DYLIB_PATH").ok();
-        std::env::set_var(
-            "ORT_DYLIB_PATH",
-            "/nonexistent/icm-test/libonnxruntime-does-not-exist.so",
-        );
+        std::env::set_var("ORT_DYLIB_PATH", bogus);
         assert!(
             !onnxruntime_dylib_available(),
             "a non-existent ORT_DYLIB_PATH must be detected as unavailable"

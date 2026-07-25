@@ -127,6 +127,8 @@ icm embeddings status
 
 If declined (or in a non-interactive context — MCP server, hooks, CI), ICM stays keyword-only until you run `icm embeddings download`. To use your own runtime, set `ORT_DYLIB_PATH` to an ONNX Runtime **1.20.x** library.
 
+The download supports macOS (arm64/x86_64), Linux (x86_64/aarch64), and Windows (x86_64). On Windows the runtime is the larger `onnxruntime.dll` package (~65 MB); everywhere else it's ~7 MB.
+
 ## Setup
 
 ```bash

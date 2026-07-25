@@ -27,7 +27,7 @@ embeddings-static = ["embeddings", "icm-core/embeddings-static"]
 # load-dynamic variant (issue #345): compiles with no build-time onnxruntime,
 # so `brew install` (homebrew-core) can build it with embeddings. Used as
 # `--no-default-features --features "embeddings-dynamic,backend-sqlite,tui,http-api"`.
-embeddings-dynamic = ["embeddings", "icm-core/embeddings-dynamic"]
+embeddings-dynamic = ["embeddings", "icm-core/embeddings-dynamic", "dep:zip"]
 tui = ["dep:ratatui", "dep:crossterm"]
 # Storage backends (additive). SQLite is in-process; postgres / opensearch
 # are network-accessible so several `icm` processes / Kubernetes replicas
@@ -74,6 +74,8 @@ rpassword = { workspace = true }
 sha2 = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+# Only the load-dynamic embeddings build needs zip (Windows onnxruntime asset).
+zip = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }

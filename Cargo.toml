@@ -59,6 +59,9 @@ rpassword = "5"
 sha2 = "0.10"
 flate2 = "1"
 tar = "0.4.45"
+# Windows onnxruntime runtime (issue #345) ships as a .zip, unlike the unix
+# .tgz; `deflate` is the only compression the Microsoft asset uses.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Platform
 libc = "0.2"

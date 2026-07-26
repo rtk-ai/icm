@@ -3486,9 +3486,11 @@ fn cmd_hook_post(
     // (a malicious tool could emit decision-keyword text to poison wake-up).
     // Pass the embedder so non-English content is also scored: the keyword
     // scorer is English-only and would silently drop FR/DE/etc. facts.
+    // Also cap the input size — see cap_tool_output_for_inline_extraction.
+    let capped_inline = cap_tool_output_for_inline_extraction(tool_output);
     match extract::extract_and_store_with_embedder(
         store,
-        tool_output,
+        capped_inline,
         &project,
         store_raw,
         icm_core::Importance::Medium,
@@ -3861,6 +3863,20 @@ pub(crate) fn truncate_tail_at_char_boundary(s: &str, max_bytes: usize) -> &str 
         start += 1;
     }
     &s[start..]
+}
+
+/// Audit finding: the inline (default, provider=none) PostToolUse extraction
+/// path ran sentence-splitting + keyword/semantic scoring over the ENTIRE
+/// tool output with no cap, unlike the async LLM path just above it (capped
+/// at 8 KB "to keep the queue reasonable"). A single large tool output (a
+/// verbose build/test log, a `cat` of a big file) could synchronously block
+/// the next PostToolUse hook for far longer than the already-noted ~3.7s
+/// typical cost, with only the outer 32 MB stdin cap as a backstop. Larger
+/// than the async path's cap since inline extraction is the path most
+/// installs actually experience in-session, and losing extraction quality
+/// would be more noticeable here.
+pub(crate) fn cap_tool_output_for_inline_extraction(tool_output: &str) -> &str {
+    truncate_tail_at_char_boundary(tool_output, 16_384)
 }
 
 /// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
@@ -9888,6 +9904,28 @@ mod hook_start_tests {
         assert!(p.contains("## Recent decisions"));
         assert!(p.contains("use SQLite for storage"));
         assert!(p.contains("fixed the spawn loop"));
+    }
+
+    /// Audit regression: the inline (default) PostToolUse extraction path
+    /// ran sentence-splitting + keyword/semantic scoring over the ENTIRE
+    /// tool output with no cap at all, unlike the async LLM path (capped at
+    /// 8 KB). A single large tool output could synchronously block the
+    /// next PostToolUse hook for far longer than normal.
+    #[test]
+    fn cap_tool_output_for_inline_extraction_bounds_large_input() {
+        let huge = "x".repeat(1_000_000);
+        let capped = cap_tool_output_for_inline_extraction(&huge);
+        assert!(
+            capped.len() <= 16_384,
+            "inline extraction input must be bounded, got {} bytes",
+            capped.len()
+        );
+    }
+
+    #[test]
+    fn cap_tool_output_for_inline_extraction_is_a_noop_for_small_input() {
+        let small = "short tool output";
+        assert_eq!(cap_tool_output_for_inline_extraction(small), small);
     }
 
     #[test]

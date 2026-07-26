@@ -23,7 +23,7 @@
 //! nearby points of vector space, both close to the English decision
 //! anchor. Tested against EN/FR/DE/ES/IT fixtures.
 
-use icm_core::{Embedder, IcmResult, Importance};
+use icm_core::{Embedder, IcmError, IcmResult, Importance};
 
 /// Importance bucket for a matched anchor. The mapping is fixed
 /// rather than configurable so the calibration of the scorer's
@@ -226,6 +226,15 @@ impl SemanticScorer {
         let mut best_pos: Option<(AnchorKind, f32)> = None;
         for (kind, anchor_emb) in &self.positive {
             let sim = cosine(embedding, anchor_emb);
+            // Audit finding: `is_none_or` unconditionally seeds `best_pos` on
+            // the first anchor regardless of `sim`. If a corrupt/adversarial
+            // embedder ever produces a non-finite similarity, it would lock
+            // in permanently (`x > NaN` is always false, so no later, valid
+            // similarity could displace it). Skip non-finite values instead
+            // of ever accepting them as a candidate best match.
+            if !sim.is_finite() {
+                continue;
+            }
             if best_pos.is_none_or(|(_, b)| sim > b) {
                 best_pos = Some((*kind, sim));
             }
@@ -257,12 +266,37 @@ impl SemanticScorer {
             return Ok(Vec::new());
         }
         let embs = embedder.embed_batch(sentences)?;
+        // Audit finding: the caller (`extract_facts_semantic`) zips this
+        // result positionally against `sentences` — if `embed_batch` ever
+        // returned a different count (a buggy/adversarial `Embedder` impl
+        // dropping or reordering an entry), `zip` would silently truncate
+        // to the shorter length and misattribute every scored result after
+        // the divergence point to the wrong original sentence. Fail loudly
+        // instead of trusting the invariant implicitly.
+        if embs.len() != sentences.len() {
+            return Err(IcmError::Embedding(format!(
+                "embed_batch returned {} embeddings for {} sentences",
+                embs.len(),
+                sentences.len()
+            )));
+        }
         Ok(embs.into_iter().map(|e| self.score(&e)).collect())
     }
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
+    // Audit finding: this used to silently compute over `min(a.len(),
+    // b.len())` — a dimension-mismatched embedding (e.g. a caller passing a
+    // candidate embedding from a different model/embedder than the one the
+    // anchors were built with) would produce a plausible-looking but
+    // mathematically wrong similarity instead of an error. Worse than a
+    // crash: undetectable, silently misclassifies. -1.0 is below any real
+    // cosine similarity, so a mismatched pair can never win `score`'s
+    // best-match selection or contaminate `max_neg`.
+    if a.len() != b.len() {
+        return -1.0;
+    }
+    let n = a.len();
     let mut dot = 0.0f32;
     let mut na = 0.0f32;
     let mut nb = 0.0f32;
@@ -278,7 +312,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icm_core::IcmError;
 
     /// Stub embedder that returns deterministic orthogonal vectors
     /// keyed on keyword presence in the input. The 8th dimension is
@@ -695,6 +728,116 @@ mod tests {
             for j in (i + 1)..tags.len() {
                 assert_ne!(tags[i], tags[j], "duplicate tag at {i}/{j}: {}", tags[i]);
             }
+        }
+    }
+
+    /// Audit regression: `cosine` used to silently compute over
+    /// `min(a.len(), b.len())` instead of validating dimensions, producing
+    /// a plausible-but-wrong similarity instead of failing. A
+    /// dimension-mismatched pair must score as if maximally dissimilar
+    /// (-1.0), never as a real match.
+    #[test]
+    fn cosine_rejects_dimension_mismatch() {
+        let a = vec![1.0f32, 0.0, 0.0, 0.0];
+        let b = vec![1.0f32, 0.0]; // shorter — would "match" on the truncated prefix
+        assert_eq!(cosine(&a, &b), -1.0);
+    }
+
+    /// Audit regression: `score_batch` must not silently trust that
+    /// `embed_batch` returns one embedding per input sentence — the caller
+    /// (`extract_facts_semantic`) zips the result positionally against the
+    /// original sentences, so a length mismatch would silently misattribute
+    /// every result after the divergence point.
+    #[test]
+    fn score_batch_errors_on_embedder_length_mismatch() {
+        struct DropsOneEmbedder;
+        impl Embedder for DropsOneEmbedder {
+            fn embed(&self, _text: &str) -> IcmResult<Vec<f32>> {
+                Ok(vec![0.0; 8])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                // Drop the last entry regardless of how many were asked for.
+                Ok(texts[..texts.len().saturating_sub(1)]
+                    .iter()
+                    .map(|_| vec![0.0; 8])
+                    .collect())
+            }
+            fn dimensions(&self) -> usize {
+                8
+            }
+        }
+
+        let embedder = DropsOneEmbedder;
+        let scorer = SemanticScorer::new(&embedder).expect("stub scorer build");
+        let result = scorer.score_batch(&embedder, &["first sentence", "second sentence"]);
+        assert!(
+            result.is_err(),
+            "a length mismatch between sentences and embeddings must error, not silently misalign"
+        );
+    }
+
+    /// Audit regression: `is_none_or` unconditionally seeded `best_pos` on
+    /// the FIRST positive anchor regardless of similarity value. If that
+    /// first anchor's embedding is corrupt (non-finite), `best_pos` locks
+    /// onto it permanently since `x > NaN` is always false — no later,
+    /// genuinely high similarity can ever displace it, and the margin
+    /// (`pos_sim - max_neg`) then propagates NaN, so the sentence is
+    /// silently dropped even though a later anchor was a clean, high-margin
+    /// match. Craft an embedder where the first positive anchor embeds to
+    /// NaN but a later one embeds identically to the query (cosine 1.0):
+    /// the fixed scorer must still surface that later match.
+    #[test]
+    fn score_does_not_lock_onto_a_non_finite_first_similarity() {
+        let first_anchor_pattern = POSITIVE_ANCHORS[0].pattern;
+        let second_anchor_pattern = POSITIVE_ANCHORS[1].pattern;
+        assert_ne!(first_anchor_pattern, second_anchor_pattern);
+
+        struct PartlyCorruptEmbedder {
+            first_anchor_pattern: &'static str,
+            second_anchor_pattern: &'static str,
+        }
+        impl Embedder for PartlyCorruptEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                if text == self.first_anchor_pattern {
+                    Ok(vec![f32::NAN, f32::NAN])
+                } else if text == self.second_anchor_pattern || text == "query" {
+                    // The query and the SECOND positive anchor embed
+                    // identically — a clean, finite cosine-1.0 match that
+                    // must win once the corrupt first anchor is skipped.
+                    Ok(vec![1.0, 0.0])
+                } else {
+                    // Every other anchor (later positives + all
+                    // negatives) is orthogonal to the query — cosine 0.0,
+                    // a clean finite non-match.
+                    Ok(vec![0.0, 1.0])
+                }
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                2
+            }
+        }
+
+        let embedder = PartlyCorruptEmbedder {
+            first_anchor_pattern,
+            second_anchor_pattern,
+        };
+        let scorer = SemanticScorer::new(&embedder)
+            .expect("stub scorer build")
+            .with_threshold(0.5);
+        let query_embedding = embedder.embed("query").unwrap();
+        let result = scorer.score(&query_embedding);
+        match result {
+            Some((_, margin)) => assert!(
+                (margin - 1.0).abs() < 1e-6,
+                "expected the clean, later cosine-1.0 anchor to win with margin ~1.0, got {margin}"
+            ),
+            None => panic!(
+                "a NaN-corrupted first anchor must not suppress a genuinely \
+                 high-similarity later anchor"
+            ),
         }
     }
 }

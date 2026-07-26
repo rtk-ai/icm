@@ -1042,6 +1042,22 @@ fn escape_like_wildcards(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// Cap on auxiliary metadata (transcript sessions/messages) - best-effort
+/// truncation, not rejection, matching MAX_MESSAGE_BYTES's rationale.
+const MAX_METADATA_BYTES: usize = 8 * 1024;
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 char.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
 /// This function strips special chars and wraps each token in double quotes.
 fn sanitize_fts_query(query: &str) -> String {
     // Limit input length to prevent abuse (UTF-8 safe truncation)
@@ -1082,6 +1098,19 @@ fn sanitize_fts_query(query: &str) -> String {
         })
         .collect();
     tokens.join(" ")
+}
+
+/// Whether `e` is FTS5 rejecting a malformed MATCH query (e.g. "hello AND",
+/// unbalanced parens) rather than a genuine database error. Used by
+/// `search_transcripts` to degrade to "no results" instead of surfacing a
+/// raw sqlite error, without pre-sanitizing the query text away from valid
+/// FTS5 syntax (which callers rely on — see
+/// `test_transcript_search_fts5_boolean_and_phrase`).
+fn is_fts5_syntax_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("fts5: syntax error")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2999,13 +3028,14 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
     })
 }
 
-impl FactsStore for SqliteStore {
-    fn set_fact(&self, entity: &str, key: &str, value: &str, source: &str) -> IcmResult<String> {
-        if entity.is_empty() || key.is_empty() {
-            return Err(IcmError::InvalidInput(
-                "entity and key must be non-empty".into(),
-            ));
-        }
+impl SqliteStore {
+    fn set_fact_inner(
+        &self,
+        entity: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+    ) -> IcmResult<String> {
         let conn = &self.conn;
         // Active row lookup
         let existing: Option<(String, String)> = conn
@@ -3051,6 +3081,36 @@ impl FactsStore for SqliteStore {
         )
         .map_err(db_err)?;
         Ok(new.id)
+    }
+}
+
+impl FactsStore for SqliteStore {
+    fn set_fact(&self, entity: &str, key: &str, value: &str, source: &str) -> IcmResult<String> {
+        if entity.is_empty() || key.is_empty() {
+            return Err(IcmError::InvalidInput(
+                "entity and key must be non-empty".into(),
+            ));
+        }
+        // SELECT (find active row) -> UPDATE (supersede it) -> INSERT (new
+        // row) was three separate statements with no transaction around
+        // them, unlike every other multi-statement write in this file
+        // (audit finding: 0 BEGIN IMMEDIATE occurrences across
+        // Facts/Feedback/Transcript vs 5 in MemoryStore). A crash or
+        // concurrent writer between the UPDATE and the INSERT could leave
+        // the entity/key with no active fact at all.
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(db_err)?;
+        match self.set_fact_inner(entity, key, value, source) {
+            Ok(id) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                Ok(id)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     fn get_fact(&self, entity: &str, key: &str) -> IcmResult<Option<Fact>> {
@@ -3230,6 +3290,7 @@ impl TranscriptStore for SqliteStore {
         project: Option<&str>,
         metadata: Option<&str>,
     ) -> IcmResult<String> {
+        let metadata = metadata.map(|s| truncate_at_char_boundary(s, MAX_METADATA_BYTES));
         let session = Session::new(
             agent.to_string(),
             project.map(|s| s.to_string()),
@@ -3278,6 +3339,7 @@ impl TranscriptStore for SqliteStore {
     ) -> IcmResult<String> {
         let conn = &self.conn;
         let now = chrono::Utc::now().to_rfc3339();
+        let metadata = metadata.map(|s| truncate_at_char_boundary(s, MAX_METADATA_BYTES));
         // INSERT OR IGNORE keeps the first row stable across re-fires.
         // The `id` is the host agent's session id (Claude Code, Codex,
         // Gemini, etc.) so repeated hook posts route to the same row.
@@ -3340,15 +3402,14 @@ impl TranscriptStore for SqliteStore {
         /// MCP `icm_transcript_record` path previously had no bound at all
         /// (audit finding).
         const MAX_MESSAGE_BYTES: usize = 256 * 1024;
-        let content = if content.len() > MAX_MESSAGE_BYTES {
-            let mut cut = MAX_MESSAGE_BYTES;
-            while !content.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            &content[..cut]
-        } else {
-            content
-        };
+        // metadata/tool_name got no cap at all even after content was capped
+        // in round 2 (audit finding) - same best-effort-truncate rationale,
+        // just smaller since they're auxiliary, not the main payload.
+        const MAX_TOOL_NAME_BYTES: usize = 512;
+
+        let content = truncate_at_char_boundary(content, MAX_MESSAGE_BYTES);
+        let tool_name = tool_name.map(|s| truncate_at_char_boundary(s, MAX_TOOL_NAME_BYTES));
+        let metadata = metadata.map(|s| truncate_at_char_boundary(s, MAX_METADATA_BYTES));
 
         let msg = Message::new(
             session_id.to_string(),
@@ -3431,6 +3492,15 @@ impl TranscriptStore for SqliteStore {
         project: Option<&str>,
         limit: usize,
     ) -> IcmResult<Vec<TranscriptHit>> {
+        // Unlike search_feedback, raw query text is bound straight to
+        // `messages_fts MATCH ?1` — intentionally, since callers rely on
+        // real FTS5 syntax here (boolean OR, phrase quoting; see
+        // test_transcript_search_fts5_boolean_and_phrase). Sanitizing like
+        // search_feedback does would silently break that. Malformed syntax
+        // (e.g. "hello AND", "(hello") threw a raw sqlite error instead of
+        // degrading gracefully (audit finding) — that's handled below by
+        // treating an FTS5 syntax error as "no results" rather than
+        // propagating the sqlite internals to the caller.
         let conn = &self.conn;
         // Build dynamic WHERE filters. FTS MATCH comes first for index usage.
         let mut sql = String::from(
@@ -3465,127 +3535,129 @@ impl TranscriptStore for SqliteStore {
 
         let mut stmt = conn.prepare(&sql).map_err(db_err)?;
         let limit_i = limit as i64;
-        let rows: Vec<TranscriptHit> = match (session_id, project) {
-            (Some(sid), Some(p)) => stmt
-                .query_map(params![query, sid, p, limit_i], |row| {
-                    let msg = Message {
-                        id: row.get("id")?,
-                        session_id: row.get("session_id")?,
-                        role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
-                        content: row.get("content")?,
-                        tool_name: row.get("tool_name")?,
-                        tokens: row.get("tokens")?,
-                        ts: parse_ts(&row.get::<_, String>("ts")?),
-                        metadata: row.get("metadata")?,
-                    };
-                    let sess = Session {
-                        id: row.get("s_id")?,
-                        agent: row.get("s_agent")?,
-                        project: row.get("s_project")?,
-                        started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
-                        updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
-                        metadata: row.get("s_metadata")?,
-                    };
-                    let raw_score: f64 = row.get("score")?;
-                    Ok(TranscriptHit {
-                        message: msg,
-                        session: sess,
-                        score: -raw_score, // FTS5 bm25 returns negative for better rank
-                    })
-                })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?,
-            (Some(sid), None) => stmt
-                .query_map(params![query, sid, limit_i], |row| {
-                    let msg = Message {
-                        id: row.get("id")?,
-                        session_id: row.get("session_id")?,
-                        role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
-                        content: row.get("content")?,
-                        tool_name: row.get("tool_name")?,
-                        tokens: row.get("tokens")?,
-                        ts: parse_ts(&row.get::<_, String>("ts")?),
-                        metadata: row.get("metadata")?,
-                    };
-                    let sess = Session {
-                        id: row.get("s_id")?,
-                        agent: row.get("s_agent")?,
-                        project: row.get("s_project")?,
-                        started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
-                        updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
-                        metadata: row.get("s_metadata")?,
-                    };
-                    let raw_score: f64 = row.get("score")?;
-                    Ok(TranscriptHit {
-                        message: msg,
-                        session: sess,
-                        score: -raw_score,
-                    })
-                })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?,
-            (None, Some(p)) => stmt
-                .query_map(params![query, p, limit_i], |row| {
-                    let msg = Message {
-                        id: row.get("id")?,
-                        session_id: row.get("session_id")?,
-                        role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
-                        content: row.get("content")?,
-                        tool_name: row.get("tool_name")?,
-                        tokens: row.get("tokens")?,
-                        ts: parse_ts(&row.get::<_, String>("ts")?),
-                        metadata: row.get("metadata")?,
-                    };
-                    let sess = Session {
-                        id: row.get("s_id")?,
-                        agent: row.get("s_agent")?,
-                        project: row.get("s_project")?,
-                        started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
-                        updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
-                        metadata: row.get("s_metadata")?,
-                    };
-                    let raw_score: f64 = row.get("score")?;
-                    Ok(TranscriptHit {
-                        message: msg,
-                        session: sess,
-                        score: -raw_score,
-                    })
-                })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?,
-            (None, None) => stmt
-                .query_map(params![query, limit_i], |row| {
-                    let msg = Message {
-                        id: row.get("id")?,
-                        session_id: row.get("session_id")?,
-                        role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
-                        content: row.get("content")?,
-                        tool_name: row.get("tool_name")?,
-                        tokens: row.get("tokens")?,
-                        ts: parse_ts(&row.get::<_, String>("ts")?),
-                        metadata: row.get("metadata")?,
-                    };
-                    let sess = Session {
-                        id: row.get("s_id")?,
-                        agent: row.get("s_agent")?,
-                        project: row.get("s_project")?,
-                        started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
-                        updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
-                        metadata: row.get("s_metadata")?,
-                    };
-                    let raw_score: f64 = row.get("score")?;
-                    Ok(TranscriptHit {
-                        message: msg,
-                        session: sess,
-                        score: -raw_score,
-                    })
-                })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?,
+        // Compute against raw rusqlite errors so a malformed FTS5 query
+        // (syntax error) can be distinguished from a real db failure below,
+        // instead of eagerly converting to IcmError via `?`.
+        let mut compute = || -> rusqlite::Result<Vec<TranscriptHit>> {
+            Ok(match (session_id, project) {
+                (Some(sid), Some(p)) => stmt
+                    .query_map(params![query, sid, p, limit_i], |row| {
+                        let msg = Message {
+                            id: row.get("id")?,
+                            session_id: row.get("session_id")?,
+                            role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
+                            content: row.get("content")?,
+                            tool_name: row.get("tool_name")?,
+                            tokens: row.get("tokens")?,
+                            ts: parse_ts(&row.get::<_, String>("ts")?),
+                            metadata: row.get("metadata")?,
+                        };
+                        let sess = Session {
+                            id: row.get("s_id")?,
+                            agent: row.get("s_agent")?,
+                            project: row.get("s_project")?,
+                            started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
+                            updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
+                            metadata: row.get("s_metadata")?,
+                        };
+                        let raw_score: f64 = row.get("score")?;
+                        Ok(TranscriptHit {
+                            message: msg,
+                            session: sess,
+                            score: -raw_score, // FTS5 bm25 returns negative for better rank
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+                (Some(sid), None) => stmt
+                    .query_map(params![query, sid, limit_i], |row| {
+                        let msg = Message {
+                            id: row.get("id")?,
+                            session_id: row.get("session_id")?,
+                            role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
+                            content: row.get("content")?,
+                            tool_name: row.get("tool_name")?,
+                            tokens: row.get("tokens")?,
+                            ts: parse_ts(&row.get::<_, String>("ts")?),
+                            metadata: row.get("metadata")?,
+                        };
+                        let sess = Session {
+                            id: row.get("s_id")?,
+                            agent: row.get("s_agent")?,
+                            project: row.get("s_project")?,
+                            started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
+                            updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
+                            metadata: row.get("s_metadata")?,
+                        };
+                        let raw_score: f64 = row.get("score")?;
+                        Ok(TranscriptHit {
+                            message: msg,
+                            session: sess,
+                            score: -raw_score,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+                (None, Some(p)) => stmt
+                    .query_map(params![query, p, limit_i], |row| {
+                        let msg = Message {
+                            id: row.get("id")?,
+                            session_id: row.get("session_id")?,
+                            role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
+                            content: row.get("content")?,
+                            tool_name: row.get("tool_name")?,
+                            tokens: row.get("tokens")?,
+                            ts: parse_ts(&row.get::<_, String>("ts")?),
+                            metadata: row.get("metadata")?,
+                        };
+                        let sess = Session {
+                            id: row.get("s_id")?,
+                            agent: row.get("s_agent")?,
+                            project: row.get("s_project")?,
+                            started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
+                            updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
+                            metadata: row.get("s_metadata")?,
+                        };
+                        let raw_score: f64 = row.get("score")?;
+                        Ok(TranscriptHit {
+                            message: msg,
+                            session: sess,
+                            score: -raw_score,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+                (None, None) => stmt
+                    .query_map(params![query, limit_i], |row| {
+                        let msg = Message {
+                            id: row.get("id")?,
+                            session_id: row.get("session_id")?,
+                            role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
+                            content: row.get("content")?,
+                            tool_name: row.get("tool_name")?,
+                            tokens: row.get("tokens")?,
+                            ts: parse_ts(&row.get::<_, String>("ts")?),
+                            metadata: row.get("metadata")?,
+                        };
+                        let sess = Session {
+                            id: row.get("s_id")?,
+                            agent: row.get("s_agent")?,
+                            project: row.get("s_project")?,
+                            started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
+                            updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
+                            metadata: row.get("s_metadata")?,
+                        };
+                        let raw_score: f64 = row.get("score")?;
+                        Ok(TranscriptHit {
+                            message: msg,
+                            session: sess,
+                            score: -raw_score,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        };
+        let rows = match compute() {
+            Ok(rows) => rows,
+            Err(e) if is_fts5_syntax_error(&e) => Vec::new(),
+            Err(e) => return Err(db_err(e)),
         };
         Ok(rows)
     }
@@ -7934,6 +8006,30 @@ mod tests {
             .unwrap();
         assert_eq!(phrase_hits.len(), 1);
         assert!(phrase_hits[0].message.content.contains("Postgres"));
+    }
+
+    /// Audit regression: `search_transcripts` bound the raw query straight
+    /// to `messages_fts MATCH ?1` with no handling for malformed FTS5
+    /// syntax. A trailing boolean operator or an unbalanced paren threw a
+    /// raw sqlite error instead of degrading gracefully to "no results" —
+    /// while still preserving valid FTS5 syntax (see the OR/phrase test
+    /// above), which a blanket `sanitize_fts_query` call would have broken.
+    #[test]
+    fn test_transcript_search_malformed_fts5_query_degrades_gracefully() {
+        let store = test_store();
+        let sid = store.create_session("cli", None, None).unwrap();
+        store
+            .record_message(&sid, Role::User, "hello world", None, None, None)
+            .unwrap();
+
+        for bad_query in ["hello AND", "(hello", "hello OR OR"] {
+            let result = store.search_transcripts(bad_query, None, None, 10);
+            assert!(
+                result.is_ok(),
+                "malformed FTS5 query {bad_query:?} must not error: {result:?}"
+            );
+            assert!(result.unwrap().is_empty());
+        }
     }
 
     #[test]

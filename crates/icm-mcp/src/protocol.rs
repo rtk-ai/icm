@@ -9,10 +9,27 @@ use serde_json::Value;
 pub struct JsonRpcMessage {
     #[allow(dead_code)]
     pub jsonrpc: String,
+    /// Audit finding: plain `Option<Value>` can't distinguish an *absent*
+    /// `id` field (a Notification — no response expected) from an id that's
+    /// *explicitly* `null` (a legal, if discouraged, Request per JSON-RPC
+    /// 2.0 — the server must still reply, with `id: null`). Both used to
+    /// deserialize to `None` and get silently dropped as if they were
+    /// Notifications, leaving a client that sent `"id": null` hanging
+    /// forever with no response. `deserialize_some` + `#[serde(default)]`
+    /// is the standard "double Option" idiom: missing → `None` (via
+    /// default), present-as-null → `Some(Value::Null)`.
+    #[serde(default, deserialize_with = "deserialize_some")]
     pub id: Option<Value>,
     pub method: Option<String>,
     #[serde(default)]
     pub params: Option<Value>,
+}
+
+fn deserialize_some<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +123,34 @@ impl ToolResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Audit regression: a Request with `"id": null` (legal per JSON-RPC
+    /// 2.0, if discouraged) must still be recognized as a Request needing a
+    /// response — not conflated with a Notification (missing `id`
+    /// entirely), which gets no response at all.
+    #[test]
+    fn json_rpc_message_distinguishes_explicit_null_id_from_missing_id() {
+        let with_null_id: JsonRpcMessage =
+            serde_json::from_value(json!({"jsonrpc": "2.0", "id": null, "method": "ping"}))
+                .unwrap();
+        assert_eq!(
+            with_null_id.id,
+            Some(Value::Null),
+            "explicit `\"id\": null` must deserialize to Some(Null), not None, \
+             or the server silently drops the request as a Notification"
+        );
+
+        let without_id: JsonRpcMessage =
+            serde_json::from_value(json!({"jsonrpc": "2.0", "method": "ping"})).unwrap();
+        assert_eq!(
+            without_id.id, None,
+            "a genuinely absent id field must still deserialize to None (Notification)"
+        );
+
+        let with_real_id: JsonRpcMessage =
+            serde_json::from_value(json!({"jsonrpc": "2.0", "id": 7, "method": "ping"})).unwrap();
+        assert_eq!(with_real_id.id, Some(json!(7)));
+    }
 
     #[test]
     fn test_tool_result_text() {

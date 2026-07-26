@@ -176,6 +176,27 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&result).to_string()
 }
 
+/// Percent-encode a value for safe use in a URL query string. Unreserved
+/// per RFC 3986 (`A-Za-z0-9-._~`) pass through; everything else — notably
+/// `+` (decoded as a literal space by `url_decode` above and most
+/// form-urlencoded parsers) and `:` (reserved in a query component) — is
+/// percent-encoded. Audit finding: `pull_memories`'s `since` RFC3339
+/// timestamp (e.g. "2026-07-25T10:00:00+02:00") was pushed into the query
+/// string unencoded, silently corrupting the filter on any backend that
+/// applies form-urlencoded decoding to query values.
+fn url_encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 // ── Login (browser OAuth) ───────────────────────────────────────────────────
 
 /// Browser-based OAuth login: opens browser, listens for callback on localhost.
@@ -451,7 +472,14 @@ pub fn pull_memories(
     );
 
     if let Some(ts) = since {
-        url.push_str(&format!("&since={}", ts));
+        // Audit finding: `since` is a raw user-supplied --since CLI value
+        // (RFC3339), pushed into the query string unencoded. RFC3339
+        // timestamps with a timezone offset contain `+` (e.g.
+        // "2026-07-25T10:00:00+02:00"), which a form-urlencoded-convention
+        // parser on the backend decodes as a literal space — silently
+        // corrupting or dropping the filter. `:` is also reserved in a
+        // query component per RFC 3986. Percent-encode it properly.
+        url.push_str(&format!("&since={}", url_encode_query_value(ts)));
     }
 
     let resp = ureq::get(&url)
@@ -668,5 +696,23 @@ mod tests {
         assert!(!requires_cloud(Scope::User));
         assert!(requires_cloud(Scope::Project));
         assert!(requires_cloud(Scope::Org));
+    }
+
+    /// Audit regression: an RFC3339 `since` timestamp with a `+HH:MM` offset
+    /// must survive round-tripping through the query string. `+` is decoded
+    /// as a literal space by form-urlencoded convention, so an unencoded
+    /// `+` silently corrupts the offset (and thus the filter).
+    #[test]
+    fn test_url_encode_query_value_escapes_reserved_chars() {
+        let encoded = url_encode_query_value("2026-07-25T10:00:00+02:00");
+        assert_eq!(encoded, "2026-07-25T10%3A00%3A00%2B02%3A00");
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains(':'));
+    }
+
+    #[test]
+    fn test_url_encode_query_value_leaves_unreserved_chars_untouched() {
+        let unreserved = "AZaz09-._~";
+        assert_eq!(url_encode_query_value(unreserved), unreserved);
     }
 }

@@ -165,17 +165,27 @@ impl App {
     }
 
     fn refresh(&mut self, store: &Store, db_path: Option<&str>) {
-        if let Ok(s) = store.stats() {
-            self.stats = s;
+        // Audit finding: silently keeping stale data on a failed reload gave
+        // the user zero indication anything went wrong (unlike the explicit
+        // action handlers in execute_confirm, which do call set_status on
+        // error). Track what failed and surface it once, instead of
+        // swallowing every Err via `if let Ok(...)`.
+        let mut failed = Vec::new();
+        match store.stats() {
+            Ok(s) => self.stats = s,
+            Err(_) => failed.push("stats"),
         }
-        if let Ok(t) = store.list_topics() {
-            self.topics = t;
+        match store.list_topics() {
+            Ok(t) => self.topics = t,
+            Err(_) => failed.push("topics"),
         }
-        if let Ok(h) = Self::load_health(store, &self.topics) {
-            self.health = h;
+        match Self::load_health(store, &self.topics) {
+            Ok(h) => self.health = h,
+            Err(_) => failed.push("health"),
         }
-        if let Ok(m) = Self::load_memoirs(store) {
-            self.memoirs = m;
+        match Self::load_memoirs(store) {
+            Ok(m) => self.memoirs = m,
+            Err(_) => failed.push("memoirs"),
         }
         self.feedback_count = store.feedback_stats().map(|s| s.total).unwrap_or(0);
         self.db_size = db_path
@@ -183,6 +193,20 @@ impl App {
             .map(|m| m.len())
             .unwrap_or(0);
         self.last_refresh = Instant::now();
+
+        // Audit finding: refresh() never reloaded the open Memories list, so
+        // it went stale versus the store after any action (decay, delete,
+        // consolidate) applied elsewhere. Reload it if a topic is open.
+        if self.topic_state.selected().is_some() {
+            self.load_topic_memories(store);
+        }
+
+        if !failed.is_empty() {
+            self.set_status(
+                format!("Refresh incomplete: {} failed to reload", failed.join(", ")),
+                Color::Red,
+            );
+        }
     }
 
     fn load_topic_memories(&mut self, store: &Store) {
@@ -199,6 +223,12 @@ impl App {
                     if !self.memories.is_empty() {
                         self.memory_state.select(Some(0));
                     }
+                    // Audit finding: the Topics-tab j/k handlers call this
+                    // to reload the Memories list for the newly-selected
+                    // topic but never reset the scroll offset, so an old
+                    // scroll position could land past the end of the new
+                    // (possibly shorter) memory's detail text.
+                    self.memory_scroll = 0;
                 }
             }
         }
@@ -209,6 +239,17 @@ impl App {
             .selected()
             .and_then(|i| self.topics.get(i))
             .map(|(name, _)| name.as_str())
+    }
+
+    /// Audit finding: `app.health` is built by silently dropping any topic
+    /// whose `topic_health()` call failed (see `load_health`), so if that
+    /// happens `app.health` is shorter than `app.topics` and every entry
+    /// after the failure shifts left. The Topic Detail panel used to index
+    /// `app.health` by the same position as `app.topic_state` — matching
+    /// by topic name instead is correct regardless of any dropped entries.
+    fn selected_topic_health(&self) -> Option<&TopicHealth> {
+        let name = self.selected_topic_name()?;
+        self.health.iter().find(|h| h.topic == name)
     }
 
     fn next_tab(&mut self) {
@@ -578,13 +619,19 @@ fn execute_confirm(app: &mut App, store: &Store, db_path: Option<&str>) {
             Ok(()) => {
                 let id_short: String = id.chars().take(8).collect();
                 app.set_status(format!("Deleted memory {id_short}"), Color::Green);
-                app.load_topic_memories(store);
-                // Adjust selection after deletion
-                if let Some(sel) = app.memory_state.selected() {
-                    if sel >= app.memories.len() && !app.memories.is_empty() {
-                        app.memory_state.select(Some(app.memories.len() - 1));
-                    } else if app.memories.is_empty() {
-                        app.memory_state.select(None);
+                // Audit finding: deleting a memory selected from the Search
+                // overlay only reloaded the Memories tab's list — the
+                // now-stale entry stayed visible (and re-selectable, hitting
+                // a confusing "not found" on a second delete) in the still-
+                // open search overlay. Purge it there too and keep the
+                // selection in bounds, mirroring load_topic_memories' own
+                // out-of-bounds handling.
+                app.search_results.retain(|m| m.id != id);
+                if let Some(sel) = app.search_state.selected() {
+                    if app.search_results.is_empty() {
+                        app.search_state.select(None);
+                    } else if sel >= app.search_results.len() {
+                        app.search_state.select(Some(app.search_results.len() - 1));
                     }
                 }
                 app.refresh(store, db_path);
@@ -916,14 +963,10 @@ fn draw_topics(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[0], &mut app.topic_state);
 
-    let detail = if let Some(idx) = app.topic_state.selected() {
-        if let Some(health) = app.health.get(idx) {
-            topic_detail_text(health)
-        } else {
-            vec![Line::from("  No health data")]
-        }
-    } else {
-        vec![Line::from("  Select a topic")]
+    let detail = match app.selected_topic_health() {
+        Some(health) => topic_detail_text(health),
+        None if app.topic_state.selected().is_some() => vec![Line::from("  No health data")],
+        None => vec![Line::from("  Select a topic")],
     };
 
     let detail_block = Paragraph::new(detail).block(
@@ -1649,5 +1692,112 @@ mod tests {
         terminal.draw(draw_help_overlay).unwrap();
         terminal.draw(|f| draw_confirm_overlay(f, &app)).unwrap();
         terminal.draw(|f| draw_search_overlay(f, &mut app)).unwrap();
+    }
+
+    /// Audit regression: `refresh()` updated stats/topics/health/memoirs but
+    /// never reloaded the currently-open Memories list, so applying an
+    /// action (decay, delete, consolidate) while a topic was open left the
+    /// displayed memories stale versus the store until the user switched
+    /// topics and back.
+    #[test]
+    fn refresh_reloads_the_open_topic_memories_list() {
+        let store = Store::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "smoke".into(),
+                "first".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        app.topic_state.select(Some(0));
+        app.load_topic_memories(&store);
+        assert_eq!(app.memories.len(), 1);
+
+        store
+            .store(Memory::new(
+                "smoke".into(),
+                "second".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        app.refresh(&store, None);
+        assert_eq!(
+            app.memories.len(),
+            2,
+            "refresh() must reload the open topic's memories, not just stats/topics/health"
+        );
+    }
+
+    /// Audit regression: deleting a memory selected from the Search overlay
+    /// only reloaded the Memories tab's list — the deleted entry stayed
+    /// visible (and re-selectable) in the still-open search overlay.
+    #[test]
+    fn deleting_a_memory_removes_it_from_search_results_too() {
+        let store = Store::in_memory().unwrap();
+        let id = store
+            .store(Memory::new(
+                "smoke".into(),
+                "to be deleted".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        app.search_results = vec![store.get(&id).unwrap().unwrap()];
+        app.search_state.select(Some(0));
+
+        app.confirm = Confirm::DeleteMemory {
+            id: id.clone(),
+            summary: "to be deleted".into(),
+        };
+        execute_confirm(&mut app, &store, None);
+
+        assert!(
+            app.search_results.iter().all(|m| m.id != id),
+            "deleted memory must be purged from search_results, not just the Memories list"
+        );
+        assert_eq!(app.search_state.selected(), None);
+    }
+
+    /// Audit regression: the Topic Detail panel indexed `app.health` by the
+    /// same position as `app.topic_state`, but `load_health` silently drops
+    /// any topic whose `topic_health()` call failed — shifting every later
+    /// entry left by one and showing the wrong topic's stats. Matching by
+    /// topic name (as done in draw_topics) is correct regardless of gaps.
+    #[test]
+    fn topic_health_lookup_is_by_name_not_position() {
+        let store = Store::in_memory().unwrap();
+        store
+            .store(Memory::new("alpha".into(), "a".into(), Importance::Medium))
+            .unwrap();
+        store
+            .store(Memory::new("beta".into(), "b".into(), Importance::Medium))
+            .unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        // topics is alpha-sorted by list_topics; simulate load_health having
+        // dropped the first entry (as it would on a failed topic_health call)
+        // by removing it directly, so `health[0]` is now "beta"'s data at
+        // the position where "alpha"'s data used to be.
+        app.health.retain(|h| h.topic != "alpha");
+        assert_eq!(app.health.len(), 1);
+        assert_eq!(app.health[0].topic, "beta");
+
+        // Select whichever topic is "alpha" and confirm the *actual*
+        // lookup method draw_topics calls resolves to no data (not "beta"'s
+        // data at index 0).
+        let alpha_idx = app.topics.iter().position(|(t, _)| t == "alpha").unwrap();
+        app.topic_state.select(Some(alpha_idx));
+        assert!(
+            app.selected_topic_health().is_none(),
+            "must not resolve alpha's slot to beta's health data by position"
+        );
+
+        // Sanity: a topic whose health *is* present still resolves.
+        let beta_idx = app.topics.iter().position(|(t, _)| t == "beta").unwrap();
+        app.topic_state.select(Some(beta_idx));
+        assert_eq!(
+            app.selected_topic_health().map(|h| h.topic.as_str()),
+            Some("beta")
+        );
     }
 }

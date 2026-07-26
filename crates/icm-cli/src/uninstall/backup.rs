@@ -157,7 +157,7 @@ impl BackupSession {
         };
         let path = self.root.join("manifest.json");
         let json = serde_json::to_string_pretty(&manifest)?;
-        std::fs::write(&path, json)
+        super::atomic_write(&path, json.as_bytes())
             .with_context(|| format!("cannot write manifest {}", path.display()))?;
         Ok(())
     }

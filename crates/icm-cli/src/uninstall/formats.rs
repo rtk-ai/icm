@@ -421,7 +421,8 @@ pub(crate) fn rewrite_json_mcp(path: &std::path::Path, dotted_key: &str) -> Resu
     let result = strip_json_mcp_server(&mut value, dotted_key);
     if matches!(result, StripResult::Removed { .. }) {
         let out = serde_json::to_string_pretty(&value)?;
-        std::fs::write(path, out).with_context(|| format!("cannot write {}", path.display()))?;
+        super::atomic_write(path, out.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
     }
     Ok(result)
 }
@@ -434,7 +435,8 @@ pub(crate) fn rewrite_json_hooks(
     let result = strip_json_hooks(&mut value, field);
     if matches!(result, StripResult::Removed { .. }) {
         let out = serde_json::to_string_pretty(&value)?;
-        std::fs::write(path, out).with_context(|| format!("cannot write {}", path.display()))?;
+        super::atomic_write(path, out.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
     }
     Ok(result)
 }
@@ -450,7 +452,8 @@ pub(crate) fn rewrite_toml(
     let result = strip_toml_table(&mut value, table, entry);
     if matches!(result, StripResult::Removed { .. }) {
         let out = toml::to_string(&value)?;
-        std::fs::write(path, out).with_context(|| format!("cannot write {}", path.display()))?;
+        super::atomic_write(path, out.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
     }
     Ok(result)
 }
@@ -461,7 +464,7 @@ pub(crate) fn rewrite_yaml_continue(path: &std::path::Path) -> Result<StripResul
     let result = strip_yaml_continue(&content);
     if matches!(result, StripResult::Removed { .. }) {
         let new_content = apply_yaml_continue(&content);
-        std::fs::write(path, new_content)
+        super::atomic_write(path, new_content.as_bytes())
             .with_context(|| format!("cannot write {}", path.display()))?;
     }
     Ok(result)
@@ -473,7 +476,7 @@ pub(crate) fn rewrite_markdown(path: &std::path::Path) -> Result<StripResult> {
     match strip_markdown_block(&content) {
         MarkdownOutcome::NoOp => Ok(StripResult::NoOp),
         MarkdownOutcome::Rewrite(new) => {
-            std::fs::write(path, new)
+            super::atomic_write(path, new.as_bytes())
                 .with_context(|| format!("cannot write {}", path.display()))?;
             Ok(StripResult::Removed { removed: 1 })
         }

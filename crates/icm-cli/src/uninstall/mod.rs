@@ -21,6 +21,21 @@ pub(crate) mod process;
 pub(crate) mod report;
 pub(crate) mod scan_dir;
 
+/// Write `content` to `path` atomically: write to a temp file in the same
+/// directory, then rename over the target. A crash or kill mid-write
+/// leaves either the old file fully intact or the new one fully written —
+/// never a truncated/corrupted file (audit finding: `formats.rs`/
+/// `backup.rs` both used plain `fs::write`, truncate-then-write, which can
+/// leave the user's real settings.json/config.toml or our own backup
+/// manifest half-written on a crash).
+pub(crate) fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".icm-tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    std::fs::write(&tmp_path, content)?;
+    std::fs::rename(&tmp_path, path)
+}
+
 /// CLI surface for `icm uninstall`. Kept here so the rest of the crate only
 /// imports `UninstallOpts` from this module.
 #[derive(Args, Debug, Clone)]
@@ -260,5 +275,48 @@ mod tests {
     fn should_not_refuse_purge_when_confirmed_clean() {
         let plan = discover::RemovalPlan::default();
         assert!(!should_refuse_purge(&plan, false));
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_temp_file() {
+        let dir =
+            std::env::temp_dir().join(format!("icm-atomic-write-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, "v1").unwrap();
+
+        atomic_write(&path, b"v2").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
+        assert!(!path.with_file_name("target.txt.icm-tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit finding: plain `fs::write` truncates the destination before
+    /// writing, so a write failure mid-way corrupts the existing file. The
+    /// atomic version must leave the original file fully intact if the
+    /// (separate) temp file write fails, since the destination is only ever
+    /// touched by the final `rename`.
+    #[test]
+    fn atomic_write_preserves_original_when_temp_write_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("icm-atomic-write-fail-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, "original").unwrap();
+        // Force the temp-file write to fail by pre-occupying its path with
+        // a directory instead of a plain file.
+        let tmp_path = path.with_file_name("target.txt.icm-tmp");
+        std::fs::create_dir_all(&tmp_path).unwrap();
+
+        let result = atomic_write(&path, b"new content");
+
+        assert!(result.is_err(), "write into a directory must fail");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "original",
+            "destination must be untouched when the temp write fails"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

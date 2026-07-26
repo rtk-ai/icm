@@ -119,7 +119,7 @@ impl InstallManifest {
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)
+        crate::uninstall::atomic_write(path, json.as_bytes())
             .with_context(|| format!("cannot write manifest {}", path.display()))?;
         Ok(())
     }

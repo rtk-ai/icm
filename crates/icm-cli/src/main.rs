@@ -9191,6 +9191,15 @@ fn cmd_memoir_inspect(
 
 // confidence_color and confidence_bar are now methods on Concept in icm-core
 
+/// Escape a value for embedding inside a DOT string literal (`"..."`).
+/// Every value interpolated into DOT export (memoir/concept/relation names)
+/// is user-chosen and must not be able to break out of its literal - an
+/// unescaped `"` would inject arbitrary DOT attributes/statements into the
+/// exported graph (audit finding).
+fn dot_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn cmd_memoir_export(store: &Store, memoir_name: &str, format: &str) -> Result<()> {
     let memoir = resolve_memoir(store, memoir_name)?;
     let concepts = store.list_concepts(&memoir.id)?;
@@ -9249,19 +9258,20 @@ fn cmd_memoir_export(store: &Store, memoir_name: &str, format: &str) -> Result<(
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         "dot" => {
-            println!("digraph \"{}\" {{", memoir.name);
+            println!("digraph \"{}\" {{", dot_escape(&memoir.name));
             println!("  rankdir=LR;");
             println!("  node [shape=box, style=\"rounded,filled\", fillcolor=white];");
             println!();
             for c in &concepts {
-                let escaped_def = c.definition.replace('"', "\\\"");
+                let escaped_def = dot_escape(&c.definition);
+                let escaped_name = dot_escape(&c.name);
                 let color = c.confidence_color();
                 println!(
                     "  \"{}\" [tooltip=\"{}\" fillcolor=\"{}\" label=\"{}\\n({:.0}%)\"];",
-                    c.name,
+                    escaped_name,
                     escaped_def,
                     color,
-                    c.name,
+                    escaped_name,
                     c.confidence * 100.0
                 );
             }
@@ -9274,7 +9284,10 @@ fn cmd_memoir_export(store: &Store, memoir_name: &str, format: &str) -> Result<(
                     let pw = 0.5 + l.weight * 2.0;
                     println!(
                         "  \"{}\" -> \"{}\" [label=\"{}\" penwidth={:.1}];",
-                        src, tgt, l.relation, pw
+                        dot_escape(src),
+                        dot_escape(tgt),
+                        dot_escape(&l.relation.to_string()),
+                        pw
                     );
                 }
             }
@@ -11822,6 +11835,20 @@ mod cmd_memoir_tests {
         make_memoir(&s, "m");
         add_concept(&s, "m", "c", "some definition");
         cmd_memoir_export(&s, "m", "dot").unwrap();
+    }
+
+    /// Audit regression: DOT export escaped the concept `definition`
+    /// (tooltip) but not the memoir/concept/relation names themselves. A
+    /// name containing a `"` broke out of its DOT string literal and
+    /// injected arbitrary attributes/statements into the exported graph.
+    #[test]
+    fn dot_escape_neutralizes_quotes_and_backslashes() {
+        assert_eq!(
+            dot_escape(r#"evil" fillcolor=red] //"#),
+            r#"evil\" fillcolor=red] //"#
+        );
+        assert_eq!(dot_escape(r"back\slash"), r"back\\slash");
+        assert_eq!(dot_escape("plain"), "plain");
     }
 
     // Unsupported format must surface the format name in the error.

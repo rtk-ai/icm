@@ -2451,15 +2451,18 @@ impl MemoirStore for SqliteStore {
         label: &Label,
         limit: usize,
     ) -> IcmResult<Vec<Concept>> {
-        // Search JSON labels column using LIKE with the serialized label pattern
+        // Search JSON labels column using LIKE with the serialized label pattern.
+        // namespace/value come from the caller (MCP tool args) and can contain
+        // %/_ ; escape them so they can't turn into unintended wildcards.
         let pattern = format!(
             "%\"namespace\":\"{}\"%\"value\":\"{}\"%",
-            label.namespace, label.value
+            escape_like_wildcards(&label.namespace),
+            escape_like_wildcards(&label.value)
         );
 
         let sql = format!(
             "SELECT {CONCEPT_COLS} FROM concepts
-             WHERE memoir_id = ?1 AND labels LIKE ?2
+             WHERE memoir_id = ?1 AND labels LIKE ?2 ESCAPE '\\'
              ORDER BY confidence DESC
              LIMIT ?3"
         );
@@ -5571,6 +5574,34 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "es");
+    }
+
+    /// Audit regression: the label pattern built by `search_concepts_by_label`
+    /// interpolated `namespace`/`value` into a LIKE pattern unescaped, so a
+    /// literal `_` in a search value acted as a SQL "any single char"
+    /// wildcard instead of matching only that exact character.
+    #[test]
+    fn test_search_concepts_by_label_escapes_wildcards() {
+        let store = test_store();
+        let m_id = store.create_memoir(make_memoir("proj")).unwrap();
+
+        let mut c1 = make_concept(&m_id, "c1", "def1");
+        c1.labels = vec![Label::new("domain", "test")];
+        store.add_concept(c1).unwrap();
+
+        let mut c2 = make_concept(&m_id, "c2", "def2");
+        c2.labels = vec![Label::new("domain", "text")];
+        store.add_concept(c2).unwrap();
+
+        // "te_t" is not the literal value of either concept, but with an
+        // unescaped `_` it matches both "test" and "text" as a wildcard.
+        let results = store
+            .search_concepts_by_label(&m_id, &Label::new("domain", "te_t"), 10)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "unescaped '_' wildcard matched unrelated label values: {results:?}"
+        );
     }
 
     // === Vector search tests ===

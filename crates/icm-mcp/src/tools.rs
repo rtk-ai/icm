@@ -1914,6 +1914,12 @@ fn tool_memoir_refine(store: &Store, args: &Value) -> ToolResult {
         Some(d) => d,
         None => return ToolResult::error("missing required field: definition".into()),
     };
+    if definition.len() > 10_000 {
+        return ToolResult::error(format!(
+            "definition too long: {} chars (max 10000)",
+            definition.len()
+        ));
+    }
 
     let memoir = match resolve_memoir(store, memoir_name) {
         Ok(m) => m,
@@ -2217,19 +2223,29 @@ fn tool_memoir_export(store: &Store, args: &Value) -> ToolResult {
             )
         }
         "dot" => {
+            // Every value below is caller-controlled (memoir/concept names,
+            // definitions, relation labels) and lands inside a DOT string
+            // literal. Escape backslash-then-quote on all of them, not just
+            // the definition tooltip, or a name containing `"` breaks out of
+            // its literal and injects arbitrary DOT attributes/statements.
+            fn dot_escape(s: &str) -> String {
+                s.replace('\\', "\\\\").replace('"', "\\\"")
+            }
+
             let mut out = format!(
                 "digraph \"{}\" {{\n  rankdir=LR;\n  node [shape=box, style=\"rounded,filled\", fillcolor=white];\n\n",
-                memoir.name
+                dot_escape(&memoir.name)
             );
             for c in &concepts {
-                let escaped = c.definition.replace('"', "\\\"");
+                let escaped_def = dot_escape(&c.definition);
+                let escaped_name = dot_escape(&c.name);
                 let color = c.confidence_color();
                 out.push_str(&format!(
                     "  \"{}\" [tooltip=\"{}\" fillcolor=\"{}\" label=\"{}\\n({:.0}%)\"];\n",
-                    c.name,
-                    escaped,
+                    escaped_name,
+                    escaped_def,
                     color,
-                    c.name,
+                    escaped_name,
                     c.confidence * 100.0
                 ));
             }
@@ -2242,7 +2258,10 @@ fn tool_memoir_export(store: &Store, args: &Value) -> ToolResult {
                     let pw = 0.5 + l.weight * 2.0;
                     out.push_str(&format!(
                         "  \"{}\" -> \"{}\" [label=\"{}\" penwidth={:.1}];\n",
-                        src, tgt, l.relation, pw
+                        dot_escape(src),
+                        dot_escape(tgt),
+                        dot_escape(&l.relation.to_string()),
+                        pw
                     ));
                 }
             }
@@ -3339,6 +3358,83 @@ mod tests {
             let list = call_tool(&store, None, "icm_memoir_list", &json!({}), false);
             assert!(!list.is_error);
         }
+    }
+
+    /// Audit regression: `icm_memoir_add_concept` caps `definition` at 10,000
+    /// chars, but `icm_memoir_refine` (which also writes a `definition`) had
+    /// no cap at all.
+    #[test]
+    fn test_memoir_refine_definition_too_long_rejected() {
+        let store = test_store();
+        let create = call_tool(
+            &store,
+            None,
+            "icm_memoir_create",
+            &json!({"name": "cap-test", "description": "test"}),
+            false,
+        );
+        assert!(!create.is_error);
+        let add = call_tool(
+            &store,
+            None,
+            "icm_memoir_add_concept",
+            &json!({"memoir": "cap-test", "name": "c1", "definition": "short"}),
+            false,
+        );
+        assert!(!add.is_error);
+
+        let too_long = "x".repeat(10_001);
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memoir_refine",
+            &json!({"memoir": "cap-test", "name": "c1", "definition": too_long}),
+            false,
+        );
+        assert!(result.is_error, "an oversized definition must be rejected");
+    }
+
+    /// Audit regression: DOT export escaped the concept `definition`
+    /// (tooltip) but not the concept `name` itself. A name containing a `"`
+    /// broke out of its DOT string literal and injected arbitrary
+    /// attributes/statements into the exported graph.
+    #[test]
+    fn test_memoir_dot_export_escapes_quotes_in_concept_name() {
+        let store = test_store();
+        let create = call_tool(
+            &store,
+            None,
+            "icm_memoir_create",
+            &json!({"name": "dot-test", "description": "test"}),
+            false,
+        );
+        assert!(!create.is_error);
+        let add = call_tool(
+            &store,
+            None,
+            "icm_memoir_add_concept",
+            &json!({
+                "memoir": "dot-test",
+                "name": "evil\" fillcolor=red] //",
+                "definition": "d"
+            }),
+            false,
+        );
+        assert!(!add.is_error);
+
+        let export = call_tool(
+            &store,
+            None,
+            "icm_memoir_export",
+            &json!({"name": "dot-test", "format": "dot"}),
+            false,
+        );
+        assert!(!export.is_error);
+        let text = &export.content[0].text;
+        assert!(
+            !text.contains("\"evil\" fillcolor=red] //\""),
+            "unescaped quote let the concept name break out of its DOT string literal: {text}"
+        );
     }
 
     #[test]

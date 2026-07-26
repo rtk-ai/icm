@@ -95,7 +95,9 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
     // corruption risk). Skip it otherwise — most users run in
     // --mode standard which never spawns `icm serve`.
     if opts.purge_data {
-        plan.processes = process::detect_icm_serve();
+        let detection = process::detect_icm_serve();
+        plan.processes = detection.processes;
+        plan.process_detection_unsupported = detection.unsupported;
     }
 
     // --- Read-only modes ---
@@ -159,14 +161,26 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
         // Refuse to purge while `icm serve` is running unless the user
         // explicitly opted in via `-y`. Serve keeps the SQLite DB open
         // via WAL; deleting underneath it can corrupt cross-session
-        // neighbour processes.
-        if !plan.processes.is_empty() && !opts.yes {
+        // neighbour processes. Audit finding: process detection isn't
+        // implemented on every platform (Windows/BSD) and can fail even
+        // where it is (e.g. `/proc` unreadable) — `process_detection_unsupported`
+        // must gate this the same as "a process was found," or an empty
+        // list silently defeats the only safeguard here.
+        if should_refuse_purge(&plan, opts.yes) {
             println!();
-            println!(
-                "Refusing to --purge-data: {} `icm serve` process(es) detected. \
-                Stop them with `pkill -f 'icm serve'` (or pass -y to override at your own risk).",
-                plan.processes.len()
-            );
+            if plan.process_detection_unsupported {
+                println!(
+                    "Refusing to --purge-data: `icm serve` process detection isn't \
+                    supported on this platform, so we can't confirm none is running. \
+                    Stop any `icm serve` process yourself, then pass -y to override."
+                );
+            } else {
+                println!(
+                    "Refusing to --purge-data: {} `icm serve` process(es) detected. \
+                    Stop them with `pkill -f 'icm serve'` (or pass -y to override at your own risk).",
+                    plan.processes.len()
+                );
+            }
             for p in &plan.processes {
                 println!("  pid={:<6} {}", p.pid, p.cmdline);
             }
@@ -177,6 +191,13 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
                     "WARNING: {} `icm serve` process(es) still running — \
                     purging the DB anyway because -y was passed.",
                     plan.processes.len()
+                );
+            } else if plan.process_detection_unsupported {
+                println!();
+                println!(
+                    "WARNING: process detection isn't supported on this platform — \
+                    purging the DB anyway because -y was passed. Make sure `icm serve` \
+                    isn't running."
                 );
             }
             let purge_outcomes = mutate::purge_data(&plan, &mut backup_session);
@@ -196,4 +217,48 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
         after.total_hits(),
     );
     Ok(exit)
+}
+
+/// Whether `--purge-data` must refuse: a live `icm serve` was detected, or
+/// detection wasn't possible at all (audit finding — an empty process list
+/// is otherwise indistinguishable from "confirmed nothing running"), and
+/// the user hasn't passed `-y` to override.
+fn should_refuse_purge(plan: &discover::RemovalPlan, yes: bool) -> bool {
+    (!plan.processes.is_empty() || plan.process_detection_unsupported) && !yes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::uninstall::discover::RunningProcess;
+
+    #[test]
+    fn should_refuse_purge_when_a_process_is_detected() {
+        let mut plan = discover::RemovalPlan::default();
+        plan.processes.push(RunningProcess {
+            pid: 1234,
+            cmdline: "icm serve".into(),
+        });
+        assert!(should_refuse_purge(&plan, false));
+        assert!(!should_refuse_purge(&plan, true), "-y must override");
+    }
+
+    /// Audit regression: detection-unsupported must refuse by default, the
+    /// same as a confirmed-running process — not be treated as "confirmed
+    /// nothing running" just because the list happens to be empty.
+    #[test]
+    fn should_refuse_purge_when_detection_is_unsupported() {
+        let plan = discover::RemovalPlan {
+            process_detection_unsupported: true,
+            ..Default::default()
+        };
+        assert!(should_refuse_purge(&plan, false));
+        assert!(!should_refuse_purge(&plan, true), "-y must override");
+    }
+
+    #[test]
+    fn should_not_refuse_purge_when_confirmed_clean() {
+        let plan = discover::RemovalPlan::default();
+        assert!(!should_refuse_purge(&plan, false));
+    }
 }

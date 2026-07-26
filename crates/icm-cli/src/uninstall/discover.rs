@@ -54,6 +54,12 @@ pub(crate) struct RemovalPlan {
     pub scan_dir_hits: Vec<LocationHit>,
     /// Reserved for the `icm serve` process detector (a later commit).
     pub processes: Vec<RunningProcess>,
+    /// Set when process detection isn't implemented on this platform
+    /// (Windows/BSD/other). An empty `processes` list is otherwise
+    /// indistinguishable from "confirmed nothing running" — audit finding:
+    /// without this flag, `--purge-data` silently skipped its one safeguard
+    /// against WAL corruption on those platforms, even without `-y`.
+    pub process_detection_unsupported: bool,
 }
 
 impl RemovalPlan {

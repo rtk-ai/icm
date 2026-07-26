@@ -138,8 +138,10 @@ pub fn build_context_snapshot_from_memories(
     let total_eligible = prefs.len() + ctx.len();
 
     // Greedy fill: identity first (it's the baseline), then project context.
-    let (identity_lines, identity_used) = fill_section(&prefs, max_chars, 0);
-    let (context_lines, context_used) = fill_section(&ctx, max_chars, identity_used);
+    let (identity_lines, identity_used, identity_forced_overflow) =
+        fill_section(&prefs, max_chars, 0);
+    let (context_lines, context_used, context_forced_overflow) =
+        fill_section(&ctx, max_chars, identity_used);
 
     let used = identity_used + context_used;
     let kept = identity_lines.len() + context_lines.len();
@@ -159,7 +161,18 @@ pub fn build_context_snapshot_from_memories(
         });
     }
 
-    let over_budget = dropped > 0 && used.saturating_mul(10) >= max_chars.saturating_mul(8);
+    // Audit finding: `dropped > 0` alone missed the case where the ONLY
+    // eligible memory is force-included as the first bullet of the first
+    // section (see `fill_section`) yet still blows the budget on its own
+    // (e.g. `per_memory_cap`'s 200-char floor exceeds a small
+    // `max_chars`) — `dropped` stays 0 since nothing was actually
+    // dropped, so `over_budget` never fired despite `total_chars >
+    // max_chars`, contradicting `fill_section`'s own documented
+    // guarantee. Fold in whether either section's forced entry alone
+    // exceeded the budget.
+    let forced_overflow = identity_forced_overflow || context_forced_overflow;
+    let over_budget =
+        (dropped > 0 || forced_overflow) && used.saturating_mul(10) >= max_chars.saturating_mul(8);
 
     ContextSnapshot {
         sections,
@@ -212,23 +225,29 @@ fn per_memory_cap(max_chars: usize) -> usize {
     (max_chars / 2).max(200)
 }
 
-/// Greedy budget fill. Returns the rendered bullet lines and the number
-/// of characters consumed (line bytes + leading "- " + trailing newline
+/// Greedy budget fill. Returns the rendered bullet lines, the number of
+/// characters consumed (line bytes + leading "- " + trailing newline
 /// accounted for so the caller's running total matches what `render`
-/// will emit).
+/// will emit), and whether the forced-first-entry exception (below) was
+/// the thing that pushed usage past `max_chars`.
 ///
 /// The "always include at least one entry" exception only triggers when
 /// `already_used == 0` — i.e. the very first section. Once another
 /// section has consumed some of the global budget, subsequent sections
-/// strictly respect the cap to keep `total_chars <= max_chars`.
+/// strictly respect the cap to keep `total_chars <= max_chars`. The one
+/// exception: a single force-included oversized entry can itself exceed
+/// `max_chars` (notably when `per_memory_cap`'s 200-char floor is larger
+/// than a small `max_chars`) — callers must fold the returned flag into
+/// `over_budget` since `dropped` alone won't reflect it.
 fn fill_section(
     candidates: &[Memory],
     max_chars: usize,
     already_used: usize,
-) -> (Vec<String>, usize) {
+) -> (Vec<String>, usize, bool) {
     let cap = per_memory_cap(max_chars);
     let mut out = Vec::new();
     let mut used = 0usize;
+    let mut forced_overflow = false;
     let first_section = already_used == 0;
     for m in candidates {
         let mut summary = sanitize(&m.summary);
@@ -247,10 +266,13 @@ fn fill_section(
         if !force_take && projected > max_chars {
             break;
         }
+        if force_take && projected > max_chars {
+            forced_overflow = true;
+        }
         used = used.saturating_add(line_len);
         out.push(summary);
     }
-    (out, used)
+    (out, used, forced_overflow)
 }
 
 fn sanitize(s: &str) -> String {
@@ -410,6 +432,39 @@ mod tests {
         assert_eq!(snap.dropped, 0);
         let body = snap.render(SnapshotFormat::Markdown);
         assert!(!body.contains("consolidate"));
+    }
+
+    /// Audit regression: a single, lone eligible memory is force-included
+    /// (see `fill_section`) even if it alone blows the budget — with a
+    /// small `max_tokens`, `per_memory_cap`'s 200-char floor exceeds the
+    /// whole budget, so the forced entry's rendered size vastly exceeds
+    /// `max_chars`. Nothing was literally "dropped" (`dropped == 0`), but
+    /// `over_budget` must still fire — `total_chars <= max_chars` is NOT
+    /// actually guaranteed here despite the doc comment on `fill_section`,
+    /// and callers (SessionStart hook) need the signal regardless.
+    #[test]
+    fn over_budget_flag_set_when_single_forced_entry_alone_exceeds_budget() {
+        let long_summary = "x".repeat(2000);
+        let memories = vec![mem("preferences", &long_summary, Importance::High)];
+        let opts = ContextSnapshotOptions {
+            max_tokens: 40, // max_chars = 160, well under the 200-char per-memory floor
+            ..Default::default()
+        };
+        let snap = build_context_snapshot_from_memories(memories, &opts);
+        assert_eq!(
+            snap.dropped, 0,
+            "the lone memory is force-included, not dropped"
+        );
+        assert!(
+            snap.total_chars > snap.max_chars,
+            "the forced entry alone should exceed the budget: {} > {}",
+            snap.total_chars,
+            snap.max_chars
+        );
+        assert!(
+            snap.over_budget,
+            "over_budget must fire even though dropped == 0"
+        );
     }
 
     #[test]

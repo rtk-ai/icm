@@ -189,4 +189,102 @@ edition = "2021"
         // Old memoir should be gone
         assert!(store.get_memoir(&r1.memoir_id).unwrap().is_none());
     }
+
+    /// Audit regression: a package listed in both `workspace.dependencies`
+    /// and `dependencies` (e.g. via `{ workspace = true }`, common in real
+    /// Cargo workspaces) used to be collected twice with the same name.
+    /// `add_concept`'s underlying `UNIQUE(memoir_id, name)` constraint then
+    /// turned the second insert into a hard error, aborting the whole learn
+    /// run and losing the memoir that a prior successful learn had created.
+    #[test]
+    fn test_learn_project_dedupes_duplicate_cargo_dependency_names() {
+        let (tmp, store) = test_store();
+
+        let project_dir = tmp.path().join("dup-deps-project");
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+
+        fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dup-deps-project"
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = "1.0"
+
+[dependencies]
+serde = { workspace = true }
+anyhow = "1"
+"#,
+        )
+        .unwrap();
+        fs::write(project_dir.join("src/lib.rs"), "pub fn hello() {}").unwrap();
+
+        let result =
+            learn_project(&store, &project_dir, None).expect("duplicate dep name must not abort");
+
+        let concepts = store.list_concepts(&result.memoir_id).unwrap();
+        let serde_count = concepts.iter().filter(|c| c.name == "serde").count();
+        assert_eq!(serde_count, 1, "serde must be deduped to a single concept");
+    }
+
+    /// Audit regression: a `workspace.members` glob pattern resolving
+    /// outside the project directory (via `../..` or a symlink) used to be
+    /// followed as-is, letting a malicious repo's manifest pull in and
+    /// expose files/directories the user never asked to learn.
+    #[test]
+    fn test_learn_project_rejects_workspace_member_path_traversal() {
+        let (tmp, store) = test_store();
+
+        // A sibling directory *outside* the project root, containing a
+        // secret the traversal must not be able to reach.
+        fs::create_dir_all(tmp.path().join("secret-outside")).unwrap();
+        fs::write(
+            tmp.path().join("secret-outside/Cargo.toml"),
+            r#"
+[package]
+name = "leaked-secret"
+version = "0.1.0"
+edition = "2021"
+description = "should never be learned"
+"#,
+        )
+        .unwrap();
+
+        let project_dir = tmp.path().join("traversal-project");
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+        fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "traversal-project"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["../secret-outside"]
+"#,
+        )
+        .unwrap();
+        fs::write(project_dir.join("src/lib.rs"), "pub fn hello() {}").unwrap();
+
+        let result = learn_project(&store, &project_dir, None).unwrap();
+
+        // The module concept name is the *directory* name ("secret-outside"),
+        // and its description is only populated by reading the escaped
+        // Cargo.toml — either is proof the traversal was followed.
+        let concepts = store.list_concepts(&result.memoir_id).unwrap();
+        assert!(
+            !concepts.iter().any(|c| c.name == "secret-outside"),
+            "workspace member outside the project root must not be learned as a module"
+        );
+        assert!(
+            !concepts
+                .iter()
+                .any(|c| c.definition.contains("should never be learned")),
+            "the escaped Cargo.toml's description must never have been read"
+        );
+    }
 }

@@ -4,6 +4,19 @@ use crate::error::IcmResult;
 use crate::memoir::{Concept, ConceptLink, Label, Memoir, Relation};
 use crate::memoir_store::MemoirStore;
 
+/// Manifests are attacker-controlled when learning an untrusted repo; refuse
+/// to read one past this size rather than slurping an arbitrarily large file
+/// into memory (e.g. a decompression-bomb-style `Cargo.toml`).
+const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+
+fn read_manifest_capped(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Result of learning a project.
 #[derive(Debug, Clone)]
 pub struct LearnResult {
@@ -275,7 +288,7 @@ fn scan_scripts(store: &dyn MemoirStore, memoir_id: &str, dir: &Path) -> IcmResu
 
 fn read_cargo_toml(dir: &Path) -> Option<String> {
     let path = dir.join("Cargo.toml");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
     let parsed: toml::Value = content.parse().ok()?;
 
     let pkg = parsed.get("package");
@@ -290,7 +303,9 @@ fn read_cargo_toml(dir: &Path) -> Option<String> {
     let desc = pkg
         .and_then(|p| p.get("description"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .replace(['\n', '\r'], " ");
+    let desc = desc.as_str();
 
     let is_workspace = parsed.get("workspace").is_some();
     let lang = if is_workspace {
@@ -308,7 +323,7 @@ fn read_cargo_toml(dir: &Path) -> Option<String> {
 
 fn read_package_json(dir: &Path) -> Option<String> {
     let path = dir.join("package.json");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
     let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let name = parsed
@@ -322,7 +337,9 @@ fn read_package_json(dir: &Path) -> Option<String> {
     let desc = parsed
         .get("description")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .replace(['\n', '\r'], " ");
+    let desc = desc.as_str();
 
     let mut info = format!("Node.js project: {name} v{version}");
     if !desc.is_empty() {
@@ -333,7 +350,7 @@ fn read_package_json(dir: &Path) -> Option<String> {
 
 fn read_pyproject_toml(dir: &Path) -> Option<String> {
     let path = dir.join("pyproject.toml");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
     let parsed: toml::Value = content.parse().ok()?;
 
     let project = parsed
@@ -350,7 +367,9 @@ fn read_pyproject_toml(dir: &Path) -> Option<String> {
     let desc = project
         .get("description")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .replace(['\n', '\r'], " ");
+    let desc = desc.as_str();
 
     let mut info = format!("Python project: {name} v{version}");
     if !desc.is_empty() {
@@ -361,7 +380,7 @@ fn read_pyproject_toml(dir: &Path) -> Option<String> {
 
 fn read_go_mod(dir: &Path) -> Option<String> {
     let path = dir.join("go.mod");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
 
     let module = content
         .lines()
@@ -376,24 +395,30 @@ fn read_go_mod(dir: &Path) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 fn collect_dependencies(dir: &Path) -> Vec<(String, String)> {
-    if let Some(deps) = collect_cargo_deps(dir) {
-        return deps;
-    }
-    if let Some(deps) = collect_npm_deps(dir) {
-        return deps;
-    }
-    if let Some(deps) = collect_python_deps(dir) {
-        return deps;
-    }
-    if let Some(deps) = collect_go_deps(dir) {
-        return deps;
-    }
-    Vec::new()
+    let deps = collect_cargo_deps(dir)
+        .or_else(|| collect_npm_deps(dir))
+        .or_else(|| collect_python_deps(dir))
+        .or_else(|| collect_go_deps(dir))
+        .unwrap_or_default();
+    dedup_by_name(deps)
+}
+
+/// Drop later entries whose name repeats an earlier one, keeping first-seen
+/// order. Manifests commonly list the same package twice (Cargo
+/// `workspace.dependencies` + `dependencies` via `{ workspace = true }`, npm
+/// `dependencies` + `devDependencies`) and `add_concept`'s underlying
+/// `UNIQUE(memoir_id, name)` constraint turns an undeduped duplicate into a
+/// hard error that aborts the whole learn run.
+fn dedup_by_name(deps: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    deps.into_iter()
+        .filter(|(name, _)| seen.insert(name.clone()))
+        .collect()
 }
 
 fn collect_cargo_deps(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("Cargo.toml");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
     let parsed: toml::Value = content.parse().ok()?;
 
     let mut deps = Vec::new();
@@ -427,7 +452,7 @@ fn collect_cargo_deps(dir: &Path) -> Option<Vec<(String, String)>> {
 
 fn collect_npm_deps(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("package.json");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
     let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let mut deps = Vec::new();
@@ -448,7 +473,7 @@ fn collect_npm_deps(dir: &Path) -> Option<Vec<(String, String)>> {
 
 fn collect_python_deps(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("pyproject.toml");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
     let parsed: toml::Value = content.parse().ok()?;
 
     let mut deps = Vec::new();
@@ -496,7 +521,7 @@ fn collect_python_deps(dir: &Path) -> Option<Vec<(String, String)>> {
 
 fn collect_go_deps(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("go.mod");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
 
     let mut deps = Vec::new();
     let mut in_require = false;
@@ -512,6 +537,13 @@ fn collect_go_deps(dir: &Path) -> Option<Vec<(String, String)>> {
         }
         if in_require {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let name = parts[0].rsplit('/').next().unwrap_or(parts[0]);
+                deps.push((name.to_string(), parts[1].to_string()));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("require ") {
+            // Single-line form: `require example.com/foo v1.2.3` (no parens).
+            let parts: Vec<&str> = rest.split_whitespace().collect();
             if parts.len() >= 2 {
                 let name = parts[0].rsplit('/').next().unwrap_or(parts[0]);
                 deps.push((name.to_string(), parts[1].to_string()));
@@ -546,7 +578,7 @@ fn collect_modules(dir: &Path) -> Vec<(String, String)> {
 
 fn collect_rust_workspace_members(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("Cargo.toml");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
     let parsed: toml::Value = content.parse().ok()?;
 
     let members = parsed
@@ -568,12 +600,14 @@ fn collect_rust_workspace_members(dir: &Path) -> Option<Vec<(String, String)>> {
 
                 // Try to read the member's Cargo.toml for description
                 let member_cargo = member_path.join("Cargo.toml");
-                let desc = if let Ok(mc) = std::fs::read_to_string(&member_cargo) {
+                let desc = if let Some(mc) = read_manifest_capped(&member_cargo) {
                     if let Ok(mp) = mc.parse::<toml::Value>() {
                         mp.get("package")
                             .and_then(|p| p.get("description"))
                             .and_then(|v| v.as_str())
-                            .map(|d| format!("Rust crate: {name} — {d}"))
+                            .map(|d| {
+                                format!("Rust crate: {name} — {}", d.replace(['\n', '\r'], " "))
+                            })
                             .unwrap_or_else(|| format!("Rust crate: {name}"))
                     } else {
                         format!("Rust crate: {name}")
@@ -594,7 +628,16 @@ fn collect_rust_workspace_members(dir: &Path) -> Option<Vec<(String, String)>> {
 }
 
 fn expand_workspace_glob(dir: &Path, pattern: &str) -> Vec<PathBuf> {
-    if pattern.contains('*') {
+    // Manifest-declared members (Cargo `workspace.members`, npm `workspaces`) are
+    // attacker-controlled when learning an untrusted repo. Reject anything that
+    // resolves (after following symlinks) outside `dir` — this also unifies
+    // symlink handling between the glob and non-glob branches below, since
+    // canonicalize() follows symlinks in both cases.
+    let Ok(canonical_dir) = dir.canonicalize() else {
+        return Vec::new();
+    };
+
+    let candidates = if pattern.contains('*') {
         // Simple glob: "crates/*" → list directories in crates/
         let prefix = pattern.trim_end_matches("/*").trim_end_matches("/*");
         let parent = dir.join(prefix);
@@ -614,12 +657,21 @@ fn expand_workspace_glob(dir: &Path, pattern: &str) -> Vec<PathBuf> {
         } else {
             Vec::new()
         }
-    }
+    };
+
+    candidates
+        .into_iter()
+        .filter(|p| {
+            p.canonicalize()
+                .map(|c| c.starts_with(&canonical_dir))
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 fn collect_npm_workspaces(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("package.json");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_manifest_capped(&path)?;
     let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let workspaces = parsed.get("workspaces").and_then(|w| w.as_array())?;

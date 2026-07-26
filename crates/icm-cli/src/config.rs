@@ -314,27 +314,55 @@ impl Default for McpConfig {
 }
 
 /// Load config from disk. Returns defaults if no config file exists.
+///
+/// Audit finding: an explicitly-set `$ICM_CONFIG` pointing at a
+/// nonexistent path (typo, moved file) used to fall back to defaults with
+/// no signal anywhere except the separate, rarely-invoked `icm config
+/// show` — every other command just silently ran on stock defaults,
+/// ignoring the user's intended config. Warn on stderr in that specific
+/// case; the auto-resolved default path not existing yet (fresh install)
+/// stays silent, since that's the expected common case.
 pub fn load_config() -> Result<Config> {
-    let path = config_path();
-
-    if let Some(p) = &path {
-        if p.exists() {
-            let content =
-                std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-            let config: Config =
-                toml::from_str(&content).with_context(|| format!("parsing {}", p.display()))?;
-            return Ok(config);
-        }
+    let (config, warning) = load_config_from(resolved_config_path())?;
+    if let Some(w) = warning {
+        eprintln!("warning: {w}");
     }
-
-    Ok(Config::default())
+    Ok(config)
 }
 
-/// Resolve the config file path (cross-platform via `directories`).
-fn config_path() -> Option<PathBuf> {
+/// Core of [`load_config`], taking the resolved path directly and
+/// returning any warning as data instead of printing it directly — keeps
+/// this testable without mutating the real process environment or
+/// capturing stderr.
+fn load_config_from(resolved: Option<(PathBuf, bool)>) -> Result<(Config, Option<String>)> {
+    let Some((path, explicit)) = resolved else {
+        return Ok((Config::default(), None));
+    };
+
+    if !path.exists() {
+        let warning = explicit.then(|| {
+            format!(
+                "$ICM_CONFIG={} does not exist — using default configuration",
+                path.display()
+            )
+        });
+        return Ok((Config::default(), warning));
+    }
+
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let config: Config =
+        toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+    Ok((config, None))
+}
+
+/// Resolve the config file path (cross-platform via `directories`), along
+/// with whether it was explicitly requested via `$ICM_CONFIG` (as opposed
+/// to auto-resolved from the platform's default config dir).
+fn resolved_config_path() -> Option<(PathBuf, bool)> {
     // 1. Environment variable
     if let Ok(p) = std::env::var("ICM_CONFIG") {
-        return Some(PathBuf::from(p));
+        return Some((PathBuf::from(p), true));
     }
 
     // 2. Platform-specific config dir:
@@ -342,7 +370,13 @@ fn config_path() -> Option<PathBuf> {
     //    Linux:   ~/.config/icm/config.toml  (XDG_CONFIG_HOME)
     //    Windows: C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml
     directories::ProjectDirs::from("dev", "icm", "icm")
-        .map(|dirs| dirs.config_dir().join("config.toml"))
+        .map(|dirs| (dirs.config_dir().join("config.toml"), false))
+}
+
+/// Resolve the config file path only (for `icm config show`, which just
+/// wants the path, not the explicit/default distinction).
+fn config_path() -> Option<PathBuf> {
+    resolved_config_path().map(|(p, _)| p)
 }
 
 /// Show the active config path (for `icm config show`).
@@ -412,5 +446,45 @@ instructions = "Custom instructions here"
         assert!(!config.extraction.store_raw);
         assert_eq!(config.recall.limit, 20);
         assert!(config.mcp.instructions.is_some());
+    }
+
+    /// Audit regression: an explicitly-set `$ICM_CONFIG` pointing at a
+    /// nonexistent path must surface a warning — silently falling back to
+    /// defaults with no signal meant every other command just ran on
+    /// stock config, ignoring the user's intended settings.
+    #[test]
+    fn load_config_from_warns_when_explicit_path_is_missing() {
+        let missing = PathBuf::from("/no/such/icm-config-dir/config.toml");
+        let (config, warning) = load_config_from(Some((missing.clone(), true))).unwrap();
+        assert_eq!(config.recall.limit, Config::default().recall.limit);
+        let warning = warning.expect("an explicit missing path must produce a warning");
+        assert!(warning.contains(&missing.display().to_string()));
+    }
+
+    /// The auto-resolved default path not existing yet (fresh install) is
+    /// the expected common case — no warning.
+    #[test]
+    fn load_config_from_is_silent_when_default_path_is_missing() {
+        let missing = PathBuf::from("/no/such/icm-config-dir/config.toml");
+        let (config, warning) = load_config_from(Some((missing, false))).unwrap();
+        assert_eq!(config.recall.limit, Config::default().recall.limit);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn load_config_from_reads_real_file_when_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[recall]\nlimit = 42\n").unwrap();
+        let (config, warning) = load_config_from(Some((path, true))).unwrap();
+        assert_eq!(config.recall.limit, 42);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn load_config_from_none_returns_defaults() {
+        let (config, warning) = load_config_from(None).unwrap();
+        assert_eq!(config.recall.limit, Config::default().recall.limit);
+        assert!(warning.is_none());
     }
 }

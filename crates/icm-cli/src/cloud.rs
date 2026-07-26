@@ -84,7 +84,7 @@ pub fn save_credentials(creds: &Credentials) -> Result<()> {
 /// then `set_permissions` left a window — created with the process umask
 /// (often world-readable) — where a crash between the two calls leaves the
 /// bearer token durably readable by other local users.
-fn write_secret_file(path: &std::path::Path, content: &str) -> Result<()> {
+pub(crate) fn write_secret_file(path: &std::path::Path, content: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;

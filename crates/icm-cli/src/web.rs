@@ -6,7 +6,7 @@ use anyhow::Result;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, Request, StatusCode},
+    http::{header, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post},
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use icm_core::{FeedbackStore, MemoirStore, MemoryStore};
 use icm_store::Store;
+
+use crate::cloud::write_secret_file;
 
 use crate::config::WebConfig;
 use crate::truncate_at_char_boundary;
@@ -81,19 +83,17 @@ pub fn resolve_password(cfg: &WebConfig) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("failed to generate password: {e}"))?;
     let generated: String = buf.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Save to credentials file
+    // Save to credentials file. Owner-only (0600) from the moment the file
+    // is created on Unix — the prior fs::write-then-set_permissions left a
+    // window where the freshly-generated dashboard password was readable
+    // under the process umask (often world-readable) before the chmod ran
+    // (audit finding, same TOCTOU class already fixed in cloud.rs).
     if let Some(ref path) = cred_path {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let entry = format!("ICM_WEB_PASSWORD={generated}\n");
-        std::fs::write(path, &entry).ok();
-        // Restrict permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
-        }
+        let _ = write_secret_file(path, &entry);
     }
 
     // Don't print the password to stderr — it would land in CI logs, shell
@@ -122,6 +122,63 @@ fn credentials_path() -> Option<std::path::PathBuf> {
 // Basic Auth middleware
 // ---------------------------------------------------------------------------
 
+/// Mutating dashboard routes that take no request body: `/api/health/decay`,
+/// `/api/health/prune`, `/api/topics/{name}/consolidate`. Basic Auth
+/// credentials are auto-reattached by the browser cross-origin (unlike a
+/// Bearer token, which JS must explicitly set), so a plain HTML form on
+/// another origin can POST to these without any preflight and ride the
+/// victim's cached credentials — CSRF (audit finding). `DELETE
+/// /api/memories/{id}` isn't exploitable this way: a non-simple method
+/// triggers a CORS preflight, which fails here since no CorsLayer is
+/// mounted.
+fn is_csrf_sensitive_post(method: &Method, path: &str) -> bool {
+    if method != Method::POST {
+        return false;
+    }
+    path == "/api/health/decay"
+        || path == "/api/health/prune"
+        || (path.starts_with("/api/topics/") && path.ends_with("/consolidate"))
+}
+
+/// Host portion of an `Origin`/`Referer` header value (strips scheme and
+/// any path/port-following segments left by a naive strip).
+fn header_host(v: &str) -> Option<&str> {
+    v.strip_prefix("http://")
+        .or_else(|| v.strip_prefix("https://"))
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or(rest))
+}
+
+/// Whether this request is same-origin, judged from `Origin` (preferred) or
+/// `Referer` (fallback — some browsers omit `Origin` on same-origin POSTs).
+/// Browsers always attach at least one of these on a cross-origin POST, so
+/// requests carrying neither are treated as a non-browser client (curl,
+/// scripts) using Basic Auth directly, not a forged browser request, and are
+/// allowed through.
+fn is_same_origin(req: &Request<Body>) -> bool {
+    let Some(host) = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    if let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        return header_host(origin) == Some(host);
+    }
+    if let Some(referer) = req
+        .headers()
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+    {
+        return header_host(referer) == Some(host);
+    }
+    true
+}
+
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -130,6 +187,17 @@ async fn auth_middleware(
     // /health is public
     if req.uri().path() == "/health" {
         return next.run(req).await;
+    }
+
+    // Basic Auth credentials are auto-reattached by the browser cross-origin
+    // (unlike a Bearer token, which JS must explicitly set), so a plain HTML
+    // form on another origin can POST to these mutating, bodyless endpoints
+    // without any preflight and ride the victim's cached credentials — CSRF
+    // (audit finding). `DELETE /api/memories/{id}` isn't exploitable this
+    // way: a non-simple method triggers a CORS preflight, which fails here
+    // since no CorsLayer is mounted.
+    if is_csrf_sensitive_post(req.method(), req.uri().path()) && !is_same_origin(&req) {
+        return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
     }
 
     let authorized = req
@@ -696,5 +764,62 @@ mod tests {
             store.stats().is_ok(),
             "store must remain usable after poison"
         );
+    }
+
+    #[test]
+    fn is_csrf_sensitive_post_matches_only_the_mutating_bodyless_routes() {
+        assert!(is_csrf_sensitive_post(&Method::POST, "/api/health/decay"));
+        assert!(is_csrf_sensitive_post(&Method::POST, "/api/health/prune"));
+        assert!(is_csrf_sensitive_post(
+            &Method::POST,
+            "/api/topics/my-topic/consolidate"
+        ));
+        // Different method or path: not covered by this check.
+        assert!(!is_csrf_sensitive_post(&Method::GET, "/api/health/decay"));
+        assert!(!is_csrf_sensitive_post(&Method::POST, "/api/memories"));
+        assert!(!is_csrf_sensitive_post(
+            &Method::DELETE,
+            "/api/memories/abc"
+        ));
+    }
+
+    /// Audit regression: `api_topic_consolidate`/`api_decay`/`api_prune`
+    /// took no request body, so Basic Auth's browser-side credential
+    /// auto-reattachment let a plain cross-origin HTML form POST to them
+    /// and ride the victim's cached credentials (CSRF) — these three POSTs
+    /// don't trigger a CORS preflight, unlike the DELETE route.
+    #[test]
+    fn is_same_origin_rejects_cross_origin_and_accepts_matching_or_absent() {
+        let req = |origin: Option<&str>, referer: Option<&str>| {
+            let mut b = Request::builder()
+                .method(Method::POST)
+                .header(header::HOST, "127.0.0.1:8787");
+            if let Some(o) = origin {
+                b = b.header(header::ORIGIN, o);
+            }
+            if let Some(r) = referer {
+                b = b.header(header::REFERER, r);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+
+        // A forged cross-origin form POST carries an Origin that doesn't
+        // match Host — must be rejected.
+        assert!(!is_same_origin(&req(Some("http://evil.example"), None)));
+        // Legit same-origin fetch() from the dashboard itself.
+        assert!(is_same_origin(&req(Some("http://127.0.0.1:8787"), None)));
+        // Some browsers omit Origin on same-origin POSTs; Referer must
+        // still be checked and matched.
+        assert!(is_same_origin(&req(
+            None,
+            Some("http://127.0.0.1:8787/dashboard")
+        )));
+        assert!(!is_same_origin(&req(
+            None,
+            Some("http://evil.example/lure")
+        )));
+        // Neither header: a non-browser client (curl/scripts) using Basic
+        // Auth directly, not a forged browser request — allowed.
+        assert!(is_same_origin(&req(None, None)));
     }
 }

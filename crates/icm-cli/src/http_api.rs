@@ -66,6 +66,24 @@ pub struct AppState {
     token: Option<String>,
 }
 
+/// Audit finding: every store access here treated a poisoned Mutex as a
+/// *permanent* fault ("store poisoned", 500) rather than recovering, unlike
+/// `web.rs::lock_store` (fixed in #372) — a single panic anywhere in Store
+/// while the lock was held (a future bug, an upstream edge case) would
+/// permanently 500 all five endpoints (recall/store/consolidate/stats/
+/// topics) for the rest of the process, recoverable only by restarting
+/// `icm serve --http`. A stdlib Mutex poison flag carries no corruption
+/// guarantee for a plain data store — the guard's data is still valid,
+/// just possibly mid-mutation from the panicking call, which the store's
+/// own operations are already robust to (each is a self-contained SQL
+/// statement/transaction).
+fn lock_store(state: &AppState) -> std::sync::MutexGuard<'_, Store> {
+    state
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl AppState {
     fn embedder_ref(&self) -> Option<&dyn Embedder> {
         self.embedder.as_deref().map(|e| e as &dyn Embedder)
@@ -294,10 +312,7 @@ fn run_recall(state: &AppState, req: &RecallReq) -> Result<Vec<(Memory, Option<f
     if req.query.trim().is_empty() {
         anyhow::bail!("missing required field: query");
     }
-    let store = state
-        .store
-        .lock()
-        .map_err(|_| anyhow::anyhow!("store poisoned"))?;
+    let store = lock_store(state);
     if let Err(e) = store.maybe_auto_decay() {
         tracing::warn!(error = %e, "auto-decay failed during /recall");
     }
@@ -427,10 +442,7 @@ async fn handle_store(
         }
     }
 
-    let outcome = match state.store.lock() {
-        Ok(store) => store.store(mem.clone()),
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
+    let outcome = lock_store(&state).store(mem.clone());
     match outcome {
         Ok(id) => {
             let mut stored = mem;
@@ -489,10 +501,7 @@ async fn handle_consolidate(
     if req.topic.trim().is_empty() {
         return err_response(StatusCode::BAD_REQUEST, "topic required", format);
     }
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
+    let store = lock_store(&state);
     let topic_memories = match store.get_by_topic(&req.topic) {
         Ok(ms) => ms,
         Err(e) => {
@@ -542,10 +551,7 @@ async fn handle_stats(
     Query(q): Query<FormatQuery>,
 ) -> Response {
     let format = OutputFormat::resolve(&q, &headers);
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
+    let store = lock_store(&state);
     match store.stats() {
         Ok(s) => {
             let payload = json!({
@@ -594,10 +600,7 @@ async fn handle_topics(
     Query(q): Query<FormatQuery>,
 ) -> Response {
     let format = OutputFormat::resolve(&q, &headers);
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
+    let store = lock_store(&state);
     match store.list_topics() {
         Ok(rows) => match format {
             OutputFormat::Json => json_value_response(json!(rows
@@ -803,5 +806,35 @@ mod tests {
         assert!(!constant_time_eq(b"secret", b"wrong!"));
         assert!(!constant_time_eq(b"short", b"longer-string"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Audit regression: every store access here treated a poisoned Mutex
+    /// as a permanent fault ("store poisoned", 500), unlike web.rs's
+    /// lock_store (fixed in #372) — a single panic anywhere in Store while
+    /// the lock was held would permanently break recall/store/consolidate/
+    /// stats/topics for the rest of the process.
+    #[test]
+    fn lock_store_recovers_from_a_poisoned_mutex() {
+        let state = AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: None,
+        };
+
+        // Poison the mutex: panic while holding the guard on another thread.
+        let poisoner = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.store.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(state.store.is_poisoned(), "setup: mutex must be poisoned");
+
+        // The recovering lock still yields a working store.
+        let store = lock_store(&state);
+        assert!(
+            store.stats().is_ok(),
+            "store must remain usable after poison"
+        );
     }
 }

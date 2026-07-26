@@ -119,6 +119,14 @@ fn extract_facts_with_kind(text: &str, project: &str) -> Vec<ScoredFact> {
         .collect()
 }
 
+/// Matches the keyword path's default `max_facts` (see `extract_facts`).
+/// Audit finding: unlike the keyword path, this had no cap at all — the
+/// caller (`extract_and_store_with_embedder`) stores every returned fact
+/// unconditionally, and it's reached from the default (uncapped)
+/// PostToolUse hook path, so a large ordinary tool output could flood the
+/// store with hundreds of low-quality rows in one hook fire.
+const MAX_SEMANTIC_FACTS: usize = 20;
+
 /// Score candidate sentences semantically and return the surviving
 /// ones tagged with their matched anchor kind. Falls back to
 /// `extract_facts_with_kind` if the embedder can't embed a batch.
@@ -145,6 +153,9 @@ fn extract_facts_semantic(
 
     let mut facts: Vec<ScoredFact> = Vec::new();
     for (sentence, result) in candidates.iter().zip(scored) {
+        if facts.len() >= MAX_SEMANTIC_FACTS {
+            break;
+        }
         if let Some((kind, _margin)) = result {
             let dominated = facts
                 .iter()
@@ -424,21 +435,32 @@ fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)>
 /// completely unrelated text. No regex dependency in this file, so this is
 /// a manual boundary check: the byte immediately before/after the match
 /// (if any) must not be alphanumeric.
-fn contains_word(haystack: &str, word: &str) -> bool {
+pub(crate) fn contains_word(haystack: &str, word: &str) -> bool {
     if word.is_empty() {
         return false;
     }
+    // A boundary is only meaningful on an end that's itself alphanumeric —
+    // `word` may be a multi-word phrase already self-delimited by a space,
+    // colon, or apostrophe (e.g. "always ", "error:"), in which case that
+    // end needs no extra check.
+    let check_before = word.chars().next().is_some_and(|c| c.is_alphanumeric());
+    let check_after = word
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric());
     let mut start = 0;
     while let Some(rel) = haystack[start..].find(word) {
         let at = start + rel;
-        let before_ok = haystack[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric());
-        let after_ok = haystack[at + word.len()..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric());
+        let before_ok = !check_before
+            || haystack[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = !check_after
+            || haystack[at + word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric());
         if before_ok && after_ok {
             return true;
         }
@@ -1316,6 +1338,12 @@ const ENTITY_PATTERNS_AFTER: &[&str] = &[
 ];
 
 /// Classify a fact into kind tags based on keyword matching.
+///
+/// Audit finding: this used plain `.contains()`, a separate keyword-table
+/// set from the ones already fixed to use `contains_word` elsewhere in
+/// this file — so "decided" matched inside "undecided" (tagging a
+/// statement of *no* decision as `kind:decision`), "shipped" matched
+/// inside "worshipped", and "limitation" matched inside "delimitation".
 pub fn classify_fact(content: &str) -> Vec<String> {
     let lower = content.to_lowercase();
     let mut tags = Vec::new();
@@ -1335,7 +1363,7 @@ pub fn classify_fact(content: &str) -> Vec<String> {
         "settled on",
         "opted for",
     ];
-    if decision_kw.iter().any(|kw| lower.contains(kw)) {
+    if decision_kw.iter().any(|kw| contains_word(&lower, kw)) {
         tags.push("kind:decision".to_string());
     }
 
@@ -1354,7 +1382,7 @@ pub fn classify_fact(content: &str) -> Vec<String> {
         "don't ",
         "do not ",
     ];
-    if preference_kw.iter().any(|kw| lower.contains(kw)) {
+    if preference_kw.iter().any(|kw| contains_word(&lower, kw)) {
         tags.push("kind:preference".to_string());
     }
 
@@ -1372,7 +1400,7 @@ pub fn classify_fact(content: &str) -> Vec<String> {
         "regression",
         "crash",
     ];
-    if problem_kw.iter().any(|kw| lower.contains(kw)) {
+    if problem_kw.iter().any(|kw| contains_word(&lower, kw)) {
         tags.push("kind:problem".to_string());
     }
 
@@ -1390,15 +1418,29 @@ pub fn classify_fact(content: &str) -> Vec<String> {
         "v2.",
         "v3.",
     ];
-    if milestone_kw.iter().any(|kw| lower.contains(kw)) {
+    if milestone_kw.iter().any(|kw| contains_word(&lower, kw)) {
         tags.push("kind:milestone".to_string());
     }
 
     tags
 }
 
+/// Above this, `detect_entities`'s per-candidate pattern scan (see below)
+/// gets too expensive; text past this point is simply not scanned for
+/// entities.
+const ENTITY_SCAN_CHAR_CAP: usize = 20_000;
+
 /// Detect person/project entity names in text using heuristic patterns.
+///
+/// Audit finding: for every capitalized candidate word this ran ~34
+/// substring scans (`ENTITY_PATTERNS_BEFORE`/`_AFTER`) over the *entire*
+/// text, with no cap — effectively O(n²) for text dense in capitalized
+/// words. Reachable via `icm import` (`extract_and_classify`) on a large
+/// export with no prior size cap, unlike the sentence-level 500-char cap
+/// the keyword scorer already applies. Bound the scan to a fixed prefix,
+/// matching the size caps already used elsewhere in this file.
 pub fn detect_entities(content: &str) -> Vec<String> {
+    let content = crate::truncate_at_char_boundary(content, ENTITY_SCAN_CHAR_CAP);
     let stop_set: HashSet<&str> = ENTITY_STOP_WORDS.iter().copied().collect();
     let mut found: HashSet<String> = HashSet::new();
 
@@ -2382,6 +2424,133 @@ mod tests {
         assert!(
             chunks.iter().any(|c| c.contains("Value contains")),
             "trailing clause should survive: {chunks:?}"
+        );
+    }
+
+    /// Audit regression: `detect_entities` must not scan past
+    /// `ENTITY_SCAN_CHAR_CAP` — build a huge text where the only
+    /// pattern-adjacent name sits well beyond the cap, and confirm it's
+    /// NOT detected (proving the cap is actually applied), while a name
+    /// within the cap still is.
+    #[test]
+    fn detect_entities_does_not_scan_past_the_cap() {
+        let padding = "the quick brown fox jumps over the lazy dog. ".repeat(1000);
+        assert!(padding.len() > ENTITY_SCAN_CHAR_CAP);
+        let text =
+            format!("Please ask Alice for a review. {padding}Please ask Zelda for a review.");
+        let entities = detect_entities(&text);
+        assert!(
+            entities.contains(&"entity:Alice".to_string()),
+            "name within the cap should still be found: {entities:?}"
+        );
+        assert!(
+            !entities.contains(&"entity:Zelda".to_string()),
+            "name past the cap must not be scanned: {entities:?}"
+        );
+    }
+
+    /// Audit regression: `classify_fact` used a separate, plain-`.contains`
+    /// keyword table from the one `contains_word` already fixed elsewhere
+    /// in this file — a statement of *no* decision must not be tagged
+    /// `kind:decision` just because "decided" is a substring of
+    /// "undecided".
+    #[test]
+    fn classify_fact_does_not_match_substrings() {
+        let tags = classify_fact("We remain undecided on the framework choice");
+        assert!(
+            !tags.contains(&"kind:decision".to_string()),
+            "undecided must not match decided: {tags:?}"
+        );
+
+        let tags = classify_fact("The cathedral bells worshipped the town every Sunday");
+        assert!(
+            !tags.contains(&"kind:milestone".to_string()),
+            "worshipped must not match shipped: {tags:?}"
+        );
+
+        let tags = classify_fact("We hit a delimitation issue with the CSV parser");
+        assert!(
+            !tags.contains(&"kind:problem".to_string()),
+            "delimitation must not match limitation: {tags:?}"
+        );
+
+        // Still detects the real, whole-word cases.
+        let tags = classify_fact("We decided to go with Postgres instead of MySQL");
+        assert!(tags.contains(&"kind:decision".to_string()));
+    }
+
+    /// Audit regression: `extract_facts_semantic` had no cap on returned
+    /// facts, unlike its keyword-path sibling (`extract_facts`, capped at
+    /// 20) — the caller stores every returned fact unconditionally, so an
+    /// uncapped semantic path could flood the store from one large input.
+    #[test]
+    fn extract_facts_semantic_caps_returned_facts() {
+        use crate::extract_semantic::SemanticScorer;
+        use icm_core::{Embedder, IcmResult};
+
+        // Keyword-keyed stub: strongly positive on the decision axis for
+        // any sentence containing "decided", zero otherwise. Mirrors the
+        // stub embedder pattern already proven against `SemanticScorer`
+        // in `extract_semantic.rs`'s own tests.
+        struct DecisionStubEmbedder;
+        impl Embedder for DecisionStubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let hit = text.to_lowercase().contains("decided");
+                Ok(vec![if hit { 1.0 } else { 0.0 }, 0.0])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                2
+            }
+        }
+
+        // 25 genuinely distinct decision sentences (different topics/
+        // vocabulary throughout, not just a changed trailing word) so
+        // `jaccard_similar`'s dedup doesn't collapse them below the cap
+        // for an unrelated reason.
+        let sentences = [
+            "We decided to use PostgreSQL instead of MySQL for the primary database.",
+            "The team decided to migrate the frontend to TypeScript after repeated type bugs.",
+            "We decided to switch the CI pipeline to GitHub Actions since CircleCI got expensive.",
+            "Engineering decided to adopt gRPC for internal services to cut REST latency overhead.",
+            "The architects decided to shard the orders table to handle rising write volume.",
+            "We decided to deprecate the legacy Python worker in favor of a Rust rewrite.",
+            "The security team decided to require hardware keys for every admin login.",
+            "Product decided to remove the free tier because support costs kept climbing.",
+            "We decided to standardize on Kubernetes instead of bespoke Ansible playbooks.",
+            "The data team decided to switch to Parquet since CSV parsing was too slow.",
+            "We decided to freeze the API schema before the mobile app launch.",
+            "The infra group decided to move object storage from S3 to a cheaper provider.",
+            "We decided to split the monolith into three services after the last outage.",
+            "The design team decided to drop the sidebar navigation for a top bar layout.",
+            "We decided to require code review approval from two engineers, not one.",
+            "The platform team decided to retire the old queue in favor of a managed broker.",
+            "We decided to cache search results for five minutes to reduce database load.",
+            "The compliance team decided to encrypt backups at rest starting next quarter.",
+            "We decided to switch our logging format to structured JSON across all services.",
+            "The mobile team decided to drop support for the oldest two OS versions.",
+            "We decided to rewrite the billing module after a rounding bug cost real money.",
+            "The ops team decided to move deploys to a blue-green strategy for safety.",
+            "We decided to consolidate three config files into a single typed schema.",
+            "The growth team decided to sunset the referral program due to low uptake.",
+            "We decided to pin dependency versions after an upstream update broke the build.",
+        ];
+        assert_eq!(
+            sentences.len(),
+            25,
+            "need more than the cap to prove it bites"
+        );
+        let text = sentences.join(" ");
+
+        let embedder = DecisionStubEmbedder;
+        let scorer = SemanticScorer::new(&embedder).expect("stub scorer build");
+        let facts = extract_facts_semantic(&text, "test", &embedder, &scorer).unwrap();
+        assert!(
+            facts.len() <= MAX_SEMANTIC_FACTS,
+            "expected at most {MAX_SEMANTIC_FACTS} facts, got {}",
+            facts.len()
         );
     }
 }

@@ -148,6 +148,39 @@ pub const QUESTIONS: &[Question] = &[
     },
 ];
 
+/// Audit finding: plain substring matching let e.g. "50" match inside
+/// "150", crediting an answer for a keyword it never actually stated.
+/// Word keywords use the standard alphanumeric-boundary check; purely
+/// numeric keywords use a digit-only boundary so a bare measurement unit
+/// (e.g. "150ms") still counts as a match for "150" — only adjacency to
+/// another digit (part of the same larger number) is rejected.
+fn matches_keyword(haystack_lower: &str, kw_lower: &str) -> bool {
+    if !kw_lower.is_empty() && kw_lower.chars().all(|c| c.is_ascii_digit()) {
+        let mut start = 0;
+        while let Some(rel) = haystack_lower[start..].find(kw_lower) {
+            let at = start + rel;
+            let before_ok = haystack_lower[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_digit());
+            let after_ok = haystack_lower[at + kw_lower.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_digit());
+            if before_ok && after_ok {
+                return true;
+            }
+            start = at + 1;
+            if start >= haystack_lower.len() {
+                break;
+            }
+        }
+        false
+    } else {
+        crate::extract::contains_word(haystack_lower, kw_lower)
+    }
+}
+
 /// Score an answer against expected keywords.
 /// Returns (matches, total_expected, score_pct).
 pub fn score_answer(answer: &str, question: &Question) -> (usize, usize, f64) {
@@ -155,7 +188,7 @@ pub fn score_answer(answer: &str, question: &Question) -> (usize, usize, f64) {
     let matches = question
         .expected
         .iter()
-        .filter(|kw| answer_lower.contains(&kw.to_lowercase()))
+        .filter(|kw| matches_keyword(&answer_lower, &kw.to_lowercase()))
         .count();
     let total = question.expected.len();
     let passed = matches >= question.min_matches;
@@ -178,3 +211,27 @@ pub const RECALL_PREFIX: &str = "\
 Answer the following question about the Meridian Protocol from memory. \
 Be specific — include exact numbers, names, and technical details. \
 If you stored information about this topic, recall it now.\n\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit regression: "50" must not get phantom credit from matching
+    /// inside "150" — this question's keywords are ["Propose", "150",
+    /// "Validate", "300", "Commit", "50"] with min_matches: 4. An answer
+    /// that only mentions "150" (not "50" on its own) must not be scored
+    /// as if it also mentioned "50".
+    #[test]
+    fn score_answer_does_not_credit_substring_collision() {
+        let question = &QUESTIONS[1];
+        assert_eq!(
+            question.expected,
+            &["Propose", "150", "Validate", "300", "Commit", "50"]
+        );
+        let answer = "Propose phase is 150ms, Validate phase is 300ms, Commit phase happens after.";
+        let (matches, _total, _score) = score_answer(answer, question);
+        // "Propose", "150", "Validate", "300", "Commit" = 5 genuine matches.
+        // "50" must not get an extra phantom match from inside "150".
+        assert_eq!(matches, 5);
+    }
+}

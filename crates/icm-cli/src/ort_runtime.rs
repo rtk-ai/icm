@@ -18,7 +18,7 @@
 //! (or an explicit user `ORT_DYLIB_PATH`) — never an ambient system library.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -233,6 +233,41 @@ fn extract_lib_zip(archive: &[u8]) -> Result<Vec<u8>> {
     bail!("onnxruntime.dll not found in onnxruntime archive")
 }
 
+/// Write the verified library bytes to `tmp`, refusing to follow a
+/// pre-existing symlink there.
+///
+/// Audit finding: `tmp` is a fixed, predictable path within the managed
+/// dir. Plain `fs::write` is `O_CREAT|O_TRUNC` with no `O_EXCL`, so a
+/// pre-planted symlink at `tmp` (another same-user process, shared
+/// CI/container) would get followed and its target clobbered with the
+/// verified library bytes — the same TOCTOU class already hardened in
+/// `cloud.rs::write_secret_file` and `upgrade.rs::write_new_binary`.
+/// Remove any existing entry first via `symlink_metadata` (reports the
+/// symlink itself, not its target), then open with `create_new`
+/// (`O_EXCL`) so even a fresh symlink racing into the gap fails the open
+/// rather than getting followed.
+fn write_lib_tmp(tmp: &Path, lib_bytes: &[u8]) -> Result<()> {
+    if std::fs::symlink_metadata(tmp).is_ok() {
+        std::fs::remove_file(tmp)
+            .with_context(|| format!("cannot remove stale {}", tmp.display()))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .with_context(|| format!("cannot create {}", tmp.display()))?;
+    f.write_all(lib_bytes)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o755))
+            .context("setting permissions on onnxruntime library")?;
+    }
+    Ok(())
+}
+
 /// Download, verify, and install onnxruntime to the managed path, then point
 /// `ort` at it. `progress` prints one-line status to stderr.
 pub fn download(progress: bool) -> Result<PathBuf> {
@@ -264,14 +299,19 @@ pub fn download(progress: bool) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     // Write to a temp sibling then rename, so a concurrent reader never sees a
     // half-written library.
+    //
+    // Audit finding: this path is fixed and predictable within the managed
+    // dir. Plain `fs::write` is `O_CREAT|O_TRUNC` with no `O_EXCL`, so a
+    // pre-planted symlink at `tmp` (another same-user process, shared
+    // CI/container) would get followed and its target clobbered with the
+    // verified library bytes — the same TOCTOU class already hardened in
+    // `cloud.rs::write_secret_file` and `upgrade.rs::write_new_binary`.
+    // Remove any existing entry first via `symlink_metadata` (reports the
+    // symlink itself, not its target), then open with `create_new`
+    // (`O_EXCL`) so even a fresh symlink racing into the gap fails the
+    // open rather than getting followed.
     let tmp = lib_path.with_extension("new");
-    std::fs::write(&tmp, &lib_bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .context("setting permissions on onnxruntime library")?;
-    }
+    write_lib_tmp(&tmp, &lib_bytes)?;
     // On Windows `rename` fails if the destination already exists (e.g. a forced
     // re-download), so clear it first. Unix `rename` replaces atomically.
     #[cfg(windows)]
@@ -545,5 +585,44 @@ mod tests {
         }
         let extracted = extract_lib(&buf, "zip").expect("should find onnxruntime.dll");
         assert_eq!(extracted, b"REAL-DLL-BYTES");
+    }
+
+    /// Audit regression: `write_lib_tmp` must not follow a pre-existing
+    /// symlink at the fixed `tmp` path — a same-user process (or a
+    /// leftover from an interrupted previous download) planting a
+    /// symlink there must not have its target clobbered.
+    #[cfg(unix)]
+    #[test]
+    fn write_lib_tmp_does_not_follow_a_preexisting_symlink() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let victim = tmp_dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+
+        let target = tmp_dir.path().join("libonnxruntime.1.20.1.dylib.new");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        write_lib_tmp(&target, b"verified library bytes").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "target must be a regular file, not still a symlink"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"verified library bytes");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched",
+            "the symlink's old target must be untouched"
+        );
+    }
+
+    #[test]
+    fn write_lib_tmp_creates_a_fresh_file() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let target = tmp_dir.path().join("libonnxruntime.1.20.1.dylib.new");
+        write_lib_tmp(&target, b"payload").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
     }
 }

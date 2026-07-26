@@ -12,6 +12,35 @@ use sha2::{Digest, Sha256};
 const REPO: &str = "rtk-ai/icm";
 const BINARY_NAME: &str = "icm";
 
+/// Parse a `major.minor.patch` prefix, ignoring any `-prerelease`/`+build`
+/// suffix. Returns `None` if the string doesn't start with three
+/// dot-separated numeric components.
+fn parse_semver_core(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Is `latest` actually newer than `current`?
+///
+/// Audit finding: the caller used to check `latest_version ==
+/// current_version` only — any *difference* (not just a newer version)
+/// triggered the upgrade flow. A source build with an unreleased version
+/// bump (e.g. `0.11.0-dev` built ahead of the last published tag
+/// `0.10.59`) would silently downgrade to the older published release.
+/// Falls back to the old equality-only check when either string doesn't
+/// parse as `major.minor.patch` — never silently treats an unparseable
+/// version as newer.
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    match (parse_semver_core(current), parse_semver_core(latest)) {
+        (Some(cur), Some(lat)) => lat > cur,
+        _ => latest != current,
+    }
+}
+
 /// Detect the target triple for this platform.
 fn detect_target() -> Result<(&'static str, &'static str)> {
     let os = std::env::consts::OS;
@@ -155,7 +184,7 @@ pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
     let latest_version = latest_tag.strip_prefix("icm-v").unwrap_or(&latest_tag);
     eprintln!("Latest version:  {latest_version}");
 
-    if latest_version == current_version {
+    if !is_newer_version(current_version, latest_version) {
         eprintln!("Already up to date.");
         return Ok(());
     }
@@ -233,23 +262,64 @@ pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
     // Write new binary to .new.
     write_new_binary(&new_path, &new_binary)?;
 
-    // Atomic swap: rename old → .old, new → current
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path).ok();
-    }
-    std::fs::rename(&current_exe, &backup_path)
-        .with_context(|| format!("cannot backup {}", current_exe.display()))?;
-    if let Err(e) = std::fs::rename(&new_path, &current_exe) {
-        // Rollback on error
-        std::fs::rename(&backup_path, &current_exe).ok();
-        return Err(e).context("failed to install new binary (rolled back)");
-    }
-
-    // Clean up backup
-    std::fs::remove_file(&backup_path).ok();
+    swap_binary_into_place(&new_path, &current_exe, &backup_path)?;
 
     eprintln!("Successfully upgraded to {latest_version}");
     Ok(())
+}
+
+/// Swap `new_path` into `current_exe`'s place, keeping `current_exe`'s
+/// prior content at `backup_path` until the swap succeeds. On failure,
+/// attempts to roll back and reports accurately whether the rollback
+/// itself succeeded.
+///
+/// Audit finding: the rollback's own result used to be discarded via
+/// `.ok()`, yet the error message unconditionally claimed "(rolled
+/// back)" — if the rollback rename itself failed (permissions changed
+/// mid-flight, disk full), the user would be told the binary was
+/// restored when `current_exe` was in fact still missing.
+fn swap_binary_into_place(new_path: &Path, current_exe: &Path, backup_path: &Path) -> Result<()> {
+    if backup_path.exists() {
+        std::fs::remove_file(backup_path).ok();
+    }
+    std::fs::rename(current_exe, backup_path)
+        .with_context(|| format!("cannot backup {}", current_exe.display()))?;
+    if let Err(e) = std::fs::rename(new_path, current_exe) {
+        let rollback_result = std::fs::rename(backup_path, current_exe);
+        return Err(swap_failure_error(
+            e,
+            rollback_result,
+            current_exe,
+            backup_path,
+        ));
+    }
+
+    // Clean up backup
+    std::fs::remove_file(backup_path).ok();
+    Ok(())
+}
+
+/// Build the error for a failed swap, reporting accurately whether the
+/// rollback attempt itself succeeded — split out from
+/// `swap_binary_into_place` so this reporting logic is directly testable
+/// without needing to simulate a real filesystem-level rollback failure.
+fn swap_failure_error(
+    swap_err: std::io::Error,
+    rollback_result: std::io::Result<()>,
+    current_exe: &Path,
+    backup_path: &Path,
+) -> anyhow::Error {
+    match rollback_result {
+        Ok(()) => {
+            anyhow::Error::new(swap_err).context("failed to install new binary (rolled back)")
+        }
+        Err(rollback_err) => anyhow::Error::new(swap_err).context(format!(
+            "failed to install new binary AND rollback failed ({rollback_err}) — \
+             {} may be missing; restore it manually from {}",
+            current_exe.display(),
+            backup_path.display()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +363,102 @@ mod tests {
         let target = tmp.path().join("icm.new");
         write_new_binary(&target, b"payload").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    }
+
+    /// Audit regression: a bare `==` check treated ANY difference as "an
+    /// update is available" rather than checking direction — a source
+    /// build ahead of the last published tag would silently downgrade.
+    #[test]
+    fn is_newer_version_requires_a_real_increase() {
+        assert!(is_newer_version("0.10.59", "0.10.60"));
+        assert!(
+            is_newer_version("0.9.0", "0.10.0"),
+            "0.10.0 > 0.9.0 numerically, not lexically"
+        );
+        assert!(
+            !is_newer_version("0.11.0-dev", "0.10.59"),
+            "an unreleased dev build ahead of the last tag must not be downgraded"
+        );
+        assert!(
+            !is_newer_version("0.10.59", "0.10.59"),
+            "equal versions are not newer"
+        );
+        assert!(
+            !is_newer_version("0.10.60", "0.10.59"),
+            "an older tag is not newer"
+        );
+    }
+
+    #[test]
+    fn is_newer_version_falls_back_to_equality_for_unparseable_versions() {
+        // Neither side parses as major.minor.patch — preserve the old
+        // equality-only behavior rather than guessing a direction.
+        assert!(is_newer_version("garbage", "also-garbage"));
+        assert!(!is_newer_version("garbage", "garbage"));
+    }
+
+    /// Audit regression: the rollback's own result must determine the
+    /// error message — a failed rollback must never be reported as
+    /// "rolled back".
+    #[test]
+    fn swap_failure_error_reports_rollback_outcome_accurately() {
+        let swap_err = std::io::Error::other("swap failed");
+        let current_exe = Path::new("/fake/icm");
+        let backup_path = Path::new("/fake/icm.old");
+
+        let ok_msg = format!(
+            "{:#}",
+            swap_failure_error(
+                std::io::Error::other("swap failed"),
+                Ok(()),
+                current_exe,
+                backup_path,
+            )
+        );
+        assert!(ok_msg.contains("rolled back"));
+        assert!(!ok_msg.contains("rollback failed"));
+
+        let rollback_err_msg = format!(
+            "{:#}",
+            swap_failure_error(
+                swap_err,
+                Err(std::io::Error::other("permission denied")),
+                current_exe,
+                backup_path,
+            )
+        );
+        assert!(
+            rollback_err_msg.contains("rollback failed"),
+            "must surface the rollback failure, not claim success: {rollback_err_msg}"
+        );
+        assert!(
+            rollback_err_msg.contains("restore it manually"),
+            "must tell the user how to recover: {rollback_err_msg}"
+        );
+    }
+
+    /// End-to-end swap test on real files: the common failure mode (the
+    /// new binary is missing) must roll back cleanly and leave the
+    /// original binary content intact.
+    #[test]
+    fn swap_binary_into_place_rolls_back_when_new_binary_is_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let current_exe = tmp.path().join("icm");
+        let new_path = tmp.path().join("icm.new");
+        let backup_path = tmp.path().join("icm.old");
+        std::fs::write(&current_exe, b"original binary").unwrap();
+        // new_path deliberately does not exist.
+
+        let result = swap_binary_into_place(&new_path, &current_exe, &backup_path);
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&current_exe).unwrap(),
+            b"original binary",
+            "original binary must survive a failed swap"
+        );
+        assert!(
+            !backup_path.exists(),
+            "backup should be consumed by the rollback"
+        );
     }
 }

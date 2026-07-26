@@ -381,21 +381,39 @@ const IMPORT_EXTENSIONS: &[&str] = &["json", "jsonl", "txt", "md"];
 
 fn collect_importable_files(path: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    collect_recursive(path, &mut files)?;
+    let canonical_root = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    collect_recursive(path, &canonical_root, &mut files)?;
     files.sort();
     Ok(files)
 }
 
-fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_recursive(dir: &Path, canonical_root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
+        // Audit finding: symlink-following with no containment check let a
+        // directory tree containing a symlink to elsewhere on disk get
+        // silently walked and its files imported as memories, outside the
+        // tree the user pointed at. Canonicalize and require containment
+        // within the originally-requested root (same pattern as
+        // learn.rs::expand_workspace_glob, round 3 #369) - this also
+        // naturally handles symlink loops, since a loop's canonicalized
+        // target is unreachable (the OS's own ELOOP limit surfaces as an
+        // Err here, which we skip rather than recursing into).
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(canonical_root) {
+            continue;
+        }
         if path.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('.') || name == "node_modules" || name == "__pycache__" {
                 continue;
             }
-            collect_recursive(&path, files)?;
+            collect_recursive(&path, canonical_root, files)?;
         } else {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if IMPORT_EXTENSIONS.contains(&ext) {
@@ -741,5 +759,34 @@ mod tests {
         // Recall
         let results = store.search_fts("SQLite decision", 5).unwrap();
         assert!(!results.is_empty(), "should recall imported facts");
+    }
+
+    /// Audit regression: `collect_recursive` followed symlinks with no
+    /// containment check, so a directory tree containing a symlink to
+    /// elsewhere on disk got silently walked and its files imported as
+    /// memories - outside the tree the user pointed the import at.
+    #[test]
+    #[cfg(unix)]
+    fn collect_importable_files_does_not_follow_symlinks_outside_the_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // A file outside the import root that must never be reached.
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("secret.md"), "should never be imported").unwrap();
+
+        // The import root, containing a symlink pointing at `outside`.
+        let root = tmp.path().join("import-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.md"), "this one is fine").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, root.join("escape-link")).unwrap();
+
+        let files = collect_importable_files(&root).unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "must only collect the real file inside the root, not the symlinked escape: {files:?}"
+        );
+        assert!(files[0].ends_with("real.md"));
     }
 }

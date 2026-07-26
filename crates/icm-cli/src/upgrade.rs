@@ -4,7 +4,7 @@
 //! against the release's `checksums.txt`, and replaces the running binary.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -109,6 +109,41 @@ fn extract_binary(archive: &[u8], is_zip: bool) -> Result<Vec<u8>> {
     bail!("binary {BINARY_NAME} not found in archive")
 }
 
+/// Write the downloaded (already SHA256-verified) binary to `path`,
+/// refusing to follow a pre-existing symlink there.
+///
+/// Audit finding: `File::create` is `O_CREAT|O_TRUNC` with no `O_EXCL` - it
+/// follows an existing symlink at `path`. If an attacker with write access
+/// to this directory pre-places a symlink pointing elsewhere, the verified
+/// download gets written through it, clobbering an unrelated file (not
+/// RCE - the payload is the legitimate SHA256-verified binary - but a real
+/// file-clobber/DoS gap, the same TOCTOU class already hardened in
+/// `cloud.rs::write_secret_file`). Remove any existing entry first via
+/// `symlink_metadata` (which reports the symlink itself, not its target) so
+/// a stale symlink or a leftover from an interrupted previous upgrade
+/// doesn't get followed, then open with `create_new` (`O_EXCL`) so even an
+/// attacker racing a fresh symlink into the gap fails the open rather than
+/// getting followed.
+fn write_new_binary(path: &Path, content: &[u8]) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("cannot remove stale {}", path.display()))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    f.write_all(content)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 /// Run the upgrade flow: fetch latest, verify checksum, replace binary.
 pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION");
@@ -195,18 +230,8 @@ pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
 
     eprintln!("Installing to {}...", current_exe.display());
 
-    // Write new binary to .new
-    {
-        let mut f = std::fs::File::create(&new_path)
-            .with_context(|| format!("cannot create {}", new_path.display()))?;
-        f.write_all(&new_binary)
-            .with_context(|| format!("cannot write {}", new_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&new_path, std::fs::Permissions::from_mode(0o755))?;
-        }
-    }
+    // Write new binary to .new.
+    write_new_binary(&new_path, &new_binary)?;
 
     // Atomic swap: rename old → .old, new → current
     if backup_path.exists() {
@@ -225,4 +250,48 @@ pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
 
     eprintln!("Successfully upgraded to {latest_version}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit regression: `File::create` follows a symlink pre-placed at
+    /// the target path, letting an attacker with write access to the
+    /// directory redirect the verified-download write elsewhere. The fix
+    /// must remove any existing entry (symlink or stale leftover) first
+    /// and never write through a symlink.
+    #[test]
+    #[cfg(unix)]
+    fn write_new_binary_does_not_follow_a_preexisting_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+
+        let target = tmp.path().join("icm.new");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        write_new_binary(&target, b"verified binary content").unwrap();
+
+        // The symlink must be gone, replaced by a real file...
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "target must be a regular file, not still a symlink"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"verified binary content");
+        // ...and the symlink's old target must be untouched.
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    }
+
+    /// Sanity check for the normal case: no pre-existing entry at all.
+    #[test]
+    fn write_new_binary_creates_a_fresh_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("icm.new");
+        write_new_binary(&target, b"payload").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    }
 }

@@ -56,6 +56,25 @@ const IDX_HOOKS: &str = "icm_hook_events";
 const IDX_PENDING: &str = "icm_pending_extractions";
 const IDX_CODE_AREAS: &str = "icm_code_areas";
 
+/// Percent-encode a value for safe use as a single path segment in a REST
+/// URL. Document ids are caller-controlled (`icm forget <id>` CLI, MCP
+/// `icm_forget`, etc.) with no format constraint enforced anywhere in the
+/// schema — without this, a crafted id containing `/`, `..`, `?`, or `#`
+/// could redirect which REST endpoint is actually hit instead of just
+/// addressing the intended document (audit finding).
+fn url_encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (self-contained, mirror the other backends)
 // ---------------------------------------------------------------------------
@@ -564,12 +583,22 @@ impl OpenSearchStore {
         // Dedup: an existing memory with the same (topic, summary_hash)
         // wins; merge importance (max) + keywords (union) + raw_excerpt
         // (prefer new) and return the existing id.
+        //
+        // Audit finding: this used to ALSO filter on `topic.keyword` (an
+        // exact-byte-match `keyword` field, no normalizer) alongside
+        // `summary_hash` — but `summary_hash` already encodes the topic via
+        // Rust's Unicode-correct `to_lowercase()`, so storing topic="Kexa"
+        // then topic="kexa" with the same summary hashed identically but
+        // failed the exact `topic.keyword` filter, silently creating a
+        // second document instead of deduping (broader than the SQLite/
+        // Postgres accented-topic case — this fires on ANY case
+        // difference). `summary_hash` alone is sufficient, matching the
+        // SQLite/Postgres fix.
         let existing = self.post(
             &format!("{IDX_MEMORIES}/_search"),
             json!({
                 "size": 1,
                 "query": {"bool": {"filter": [
-                    {"term": {"topic.keyword": memory.topic}},
                     {"term": {"summary_hash": hash}}
                 ]}}
             }),
@@ -631,7 +660,11 @@ impl OpenSearchStore {
 
         self.request(
             "PUT",
-            &format!("{IDX_MEMORIES}/_doc/{}?{}", memory.id, self.refresh_param()),
+            &format!(
+                "{IDX_MEMORIES}/_doc/{}?{}",
+                url_encode_path_segment(&memory.id),
+                self.refresh_param()
+            ),
             Some(Self::memory_to_source(memory)),
             false,
         )?;
@@ -650,7 +683,7 @@ impl MemoryStore for OpenSearchStore {
     }
 
     fn get(&self, id: &str) -> IcmResult<Option<Memory>> {
-        let path = format!("{IDX_MEMORIES}/_doc/{id}");
+        let path = format!("{IDX_MEMORIES}/_doc/{}", url_encode_path_segment(id));
         match self.get_json(&path)? {
             Some(v) => {
                 if v.get("found").and_then(|f| f.as_bool()).unwrap_or(false) {
@@ -674,7 +707,11 @@ impl MemoryStore for OpenSearchStore {
         // Replace the document wholesale (index by id).
         self.request(
             "PUT",
-            &format!("{IDX_MEMORIES}/_doc/{}?{}", memory.id, self.refresh_param()),
+            &format!(
+                "{IDX_MEMORIES}/_doc/{}?{}",
+                url_encode_path_segment(&memory.id),
+                self.refresh_param()
+            ),
             Some(doc),
             false,
         )?;
@@ -687,7 +724,11 @@ impl MemoryStore for OpenSearchStore {
         }
         self.request(
             "DELETE",
-            &format!("{IDX_MEMORIES}/_doc/{id}?{}", self.refresh_param()),
+            &format!(
+                "{IDX_MEMORIES}/_doc/{}?{}",
+                url_encode_path_segment(id),
+                self.refresh_param()
+            ),
             None,
             true,
         )?;
@@ -698,6 +739,11 @@ impl MemoryStore for OpenSearchStore {
         if keywords.is_empty() {
             return Ok(Vec::new());
         }
+        // Audit finding: unlike Postgres/SQLite, `limit` was never clamped
+        // here — a caller-supplied limit above OpenSearch's own
+        // `index.max_result_window` (default 10,000) returns a hard 400
+        // error instead of gracefully truncating like the other backends.
+        let limit = limit.min(100);
         let joined = keywords.join(" ");
         let resp = self.post(
             &format!("{IDX_MEMORIES}/_search"),
@@ -716,6 +762,7 @@ impl MemoryStore for OpenSearchStore {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        let limit = limit.min(100);
         let resp = self.post(
             &format!("{IDX_MEMORIES}/_search"),
             json!({
@@ -734,6 +781,7 @@ impl MemoryStore for OpenSearchStore {
         embedding: &[f32],
         limit: usize,
     ) -> IcmResult<Vec<(Memory, f32)>> {
+        let limit = limit.min(1000);
         let resp = self.post(
             &format!("{IDX_MEMORIES}/_search"),
             json!({
@@ -859,9 +907,14 @@ impl MemoryStore for OpenSearchStore {
             &format!("{IDX_MEMORIES}/_update_by_query?{}&conflicts=proceed", self.refresh_param()),
             json!({
                 "query": {"bool": {"must_not": [{"term": {"importance": "critical"}}]}},
+                // Audit finding: for `low` importance with low access count,
+                // the raw multiplier goes negative once decay_factor < 0.5
+                // (still inside the CLI's own validated [0.0, 1.0) range) —
+                // same bug already fixed for SQLite/Postgres. Math.max is
+                // Painless's equivalent clamp.
                 "script": {
                     "lang": "painless",
-                    "source": "double f = params.factor; String imp = ctx._source.importance; double mult = imp != null && imp.equals('high') ? 0.5 : (imp != null && imp.equals('low') ? 2.0 : 1.0); double ac = ctx._source.access_count == null ? 0 : ctx._source.access_count; if (ac > 5) ac = 5; ctx._source.weight = ctx._source.weight * (1.0 - (1.0 - f) * mult / (1.0 + ac * 0.1));",
+                    "source": "double f = params.factor; String imp = ctx._source.importance; double mult = imp != null && imp.equals('high') ? 0.5 : (imp != null && imp.equals('low') ? 2.0 : 1.0); double ac = ctx._source.access_count == null ? 0 : ctx._source.access_count; if (ac > 5) ac = 5; double m = Math.max(0.0, 1.0 - (1.0 - f) * mult / (1.0 + ac * 0.1)); ctx._source.weight = ctx._source.weight * m;",
                     "params": {"factor": decay_factor as f64}
                 }
             }),
@@ -922,17 +975,41 @@ impl MemoryStore for OpenSearchStore {
         if self.readonly {
             return Err(IcmError::ReadOnly("consolidate".into()));
         }
-        // Not atomic (delete-then-insert); acceptable for a maintenance op.
+        // Audit findings, both fixed together:
+        // 1. `critical` memories are never deleted — same contract
+        //    apply_decay/prune already honor, and the same fix already
+        //    applied to SQLite/Postgres consolidate_topic. This delete
+        //    query previously wiped critical memories in the topic too.
+        // 2. Still not atomic (no multi-document transaction in
+        //    OpenSearch), but reordered to insert-then-delete: if
+        //    `store_inner` fails (dimension mismatch, network blip,
+        //    cluster unavailable), the originals are left untouched
+        //    instead of being gone with no replacement ever written. The
+        //    failure mode is now "harmless duplication a retry fixes",
+        //    not data loss — the consolidated memory gets a fresh id, so
+        //    it can't collide with any original.
+        let consolidated = validate_and_normalize(consolidated)?;
+        self.check_dims(&consolidated)?;
+        // `store_inner` returns the id actually used — the caller's fresh
+        // id on a normal insert, or an existing row's id if this exact
+        // (topic, summary_hash) happened to already exist (dedup merge).
+        // Either way it now has the SAME topic as the memories being
+        // consolidated, so it must be excluded from the delete below or it
+        // would delete the very memory it just wrote/merged into.
+        let consolidated_id = self.store_inner(&consolidated)?;
         self.post(
             &format!(
                 "{IDX_MEMORIES}/_delete_by_query?{}&conflicts=proceed",
                 self.refresh_param()
             ),
-            json!({"query": {"term": {"topic.keyword": topic}}}),
+            json!({"query": {"bool": {
+                "must": [{"term": {"topic.keyword": topic}}],
+                "must_not": [
+                    {"term": {"importance": "critical"}},
+                    {"ids": {"values": [consolidated_id]}}
+                ]
+            }}}),
         )?;
-        let consolidated = validate_and_normalize(consolidated)?;
-        self.check_dims(&consolidated)?;
-        self.store_inner(&consolidated)?;
         Ok(())
     }
 
@@ -1831,5 +1908,49 @@ impl TranscriptStore for OpenSearchStore {
     }
     fn transcript_stats(&self) -> IcmResult<TranscriptStats> {
         unsupported("transcript.transcript_stats")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit regression: a memory id containing reserved URL characters
+    /// (e.g. `/`, `..`, `?`) was interpolated straight into the `_doc/{id}`
+    /// REST path, letting an attacker-controlled id redirect the request to
+    /// a different document/endpoint.
+    #[test]
+    fn test_url_encode_path_segment() {
+        assert_eq!(
+            url_encode_path_segment("abc-DEF_123.~"),
+            "abc-DEF_123.~",
+            "unreserved chars must pass through unchanged"
+        );
+        assert_eq!(url_encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(url_encode_path_segment("../secret"), "..%2Fsecret");
+        assert_eq!(url_encode_path_segment("id?x=1"), "id%3Fx%3D1");
+        assert_eq!(url_encode_path_segment("id#frag"), "id%23frag");
+        assert_eq!(url_encode_path_segment("a b"), "a%20b");
+    }
+
+    /// Audit regression: `apply_decay`'s Painless script computed a raw
+    /// multiplier that goes negative for low-importance/low-access memories
+    /// at factor<0.5 (still inside the CLI's own validated range). This
+    /// mirrors the exact formula now wrapped in `Math.max(0.0, ...)`.
+    #[test]
+    fn test_apply_decay_formula_would_go_negative_without_clamp() {
+        let factor: f64 = 0.4;
+        let mult: f64 = 2.0; // low importance
+        let access: f64 = 0.0;
+        let raw = 1.0 - (1.0 - factor) * mult / (1.0 + access * 0.1);
+        assert!(
+            raw < 0.0,
+            "expected the pre-clamp formula to go negative, got {raw}"
+        );
+        assert_eq!(
+            raw.max(0.0),
+            0.0,
+            "Math.max(0.0, ...) must clamp this to 0.0"
+        );
     }
 }

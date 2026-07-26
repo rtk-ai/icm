@@ -124,6 +124,15 @@ fn summary_hash(topic: &str, summary: &str) -> String {
 const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_TOPIC_BYTES: usize = 256;
 
+/// Escape `%`, `_`, and the escape character itself so a value can be
+/// safely wrapped in a LIKE/ILIKE pattern. Pair with `ESCAPE '\'` in the
+/// SQL. Mirrors the SQLite backend's `escape_like_wildcards`.
+fn escape_like_wildcards(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// Validate and normalize a `Memory` before insertion. Mirrors the
 /// SQLite backend's `validate_and_normalize`.
 fn validate_and_normalize(mut memory: Memory) -> IcmResult<Memory> {
@@ -214,9 +223,10 @@ fn row_to_memory(row: &postgres::Row) -> Memory {
 /// Insert a memory, or merge metadata into an existing duplicate.
 ///
 /// Dedup contract identical to the SQLite backend: a collision on
-/// `(LOWER(topic), summary_hash)` is ignored and the existing row's id is
-/// returned, after merging the caller's importance (take max), keywords
-/// (union), and `raw_excerpt` (prefer new) into it.
+/// `summary_hash` alone (which already encodes the topic, Rust-side,
+/// Unicode-correct) is ignored and the existing row's id is returned, after
+/// merging the caller's importance (take max), keywords (union), and
+/// `raw_excerpt` (prefer new) into it.
 fn insert_or_merge_memory<C: GenericClient>(c: &mut C, memory: &Memory) -> IcmResult<String> {
     let keywords_json = serde_json::to_string(&memory.keywords)?;
     let related_json = serde_json::to_string(&memory.related_ids)?;
@@ -237,7 +247,7 @@ fn insert_or_merge_memory<C: GenericClient>(c: &mut C, memory: &Memory) -> IcmRe
               topic, summary, raw_excerpt, keywords, importance,
               source_type, source_data, related_ids, summary_hash, embedding)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-             ON CONFLICT (LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL
+             ON CONFLICT (summary_hash) WHERE summary_hash IS NOT NULL
              DO NOTHING
              RETURNING id",
             &[
@@ -269,8 +279,8 @@ fn insert_or_merge_memory<C: GenericClient>(c: &mut C, memory: &Memory) -> IcmRe
     let existing = c
         .query_one(
             "SELECT id, importance, keywords, raw_excerpt FROM memories
-             WHERE LOWER(topic) = LOWER($1) AND summary_hash = $2",
-            &[&memory.topic, &hash],
+             WHERE summary_hash = $1",
+            &[&hash],
         )
         .map_err(pg_err)?;
 
@@ -868,12 +878,17 @@ impl PostgresStore {
 
     /// Memories whose topic starts with `topic` (prefix match).
     pub fn get_by_topic_prefix(&self, topic: &str) -> IcmResult<Vec<Memory>> {
-        let pattern = format!("{topic}%");
+        // Audit finding: `topic` (the literal prefix to match) was
+        // interpolated unescaped — a topic containing `%`/`_` turned into
+        // unintended wildcards within what's meant to be a literal prefix.
+        // The trailing `%` is the deliberate "starts with" wildcard and
+        // stays outside the escaped portion.
+        let pattern = format!("{}%", escape_like_wildcards(topic));
         let mut c = self.conn()?;
         let rows = c
             .query(
                 &format!(
-                    "SELECT {SELECT_COLS} FROM memories WHERE topic LIKE $1 \
+                    "SELECT {SELECT_COLS} FROM memories WHERE topic LIKE $1 ESCAPE '\\' \
                      ORDER BY weight DESC LIMIT 500"
                 ),
                 &[&pattern],
@@ -993,6 +1008,31 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
         .map(|row| row.get(0));
     let dims = stored.map(|d| d as usize).unwrap_or(requested_dims);
 
+    // Migration: the unique index used to be `(LOWER(topic), summary_hash)`.
+    // `summary_hash` already encodes the topic via Rust's Unicode-correct
+    // `to_lowercase()`, while Postgres's `LOWER()` behavior depends on the
+    // cluster's locale (ASCII-only under `C`/POSIX, common in minimal
+    // Docker/CI images) — the composite key could let two rows with an
+    // identical `summary_hash` coexist whenever their topic's SQL-LOWER()
+    // forms differed under that locale (audit finding, same class already
+    // fixed for SQLite). `CREATE INDEX IF NOT EXISTS` would silently keep
+    // the old definition on an already-migrated DB (same index name), so
+    // drop it first if it still has the old column list.
+    let old_index_def: Option<String> = client
+        .query_opt(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_memories_topic_hash'",
+            &[],
+        )
+        .map_err(pg_err)?
+        .map(|row| row.get(0));
+    if let Some(def) = old_index_def {
+        if def.to_lowercase().contains("lower(topic") {
+            client
+                .batch_execute("DROP INDEX idx_memories_topic_hash;")
+                .map_err(pg_err)?;
+        }
+    }
+
     client
         .batch_execute(&format!(
             "CREATE TABLE IF NOT EXISTS memories (
@@ -1025,7 +1065,7 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
             CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
             CREATE INDEX IF NOT EXISTS idx_memories_fts ON memories USING GIN (fts);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_topic_hash
-                ON memories (LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;
+                ON memories (summary_hash) WHERE summary_hash IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS pending_extractions (
                 id TEXT PRIMARY KEY,
@@ -1190,10 +1230,15 @@ impl MemoryStore for PostgresStore {
         let mut owned: Vec<Box<dyn ToSql + Sync>> = Vec::new();
         let mut where_parts: Vec<String> = Vec::new();
         for k in keywords {
-            owned.push(Box::new(format!("%{k}%")));
+            // Audit finding: a keyword containing `%`/`_` was interpolated
+            // straight into the ILIKE pattern unescaped (same bug already
+            // fixed for SQLite's search_by_keywords). Escape and declare the
+            // escape character explicitly.
+            owned.push(Box::new(format!("%{}%", escape_like_wildcards(k))));
             let p = owned.len();
             where_parts.push(format!(
-                "(keywords ILIKE ${p} OR summary ILIKE ${p} OR topic ILIKE ${p})"
+                "(keywords ILIKE ${p} ESCAPE '\\' OR summary ILIKE ${p} ESCAPE '\\' \
+                 OR topic ILIKE ${p} ESCAPE '\\')"
             ));
         }
         owned.push(Box::new(limit as i64));
@@ -1232,6 +1277,10 @@ impl MemoryStore for PostgresStore {
         embedding: &[f32],
         limit: usize,
     ) -> IcmResult<Vec<(Memory, f32)>> {
+        // Found while auditing OpenSearch's equivalent (which had no clamp
+        // at all): this function was also missing one, unlike its sibling
+        // search functions in this same file.
+        let limit = limit.min(1000);
         let qv = pgvector::Vector::from(embedding.to_vec());
         let mut c = self.conn()?;
         let rows = c
@@ -1376,7 +1425,13 @@ impl MemoryStore for PostgresStore {
                 // `$1::float8` is explicit so PostgreSQL doesn't infer the
                 // parameter as `numeric`/`real` from a neighbouring operand
                 // and reject the `f64` we bind ("error serializing parameter").
-                "UPDATE memories SET weight = weight * (
+                // Audit finding: for `low` importance with low access count,
+                // the raw multiplier goes negative once decay_factor < 0.5
+                // (still inside the CLI's own validated [0.0, 1.0) range) —
+                // the same bug already fixed for SQLite (GREATEST here is
+                // Postgres's equivalent of SQLite's MAX). See store.rs
+                // apply_decay for the full derivation.
+                "UPDATE memories SET weight = weight * GREATEST(0.0,
                     1.0 - (1.0 - $1::float8) *
                     CASE importance
                         WHEN 'high' THEN 0.5
@@ -1440,10 +1495,22 @@ impl MemoryStore for PostgresStore {
         if self.readonly {
             return Err(IcmError::ReadOnly("consolidate_topic".into()));
         }
+        // The consolidated memory goes through the same validation as any
+        // other write — an MCP-provided consolidate summary previously
+        // bypassed every size/NUL check (same gap already closed on SQLite).
+        let consolidated = validate_and_normalize(consolidated)?;
         let mut c = self.conn()?;
         let mut tx = c.transaction().map_err(pg_err)?;
-        tx.execute("DELETE FROM memories WHERE topic = $1", &[&topic])
-            .map_err(pg_err)?;
+        // Audit finding: `critical` memories are never deleted — same
+        // contract `apply_decay`/`prune` already honor, and the same fix
+        // already applied to SQLite's consolidate_topic. This unconditional
+        // DELETE previously wiped critical memories in a consolidated topic
+        // too.
+        tx.execute(
+            "DELETE FROM memories WHERE topic = $1 AND importance <> 'critical'",
+            &[&topic],
+        )
+        .map_err(pg_err)?;
         insert_or_merge_memory(&mut tx, &consolidated)?;
         tx.commit().map_err(pg_err)?;
         Ok(())
@@ -1752,5 +1819,44 @@ impl TranscriptStore for PostgresStore {
     }
     fn transcript_stats(&self) -> IcmResult<TranscriptStats> {
         unsupported("transcript.transcript_stats")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit regression: a keyword containing `%`/`_` was interpolated
+    /// straight into an ILIKE pattern unescaped, turning it into an
+    /// unintended wildcard.
+    #[test]
+    fn test_escape_like_wildcards() {
+        assert_eq!(escape_like_wildcards("100%"), "100\\%");
+        assert_eq!(escape_like_wildcards("snake_case"), "snake\\_case");
+        assert_eq!(escape_like_wildcards("back\\slash"), "back\\\\slash");
+        assert_eq!(escape_like_wildcards("plain"), "plain");
+    }
+
+    /// Audit regression: `apply_decay`'s raw multiplier goes negative for
+    /// `low` importance + low access count at factor < 0.5 (still inside
+    /// the CLI's own validated [0.0, 1.0) range). This reproduces the exact
+    /// arithmetic the SQL `GREATEST(0.0, ...)` clamp now guards, as a plain
+    /// Rust assertion (no live Postgres needed to prove the formula itself
+    /// would go negative without the clamp).
+    #[test]
+    fn test_apply_decay_formula_would_go_negative_without_clamp() {
+        let factor: f64 = 0.4;
+        let mult: f64 = 2.0; // low importance
+        let access: f64 = 0.0;
+        let raw = 1.0 - (1.0 - factor) * mult / (1.0 + access * 0.1);
+        assert!(
+            raw < 0.0,
+            "expected the pre-clamp formula to go negative, got {raw}"
+        );
+        assert_eq!(
+            raw.max(0.0),
+            0.0,
+            "GREATEST(0.0, ...) must clamp this to 0.0"
+        );
     }
 }

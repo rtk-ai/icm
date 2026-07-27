@@ -2083,7 +2083,10 @@ fn tool_memoir_link(store: &Store, args: &Value) -> ToolResult {
 
     let relation: Relation = match relation_str.parse() {
         Ok(r) => r,
-        Err(e) => return ToolResult::error(format!("invalid relation: {e}")),
+        // `Relation::from_str`'s error already reads "invalid relation:
+        // <value>" — re-prefixing here doubled it to "invalid relation:
+        // invalid relation: <value>".
+        Err(e) => return ToolResult::error(e),
     };
 
     let memoir = match resolve_memoir(store, memoir_name) {
@@ -2541,6 +2544,49 @@ mod tests {
         assert!(
             !compact_out.contains('\n') || compact_out.matches('\n').count() == 1,
             "compact: embedded newline forged an extra line: {compact_out}"
+        );
+    }
+
+    /// Manual-testing finding: `tool_memoir_link` re-wrapped
+    /// `Relation::from_str`'s error (already "invalid relation: <value>")
+    /// in another "invalid relation: {e}", doubling the prefix.
+    #[test]
+    fn memoir_link_invalid_relation_error_is_not_doubled() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memoir_create",
+            &json!({"name": "m"}),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_memoir_add_concept",
+            &json!({"memoir": "m", "name": "a", "definition": "a"}),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_memoir_add_concept",
+            &json!({"memoir": "m", "name": "b", "definition": "b"}),
+            false,
+        );
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memoir_link",
+            &json!({"memoir": "m", "from": "a", "to": "b", "relation": "relates_to"}),
+            false,
+        );
+        assert!(result.is_error);
+        let text = &result.content[0].text;
+        assert_eq!(
+            text.matches("invalid relation:").count(),
+            1,
+            "error prefix must not be doubled: {text}"
         );
     }
 

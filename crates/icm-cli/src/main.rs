@@ -6913,6 +6913,34 @@ impl WorkerLock {
 /// Successfully-processed rows are deleted from the queue regardless of
 /// whether facts were extracted (so an output with no extractable
 /// content doesn't loop forever).
+/// Drain `pending` through the local fastembed extractor — no network or
+/// LLM CLI needed, so this is the fallback used both when no LLM provider
+/// is configured/available and when a configured one fails at runtime.
+/// Returns `(facts_stored, rows_dequeued)`.
+fn extract_pending_drain_fastembed(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    pending: &[icm_store::PendingRow],
+) -> Result<(usize, usize)> {
+    let ids: Vec<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
+    let mut stored = 0usize;
+    for (_, project, _, raw, _) in pending {
+        match extract::extract_and_store_with_embedder(
+            store,
+            raw,
+            project,
+            false,
+            icm_core::Importance::Medium,
+            embedder,
+        ) {
+            Ok(n) => stored += n,
+            Err(e) => eprintln!("[extract-pending] fastembed row failed: {e}"),
+        }
+    }
+    let deleted = store.delete_pending_extractions(&ids)?;
+    Ok((stored, deleted))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_extract_pending(
     store: &Store,
@@ -6974,33 +7002,13 @@ fn cmd_extract_pending(
         // No usable LLM CLI — drain with the fastembed extractor. The
         // model loads once for this whole batch, instead of once per
         // tool call as the pre-#239 hook path did.
-        let ids: Vec<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
-
         if dry_run {
             println!("=== Dry run (fastembed) ===");
             println!("rows: {}", pending.len());
             return Ok(());
         }
 
-        let mut stored = 0usize;
-        for (_, project, _, raw, _) in &pending {
-            // Cap auto-extracted importance at Medium: queued tool
-            // output is untrusted (a malicious tool could emit
-            // decision-keyword text to poison wake-up).
-            match extract::extract_and_store_with_embedder(
-                store,
-                raw,
-                project,
-                false,
-                icm_core::Importance::Medium,
-                embedder,
-            ) {
-                Ok(n) => stored += n,
-                Err(e) => eprintln!("[extract-pending] fastembed row failed: {e}"),
-            }
-        }
-
-        let deleted = store.delete_pending_extractions(&ids)?;
+        let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, &pending)?;
         println!(
             "Processed {} rows (fastembed), extracted {} facts, dequeued {}.",
             pending.len(),
@@ -7075,9 +7083,27 @@ fn cmd_extract_pending(
             return Ok(());
         }
         Err(e) => {
-            eprintln!("[extract-pending] provider failed: {e}");
-            // Don't delete — let the next run retry.
-            return Err(e);
+            // A CLI missing from PATH already downgrades to fastembed above
+            // (see the `cli_on_path` check) — this handles the sibling
+            // failure mode: the CLI is present but errors at runtime (auth
+            // expired, network down, rate-limited). Left as a hard error,
+            // that's the exact "queue never empties" scenario the PATH
+            // check was built to avoid, just triggered a different way:
+            // every future extract-pending run keeps hitting the same
+            // failing CLI and the queue grows forever. Fall back to the
+            // local extractor for this batch instead.
+            eprintln!(
+                "[extract-pending] provider failed: {e} — falling back to \
+                 the fastembed extractor for this batch"
+            );
+            let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, &pending)?;
+            println!(
+                "Processed {} rows (fastembed fallback), extracted {} facts, dequeued {}.",
+                pending.len(),
+                stored,
+                deleted,
+            );
+            return Ok(());
         }
     };
 
@@ -7102,7 +7128,15 @@ fn cmd_extract_pending(
             .map(|s| s.as_str())
             .unwrap_or("project");
         let topic = format!("context-{project}");
-        let mem = Memory::new(topic, fact.to_string(), Importance::Medium);
+        let mut mem = Memory::new(topic, fact.to_string(), Importance::Medium);
+        // Same bug class as #394: this LLM-backed extraction path is a
+        // sibling of extract_and_store_with_embedder and had the same gap
+        // — the embedder was available but never attached to the Memory.
+        if let Some(emb) = embedder {
+            if let Ok(vec) = emb.embed(&mem.embed_text()) {
+                mem.embedding = Some(vec);
+            }
+        }
         store.store(mem)?;
         stored += 1;
     }
@@ -11133,6 +11167,68 @@ mod cli_contracts_tests {
             "kept originals are live, so related_ids pointing at them is meaningful: {:?}",
             consolidated.related_ids
         );
+    }
+
+    /// Manual-testing finding: `extract_pending_drain_fastembed` (the local
+    /// no-LLM fallback used both when no provider is configured and, after
+    /// this fix, when a configured provider fails at runtime) must attach
+    /// an embedding to every fact it stores — same bug class as #394 — and
+    /// must dequeue every processed row.
+    #[test]
+    fn extract_pending_drain_fastembed_attaches_embeddings_and_dequeues() {
+        use icm_core::{Embedder, IcmResult};
+
+        // A constant-output stub degenerates SemanticScorer (every anchor
+        // and candidate sentence embed identically, so nothing scores above
+        // anything else and zero facts are extracted) — key it on the
+        // "decided" anchor like the other embedder stubs in this codebase.
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let hit = text.to_lowercase().contains("decided");
+                let mut v = vec![0.0_f32; 64];
+                v[0] = if hit { 1.0 } else { 0.0 };
+                v[1] = if hit { 0.0 } else { 1.0 };
+                Ok(v)
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let embedder = StubEmbedder;
+        let id = store
+            .enqueue_pending_extraction(
+                "t",
+                "Bash",
+                "We decided to switch from REST to gRPC for internal service calls \
+                 because of latency requirements.",
+            )
+            .unwrap();
+
+        let pending = store.list_pending_extractions(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, id);
+
+        let (stored, deleted) =
+            extract_pending_drain_fastembed(&store, Some(&embedder), &pending).unwrap();
+        assert!(stored > 0, "expected at least one fact to be extracted");
+        assert_eq!(deleted, 1);
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+
+        let memories = store.get_by_topic("context-t").unwrap();
+        assert!(!memories.is_empty());
+        for m in &memories {
+            assert!(
+                m.embedding.is_some(),
+                "fastembed-drained memory {:?} must have an embedding",
+                m.summary
+            );
+        }
     }
 
     /// Issue #186: `icm health` must expose `--summarizer-provider` to

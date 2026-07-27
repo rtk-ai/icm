@@ -788,7 +788,7 @@ pub fn call_tool_with_config(
         "icm_memory_forget" => tool_forget(store, args),
         "icm_memory_forget_topic" => tool_forget_topic(store, args),
         "icm_memory_update" => tool_update(store, embedder, args),
-        "icm_memory_consolidate" => tool_consolidate(store, args),
+        "icm_memory_consolidate" => tool_consolidate(store, embedder, args),
         "icm_memory_list_topics" => tool_list_topics(store),
         "icm_memory_stats" => tool_stats(store),
         "icm_memory_health" => tool_health(store, args),
@@ -1454,7 +1454,7 @@ fn tool_learn(store: &Store, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_consolidate(store: &Store, args: &Value) -> ToolResult {
+fn tool_consolidate(store: &Store, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -1464,7 +1464,14 @@ fn tool_consolidate(store: &Store, args: &Value) -> ToolResult {
         None => return ToolResult::error("missing required field: summary".into()),
     };
 
-    let consolidated = Memory::new(topic.into(), summary.into(), icm_core::Importance::High);
+    let mut consolidated = Memory::new(topic.into(), summary.into(), icm_core::Importance::High);
+    // Same bug class as #394/#395/cmd_consolidate: this tool never attached
+    // an embedding to the merged memory it creates.
+    if let Some(emb) = embedder {
+        if let Ok(vec) = emb.embed(&consolidated.embed_text()) {
+            consolidated.embedding = Some(vec);
+        }
+    }
 
     match store.consolidate_topic(topic, consolidated) {
         Ok(()) => ToolResult::text(format!("Consolidated topic: {topic}")),
@@ -2587,6 +2594,47 @@ mod tests {
             text.matches("invalid relation:").count(),
             1,
             "error prefix must not be doubled: {text}"
+        );
+    }
+
+    /// Manual-testing finding (against a real local Postgres backend):
+    /// `tool_consolidate` (icm_memory_consolidate) never received the
+    /// `embedder` that `call_tool_with_config` already threads through to
+    /// its sibling tools, so the merged memory it creates was always born
+    /// with `embedding: None` — same bug class as #394/#395/cmd_consolidate.
+    #[test]
+    fn tool_consolidate_attaches_an_embedding_to_the_merged_memory() {
+        use icm_core::{Embedder, IcmResult};
+
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, _text: &str) -> IcmResult<Vec<f32>> {
+                Ok(vec![0.3_f32; 64])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let embedder = StubEmbedder;
+        let result = call_tool(
+            &store,
+            Some(&embedder),
+            "icm_memory_consolidate",
+            &json!({"topic": "t", "summary": "merged summary"}),
+            false,
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let memories = store.get_by_topic("t").unwrap();
+        assert_eq!(memories.len(), 1);
+        assert!(
+            memories[0].embedding.is_some(),
+            "consolidated memory must have an embedding attached"
         );
     }
 

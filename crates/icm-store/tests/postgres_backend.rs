@@ -23,6 +23,21 @@ fn skip_if_no_pg() -> bool {
         eprintln!("skipping: ICM_POSTGRES_URL not set");
         return true;
     }
+    // Manual-testing finding (same class as the OpenSearch test file):
+    // `Store::with_dims` picks its backend from `ICM_DB_BACKEND`, which
+    // defaults to sqlite when unset — a build with `--all-features` has
+    // the sqlite backend compiled in too, so setting only
+    // `ICM_POSTGRES_URL` and forgetting `ICM_DB_BACKEND=postgres` silently
+    // runs every "postgres" test against an ephemeral SQLite store
+    // instead, reporting a false-green "postgres works" without ever
+    // touching PostgreSQL. Fail loudly instead.
+    match std::env::var("ICM_DB_BACKEND").as_deref() {
+        Ok("postgres") | Ok("postgresql") | Ok("pg") => {}
+        other => panic!(
+            "ICM_POSTGRES_URL is set but ICM_DB_BACKEND is {other:?}, not \"postgres\" — \
+             these tests would silently run against sqlite instead. Set ICM_DB_BACKEND=postgres."
+        ),
+    }
     false
 }
 
@@ -154,4 +169,60 @@ fn postgres_vector_knn_ranks_semantically() {
     for m in store.get_by_topic(&ns).expect("by topic") {
         let _ = store.delete(&m.id);
     }
+}
+
+/// Manual-testing finding (same as the SQLite/OpenSearch backends):
+/// deleting a memory left it as a dangling entry in every other memory's
+/// `related_ids` forever. Verified real end to end against a live
+/// PostgreSQL.
+#[test]
+fn postgres_delete_cleans_up_dangling_related_ids() {
+    if skip_if_no_pg() {
+        return;
+    }
+    let store = Store::with_dims(
+        std::path::Path::new("ignored"),
+        icm_core::DEFAULT_EMBEDDING_DIMS,
+    )
+    .expect("connect + migrate postgres");
+
+    let ns = format!("itest-related-{}", ulid::Ulid::new());
+    let mut a = mem(&ns, "memory a", Importance::Medium);
+    let mut b = mem(&ns, "memory b", Importance::Medium);
+    let mut c = mem(&ns, "memory c", Importance::Medium);
+
+    let a_id = store.store(a.clone()).expect("store a");
+    let b_id = store.store(b.clone()).expect("store b");
+    let c_id = store.store(c.clone()).expect("store c");
+
+    a.id = a_id.clone();
+    a.related_ids = vec![b_id.clone(), c_id.clone()];
+    store.update(&a).expect("link a");
+    b.id = b_id.clone();
+    b.related_ids = vec![a_id.clone(), c_id.clone()];
+    store.update(&b).expect("link b");
+    c.id = c_id.clone();
+    c.related_ids = vec![a_id.clone(), b_id.clone()];
+    store.update(&c).expect("link c");
+
+    store.delete(&a_id).expect("delete a");
+
+    let b_after = store.get(&b_id).expect("get b").expect("b exists");
+    assert!(
+        !b_after.related_ids.contains(&a_id),
+        "b's related_ids must no longer reference the deleted a: {:?}",
+        b_after.related_ids
+    );
+    assert_eq!(b_after.related_ids, vec![c_id.clone()]);
+
+    let c_after = store.get(&c_id).expect("get c").expect("c exists");
+    assert!(
+        !c_after.related_ids.contains(&a_id),
+        "c's related_ids must no longer reference the deleted a: {:?}",
+        c_after.related_ids
+    );
+    assert_eq!(c_after.related_ids, vec![b_id.clone()]);
+
+    let _ = store.delete(&b_id);
+    let _ = store.delete(&c_id);
 }

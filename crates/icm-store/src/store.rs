@@ -1544,13 +1544,44 @@ impl MemoryStore for SqliteStore {
             if changed == 0 {
                 return Err(IcmError::NotFound(id.to_string()));
             }
+
+            // Manual-testing finding: deleting a memory left it as a
+            // dangling entry in every other memory's `related_ids`
+            // (auto-link back-references) forever — `expand_with_neighbors`
+            // tolerates the miss silently, but each stale id still spends a
+            // slot out of the caller's `max_neighbors` budget instead of
+            // surfacing a real, live neighbor, and any external consumer of
+            // the JSON export sees a reference to nothing. Strip the
+            // deleted id from every `related_ids` array that mentions it.
+            // The `LIKE` clause is a cheap prefilter (only rows that could
+            // possibly match do the JSON rewrite); it matches the
+            // JSON-quoted form specifically so a ULID that happens to be a
+            // literal substring of another can't cause a false hit.
+            self.conn
+                .execute(
+                    "UPDATE memories
+                        SET related_ids = (
+                            SELECT COALESCE(json_group_array(value), '[]')
+                            FROM json_each(memories.related_ids)
+                            WHERE value != ?1
+                        )
+                        WHERE related_ids LIKE '%\"' || ?1 || '\"%'",
+                    params![id],
+                )
+                .map_err(db_err)?;
+
             Ok(())
         })();
 
         match result {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT;").map_err(db_err)?;
-                self.cache_invalidate(id);
+                // The related_ids cleanup above can touch an arbitrary
+                // number of other rows, not just `id` — clear the whole
+                // cache rather than tracking which ones, so a cached
+                // neighbor's `related_ids` can't keep serving the
+                // just-deleted id after this returns.
+                self.cache_clear();
                 Ok(())
             }
             Err(e) => {
@@ -4735,6 +4766,50 @@ mod tests {
         let store = test_store();
         let result = store.delete("nonexistent");
         assert!(matches!(result, Err(IcmError::NotFound(_))));
+    }
+
+    /// Manual-testing finding: deleting a memory left it as a dangling
+    /// entry in every other memory's `related_ids` (auto-link
+    /// back-references) forever. `expand_with_neighbors` tolerates the
+    /// miss silently, but each stale id still spends a slot out of the
+    /// caller's `max_neighbors` budget instead of surfacing a real, live
+    /// neighbor, and any external consumer of the JSON export sees a
+    /// reference to nothing.
+    #[test]
+    fn test_delete_cleans_up_dangling_related_ids() {
+        let store = test_store();
+
+        let mut a = make_memory("t", "memory a");
+        let mut b = make_memory("t", "memory b");
+        let mut c = make_memory("t", "memory c");
+        let a_id = store.store(a.clone()).unwrap();
+        let b_id = store.store(b.clone()).unwrap();
+        let c_id = store.store(c.clone()).unwrap();
+
+        a.id = a_id.clone();
+        a.related_ids = vec![b_id.clone(), c_id.clone()];
+        store.update(&a).unwrap();
+        b.id = b_id.clone();
+        b.related_ids = vec![a_id.clone(), c_id.clone()];
+        store.update(&b).unwrap();
+        c.id = c_id.clone();
+        c.related_ids = vec![a_id.clone(), b_id.clone()];
+        store.update(&c).unwrap();
+
+        store.delete(&a_id).unwrap();
+
+        let b_after = store.get(&b_id).unwrap().unwrap();
+        assert_eq!(
+            b_after.related_ids,
+            vec![c_id.clone()],
+            "b's related_ids must no longer reference the deleted a"
+        );
+        let c_after = store.get(&c_id).unwrap().unwrap();
+        assert_eq!(
+            c_after.related_ids,
+            vec![b_id.clone()],
+            "c's related_ids must no longer reference the deleted a"
+        );
     }
 
     #[test]

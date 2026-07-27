@@ -732,6 +732,32 @@ impl MemoryStore for OpenSearchStore {
             None,
             true,
         )?;
+
+        // Manual-testing finding (same class as the SQLite/Postgres
+        // backends): a deleted memory otherwise stays as a dangling entry
+        // in every other memory's `related_ids` forever. `related_ids` is
+        // mapped as a `keyword` array field, so a term query finds every
+        // document that references it and a Painless script strips it out
+        // in place. Best-effort: a failure here doesn't roll back the
+        // delete above (OpenSearch has no cross-document transaction to
+        // roll back into) — surfacing an error would make a successful
+        // delete look like it failed, so log and move on.
+        if let Err(e) = self.post(
+            &format!(
+                "{IDX_MEMORIES}/_update_by_query?conflicts=proceed&{}",
+                self.refresh_param()
+            ),
+            json!({
+                "script": {
+                    "source": "ctx._source.related_ids.removeIf(x -> x == params.deleted_id)",
+                    "params": {"deleted_id": id}
+                },
+                "query": {"term": {"related_ids": id}}
+            }),
+        ) {
+            tracing::warn!(error = %e, id, "failed to clean up dangling related_ids after delete");
+        }
+
         Ok(())
     }
 

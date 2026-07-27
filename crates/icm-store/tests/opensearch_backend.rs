@@ -8,9 +8,14 @@
 //!     -e discovery.type=single-node -e DISABLE_SECURITY_PLUGIN=true \
 //!     -e DISABLE_INSTALL_DEMO_CONFIG=true \
 //!     opensearchproject/opensearch:2
-//! ICM_OPENSEARCH_URL=http://localhost:9201 \
+//! ICM_OPENSEARCH_URL=http://localhost:9201 ICM_DB_BACKEND=opensearch \
 //!     cargo test -p icm-store --no-default-features --features opensearch
 //! ```
+//!
+//! `ICM_DB_BACKEND=opensearch` is required too — `Store::with_dims` resolves
+//! the backend from it and defaults to sqlite otherwise, which fails to
+//! connect with a confusing "sqlite backend was requested but this build
+//! was not compiled with its Cargo feature" error (manual-testing finding).
 //!
 //! When `ICM_OPENSEARCH_URL` is unset the test prints a skip notice and
 //! returns, so a backend-less CI run stays green.
@@ -23,6 +28,21 @@ fn skip_if_no_os() -> bool {
     if std::env::var("ICM_OPENSEARCH_URL").is_err() {
         eprintln!("skipping: ICM_OPENSEARCH_URL not set");
         return true;
+    }
+    // Manual-testing finding: `Store::with_dims` picks its backend from
+    // `ICM_DB_BACKEND`, which defaults to sqlite when unset — a build with
+    // `--all-features` has the sqlite backend compiled in too, so setting
+    // only `ICM_OPENSEARCH_URL` and forgetting `ICM_DB_BACKEND=opensearch`
+    // silently runs every "opensearch" test against an ephemeral SQLite
+    // store instead. All the CRUD/KNN assertions still pass (SQLite
+    // supports them natively), so this reports a false-green "opensearch
+    // works" without ever touching OpenSearch. Fail loudly instead.
+    match std::env::var("ICM_DB_BACKEND").as_deref() {
+        Ok("opensearch") | Ok("os") => {}
+        other => panic!(
+            "ICM_OPENSEARCH_URL is set but ICM_DB_BACKEND is {other:?}, not \"opensearch\" — \
+             these tests would silently run against sqlite instead. Set ICM_DB_BACKEND=opensearch."
+        ),
     }
     false
 }
@@ -145,4 +165,61 @@ fn opensearch_vector_knn_ranks_semantically() {
     for m in store.get_by_topic(&ns).expect("by topic") {
         let _ = store.delete(&m.id);
     }
+}
+
+/// Manual-testing finding: deleting a memory left it as a dangling entry
+/// in every other memory's `related_ids` forever. Verified real end to end
+/// against a live OpenSearch (2026-07-27): before the fix, deleting `a`
+/// left `["a", "c"]` in `b`'s document; after, `b` correctly has just
+/// `["c"]`.
+#[test]
+fn opensearch_delete_cleans_up_dangling_related_ids() {
+    if skip_if_no_os() {
+        return;
+    }
+    let store = Store::with_dims(
+        std::path::Path::new("ignored"),
+        icm_core::DEFAULT_EMBEDDING_DIMS,
+    )
+    .expect("connect + migrate opensearch");
+
+    let ns = format!("itest-related-{}", ulid::Ulid::new());
+    let mut a = mem(&ns, "memory a", Importance::Medium);
+    let mut b = mem(&ns, "memory b", Importance::Medium);
+    let mut c = mem(&ns, "memory c", Importance::Medium);
+
+    let a_id = store.store(a.clone()).expect("store a");
+    let b_id = store.store(b.clone()).expect("store b");
+    let c_id = store.store(c.clone()).expect("store c");
+
+    a.id = a_id.clone();
+    a.related_ids = vec![b_id.clone(), c_id.clone()];
+    store.update(&a).expect("link a");
+    b.id = b_id.clone();
+    b.related_ids = vec![a_id.clone(), c_id.clone()];
+    store.update(&b).expect("link b");
+    c.id = c_id.clone();
+    c.related_ids = vec![a_id.clone(), b_id.clone()];
+    store.update(&c).expect("link c");
+
+    store.delete(&a_id).expect("delete a");
+
+    let b_after = store.get(&b_id).expect("get b").expect("b exists");
+    assert!(
+        !b_after.related_ids.contains(&a_id),
+        "b's related_ids must no longer reference the deleted a: {:?}",
+        b_after.related_ids
+    );
+    assert_eq!(b_after.related_ids, vec![c_id.clone()]);
+
+    let c_after = store.get(&c_id).expect("get c").expect("c exists");
+    assert!(
+        !c_after.related_ids.contains(&a_id),
+        "c's related_ids must no longer reference the deleted a: {:?}",
+        c_after.related_ids
+    );
+    assert_eq!(c_after.related_ids, vec![b_id.clone()]);
+
+    let _ = store.delete(&b_id);
+    let _ = store.delete(&c_id);
 }

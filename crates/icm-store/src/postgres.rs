@@ -1211,12 +1211,30 @@ impl MemoryStore for PostgresStore {
             return Err(IcmError::ReadOnly("delete".into()));
         }
         let mut c = self.conn()?;
-        let changed = c
+        let mut tx = c.transaction().map_err(pg_err)?;
+        let changed = tx
             .execute("DELETE FROM memories WHERE id = $1", &[&id])
             .map_err(pg_err)?;
         if changed == 0 {
             return Err(IcmError::NotFound(id.to_string()));
         }
+        // Manual-testing finding (same class as the SQLite backend): a
+        // deleted memory otherwise stays as a dangling entry in every
+        // other memory's `related_ids` forever. Strip it out. `LIKE` is a
+        // cheap prefilter; the JSON-quoted match guards against a ULID
+        // that happens to be a literal substring of another.
+        tx.execute(
+            "UPDATE memories
+                SET related_ids = (
+                    SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)::text
+                    FROM jsonb_array_elements_text(related_ids::jsonb) AS elem
+                    WHERE elem != $1
+                )
+                WHERE related_ids LIKE '%\"' || $1 || '\"%'",
+            &[&id],
+        )
+        .map_err(pg_err)?;
+        tx.commit().map_err(pg_err)?;
         Ok(())
     }
 

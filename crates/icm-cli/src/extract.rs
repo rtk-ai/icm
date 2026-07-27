@@ -91,6 +91,16 @@ pub fn extract_and_store_with_embedder(
         if let Some(k) = kind {
             mem.keywords.push(k.as_tag().to_string());
         }
+        // `embedder` was only used above for scoring/classification — the
+        // resulting Memory never got its own `embedding` set, so every
+        // extracted fact was permanently invisible to vector search and,
+        // worse, systematically outranked in `search_hybrid` (70% vector
+        // weight) by unrelated memories that happened to have one.
+        if let Some(emb) = embedder {
+            if let Ok(vec) = emb.embed(&mem.embed_text()) {
+                mem.embedding = Some(vec);
+            }
+        }
         store.store(mem)?;
         stored += 1;
     }
@@ -98,11 +108,16 @@ pub fn extract_and_store_with_embedder(
     // Fallback: store truncated raw text as low-importance memory
     if stored == 0 && store_raw && text.len() >= 50 {
         let raw = crate::truncate_tail_at_char_boundary(text, 2000);
-        let mem = Memory::new(
+        let mut mem = Memory::new(
             format!("context-{project}"),
             raw.to_string(),
             Importance::Low,
         );
+        if let Some(emb) = embedder {
+            if let Ok(vec) = emb.embed(&mem.embed_text()) {
+                mem.embedding = Some(vec);
+            }
+        }
         store.store(mem)?;
         stored = 1;
     }
@@ -2633,6 +2648,125 @@ mod tests {
             facts.len() <= MAX_SEMANTIC_FACTS,
             "expected at most {MAX_SEMANTIC_FACTS} facts, got {}",
             facts.len()
+        );
+    }
+
+    /// Manual-testing finding: `extract_and_store_with_embedder` used its
+    /// `embedder` argument only for fact *scoring* (SemanticScorer) and
+    /// never attached the resulting vector to the `Memory` before storing
+    /// it. Every fact learned through `icm extract`, `extract-pending`
+    /// (the hook drain queue), and the PostToolUse/Stop hook paths — which
+    /// all call this same function — was therefore stored with
+    /// `embedding: None`. That's not just "no vector search for these
+    /// facts": in `search_hybrid` (30% FTS + 70% vector), a fact with no
+    /// embedding scores 0 on the 70%-weighted half no matter how well it
+    /// matches, so it gets ranked *below* unrelated memories that merely
+    /// happen to have some embedding. Verified end to end against the real
+    /// compiled binary + a real local SQLite db before writing this test.
+    #[test]
+    fn extract_and_store_with_embedder_attaches_an_embedding_to_stored_facts() {
+        use icm_core::{Embedder, IcmResult};
+
+        // A constant-output stub degenerates SemanticScorer (every anchor
+        // and every sentence embed identically, so nothing scores above
+        // any other candidate and zero facts are extracted) — key it on
+        // the "decided" anchor like the other stubs in this file so the
+        // decision sentence actually gets classified as a fact.
+        struct DecisionStubEmbedder;
+        impl Embedder for DecisionStubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let hit = text.to_lowercase().contains("decided");
+                let mut v = vec![0.0_f32; 64];
+                v[0] = if hit { 1.0 } else { 0.0 };
+                v[1] = if hit { 0.0 } else { 1.0 };
+                Ok(v)
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let embedder = DecisionStubEmbedder;
+        let text = "We decided to switch from REST to gRPC for internal service calls \
+                     because of latency requirements.";
+        let stored = extract_and_store_with_embedder(
+            &store,
+            text,
+            "t",
+            false,
+            Importance::Critical,
+            Some(&embedder),
+        )
+        .unwrap();
+        assert!(stored > 0, "expected at least one fact to be extracted");
+
+        let memories = store.get_by_topic("context-t").unwrap();
+        assert!(
+            !memories.is_empty(),
+            "expected the extracted fact under topic context-t"
+        );
+        for m in &memories {
+            assert!(
+                m.embedding.is_some(),
+                "extracted memory {:?} must have an embedding attached, got None",
+                m.summary
+            );
+            // The stored fact's own content still contains "decided" (it's
+            // extracted straight from the input sentence), so its
+            // recomputed embedding must match the "hit" vector.
+            let mut expected = vec![0.0_f32; 64];
+            expected[0] = 1.0;
+            assert_eq!(m.embedding.as_deref(), Some(expected.as_slice()));
+        }
+    }
+
+    /// Same bug, the raw-text fallback path (extraction found nothing
+    /// scoreable, so the truncated raw text itself is stored).
+    #[test]
+    fn extract_and_store_with_embedder_attaches_an_embedding_to_the_raw_fallback() {
+        use icm_core::{Embedder, IcmResult};
+
+        struct FixedVecEmbedder;
+        impl Embedder for FixedVecEmbedder {
+            fn embed(&self, _text: &str) -> IcmResult<Vec<f32>> {
+                let mut v = vec![0.0_f32; 64];
+                v[0] = 0.7;
+                v[1] = 0.2;
+                Ok(v)
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let embedder = FixedVecEmbedder;
+        // 50+ chars, no keyword/semantic anchors at all, so extraction
+        // finds nothing and the raw-text fallback fires.
+        let text = "zzz qqq xxx yyy www zzz qqq xxx yyy www zzz qqq xxx yyy www zzz";
+        let stored = extract_and_store_with_embedder(
+            &store,
+            text,
+            "t",
+            true,
+            Importance::Low,
+            Some(&embedder),
+        )
+        .unwrap();
+        assert_eq!(stored, 1);
+
+        let memories = store.get_by_topic("context-t").unwrap();
+        assert_eq!(memories.len(), 1);
+        assert!(
+            memories[0].embedding.is_some(),
+            "raw-text fallback memory must have an embedding attached"
         );
     }
 }

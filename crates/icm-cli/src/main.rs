@@ -2069,7 +2069,8 @@ fn main() -> Result<()> {
                 CliImportFormat::Slack => Some(import::ImportFormat::Slack),
                 CliImportFormat::Text => Some(import::ImportFormat::Text),
             };
-            import::cmd_import(&store, path, fmt, project, dry_run)
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            import::cmd_import(&store, path, fmt, project, dry_run, emb_ref)
         }
         Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
         Commands::RecallProject { limit } => cmd_recall_project(&store, limit),

@@ -453,6 +453,7 @@ pub fn cmd_import(
     format: Option<ImportFormat>,
     project: String,
     dry_run: bool,
+    embedder: Option<&dyn icm_core::Embedder>,
 ) -> Result<()> {
     let files = if path.is_dir() {
         collect_importable_files(&path)?
@@ -494,7 +495,7 @@ pub fn cmd_import(
         }
 
         let text = exchanges_to_text(&exchanges);
-        let facts = extract::extract_and_classify(&text, &project);
+        let facts = extract::extract_and_classify_with_embedder(&text, &project, embedder);
 
         if facts.is_empty() {
             continue;
@@ -728,7 +729,7 @@ mod tests {
 
         let store = Store::in_memory().unwrap();
         // Pre-fix this panicked with "byte index 500 is not a char boundary".
-        cmd_import(&store, path, None, "test".into(), false).unwrap();
+        cmd_import(&store, path, None, "test".into(), false, None).unwrap();
     }
 
     #[test]
@@ -741,7 +742,7 @@ mod tests {
         );
         let (exchanges, thread_id) = parse_claude_code(jsonl).unwrap();
         let text = exchanges_to_text(&exchanges);
-        let facts = extract::extract_and_classify(&text, "test");
+        let facts = extract::extract_and_classify_with_embedder(&text, "test", None);
 
         // Should extract at least one fact (decision + entities)
         assert!(!facts.is_empty(), "should extract facts from conversation");

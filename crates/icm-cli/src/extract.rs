@@ -1499,18 +1499,42 @@ pub fn detect_entities(content: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extract facts with classification and entity detection.
-pub fn extract_and_classify(
+/// Extract facts with classification and entity detection, using the
+/// semantic multilingual scorer when `embedder` is available (falls back
+/// to the English-only keyword scorer otherwise, or if the embedder
+/// fails).
+///
+/// Manual-testing finding (2026-07-27): `icm import` always called the
+/// keyword-only path (`extract_and_classify`), even though this file's
+/// own module doc for `extract_semantic.rs` gives cross-lingual
+/// extraction as the headline reason that scorer exists — a French (or
+/// any non-English) import extracted zero facts silently. `import`'s
+/// caller now passes its already-loaded embedder through.
+pub fn extract_and_classify_with_embedder(
     text: &str,
     project: &str,
+    embedder: Option<&dyn Embedder>,
 ) -> Vec<(String, String, Importance, Vec<String>)> {
-    let facts = extract_facts(text, project);
+    let facts: Vec<ScoredFact> = match embedder {
+        Some(emb) => match SemanticScorer::new(emb) {
+            Ok(scorer) => extract_facts_semantic(text, project, emb, &scorer)
+                .unwrap_or_else(|_| extract_facts_with_kind(text, project)),
+            Err(_) => extract_facts_with_kind(text, project),
+        },
+        None => extract_facts_with_kind(text, project),
+    };
     let global_entities = detect_entities(text);
 
     facts
         .into_iter()
-        .map(|(topic, content, importance)| {
+        .map(|(topic, content, importance, kind)| {
             let mut extra_kw = classify_fact(&content);
+            if let Some(k) = kind {
+                let tag = k.as_tag().to_string();
+                if !extra_kw.contains(&tag) {
+                    extra_kw.push(tag);
+                }
+            }
             let local_entities = detect_entities(&content);
             for e in local_entities {
                 if !extra_kw.contains(&e) {
@@ -2131,10 +2155,68 @@ mod tests {
     #[test]
     fn test_extract_and_classify_enriches() {
         let text = "We decided to use SQLite because Postgres was overkill";
-        let results = extract_and_classify(text, "test");
+        let results = extract_and_classify_with_embedder(text, "test", None);
         assert!(!results.is_empty());
         let (_, _, _, kw) = &results[0];
         assert!(kw.iter().any(|k| k.starts_with("kind:")));
+    }
+
+    /// Manual-testing finding (2026-07-27): `icm import` always called the
+    /// keyword-only path (English-only), even on non-English text, even
+    /// when an embedder was available. A French decision sentence must
+    /// extract zero facts via the keyword-only fallback (embedder: None,
+    /// what `icm import` used to always get) but extract a real,
+    /// correctly-tagged fact once an embedder is passed through.
+    #[test]
+    fn extract_and_classify_with_embedder_uses_the_semantic_path_when_available() {
+        use icm_core::{Embedder, IcmResult};
+
+        // Orthogonal 2D vectors keyed on a decision marker present in both
+        // the real Decision anchors (POSITIVE_ANCHORS: "decision" /
+        // "decided" / "chose") and the French test sentence ("décidé") —
+        // every other anchor (other positive kinds + all negatives) falls
+        // on the opposite axis, giving a clean, non-degenerate margin.
+        struct FrenchDecisionStubEmbedder;
+        impl Embedder for FrenchDecisionStubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let lower = text.to_lowercase();
+                let hit = lower.contains("decision")
+                    || lower.contains("decided")
+                    || lower.contains("chose")
+                    || lower.contains("décidé");
+                Ok(vec![
+                    if hit { 1.0 } else { 0.0 },
+                    if hit { 0.0 } else { 1.0 },
+                ])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                2
+            }
+        }
+
+        let text = "On a décidé d'utiliser Redis pour le cache devant la base de données.";
+
+        let keyword_only = extract_and_classify_with_embedder(text, "test", None);
+        assert!(
+            keyword_only.is_empty(),
+            "sanity check: the English-only keyword path must not match French text: {keyword_only:?}"
+        );
+
+        let embedder = FrenchDecisionStubEmbedder;
+        let semantic = extract_and_classify_with_embedder(text, "test", Some(&embedder));
+        assert!(
+            !semantic.is_empty(),
+            "the semantic path must extract the French decision sentence"
+        );
+        let (_, content, _, kw) = &semantic[0];
+        assert!(content.contains("Redis"));
+        assert!(
+            kw.iter().any(|k| k.starts_with("kind:")),
+            "expected a kind: tag from the matched anchor: {kw:?}"
+        );
     }
 
     // ── Regression tests for the splitter ──────────────────────────────

@@ -223,3 +223,55 @@ fn opensearch_delete_cleans_up_dangling_related_ids() {
     let _ = store.delete(&b_id);
     let _ = store.delete(&c_id);
 }
+
+/// Manual-testing finding: `consolidate_topic` does its own bulk
+/// `_delete_by_query`, entirely separate from the single-id `delete` — so
+/// it had the same dangling related_ids bug in a second place. An external
+/// memory (in a different topic) that referenced one of the
+/// consolidated-away ids must have that reference cleaned up too.
+#[test]
+fn opensearch_consolidate_topic_cleans_up_dangling_related_ids_in_other_memories() {
+    if skip_if_no_os() {
+        return;
+    }
+    let store = Store::with_dims(
+        std::path::Path::new("ignored"),
+        icm_core::DEFAULT_EMBEDDING_DIMS,
+    )
+    .expect("connect + migrate opensearch");
+
+    let ns = format!("itest-cons-{}", ulid::Ulid::new());
+    let a_id = store
+        .store(mem(&ns, "memory a", Importance::Medium))
+        .expect("store a");
+    let b_id = store
+        .store(mem(&ns, "memory b", Importance::Medium))
+        .expect("store b");
+
+    let mut external = mem(
+        &format!("{ns}-external"),
+        "external memory",
+        Importance::Medium,
+    );
+    external.related_ids = vec![a_id.clone(), b_id.clone()];
+    let external_id = store.store(external).expect("store external");
+
+    store
+        .consolidate_topic(&ns, mem(&ns, "rollup", Importance::Medium))
+        .expect("consolidate");
+
+    let external_after = store
+        .get(&external_id)
+        .expect("get external")
+        .expect("exists");
+    assert!(
+        external_after.related_ids.is_empty(),
+        "external memory must no longer reference the consolidated-away ids: {:?}",
+        external_after.related_ids
+    );
+
+    for m in store.get_by_topic(&ns).expect("by topic") {
+        let _ = store.delete(&m.id);
+    }
+    let _ = store.delete(&external_id);
+}

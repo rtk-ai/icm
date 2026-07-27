@@ -1016,6 +1016,16 @@ impl MemoryStore for OpenSearchStore {
         //    it can't collide with any original.
         let consolidated = validate_and_normalize(consolidated)?;
         self.check_dims(&consolidated)?;
+        // Manual-testing finding: captured before store_inner/delete below
+        // (the deleted rows are gone afterward), so any *other* memory's
+        // related_ids pointing at them can be cleaned up — same dangling-
+        // reference bug already fixed for the single-id `delete`.
+        let deleted_ids: Vec<String> = self
+            .get_by_topic(topic)?
+            .into_iter()
+            .filter(|m| m.importance != Importance::Critical)
+            .map(|m| m.id)
+            .collect();
         // `store_inner` returns the id actually used — the caller's fresh
         // id on a normal insert, or an existing row's id if this exact
         // (topic, summary_hash) happened to already exist (dedup merge).
@@ -1036,6 +1046,25 @@ impl MemoryStore for OpenSearchStore {
                 ]
             }}}),
         )?;
+
+        if !deleted_ids.is_empty() {
+            if let Err(e) = self.post(
+                &format!(
+                    "{IDX_MEMORIES}/_update_by_query?conflicts=proceed&{}",
+                    self.refresh_param()
+                ),
+                json!({
+                    "script": {
+                        "source": "ctx._source.related_ids.removeIf(x -> params.deleted_ids.contains(x))",
+                        "params": {"deleted_ids": deleted_ids}
+                    },
+                    "query": {"terms": {"related_ids": deleted_ids}}
+                }),
+            ) {
+                tracing::warn!(topic, error = %e, "consolidate_topic: failed to clean up dangling related_ids");
+            }
+        }
+
         Ok(())
     }
 

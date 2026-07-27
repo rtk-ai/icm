@@ -2013,6 +2013,23 @@ impl MemoryStore for SqliteStore {
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
+        // Manual-testing finding: captured before the delete below, since
+        // afterward the rows (and thus this query) are gone. Used to clean
+        // up any *other* memory's related_ids that pointed at these —
+        // same dangling-reference bug already fixed for the single-id
+        // `delete`, reachable here too since this is a second, separate
+        // bulk-delete code path.
+        let deleted_ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM memories WHERE topic = ?1 AND importance != 'critical'")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![topic], |row| row.get::<_, String>(0))
+                .map_err(db_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
+        };
+
         // `critical` memories are never deleted — same contract as
         // `apply_decay` and `prune`. Consolidation replaces the expendable
         // tail of a topic, not its "never forget" entries (audit finding:
@@ -2036,6 +2053,27 @@ impl MemoryStore for SqliteStore {
             tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after memories delete failed");
             let _ = self.conn.execute_batch("ROLLBACK;");
             return Err(IcmError::Database(e.to_string()));
+        }
+
+        if !deleted_ids.is_empty() {
+            let ids_json = serde_json::to_string(&deleted_ids).map_err(IcmError::from)?;
+            if let Err(e) = self.conn.execute(
+                "UPDATE memories
+                    SET related_ids = (
+                        SELECT COALESCE(json_group_array(value), '[]')
+                        FROM json_each(memories.related_ids)
+                        WHERE value NOT IN (SELECT value FROM json_each(?1))
+                    )
+                    WHERE EXISTS (
+                        SELECT 1 FROM json_each(memories.related_ids)
+                        WHERE value IN (SELECT value FROM json_each(?1))
+                    )",
+                params![ids_json],
+            ) {
+                tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after related_ids cleanup failed");
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                return Err(IcmError::Database(e.to_string()));
+            }
         }
 
         if let Err(e) = self.store_inner(&consolidated) {
@@ -5197,6 +5235,34 @@ mod tests {
         assert!(summaries.contains(&"never forget this"));
         assert!(summaries.contains(&"rollup"));
         assert!(!summaries.contains(&"expendable 1"));
+    }
+
+    /// Manual-testing finding: consolidate_topic bulk-deletes the topic's
+    /// non-critical memories and does its own DELETE, entirely separate
+    /// from the single-id `delete()` — so it had the same dangling
+    /// related_ids bug in a second place. An external memory (in a
+    /// different topic) that referenced one of the consolidated-away ids
+    /// must have that reference cleaned up too.
+    #[test]
+    fn consolidate_topic_cleans_up_dangling_related_ids_in_other_memories() {
+        let store = test_store();
+        let a_id = store.store(make_memory("t", "memory a")).unwrap();
+        let b_id = store.store(make_memory("t", "memory b")).unwrap();
+
+        let mut external = make_memory("other-topic", "external memory");
+        external.related_ids = vec![a_id.clone(), b_id.clone()];
+        let external_id = store.store(external).unwrap();
+
+        store
+            .consolidate_topic("t", make_memory("t", "rollup"))
+            .unwrap();
+
+        let external_after = store.get(&external_id).unwrap().unwrap();
+        assert!(
+            external_after.related_ids.is_empty(),
+            "external memory must no longer reference the consolidated-away ids: {:?}",
+            external_after.related_ids
+        );
     }
 
     /// Audit regression: critical memories are exempt from consolidation, so

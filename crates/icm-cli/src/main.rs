@@ -7239,15 +7239,24 @@ fn cmd_consolidate(
 
     let mut consolidated = Memory::new(topic.to_string(), merged_summary, best_importance);
     consolidated.keywords = all_keywords;
-    consolidated.related_ids = memories.iter().map(|m| m.id.clone()).collect();
 
     if keep_originals {
+        // The originals survive this call, so pointing the consolidated
+        // memory's related_ids at them is a meaningful, live provenance
+        // link — expand_with_neighbors can actually follow it.
+        consolidated.related_ids = memories.iter().map(|m| m.id.clone()).collect();
         let id = store.store(consolidated)?;
         println!(
             "Consolidated {} memories from '{topic}' into {id} (originals kept).",
             memories.len()
         );
     } else {
+        // Manual-testing finding: the consolidated memory used to inherit
+        // the originals' ids as related_ids unconditionally — but in this
+        // branch those originals are deleted in the same operation, so it
+        // was born already pointing at nothing. Leave related_ids empty;
+        // consolidate_topic separately cleans up any *other* memory that
+        // referenced the now-deleted originals.
         store.consolidate_topic(topic, consolidated)?;
         println!(
             "Consolidated {} memories from '{topic}' into 1 (originals removed).",
@@ -11032,6 +11041,97 @@ mod cli_contracts_tests {
         assert!(
             !safe.contains("Originals will be deleted"),
             "no destructive-deletion clause when keep_originals=true: {safe}"
+        );
+    }
+
+    /// Manual-testing finding: the destructive (keep_originals=false) path
+    /// used to set the new consolidated memory's own `related_ids` to the
+    /// original ids being deleted in the same operation — born pointing at
+    /// nothing. It must come out empty instead.
+    #[test]
+    fn cmd_consolidate_destructive_does_not_self_reference_deleted_originals() {
+        let store = Store::in_memory().unwrap();
+        store
+            .store(icm_core::Memory::new(
+                "t".into(),
+                "expendable 1".into(),
+                icm_core::Importance::Medium,
+            ))
+            .unwrap();
+        store
+            .store(icm_core::Memory::new(
+                "t".into(),
+                "expendable 2".into(),
+                icm_core::Importance::Medium,
+            ))
+            .unwrap();
+
+        cmd_consolidate(
+            &store,
+            "t",
+            false,
+            &config::SummarizerConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let after = store.get_by_topic("t").unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(
+            after[0].related_ids.is_empty(),
+            "consolidated memory must not be born self-referencing the deleted originals: {:?}",
+            after[0].related_ids
+        );
+    }
+
+    /// The keep_originals=true path is the mirror case: the originals
+    /// survive, so related_ids pointing at them is meaningful and must
+    /// still be set.
+    #[test]
+    fn cmd_consolidate_keep_originals_still_links_to_them() {
+        let store = Store::in_memory().unwrap();
+        let id1 = store
+            .store(icm_core::Memory::new(
+                "t".into(),
+                "expendable 1".into(),
+                icm_core::Importance::Medium,
+            ))
+            .unwrap();
+        let id2 = store
+            .store(icm_core::Memory::new(
+                "t".into(),
+                "expendable 2".into(),
+                icm_core::Importance::Medium,
+            ))
+            .unwrap();
+
+        cmd_consolidate(
+            &store,
+            "t",
+            true,
+            &config::SummarizerConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let all = store.get_by_topic("t").unwrap();
+        let consolidated = all
+            .iter()
+            .find(|m| !id1.eq(&m.id) && !id2.eq(&m.id))
+            .expect("the new consolidated memory must exist alongside the kept originals");
+        assert_eq!(
+            all.len(),
+            3,
+            "originals must survive alongside the new consolidated memory"
+        );
+        assert!(
+            consolidated.related_ids.contains(&id1) && consolidated.related_ids.contains(&id2),
+            "kept originals are live, so related_ids pointing at them is meaningful: {:?}",
+            consolidated.related_ids
         );
     }
 

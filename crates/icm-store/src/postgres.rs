@@ -1524,11 +1524,40 @@ impl MemoryStore for PostgresStore {
         // already applied to SQLite's consolidate_topic. This unconditional
         // DELETE previously wiped critical memories in a consolidated topic
         // too.
+        // Manual-testing finding: captured before the delete, since
+        // afterward these rows are gone. Used to clean up any *other*
+        // memory's related_ids that pointed at them — same dangling-
+        // reference bug already fixed for the single-id `delete`.
+        let deleted_ids: Vec<String> = tx
+            .query(
+                "SELECT id FROM memories WHERE topic = $1 AND importance <> 'critical'",
+                &[&topic],
+            )
+            .map_err(pg_err)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+
         tx.execute(
             "DELETE FROM memories WHERE topic = $1 AND importance <> 'critical'",
             &[&topic],
         )
         .map_err(pg_err)?;
+
+        if !deleted_ids.is_empty() {
+            tx.execute(
+                "UPDATE memories
+                    SET related_ids = (
+                        SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)::text
+                        FROM jsonb_array_elements_text(related_ids::jsonb) AS elem
+                        WHERE elem <> ALL($1::text[])
+                    )
+                    WHERE related_ids::jsonb ?| $1::text[]",
+                &[&deleted_ids],
+            )
+            .map_err(pg_err)?;
+        }
+
         insert_or_merge_memory(&mut tx, &consolidated)?;
         tx.commit().map_err(pg_err)?;
         Ok(())

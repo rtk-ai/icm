@@ -1860,6 +1860,7 @@ impl FeedbackStore for OpenSearchStore {
     fn search_feedback(
         &self,
         _query: &str,
+        _query_embedding: Option<&[f32]>,
         _topic: Option<&str>,
         _limit: usize,
     ) -> IcmResult<Vec<Feedback>> {

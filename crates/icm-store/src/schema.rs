@@ -302,12 +302,24 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             reason TEXT,
             source TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
-            applied_count INTEGER DEFAULT 0
+            applied_count INTEGER DEFAULT 0,
+            embedding BLOB
         );
         CREATE INDEX IF NOT EXISTS idx_feedback_topic ON feedback(topic);
         ",
     )
     .map_err(db_err)?;
+
+    // Migration: add `embedding` to `feedback` for existing DBs that
+    // predate feedback search's semantic fallback (manual-testing finding
+    // — see Feedback::embedding's doc comment). Must run after the table
+    // above exists, unlike the memories/summary_hash migration higher up.
+    if let Err(e) = conn.execute("ALTER TABLE feedback ADD COLUMN embedding BLOB", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(db_err(e));
+        }
+    }
 
     // Feedback FTS table. Same TOCTOU race as memories_fts above (BEGIN
     // IMMEDIATE fix) — see its comment.

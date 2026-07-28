@@ -12,6 +12,13 @@ pub struct Feedback {
     pub source: String,
     pub created_at: DateTime<Utc>,
     pub applied_count: u32,
+    /// Manual-testing finding: `feedback search` had no semantic fallback
+    /// at all — pure FTS5 with implicit AND, so a query missing even one
+    /// exact token (no stemming) returned nothing, even with an obviously
+    /// relevant entry present. Mirrors `Memory::embedding`: attached by
+    /// the caller (CLI/MCP) via an `Embedder` before `store_feedback`.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl Feedback {
@@ -33,7 +40,16 @@ impl Feedback {
             source,
             created_at: Utc::now(),
             applied_count: 0,
+            embedding: None,
         }
+    }
+
+    /// Text used to compute this feedback's embedding — mirrors
+    /// `Memory::embed_text`. `context` carries the situation, `predicted`/
+    /// `corrected` carry the actual correction content a future query is
+    /// most likely to be phrased against.
+    pub fn embed_text(&self) -> String {
+        format!("{} {} {}", self.context, self.predicted, self.corrected)
     }
 }
 

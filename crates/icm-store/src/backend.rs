@@ -652,10 +652,11 @@ impl FeedbackStore for Store {
     fn search_feedback(
         &self,
         query: &str,
+        query_embedding: Option<&[f32]>,
         topic: Option<&str>,
         limit: usize,
     ) -> IcmResult<Vec<Feedback>> {
-        dispatch!(self, search_feedback(query, topic, limit))
+        dispatch!(self, search_feedback(query, query_embedding, topic, limit))
     }
     fn list_feedback(&self, topic: Option<&str>, limit: usize) -> IcmResult<Vec<Feedback>> {
         dispatch!(self, list_feedback(topic, limit))

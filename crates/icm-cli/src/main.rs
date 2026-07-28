@@ -1811,12 +1811,20 @@ fn main() -> Result<()> {
                 corrected,
                 reason,
                 source,
-            } => cmd_feedback_record(&store, topic, context, predicted, corrected, reason, source),
+            } => {
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                cmd_feedback_record(
+                    &store, emb_ref, topic, context, predicted, corrected, reason, source,
+                )
+            }
             FeedbackCommands::Search {
                 query,
                 topic,
                 limit,
-            } => cmd_feedback_search(&store, &query, topic.as_deref(), limit),
+            } => {
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                cmd_feedback_search(&store, emb_ref, &query, topic.as_deref(), limit)
+            }
             FeedbackCommands::List { topic, limit } => {
                 cmd_feedback_list(&store, topic.as_deref(), limit)
             }
@@ -2781,8 +2789,10 @@ fn cmd_health(store: &Store, topic_filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_feedback_record(
     store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
     topic: String,
     context: String,
     predicted: String,
@@ -2790,7 +2800,7 @@ fn cmd_feedback_record(
     reason: Option<String>,
     source: String,
 ) -> Result<()> {
-    let feedback = Feedback::new(
+    let mut feedback = Feedback::new(
         topic.clone(),
         context,
         predicted.clone(),
@@ -2798,6 +2808,14 @@ fn cmd_feedback_record(
         reason,
         source,
     );
+    // Manual-testing finding: feedback search had no semantic fallback at
+    // all — attach an embedding here so search_feedback can blend
+    // semantic similarity in, mirroring cmd_store.
+    if let Some(emb) = embedder {
+        if let Ok(v) = emb.embed(&feedback.embed_text()) {
+            feedback.embedding = Some(v);
+        }
+    }
     let id = store.store_feedback(feedback)?;
     println!("Feedback recorded: {id}");
     println!("  topic: {topic}");
@@ -2808,11 +2826,13 @@ fn cmd_feedback_record(
 
 fn cmd_feedback_search(
     store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
     query: &str,
     topic: Option<&str>,
     limit: usize,
 ) -> Result<()> {
-    let results = store.search_feedback(query, topic, limit)?;
+    let query_embedding = embedder.and_then(|emb| emb.embed_query(query).ok());
+    let results = store.search_feedback(query, query_embedding.as_deref(), topic, limit)?;
     if results.is_empty() {
         println!("No feedback found.");
         return Ok(());

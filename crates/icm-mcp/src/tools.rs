@@ -808,8 +808,8 @@ pub fn call_tool_with_config(
         // Learn tool
         "icm_learn" => tool_learn(store, args),
         // Feedback tools
-        "icm_feedback_record" => tool_feedback_record(store, args, compact),
-        "icm_feedback_search" => tool_feedback_search(store, args),
+        "icm_feedback_record" => tool_feedback_record(store, embedder, args, compact),
+        "icm_feedback_search" => tool_feedback_search(store, embedder, args),
         "icm_feedback_stats" => tool_feedback_stats(store),
         // Transcript tools
         "icm_transcript_start_session" => tool_transcript_start_session(store, args),
@@ -2391,7 +2391,12 @@ fn tool_memoir_export(store: &Store, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResult {
+fn tool_feedback_record(
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    args: &Value,
+    compact: bool,
+) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -2425,7 +2430,7 @@ fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResul
         }
     }
 
-    let feedback = Feedback::new(
+    let mut feedback = Feedback::new(
         topic.into(),
         context.into(),
         predicted.into(),
@@ -2433,6 +2438,15 @@ fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResul
         reason,
         source,
     );
+    // Manual-testing finding: feedback search had no semantic fallback at
+    // all — pure FTS5 with implicit AND, so a query missing even one exact
+    // token returned nothing. Attach an embedding here so search_feedback
+    // can blend semantic similarity in, mirroring icm_memory_store.
+    if let Some(emb) = embedder {
+        if let Ok(v) = emb.embed(&feedback.embed_text()) {
+            feedback.embedding = Some(v);
+        }
+    }
 
     let id = feedback.id.clone();
     match store.store_feedback(feedback) {
@@ -2447,15 +2461,20 @@ fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResul
     }
 }
 
-fn tool_feedback_search(store: &Store, args: &Value) -> ToolResult {
+fn tool_feedback_search(
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    args: &Value,
+) -> ToolResult {
     let query = match get_str(args, "query") {
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
     };
     let topic = get_str(args, "topic");
     let limit = get_i64(args, "limit", 5).clamp(1, 100) as usize;
+    let query_embedding = embedder.and_then(|emb| emb.embed_query(query).ok());
 
-    match store.search_feedback(query, topic, limit) {
+    match store.search_feedback(query, query_embedding.as_deref(), topic, limit) {
         Ok(results) => {
             if results.is_empty() {
                 return ToolResult::text("No feedback found.".into());

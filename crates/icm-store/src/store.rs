@@ -393,11 +393,72 @@ impl SqliteStore {
         }
         let conn = Connection::open(path)
             .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;",
-        )
-        .map_err(db_err)?;
-        init_db_with_dims(&conn, embedding_dims)?;
+        // Schema/PRAGMA setup races with other processes opening the same
+        // brand-new DB simultaneously (found via real concurrent testing:
+        // 10 processes opening one fresh DB, several hung, others errored,
+        // zero succeeded). Both the WAL-mode switch (needs a brief
+        // exclusive lock to convert a fresh file — busy_timeout must be
+        // set first in the same batch, or this statement itself has no
+        // timeout active yet) and init_db_with_dims's schema creation
+        // (BEGIN IMMEDIATE-wrapped in schema.rs, but SQLite's FTS5
+        // virtual-table module can still surface a transient error on the
+        // loser even so) are retried together here: whatever the winner
+        // already committed, a fresh attempt's PRAGMA + existence checks
+        // correctly see and no-op past it. Jittered, not just linear,
+        // backoff: a fixed schedule lets many racing processes retry in
+        // near-lockstep and collide again and again.
+        let mut last_err = None;
+        for attempt in 0..40u32 {
+            if attempt > 0 {
+                let base_ms = (attempt as u64).min(20) * 15;
+                let jitter_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| u64::from(d.subsec_nanos()) % 40)
+                    .unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(base_ms + jitter_ms));
+            }
+            // A short busy_timeout during this retry loop, not the normal
+            // 30s: 30s is meant to tolerate *ordinary* write contention
+            // during real use (e.g. a hook write racing a consolidate),
+            // but stacked with up to 40 outer attempts here it turns into
+            // a potentially multi-minute worst case under real multi-
+            // process contention (measured: several real `icm` processes
+            // hung well past 60s with the 30s inner timeout) — the outer
+            // jittered loop is what actually provides the robustness here,
+            // so the inner SQLite-level wait only needs to be long enough
+            // to smooth over a single competing transaction, not to be a
+            // retry mechanism in its own right. Restored to 30s below once
+            // the schema is confirmed present.
+            let attempt_result = conn
+                .execute_batch(
+                    "PRAGMA busy_timeout=1000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
+                )
+                .map_err(db_err)
+                .and_then(|()| init_db_with_dims(&conn, embedding_dims));
+            match attempt_result {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let transient = msg.contains("vtable constructor failed")
+                        || msg.contains("already exists")
+                        || msg.contains("database is locked")
+                        || msg.contains("database is busy");
+                    last_err = Some(e);
+                    if !transient {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        conn.execute_batch("PRAGMA busy_timeout=30000;")
+            .map_err(db_err)?;
+
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),

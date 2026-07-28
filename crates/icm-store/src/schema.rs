@@ -183,10 +183,19 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
     )
     .map_err(db_err)?;
 
-    // Check if FTS table already exists (memories)
-    if !fts_table_exists(conn, "memories_fts")? {
-        conn.execute_batch(
-            "
+    // Check if FTS table already exists (memories). Atomic via BEGIN
+    // IMMEDIATE: a plain check-then-create from Rust is a TOCTOU race —
+    // two processes opening the same brand-new DB concurrently can both
+    // see "missing" and both try to create it; the loser gets a hard
+    // "table already exists" error or a broken FTS5 vtable ("vtable
+    // constructor failed"), found via real concurrent testing. Acquiring
+    // the write lock before re-checking makes the loser's re-check
+    // correctly see the winner's already-committed table and no-op.
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(db_err)?;
+    let memories_fts_init: Result<(), IcmError> = (|| {
+        if !fts_table_exists(conn, "memories_fts")? {
+            conn.execute_batch(
+                "
             CREATE VIRTUAL TABLE memories_fts USING fts5(
                 id,
                 topic,
@@ -213,14 +222,26 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
                 VALUES (new.rowid, new.id, new.topic, new.summary, new.keywords);
             END;
             ",
-        )
-        .map_err(db_err)?;
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    })();
+    match memories_fts_init {
+        Ok(()) => conn.execute_batch("COMMIT;").map_err(db_err)?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
     }
 
-    // Check if concepts FTS table already exists
-    if !fts_table_exists(conn, "concepts_fts")? {
-        conn.execute_batch(
-            "
+    // Check if concepts FTS table already exists. Same TOCTOU race as
+    // memories_fts above (BEGIN IMMEDIATE fix) — see its comment.
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(db_err)?;
+    let concepts_fts_init: Result<(), IcmError> = (|| {
+        if !fts_table_exists(conn, "concepts_fts")? {
+            conn.execute_batch(
+                "
             CREATE VIRTUAL TABLE concepts_fts USING fts5(
                 id,
                 name,
@@ -247,8 +268,17 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
                 VALUES (new.rowid, new.id, new.name, new.definition, new.labels);
             END;
             ",
-        )
-        .map_err(db_err)?;
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    })();
+    match concepts_fts_init {
+        Ok(()) => conn.execute_batch("COMMIT;").map_err(db_err)?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
     }
 
     // Metadata key-value table for internal state (e.g. last_decay_at)
@@ -279,10 +309,13 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
     )
     .map_err(db_err)?;
 
-    // Feedback FTS table
-    if !fts_table_exists(conn, "feedback_fts")? {
-        conn.execute_batch(
-            "
+    // Feedback FTS table. Same TOCTOU race as memories_fts above (BEGIN
+    // IMMEDIATE fix) — see its comment.
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(db_err)?;
+    let feedback_fts_init: Result<(), IcmError> = (|| {
+        if !fts_table_exists(conn, "feedback_fts")? {
+            conn.execute_batch(
+                "
             CREATE VIRTUAL TABLE feedback_fts USING fts5(
                 id, topic, context, predicted, corrected, reason,
                 content='feedback', content_rowid='rowid'
@@ -305,8 +338,17 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
                 VALUES (new.rowid, new.id, new.topic, new.context, new.predicted, new.corrected, new.reason);
             END;
             ",
-        )
-        .map_err(db_err)?;
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    })();
+    match feedback_fts_init {
+        Ok(()) => conn.execute_batch("COMMIT;").map_err(db_err)?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
     }
 
     // Structured facts (issue #273): one row per `(entity, key,
@@ -427,10 +469,14 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
     )
     .map_err(db_err)?;
 
-    // FTS5 over messages.content (+ role/tool_name so 'role:tool' style filters work)
-    if !fts_table_exists(conn, "messages_fts")? {
-        conn.execute_batch(
-            "
+    // FTS5 over messages.content (+ role/tool_name so 'role:tool' style
+    // filters work). Same TOCTOU race as memories_fts above (BEGIN
+    // IMMEDIATE fix) — see its comment.
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(db_err)?;
+    let messages_fts_init: Result<(), IcmError> = (|| {
+        if !fts_table_exists(conn, "messages_fts")? {
+            conn.execute_batch(
+                "
             CREATE VIRTUAL TABLE messages_fts USING fts5(
                 id UNINDEXED,
                 session_id UNINDEXED,
@@ -458,8 +504,17 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
                 VALUES (new.rowid, new.id, new.session_id, new.role, new.content, COALESCE(new.tool_name, ''));
             END;
             ",
-        )
-        .map_err(db_err)?;
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    })();
+    match messages_fts_init {
+        Ok(()) => conn.execute_batch("COMMIT;").map_err(db_err)?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
     }
 
     // Migration: add updated_at column if missing (existing DBs pre-0.3.1)
@@ -492,14 +547,36 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
     // which churned the FTS index and could create ghost entries.
     migrate_fts_update_trigger(conn)?;
 
-    // sqlite-vec virtual table for vector search (dimension-aware)
-    let vec_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_memories'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_err)?;
+    // sqlite-vec virtual table for vector search (dimension-aware). The
+    // existence check + first-time create is the same TOCTOU race as the
+    // FTS5 tables above (BEGIN IMMEDIATE fix) — see memories_fts's
+    // comment. The already-exists + dims-mismatch-recreate branch below
+    // is unaffected: it has its own transaction and only runs when the
+    // table demonstrably existed before this connection opened it.
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(db_err)?;
+    let vec_create_result: Result<bool, IcmError> = (|| {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_memories'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if !exists {
+            create_vec_table(conn, embedding_dims)?;
+        }
+        Ok(exists)
+    })();
+    let vec_exists = match vec_create_result {
+        Ok(existed_before) => {
+            conn.execute_batch("COMMIT;").map_err(db_err)?;
+            existed_before
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
+    };
 
     if vec_exists {
         // Check if stored dims differ from requested dims — if so, recreate
@@ -528,8 +605,6 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             create_vec_table(&tx, embedding_dims)?;
             tx.commit().map_err(db_err)?;
         }
-    } else {
-        create_vec_table(conn, embedding_dims)?;
     }
 
     // Defensive dim-drift sweep (issue #200).
@@ -606,6 +681,63 @@ mod tests {
         init_db(&conn).unwrap();
         // Second call should be idempotent
         init_db(&conn).unwrap();
+    }
+
+    /// Manual-testing finding: 10 real `icm` processes opening the same
+    /// brand-new (not-yet-created) DB file concurrently reproducibly hung
+    /// (several past 60s) or errored ("table memories_fts already exists",
+    /// "vtable constructor failed: memories_fts", "database is locked") —
+    /// and **zero** of the 10 stores actually succeeded. Root cause: each
+    /// FTS5/vec0 virtual table used a plain "check sqlite_master, then
+    /// CREATE" from Rust — a TOCTOU race, since `CREATE VIRTUAL TABLE` has
+    /// no `IF NOT EXISTS` guard here. Reproduced at the unit level with
+    /// real OS threads, each opening its own `Connection` (in-memory DBs
+    /// don't share state across connections, so this needs a real file) to
+    /// the same fresh path and racing `init_db`.
+    #[test]
+    fn concurrent_first_open_of_a_fresh_db_never_races_schema_creation() {
+        ensure_vec_init();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.db");
+
+        // Exercise the real production entry point end to end (PRAGMA
+        // ordering + BEGIN IMMEDIATE schema wrapping + the retry-on-
+        // transient-error safety net), not a hand-rolled approximation.
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || -> Result<(), IcmError> {
+                    crate::store::SqliteStore::with_dims(&path, icm_core::DEFAULT_EMBEDDING_DIMS)
+                        .map(|_| ())
+                })
+            })
+            .collect();
+
+        let mut failures = Vec::new();
+        for h in handles {
+            if let Err(e) = h.join().unwrap() {
+                failures.push(e.to_string());
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "concurrent first-open must never fail: {failures:?}"
+        );
+
+        // The schema must be fully, correctly formed afterward.
+        let conn = Connection::open(&path).unwrap();
+        for table in [
+            "memories_fts",
+            "concepts_fts",
+            "feedback_fts",
+            "messages_fts",
+            "vec_memories",
+        ] {
+            assert!(
+                fts_table_exists(&conn, table).unwrap(),
+                "{table} must exist after concurrent init"
+            );
+        }
     }
 
     /// Simulates upgrading a pre-0.10.43 database (no `summary_hash`

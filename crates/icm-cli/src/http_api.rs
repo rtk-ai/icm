@@ -524,7 +524,15 @@ async fn handle_consolidate(
         .map(|m| m.summary.as_str())
         .collect::<Vec<_>>()
         .join(" | ");
-    let consolidated = Memory::new(req.topic.clone(), summary, Importance::High);
+    let mut consolidated = Memory::new(req.topic.clone(), summary, Importance::High);
+    // Same bug class as #400 (cmd_consolidate/tool_consolidate): this is a
+    // third, independent /consolidate implementation that had the same gap
+    // — never attached an embedding to the merged memory it creates.
+    if let Some(emb) = state.embedder_ref() {
+        if let Ok(v) = emb.embed(&consolidated.embed_text()) {
+            consolidated.embedding = Some(v);
+        }
+    }
 
     let result = if req.keep_originals {
         store.store(consolidated.clone()).map(|_| ())
@@ -835,6 +843,72 @@ mod tests {
         assert!(
             store.stats().is_ok(),
             "store must remain usable after poison"
+        );
+    }
+
+    /// Manual-testing finding (against the real HTTP server): a third,
+    /// independent /consolidate implementation — same bug class as #400
+    /// (cmd_consolidate/tool_consolidate) — never attached an embedding
+    /// to the merged memory it creates, even though `state.embedder_ref()`
+    /// is right there and every sibling handler (store/recall/embed_all)
+    /// already uses it.
+    #[tokio::test]
+    async fn handle_consolidate_attaches_an_embedding_to_the_merged_memory() {
+        use icm_core::IcmResult;
+
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, _text: &str) -> IcmResult<Vec<f32>> {
+                Ok(vec![0.4_f32; 64])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        store
+            .store(Memory::new(
+                "http-test".into(),
+                "expendable 1".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "http-test".into(),
+                "expendable 2".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+
+        let state = AppState {
+            store: Arc::new(Mutex::new(store)),
+            embedder: Some(Arc::new(StubEmbedder)),
+            token: None,
+        };
+
+        let resp = handle_consolidate(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(FormatQuery::default()),
+            Json(ConsolidateReq {
+                topic: "http-test".into(),
+                keep_originals: false,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let store = lock_store(&state);
+        let memories = store.get_by_topic("http-test").unwrap();
+        assert_eq!(memories.len(), 1);
+        assert!(
+            memories[0].embedding.is_some(),
+            "consolidated memory must have an embedding attached"
         );
     }
 }

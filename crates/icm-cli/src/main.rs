@@ -2288,12 +2288,14 @@ fn main() -> Result<()> {
         #[cfg(feature = "tui")]
         Commands::Dashboard => {
             let db_path_str = db_path.to_string_lossy().to_string();
-            tui::run_dashboard(&store, Some(&db_path_str))
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            tui::run_dashboard(&store, Some(&db_path_str), emb_ref)
         }
         #[cfg(feature = "tui")]
         Commands::Tui => {
             let db_path_str = db_path.to_string_lossy().to_string();
-            tui::run_dashboard(&store, Some(&db_path_str))
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            tui::run_dashboard(&store, Some(&db_path_str), emb_ref)
         }
     }
 }

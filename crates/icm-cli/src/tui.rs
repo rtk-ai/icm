@@ -27,8 +27,8 @@ use ratatui::{
 };
 
 use icm_core::{
-    format_local, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore, StoreStats,
-    TopicHealth,
+    format_local, Embedder, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore,
+    StoreStats, TopicHealth,
 };
 use icm_store::Store;
 
@@ -59,7 +59,7 @@ struct StatusMsg {
 }
 
 /// Application state
-struct App {
+struct App<'a> {
     tab: usize,
     quit: bool,
     stats: StoreStats,
@@ -89,10 +89,20 @@ struct App {
     /// Summarizer config (TOML / CLI override). Honored by the consolidate
     /// confirm path so TUI behavior stays consistent with the CLI.
     summarizer_cfg: crate::config::SummarizerConfig,
+    /// Manual-testing finding: the TUI's own consolidate action (`c` on the
+    /// Topics/Health tab) built its merged Memory directly and never had
+    /// an embedder available at all to attach one — a fourth independent
+    /// instance of the bug fixed in cmd_consolidate/tool_consolidate/
+    /// handle_consolidate (#400, #402).
+    embedder: Option<&'a dyn Embedder>,
 }
 
-impl App {
-    fn new(store: &Store, db_path: Option<&str>) -> Result<Self> {
+impl<'a> App<'a> {
+    fn new(
+        store: &Store,
+        db_path: Option<&str>,
+        embedder: Option<&'a dyn Embedder>,
+    ) -> Result<Self> {
         let stats = store.stats()?;
         let topics = store.list_topics()?;
         let health = Self::load_health(store, &topics)?;
@@ -133,6 +143,7 @@ impl App {
             confirm: Confirm::None,
             status: None,
             summarizer_cfg: crate::config::SummarizerConfig::default(),
+            embedder,
         };
 
         app.load_topic_memories(store);
@@ -317,7 +328,11 @@ impl Drop for TerminalRestoreGuard {
     }
 }
 
-pub fn run_dashboard(store: &Store, db_path: Option<&str>) -> Result<()> {
+pub fn run_dashboard(
+    store: &Store,
+    db_path: Option<&str>,
+    embedder: Option<&dyn Embedder>,
+) -> Result<()> {
     // Audit finding: nothing in icm-cli ever restored the terminal on a
     // panic or an early error return. Two distinct mechanisms are needed:
     //
@@ -348,7 +363,7 @@ pub fn run_dashboard(store: &Store, db_path: Option<&str>) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(store, db_path)?;
+    let mut app = App::new(store, db_path, embedder)?;
     // Read the summarizer block once at startup so the consolidate action in
     // the TUI honors the same config as the CLI. Errors are swallowed: the
     // default (provider = "none") preserves the historical lexical behavior.
@@ -694,11 +709,16 @@ fn execute_confirm(app: &mut App, store: &Store, db_path: Option<&str>) {
                     }
                 };
 
-                let consolidated = icm_core::Memory::new(
+                let mut consolidated = icm_core::Memory::new(
                     topic.clone(),
                     format!("[consolidated] {combined}"),
                     icm_core::Importance::Medium,
                 );
+                if let Some(emb) = app.embedder {
+                    if let Ok(v) = emb.embed(&consolidated.embed_text()) {
+                        consolidated.embedding = Some(v);
+                    }
+                }
                 match store.consolidate_topic(&topic, consolidated) {
                     Ok(()) => {
                         app.set_status(
@@ -1666,7 +1686,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let store = Store::in_memory().unwrap();
-        let mut app = App::new(&store, None).unwrap();
+        let mut app = App::new(&store, None, None).unwrap();
         // draw_confirm_overlay early-returns on Confirm::None (App::new's
         // default) — set a real variant so the Rect computation actually
         // runs and the underflow bug would actually be exercised.
@@ -1686,7 +1706,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let store = Store::in_memory().unwrap();
-        let mut app = App::new(&store, None).unwrap();
+        let mut app = App::new(&store, None, None).unwrap();
         app.confirm = Confirm::PruneStale;
 
         terminal.draw(draw_help_overlay).unwrap();
@@ -1709,7 +1729,7 @@ mod tests {
                 Importance::Medium,
             ))
             .unwrap();
-        let mut app = App::new(&store, None).unwrap();
+        let mut app = App::new(&store, None, None).unwrap();
         app.topic_state.select(Some(0));
         app.load_topic_memories(&store);
         assert_eq!(app.memories.len(), 1);
@@ -1742,7 +1762,7 @@ mod tests {
                 Importance::Medium,
             ))
             .unwrap();
-        let mut app = App::new(&store, None).unwrap();
+        let mut app = App::new(&store, None, None).unwrap();
         app.search_results = vec![store.get(&id).unwrap().unwrap()];
         app.search_state.select(Some(0));
 
@@ -1773,7 +1793,7 @@ mod tests {
         store
             .store(Memory::new("beta".into(), "b".into(), Importance::Medium))
             .unwrap();
-        let mut app = App::new(&store, None).unwrap();
+        let mut app = App::new(&store, None, None).unwrap();
         // topics is alpha-sorted by list_topics; simulate load_health having
         // dropped the first entry (as it would on a failed topic_health call)
         // by removing it directly, so `health[0]` is now "beta"'s data at
@@ -1798,6 +1818,56 @@ mod tests {
         assert_eq!(
             app.selected_topic_health().map(|h| h.topic.as_str()),
             Some("beta")
+        );
+    }
+
+    /// Manual-testing finding: the TUI's own consolidate action (`c` on the
+    /// Topics/Health tab) never had an embedder threaded through to it at
+    /// all — a fourth independent instance of the bug fixed in
+    /// cmd_consolidate/tool_consolidate/handle_consolidate (#400, #402).
+    #[test]
+    fn consolidate_action_attaches_an_embedding_to_the_merged_memory() {
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
+                Ok(vec![0.2_f32; 64])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        store
+            .store(Memory::new(
+                "smoke".into(),
+                "expendable 1".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "smoke".into(),
+                "expendable 2".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+
+        let embedder = StubEmbedder;
+        let mut app = App::new(&store, None, Some(&embedder)).unwrap();
+        app.confirm = Confirm::ConsolidateTopic {
+            topic: "smoke".into(),
+        };
+        execute_confirm(&mut app, &store, None);
+
+        let memories = store.get_by_topic("smoke").unwrap();
+        assert_eq!(memories.len(), 1);
+        assert!(
+            memories[0].embedding.is_some(),
+            "consolidated memory must have an embedding attached"
         );
     }
 }

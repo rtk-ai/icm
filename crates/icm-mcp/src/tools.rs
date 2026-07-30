@@ -13,7 +13,10 @@ use icm_core::{
 use icm_store::Store;
 
 use crate::output::{
-    ListTopicsOutput, ListTopicsTool, RecallOutput, RecallTool, StatsOutput, StatsTool, TypedTool,
+    ListTopicsOutput, ListTopicsTool, RecallOutput, RecallTool, StatsOutput, StatsTool,
+    TranscriptRecordOutput, TranscriptRecordTool, TranscriptSearchOutput, TranscriptSearchTool,
+    TranscriptShowOutput, TranscriptShowTool, TranscriptStartSessionOutput,
+    TranscriptStartSessionTool, TranscriptStatsOutput, TranscriptStatsTool, TypedTool,
 };
 use crate::protocol::ToolResult;
 
@@ -900,7 +903,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
             }
         }),
         // --- Transcript tools (verbatim session replay) ---
-        tool_spec!("icm_transcript_start_session", ToolBehavior::additive(), handler = |context| {
+        tool_spec!(typed TranscriptStartSessionTool, ToolBehavior::additive(), handler = |context| {
             tool_transcript_start_session(context.store, context.args)
         }, {
             "description": "Create a new transcript session for verbatim message capture. Returns the session_id used by subsequent icm_transcript_record calls. Use once per conversation or debugging session.",
@@ -922,7 +925,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
                 }
             }
         }),
-        tool_spec!("icm_transcript_record", ToolBehavior::additive(), handler = |context| {
+        tool_spec!(typed TranscriptRecordTool, ToolBehavior::additive(), handler = |context| {
             tool_transcript_record(context.store, context.args)
         }, {
             "description": "Append a verbatim message to a transcript session. Stores the raw content with no summarization. Use once per user turn, assistant reply, or tool call for full replay fidelity.",
@@ -958,7 +961,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
                 "required": ["session_id", "role", "content"]
             }
         }),
-        tool_spec!("icm_transcript_search", ToolBehavior::read_only(), handler = |context| {
+        tool_spec!(typed TranscriptSearchTool, ToolBehavior::read_only(), handler = |context| {
             tool_transcript_search(context.store, context.args)
         }, {
             "description": "Full-text search across recorded transcript messages (FTS5 BM25). Supports boolean operators, phrase matches, and prefix queries. Use to recall exact quotes or debug past decisions.",
@@ -987,7 +990,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
                 "required": ["query"]
             }
         }),
-        tool_spec!("icm_transcript_show", ToolBehavior::read_only(), handler = |context| {
+        tool_spec!(typed TranscriptShowTool, ToolBehavior::read_only(), handler = |context| {
             tool_transcript_show(context.store, context.args)
         }, {
             "description": "Replay the full message thread of a transcript session, chronologically. Returns up to `limit` messages with role, content, tool name, timestamp.",
@@ -1000,7 +1003,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
                 "required": ["session_id"]
             }
         }),
-        tool_spec!("icm_transcript_stats", ToolBehavior::read_only(), handler = |context| {
+        tool_spec!(typed TranscriptStatsTool, ToolBehavior::read_only(), handler = |context| {
             tool_transcript_stats(context.store)
         }, {
             "description": "Global transcript statistics: session count, message count, total bytes, breakdown by role and agent, top sessions by message count.",
@@ -1124,7 +1127,14 @@ fn tool_transcript_start_session(store: &Store, args: &Value) -> ToolResult {
     let project = args.get("project").and_then(|v| v.as_str());
     let metadata = args.get("metadata").and_then(|v| v.as_str());
     match store.create_session(agent, project, metadata) {
-        Ok(id) => ToolResult::text(format!("{{\"session_id\":\"{id}\"}}")),
+        Ok(id) => {
+            let text = format!("{{\"session_id\":\"{id}\"}}");
+            TranscriptStartSessionTool::result(
+                text,
+                TranscriptStartSessionOutput::new(id),
+                "Transcript session started; sessionId is in structuredContent.".into(),
+            )
+        }
         Err(e) => ToolResult::error(format!("start_session failed: {e}")),
     }
 }
@@ -1155,7 +1165,14 @@ fn tool_transcript_record(store: &Store, args: &Value) -> ToolResult {
     let tokens = args.get("tokens").and_then(|v| v.as_i64());
     let metadata = args.get("metadata").and_then(|v| v.as_str());
     match store.record_message(session_id, role, content, tool_name, tokens, metadata) {
-        Ok(id) => ToolResult::text(format!("{{\"message_id\":\"{id}\"}}")),
+        Ok(id) => {
+            let text = format!("{{\"message_id\":\"{id}\"}}");
+            TranscriptRecordTool::result(
+                text,
+                TranscriptRecordOutput::new(id, session_id.to_owned()),
+                "Transcript message recorded; identifiers are in structuredContent.".into(),
+            )
+        }
         Err(e) => ToolResult::error(format!("record failed: {e}")),
     }
 }
@@ -1176,7 +1193,12 @@ fn tool_transcript_search(store: &Store, args: &Value) -> ToolResult {
     match store.search_transcripts(query, session_id, project, limit) {
         Ok(hits) => {
             let json = serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into());
-            ToolResult::text(json)
+            let summary = format!(
+                "{} transcript search hit{} returned in structuredContent.",
+                hits.len(),
+                if hits.len() == 1 { "" } else { "s" }
+            );
+            TranscriptSearchTool::result(json, TranscriptSearchOutput::from_hits(&hits), summary)
         }
         Err(e) => ToolResult::error(format!("search failed: {e}")),
     }
@@ -1203,13 +1225,26 @@ fn tool_transcript_show(store: &Store, args: &Value) -> ToolResult {
         Err(e) => return ToolResult::error(format!("list_messages failed: {e}")),
     };
     let body = json!({ "session": sess, "messages": msgs });
-    ToolResult::text(body.to_string())
+    let summary = format!(
+        "{} transcript message{} returned in structuredContent.",
+        msgs.len(),
+        if msgs.len() == 1 { "" } else { "s" }
+    );
+    TranscriptShowTool::result(
+        body.to_string(),
+        TranscriptShowOutput::new(&sess, &msgs),
+        summary,
+    )
 }
 
 fn tool_transcript_stats(store: &Store) -> ToolResult {
     use icm_core::TranscriptStore;
     match store.transcript_stats() {
-        Ok(s) => ToolResult::text(serde_json::to_string(&s).unwrap_or_else(|_| "{}".into())),
+        Ok(stats) => TranscriptStatsTool::result(
+            serde_json::to_string(&stats).unwrap_or_else(|_| "{}".into()),
+            TranscriptStatsOutput::from(&stats),
+            "Transcript statistics returned in structuredContent.".into(),
+        ),
         Err(e) => ToolResult::error(format!("stats failed: {e}")),
     }
 }
@@ -3147,6 +3182,113 @@ mod tests {
                 T::NAME
             );
         }
+    }
+
+    #[test]
+    fn transcript_tools_return_typed_receipts_results_and_stats() {
+        let store = test_store();
+        let started = call_tool(
+            &store,
+            None,
+            "icm_transcript_start_session",
+            &json!({"agent": "test-agent", "project": "icm"}),
+            false,
+        );
+        assert_structured_result_matches::<TranscriptStartSessionTool>(&started);
+        let session_id = started.structured_content.as_ref().unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            started.content[0].text,
+            format!("{{\"session_id\":\"{session_id}\"}}")
+        );
+
+        let recorded = call_tool(
+            &store,
+            None,
+            "icm_transcript_record",
+            &json!({
+                "session_id": session_id,
+                "role": "assistant",
+                "content": "structured transcript needle",
+                "tokens": 3
+            }),
+            false,
+        );
+        assert_structured_result_matches::<TranscriptRecordTool>(&recorded);
+        let receipt = recorded.structured_content.as_ref().unwrap();
+        assert_eq!(receipt["sessionId"], session_id);
+        let message_id = receipt["messageId"].as_str().unwrap();
+        assert_eq!(
+            recorded.content[0].text,
+            format!("{{\"message_id\":\"{message_id}\"}}")
+        );
+
+        let search = call_tool(
+            &store,
+            None,
+            "icm_transcript_search",
+            &json!({"query": "structured transcript needle"}),
+            false,
+        );
+        assert_structured_result_matches::<TranscriptSearchTool>(&search);
+        let search_data = search.structured_content.as_ref().unwrap();
+        assert_eq!(search_data["count"], 1);
+        assert_eq!(search_data["hits"][0]["message"]["sessionId"], session_id);
+        assert_eq!(search_data["hits"][0]["message"]["role"], "assistant");
+        assert_eq!(search_data["hits"][0]["session"]["agent"], "test-agent");
+        let legacy_search: Value = serde_json::from_str(&search.content[0].text).unwrap();
+        assert_eq!(legacy_search[0]["message"]["session_id"], session_id);
+        assert!(legacy_search[0]["message"].get("sessionId").is_none());
+
+        let shown = call_tool(
+            &store,
+            None,
+            "icm_transcript_show",
+            &json!({"session_id": session_id}),
+            false,
+        );
+        assert_structured_result_matches::<TranscriptShowTool>(&shown);
+        let shown_data = shown.structured_content.as_ref().unwrap();
+        assert_eq!(shown_data["messageCount"], 1);
+        assert_eq!(shown_data["session"]["id"], session_id);
+        assert_eq!(shown_data["messages"][0]["tokens"], 3);
+        let legacy_show: Value = serde_json::from_str(&shown.content[0].text).unwrap();
+        assert_eq!(legacy_show["messages"][0]["session_id"], session_id);
+
+        let stats = call_tool(&store, None, "icm_transcript_stats", &json!({}), false);
+        assert_structured_result_matches::<TranscriptStatsTool>(&stats);
+        let stats_data = stats.structured_content.as_ref().unwrap();
+        assert_eq!(stats_data["totalSessions"], 1);
+        assert_eq!(stats_data["totalMessages"], 1);
+        assert_eq!(stats_data["byRole"][0]["role"], "assistant");
+        assert_eq!(stats_data["byAgent"][0]["agent"], "test-agent");
+        assert!(stats_data["topSessions"][0]["sessionId"].as_str().is_some());
+        let legacy_stats: Value = serde_json::from_str(&stats.content[0].text).unwrap();
+        assert_eq!(legacy_stats["total_sessions"], 1);
+        assert!(legacy_stats.get("totalSessions").is_none());
+    }
+
+    #[test]
+    fn transcript_output_schemas_are_specific_and_closed() {
+        let definitions = tool_definitions(true);
+        let search = &tool_named(&definitions, "icm_transcript_search")["outputSchema"];
+        assert_eq!(search["required"], json!(["count", "hits"]));
+        assert_eq!(
+            search["properties"]["hits"]["items"]["properties"]["message"]["additionalProperties"],
+            false
+        );
+
+        let stats = &tool_named(&definitions, "icm_transcript_stats")["outputSchema"];
+        assert_eq!(
+            stats["properties"]["byRole"]["items"]["required"],
+            json!(["role", "count"])
+        );
+        assert_eq!(
+            stats["properties"]["topSessions"]["items"]["required"],
+            json!(["sessionId", "count"])
+        );
     }
 
     /// Audit regression: `format_memory_output` (icm_memory_recall's text

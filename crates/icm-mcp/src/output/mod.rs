@@ -1,4 +1,5 @@
 mod memory;
+mod transcript;
 
 use schemars::{generate::SchemaSettings, JsonSchema};
 use serde::Serialize;
@@ -8,6 +9,11 @@ use crate::protocol::ToolResult;
 
 pub(crate) use memory::{
     ListTopicsOutput, ListTopicsTool, RecallOutput, RecallTool, StatsOutput, StatsTool,
+};
+pub(crate) use transcript::{
+    TranscriptRecordOutput, TranscriptRecordTool, TranscriptSearchOutput, TranscriptSearchTool,
+    TranscriptShowOutput, TranscriptShowTool, TranscriptStartSessionOutput,
+    TranscriptStartSessionTool, TranscriptStatsOutput, TranscriptStatsTool,
 };
 
 pub(crate) trait ToolOutput: Serialize + JsonSchema {}

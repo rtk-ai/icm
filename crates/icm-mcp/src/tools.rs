@@ -195,6 +195,31 @@ struct ToolCallContext<'a> {
     auto_consolidate: AutoConsolidate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ToolDefinitionOptions {
+    annotations: bool,
+    output_schemas: bool,
+}
+
+impl ToolDefinitionOptions {
+    pub(crate) const fn none() -> Self {
+        Self {
+            annotations: false,
+            output_schemas: false,
+        }
+    }
+
+    pub(crate) const fn with_annotations(mut self) -> Self {
+        self.annotations = true;
+        self
+    }
+
+    pub(crate) const fn with_output_schemas(mut self) -> Self {
+        self.output_schemas = true;
+        self
+    }
+}
+
 struct ToolSpec {
     name: &'static str,
     definition: Value,
@@ -223,14 +248,14 @@ impl ToolSpec {
         }
     }
 
-    fn render(&self, include_annotations: bool) -> Value {
+    fn render(&self, options: ToolDefinitionOptions) -> Value {
         let mut definition = self.definition.clone();
         if let Some(object) = definition.as_object_mut() {
             object.insert("name".into(), self.name.into());
-            if include_annotations {
+            if options.annotations {
                 object.insert("annotations".into(), self.behavior.annotations());
             }
-            if let Some(output_schema) = self.output_schema {
+            if let (true, Some(output_schema)) = (options.output_schemas, self.output_schema) {
                 object.insert("outputSchema".into(), output_schema());
             }
         }
@@ -327,17 +352,22 @@ macro_rules! tool_spec {
 }
 
 pub fn tool_definitions(has_embedder: bool) -> Value {
-    tool_definitions_with_annotations(has_embedder, true)
+    tool_definitions_with_options(
+        has_embedder,
+        ToolDefinitionOptions::none()
+            .with_annotations()
+            .with_output_schemas(),
+    )
 }
 
-pub(crate) fn tool_definitions_with_annotations(
+pub(crate) fn tool_definitions_with_options(
     has_embedder: bool,
-    include_annotations: bool,
+    options: ToolDefinitionOptions,
 ) -> Value {
     let tools = tool_catalog()
         .iter()
         .filter(|spec| spec.availability.is_available(has_embedder))
-        .map(|spec| spec.render(include_annotations))
+        .map(|spec| spec.render(options))
         .collect::<Vec<_>>();
 
     json!({ "tools": tools })
@@ -2903,6 +2933,52 @@ mod tests {
     }
 
     #[test]
+    fn tool_definition_options_are_independent() {
+        fn fixture_output_schema() -> Value {
+            json!({ "type": "object" })
+        }
+
+        let render = |options| {
+            tool_spec!(
+                "fixture",
+                ToolBehavior::read_only(),
+                output_schema = fixture_output_schema,
+                handler = |_| ToolResult::text("fixture".into()),
+                {
+                    "description": "Fixture tool",
+                    "inputSchema": { "type": "object" }
+                }
+            )
+            .render(options)
+        };
+
+        for (options, has_annotations, has_output_schema) in [
+            (ToolDefinitionOptions::none(), false, false),
+            (
+                ToolDefinitionOptions::none().with_annotations(),
+                true,
+                false,
+            ),
+            (
+                ToolDefinitionOptions::none().with_output_schemas(),
+                false,
+                true,
+            ),
+            (
+                ToolDefinitionOptions::none()
+                    .with_annotations()
+                    .with_output_schemas(),
+                true,
+                true,
+            ),
+        ] {
+            let definition = render(options);
+            assert_eq!(definition.get("annotations").is_some(), has_annotations);
+            assert_eq!(definition.get("outputSchema").is_some(), has_output_schema);
+        }
+    }
+
+    #[test]
     fn tool_definitions_are_annotated_without_changing_legacy_shape() {
         let definitions = tool_definitions(true);
         let tools = definitions["tools"].as_array().unwrap();
@@ -2955,7 +3031,7 @@ mod tests {
         assert_eq!(embed["destructiveHint"], false);
         assert_eq!(embed["idempotentHint"], true);
 
-        let legacy = tool_definitions_with_annotations(true, false);
+        let legacy = tool_definitions_with_options(true, ToolDefinitionOptions::none());
         let mut modern_without_annotations = definitions;
 
         for tool in legacy["tools"].as_array().unwrap() {

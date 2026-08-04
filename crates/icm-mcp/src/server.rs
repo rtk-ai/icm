@@ -11,7 +11,9 @@ use crate::tools::{self, AutoConsolidate};
 
 const SERVER_NAME: &str = "icm";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROTOCOL_VERSION: &str = "2024-11-05";
+const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
+const PREVIOUS_PROTOCOL_VERSION: &str = "2025-06-18";
+const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Number of non-store tool calls before we nudge the agent to store.
 const STORE_NUDGE_THRESHOLD: u32 = 10;
@@ -63,6 +65,10 @@ pub fn run_server(
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
     let mut calls_since_store: u32 = 0;
+    // Default to the historical protocol until initialization succeeds. This
+    // preserves the legacy tools/list shape for old or non-conforming clients
+    // that call it before initialize.
+    let mut negotiated_protocol_version = LEGACY_PROTOCOL_VERSION;
     let mut buf: Vec<u8> = Vec::new();
 
     loop {
@@ -113,9 +119,16 @@ pub fn run_server(
         };
 
         let response = match method {
-            "initialize" => handle_initialize(id),
+            "initialize" => {
+                negotiated_protocol_version = negotiate_protocol_version(&msg.params);
+                handle_initialize(id, negotiated_protocol_version)
+            }
             "ping" => JsonRpcResponse::ok(id, json!({})),
-            "tools/list" => handle_tools_list(id, embedder.is_some()),
+            "tools/list" => handle_tools_list(
+                id,
+                embedder.is_some(),
+                supports_tool_annotations(negotiated_protocol_version),
+            ),
             "tools/call" => handle_tools_call(
                 id,
                 &msg.params,
@@ -141,11 +154,35 @@ fn write_response(stdout: &mut io::Stdout, resp: &JsonRpcResponse) -> anyhow::Re
     Ok(())
 }
 
-fn handle_initialize(id: Value) -> JsonRpcResponse {
+fn negotiate_protocol_version(params: &Option<Value>) -> &'static str {
+    match params
+        .as_ref()
+        .and_then(|value| value.get("protocolVersion"))
+        .and_then(Value::as_str)
+    {
+        // The MCP lifecycle requires echoing a requested version when the
+        // server supports it.
+        Some(LEGACY_PROTOCOL_VERSION) => LEGACY_PROTOCOL_VERSION,
+        Some(PREVIOUS_PROTOCOL_VERSION) => PREVIOUS_PROTOCOL_VERSION,
+        Some(LATEST_PROTOCOL_VERSION) => LATEST_PROTOCOL_VERSION,
+        // Keep accepting clients that omit the required field, matching ICM's
+        // pre-negotiation behavior rather than breaking them on upgrade.
+        None => LEGACY_PROTOCOL_VERSION,
+        // For unsupported versions, advertise the latest version ICM supports
+        // and let the client accept it or disconnect per the MCP lifecycle.
+        Some(_) => LATEST_PROTOCOL_VERSION,
+    }
+}
+
+fn supports_tool_annotations(protocol_version: &str) -> bool {
+    protocol_version != LEGACY_PROTOCOL_VERSION
+}
+
+fn handle_initialize(id: Value, protocol_version: &str) -> JsonRpcResponse {
     JsonRpcResponse::ok(
         id,
         json!({
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": protocol_version,
             "capabilities": {
                 "tools": {}
             },
@@ -177,8 +214,11 @@ Do NOT store: trivial details, information already in CLAUDE.md, ephemeral state
 \n\
 Importance levels: critical (never forgotten), high (slow decay), medium (normal), low (fast decay).";
 
-fn handle_tools_list(id: Value, has_embedder: bool) -> JsonRpcResponse {
-    JsonRpcResponse::ok(id, tools::tool_definitions(has_embedder))
+fn handle_tools_list(id: Value, has_embedder: bool, include_annotations: bool) -> JsonRpcResponse {
+    JsonRpcResponse::ok(
+        id,
+        tools::tool_definitions_with_annotations(has_embedder, include_annotations),
+    )
 }
 
 fn handle_tools_call(
@@ -232,4 +272,64 @@ fn handle_tools_call(
     }
 
     JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap_or(json!(null)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn initialize_params(protocol_version: Option<&str>) -> Option<Value> {
+        protocol_version.map(|version| {
+            json!({
+                "protocolVersion": version,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0.0"
+                }
+            })
+        })
+    }
+
+    #[test]
+    fn protocol_negotiation_echoes_supported_versions() {
+        for (version, has_annotations) in [
+            (LEGACY_PROTOCOL_VERSION, false),
+            (PREVIOUS_PROTOCOL_VERSION, true),
+            (LATEST_PROTOCOL_VERSION, true),
+        ] {
+            let params = initialize_params(Some(version));
+            let negotiated = negotiate_protocol_version(&params);
+            assert_eq!(negotiated, version);
+            assert_eq!(supports_tool_annotations(negotiated), has_annotations);
+
+            let response = handle_initialize(json!(1), negotiated);
+            assert_eq!(response.result.unwrap()["protocolVersion"], version);
+        }
+    }
+
+    #[test]
+    fn protocol_negotiation_uses_compatible_fallbacks() {
+        assert_eq!(negotiate_protocol_version(&None), LEGACY_PROTOCOL_VERSION);
+
+        let params = initialize_params(Some("2099-01-01"));
+        assert_eq!(negotiate_protocol_version(&params), LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn tools_list_shape_follows_negotiated_protocol() {
+        let legacy = handle_tools_list(json!(1), true, false).result.unwrap();
+        assert!(legacy["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("annotations").is_none()));
+
+        let modern = handle_tools_list(json!(2), true, true).result.unwrap();
+        assert!(modern["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("annotations").is_some()));
+    }
 }

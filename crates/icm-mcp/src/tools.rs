@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use chrono::Utc;
 use serde_json::{json, Value};
 
@@ -103,14 +105,260 @@ fn try_auto_consolidate(
 }
 
 // ---------------------------------------------------------------------------
-// Tool schemas for tools/list
+// Tool catalog for tools/list
 // ---------------------------------------------------------------------------
 
-pub fn tool_definitions(has_embedder: bool) -> Value {
-    let mut tools = vec![
-        // --- Memory tools ---
+#[derive(Clone, Copy)]
+struct ToolBehavior {
+    read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+    open_world: bool,
+}
+
+impl ToolBehavior {
+    const fn read_only() -> Self {
+        Self {
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        }
+    }
+
+    const fn additive() -> Self {
+        Self {
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        }
+    }
+
+    const fn destructive() -> Self {
+        Self {
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+            open_world: false,
+        }
+    }
+
+    const fn idempotent_update() -> Self {
+        Self {
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        }
+    }
+
+    const fn open_world(mut self) -> Self {
+        self.open_world = true;
+        self
+    }
+
+    fn annotations(self) -> Value {
         json!({
-            "name": "icm_memory_store",
+            "readOnlyHint": self.read_only,
+            "destructiveHint": self.destructive,
+            "idempotentHint": self.idempotent,
+            "openWorldHint": self.open_world
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolAvailability {
+    Always,
+    RequiresEmbedder,
+}
+
+impl ToolAvailability {
+    fn is_available(self, has_embedder: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::RequiresEmbedder => has_embedder,
+        }
+    }
+}
+
+type ToolOutputSchema = fn() -> Value;
+type ToolHandler = for<'a> fn(ToolCallContext<'a>) -> ToolResult;
+
+#[derive(Clone, Copy)]
+struct ToolCallContext<'a> {
+    store: &'a Store,
+    embedder: Option<&'a dyn Embedder>,
+    args: &'a Value,
+    compact: bool,
+    auto_consolidate: AutoConsolidate,
+}
+
+struct ToolSpec {
+    name: &'static str,
+    definition: Value,
+    behavior: ToolBehavior,
+    availability: ToolAvailability,
+    output_schema: Option<ToolOutputSchema>,
+    handler: ToolHandler,
+}
+
+impl ToolSpec {
+    fn new(
+        name: &'static str,
+        definition: Value,
+        behavior: ToolBehavior,
+        availability: ToolAvailability,
+        output_schema: Option<ToolOutputSchema>,
+        handler: ToolHandler,
+    ) -> Self {
+        Self {
+            name,
+            definition,
+            behavior,
+            availability,
+            output_schema,
+            handler,
+        }
+    }
+
+    fn render(&self, include_annotations: bool) -> Value {
+        let mut definition = self.definition.clone();
+        if let Some(object) = definition.as_object_mut() {
+            object.insert("name".into(), self.name.into());
+            if include_annotations {
+                object.insert("annotations".into(), self.behavior.annotations());
+            }
+            if let Some(output_schema) = self.output_schema {
+                object.insert("outputSchema".into(), output_schema());
+            }
+        }
+        definition
+    }
+
+    fn call(&self, context: ToolCallContext<'_>) -> ToolResult {
+        (self.handler)(context)
+    }
+}
+
+macro_rules! tool_spec {
+    (
+        @build
+        $name:literal,
+        $behavior:expr,
+        $availability:expr,
+        $output_schema:expr,
+        $handler:expr,
+        { $($definition:tt)* }
+    ) => {
+        ToolSpec::new(
+            $name,
+            json!({ $($definition)* }),
+            $behavior,
+            $availability,
+            $output_schema,
+            $handler,
+        )
+    };
+    ($name:literal, $behavior:expr, handler = $handler:expr, { $($definition:tt)* }) => {
+        tool_spec!(
+            @build
+            $name,
+            $behavior,
+            ToolAvailability::Always,
+            None,
+            $handler,
+            { $($definition)* }
+        )
+    };
+    (
+        $name:literal,
+        $behavior:expr,
+        output_schema = $output_schema:path,
+        handler = $handler:expr,
+        { $($definition:tt)* }
+    ) => {
+        tool_spec!(
+            @build
+            $name,
+            $behavior,
+            ToolAvailability::Always,
+            Some($output_schema),
+            $handler,
+            { $($definition)* }
+        )
+    };
+    (
+        $name:literal,
+        $behavior:expr,
+        requires_embedder,
+        handler = $handler:expr,
+        { $($definition:tt)* }
+    ) => {
+        tool_spec!(
+            @build
+            $name,
+            $behavior,
+            ToolAvailability::RequiresEmbedder,
+            None,
+            $handler,
+            { $($definition)* }
+        )
+    };
+    (
+        $name:literal,
+        $behavior:expr,
+        requires_embedder,
+        output_schema = $output_schema:path,
+        handler = $handler:expr,
+        { $($definition:tt)* }
+    ) => {
+        tool_spec!(
+            @build
+            $name,
+            $behavior,
+            ToolAvailability::RequiresEmbedder,
+            Some($output_schema),
+            $handler,
+            { $($definition)* }
+        )
+    };
+}
+
+pub fn tool_definitions(has_embedder: bool) -> Value {
+    tool_definitions_with_annotations(has_embedder, true)
+}
+
+pub(crate) fn tool_definitions_with_annotations(
+    has_embedder: bool,
+    include_annotations: bool,
+) -> Value {
+    let tools = tool_catalog()
+        .iter()
+        .filter(|spec| spec.availability.is_available(has_embedder))
+        .map(|spec| spec.render(include_annotations))
+        .collect::<Vec<_>>();
+
+    json!({ "tools": tools })
+}
+
+fn tool_catalog() -> &'static [ToolSpec] {
+    static CATALOG: OnceLock<Vec<ToolSpec>> = OnceLock::new();
+
+    CATALOG.get_or_init(|| vec![
+        // --- Memory tools ---
+        // Storing can trigger auto-consolidation, which replaces a topic's
+        // entries with a consolidated memory.
+        tool_spec!("icm_memory_store", ToolBehavior::destructive(), handler = |context| {
+            tool_store(
+                context.store,
+                context.embedder,
+                context.args,
+                context.compact,
+                context.auto_consolidate,
+            )
+        }, {
             "description": "Store important information in ICM long-term memory. Use to save decisions, preferences, project context, resolved errors — anything that should persist between sessions.",
             "inputSchema": {
                 "type": "object",
@@ -142,8 +390,16 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["topic", "content"]
             }
         }),
-        json!({
-            "name": "icm_memory_recall",
+        // Recall updates access counters and may run auto-decay, so it is not
+        // read-only or idempotent despite returning query data.
+        tool_spec!("icm_memory_recall", ToolBehavior::additive(), handler = |context| {
+            tool_recall(
+                context.store,
+                context.embedder,
+                context.args,
+                context.compact,
+            )
+        }, {
             "description": "Search ICM long-term memory. Use to find past decisions, project context, preferences, or solutions to previously encountered problems.",
             "inputSchema": {
                 "type": "object",
@@ -175,8 +431,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["query"]
             }
         }),
-        json!({
-            "name": "icm_memory_forget",
+        tool_spec!("icm_memory_forget", ToolBehavior::destructive(), handler = |context| {
+            tool_forget(context.store, context.args)
+        }, {
             "description": "Delete a specific memory by its ID. Use when information is obsolete or incorrect.",
             "inputSchema": {
                 "type": "object",
@@ -189,8 +446,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["id"]
             }
         }),
-        json!({
-            "name": "icm_memory_forget_topic",
+        tool_spec!("icm_memory_forget_topic", ToolBehavior::destructive(), handler = |context| {
+            tool_forget_topic(context.store, context.args)
+        }, {
             "description": "Delete ALL memories in a topic. Use to clear an entire topic at once.",
             "inputSchema": {
                 "type": "object",
@@ -203,8 +461,11 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["topic"]
             }
         }),
-        json!({
-            "name": "icm_learn",
+        // Learning scans a caller-selected directory outside ICM's closed
+        // memory domain before adding the discovered project knowledge.
+        tool_spec!("icm_learn", ToolBehavior::additive().open_world(), handler = |context| {
+            tool_learn(context.store, context.args)
+        }, {
             "description": "Scan a project directory and create a Memoir knowledge graph with its structure, dependencies, modules, and config files.",
             "inputSchema": {
                 "type": "object",
@@ -220,8 +481,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 }
             }
         }),
-        json!({
-            "name": "icm_memory_consolidate",
+        tool_spec!("icm_memory_consolidate", ToolBehavior::destructive(), handler = |context| {
+            tool_consolidate(context.store, context.embedder, context.args)
+        }, {
             "description": "Consolidate all memories of a topic into a single summary. Useful when a topic accumulates too many entries.",
             "inputSchema": {
                 "type": "object",
@@ -238,24 +500,27 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["topic", "summary"]
             }
         }),
-        json!({
-            "name": "icm_memory_list_topics",
+        tool_spec!("icm_memory_list_topics", ToolBehavior::read_only(), handler = |context| {
+            tool_list_topics(context.store)
+        }, {
             "description": "List all available topics in memory with their counts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
             }
         }),
-        json!({
-            "name": "icm_memory_stats",
+        tool_spec!("icm_memory_stats", ToolBehavior::read_only(), handler = |context| {
+            tool_stats(context.store)
+        }, {
             "description": "Get global ICM memory statistics.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
             }
         }),
-        json!({
-            "name": "icm_memory_update",
+        tool_spec!("icm_memory_update", ToolBehavior::destructive(), handler = |context| {
+            tool_update(context.store, context.embedder, context.args)
+        }, {
             "description": "Update an existing memory in-place. Use to correct, refresh, or extend a memory without creating a duplicate.",
             "inputSchema": {
                 "type": "object",
@@ -282,8 +547,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["id", "content"]
             }
         }),
-        json!({
-            "name": "icm_memory_health",
+        tool_spec!("icm_memory_health", ToolBehavior::read_only(), handler = |context| {
+            tool_health(context.store, context.args)
+        }, {
             "description": "Get health stats for all topics: entry count, staleness, consolidation needs. Use to audit memory hygiene.",
             "inputSchema": {
                 "type": "object",
@@ -296,8 +562,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         // --- Memoir tools ---
-        json!({
-            "name": "icm_memoir_create",
+        tool_spec!("icm_memoir_create", ToolBehavior::additive(), handler = |context| {
+            tool_memoir_create(context.store, context.args)
+        }, {
             "description": "Create a new memoir — a permanent knowledge container. Memoirs hold concepts that never decay.",
             "inputSchema": {
                 "type": "object",
@@ -314,16 +581,18 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["name"]
             }
         }),
-        json!({
-            "name": "icm_memoir_list",
+        tool_spec!("icm_memoir_list", ToolBehavior::read_only(), handler = |context| {
+            tool_memoir_list(context.store)
+        }, {
             "description": "List all memoirs with their concept counts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
             }
         }),
-        json!({
-            "name": "icm_memoir_show",
+        tool_spec!("icm_memoir_show", ToolBehavior::read_only(), handler = |context| {
+            tool_memoir_show(context.store, context.args)
+        }, {
             "description": "Show a memoir's stats, labels, and all its concepts.",
             "inputSchema": {
                 "type": "object",
@@ -336,8 +605,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["name"]
             }
         }),
-        json!({
-            "name": "icm_memoir_add_concept",
+        tool_spec!("icm_memoir_add_concept", ToolBehavior::additive(), handler = |context| {
+            tool_memoir_add_concept(context.store, context.args)
+        }, {
             "description": "Add a permanent concept to a memoir. Concepts are knowledge nodes that get refined, never decayed.",
             "inputSchema": {
                 "type": "object",
@@ -362,8 +632,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["memoir", "name", "definition"]
             }
         }),
-        json!({
-            "name": "icm_memoir_refine",
+        tool_spec!("icm_memoir_refine", ToolBehavior::destructive(), handler = |context| {
+            tool_memoir_refine(context.store, context.args)
+        }, {
             "description": "Refine an existing concept with a new, improved definition. Bumps revision and boosts confidence.",
             "inputSchema": {
                 "type": "object",
@@ -384,8 +655,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["memoir", "name", "definition"]
             }
         }),
-        json!({
-            "name": "icm_memoir_search",
+        tool_spec!("icm_memoir_search", ToolBehavior::read_only(), handler = |context| {
+            tool_memoir_search(context.store, context.args)
+        }, {
             "description": "Full-text search concepts within a memoir.",
             "inputSchema": {
                 "type": "object",
@@ -411,8 +683,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["memoir", "query"]
             }
         }),
-        json!({
-            "name": "icm_memoir_link",
+        tool_spec!("icm_memoir_link", ToolBehavior::additive(), handler = |context| {
+            tool_memoir_link(context.store, context.args)
+        }, {
             "description": "Create a directed, typed edge between two concepts in the same memoir.",
             "inputSchema": {
                 "type": "object",
@@ -438,8 +711,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["memoir", "from", "to", "relation"]
             }
         }),
-        json!({
-            "name": "icm_memoir_inspect",
+        tool_spec!("icm_memoir_inspect", ToolBehavior::read_only(), handler = |context| {
+            tool_memoir_inspect(context.store, context.args)
+        }, {
             "description": "Inspect a concept and its graph neighborhood (BFS).",
             "inputSchema": {
                 "type": "object",
@@ -461,8 +735,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["memoir", "name"]
             }
         }),
-        json!({
-            "name": "icm_memoir_export",
+        tool_spec!("icm_memoir_export", ToolBehavior::read_only(), handler = |context| {
+            tool_memoir_export(context.store, context.args)
+        }, {
             "description": "Export a memoir's full concept graph. Formats: json (structured), dot (Graphviz), ascii (visual), ai (compact markdown for LLM context).",
             "inputSchema": {
                 "type": "object",
@@ -481,8 +756,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["name"]
             }
         }),
-        json!({
-            "name": "icm_memory_extract_patterns",
+        tool_spec!("icm_memory_extract_patterns", ToolBehavior::additive(), handler = |context| {
+            tool_extract_patterns(context.store, context.args)
+        }, {
             "description": "Detect recurring patterns in a topic by keyword similarity. Optionally create concepts in a memoir from detected patterns.",
             "inputSchema": {
                 "type": "object",
@@ -505,8 +781,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["topic"]
             }
         }),
-        json!({
-            "name": "icm_memoir_search_all",
+        tool_spec!("icm_memoir_search_all", ToolBehavior::read_only(), handler = |context| {
+            tool_memoir_search_all(context.store, context.args)
+        }, {
             "description": "Full-text search concepts across all memoirs.",
             "inputSchema": {
                 "type": "object",
@@ -525,8 +802,14 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         // --- Feedback tools ---
-        json!({
-            "name": "icm_feedback_record",
+        tool_spec!("icm_feedback_record", ToolBehavior::additive(), handler = |context| {
+            tool_feedback_record(
+                context.store,
+                context.embedder,
+                context.args,
+                context.compact,
+            )
+        }, {
             "description": "Record a correction/feedback when an AI prediction was wrong. Helps improve future predictions by learning from mistakes.",
             "inputSchema": {
                 "type": "object",
@@ -559,8 +842,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["topic", "context", "predicted", "corrected"]
             }
         }),
-        json!({
-            "name": "icm_feedback_search",
+        tool_spec!("icm_feedback_search", ToolBehavior::read_only(), handler = |context| {
+            tool_feedback_search(context.store, context.embedder, context.args)
+        }, {
             "description": "Search past feedback/corrections to inform current predictions. Use before making predictions to learn from past mistakes.",
             "inputSchema": {
                 "type": "object",
@@ -584,8 +868,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["query"]
             }
         }),
-        json!({
-            "name": "icm_feedback_stats",
+        tool_spec!("icm_feedback_stats", ToolBehavior::read_only(), handler = |context| {
+            tool_feedback_stats(context.store)
+        }, {
             "description": "Get feedback statistics: total count, breakdown by topic, most applied corrections.",
             "inputSchema": {
                 "type": "object",
@@ -593,8 +878,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
             }
         }),
         // --- Transcript tools (verbatim session replay) ---
-        json!({
-            "name": "icm_transcript_start_session",
+        tool_spec!("icm_transcript_start_session", ToolBehavior::additive(), handler = |context| {
+            tool_transcript_start_session(context.store, context.args)
+        }, {
             "description": "Create a new transcript session for verbatim message capture. Returns the session_id used by subsequent icm_transcript_record calls. Use once per conversation or debugging session.",
             "inputSchema": {
                 "type": "object",
@@ -614,8 +900,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 }
             }
         }),
-        json!({
-            "name": "icm_transcript_record",
+        tool_spec!("icm_transcript_record", ToolBehavior::additive(), handler = |context| {
+            tool_transcript_record(context.store, context.args)
+        }, {
             "description": "Append a verbatim message to a transcript session. Stores the raw content with no summarization. Use once per user turn, assistant reply, or tool call for full replay fidelity.",
             "inputSchema": {
                 "type": "object",
@@ -649,8 +936,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["session_id", "role", "content"]
             }
         }),
-        json!({
-            "name": "icm_transcript_search",
+        tool_spec!("icm_transcript_search", ToolBehavior::read_only(), handler = |context| {
+            tool_transcript_search(context.store, context.args)
+        }, {
             "description": "Full-text search across recorded transcript messages (FTS5 BM25). Supports boolean operators, phrase matches, and prefix queries. Use to recall exact quotes or debug past decisions.",
             "inputSchema": {
                 "type": "object",
@@ -677,8 +965,9 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["query"]
             }
         }),
-        json!({
-            "name": "icm_transcript_show",
+        tool_spec!("icm_transcript_show", ToolBehavior::read_only(), handler = |context| {
+            tool_transcript_show(context.store, context.args)
+        }, {
             "description": "Replay the full message thread of a transcript session, chronologically. Returns up to `limit` messages with role, content, tool name, timestamp.",
             "inputSchema": {
                 "type": "object",
@@ -689,16 +978,18 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 "required": ["session_id"]
             }
         }),
-        json!({
-            "name": "icm_transcript_stats",
+        tool_spec!("icm_transcript_stats", ToolBehavior::read_only(), handler = |context| {
+            tool_transcript_stats(context.store)
+        }, {
             "description": "Global transcript statistics: session count, message count, total bytes, breakdown by role and agent, top sessions by message count.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
             }
         }),
-        json!({
-            "name": "icm_wake_up",
+        tool_spec!("icm_wake_up", ToolBehavior::read_only(), handler = |context| {
+            tool_wake_up(context.store, context.args)
+        }, {
             "description": "Build a compact critical-facts pack for LLM system-prompt injection. Selects critical/high memories (and preferences) optionally scoped by project, ranks by importance × recency × weight, and truncates to a token budget. Use at session start to hydrate an agent with the most load-bearing context.",
             "inputSchema": {
                 "type": "object",
@@ -728,25 +1019,29 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                 }
             }
         }),
-    ];
-
-    if has_embedder {
-        tools.push(json!({
-            "name": "icm_memory_embed_all",
-            "description": "Generate embeddings for all memories that don't have one yet. Use this to backfill vector search capability.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "topic": {
-                        "type": "string",
-                        "description": "Only embed memories in this topic (optional)"
+        // This only fills missing embeddings, so repeating it with the same
+        // arguments has no further effect.
+        tool_spec!(
+            "icm_memory_embed_all",
+            ToolBehavior::idempotent_update(),
+            requires_embedder,
+            handler = |context| {
+                tool_embed_all(context.store, context.embedder, context.args)
+            },
+            {
+                "description": "Generate embeddings for all memories that don't have one yet. Use this to backfill vector search capability.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Only embed memories in this topic (optional)"
+                        }
                     }
                 }
             }
-        }));
-    }
-
-    json!({ "tools": tools })
+        ),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -781,46 +1076,20 @@ pub fn call_tool_with_config(
     compact: bool,
     auto_consolidate: AutoConsolidate,
 ) -> ToolResult {
-    match name {
-        // Memory tools
-        "icm_memory_store" => tool_store(store, embedder, args, compact, auto_consolidate),
-        "icm_memory_recall" => tool_recall(store, embedder, args, compact),
-        "icm_memory_forget" => tool_forget(store, args),
-        "icm_memory_forget_topic" => tool_forget_topic(store, args),
-        "icm_memory_update" => tool_update(store, embedder, args),
-        "icm_memory_consolidate" => tool_consolidate(store, embedder, args),
-        "icm_memory_list_topics" => tool_list_topics(store),
-        "icm_memory_stats" => tool_stats(store),
-        "icm_memory_health" => tool_health(store, args),
-        "icm_memory_extract_patterns" => tool_extract_patterns(store, args),
-        "icm_memory_embed_all" => tool_embed_all(store, embedder, args),
-        // Memoir tools
-        "icm_memoir_create" => tool_memoir_create(store, args),
-        "icm_memoir_list" => tool_memoir_list(store),
-        "icm_memoir_show" => tool_memoir_show(store, args),
-        "icm_memoir_add_concept" => tool_memoir_add_concept(store, args),
-        "icm_memoir_refine" => tool_memoir_refine(store, args),
-        "icm_memoir_search" => tool_memoir_search(store, args),
-        "icm_memoir_search_all" => tool_memoir_search_all(store, args),
-        "icm_memoir_link" => tool_memoir_link(store, args),
-        "icm_memoir_inspect" => tool_memoir_inspect(store, args),
-        "icm_memoir_export" => tool_memoir_export(store, args),
-        // Learn tool
-        "icm_learn" => tool_learn(store, args),
-        // Feedback tools
-        "icm_feedback_record" => tool_feedback_record(store, embedder, args, compact),
-        "icm_feedback_search" => tool_feedback_search(store, embedder, args),
-        "icm_feedback_stats" => tool_feedback_stats(store),
-        // Transcript tools
-        "icm_transcript_start_session" => tool_transcript_start_session(store, args),
-        "icm_transcript_record" => tool_transcript_record(store, args),
-        "icm_transcript_search" => tool_transcript_search(store, args),
-        "icm_transcript_show" => tool_transcript_show(store, args),
-        "icm_transcript_stats" => tool_transcript_stats(store),
-        // Wake-up tool
-        "icm_wake_up" => tool_wake_up(store, args),
-        _ => ToolResult::error(format!("unknown tool: {name}")),
-    }
+    let context = ToolCallContext {
+        store,
+        embedder,
+        args,
+        compact,
+        auto_consolidate,
+    };
+    tool_catalog()
+        .iter()
+        .find(|spec| spec.name == name)
+        .map_or_else(
+            || ToolResult::error(format!("unknown tool: {name}")),
+            |spec| spec.call(context),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -2536,10 +2805,174 @@ fn tool_feedback_stats(store: &Store) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn test_store() -> Store {
         Store::in_memory().unwrap()
+    }
+
+    fn tool_named<'a>(definitions: &'a Value, name: &str) -> &'a Value {
+        definitions["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool not listed: {name}"))
+    }
+
+    #[test]
+    fn tool_catalog_is_cached_unique_ordered_and_dispatchable() {
+        let catalog = tool_catalog();
+        assert!(std::ptr::eq(catalog, tool_catalog()));
+        let mut names = HashSet::new();
+
+        for spec in catalog {
+            assert!(names.insert(spec.name), "duplicate tool: {}", spec.name);
+            let definition = spec
+                .definition
+                .as_object()
+                .unwrap_or_else(|| panic!("{} has a non-object definition", spec.name));
+            assert!(
+                definition.get("name").is_none(),
+                "{} duplicates its catalog name in the definition",
+                spec.name
+            );
+            assert!(
+                definition.get("description").is_some_and(Value::is_string),
+                "{} has no description",
+                spec.name
+            );
+            assert!(
+                definition.get("inputSchema").is_some_and(Value::is_object),
+                "{} has no input schema",
+                spec.name
+            );
+            if let Some(output_schema) = spec.output_schema {
+                assert!(
+                    output_schema().is_object(),
+                    "{} has a non-object output schema",
+                    spec.name
+                );
+            }
+        }
+
+        let expected_names = catalog.iter().map(|spec| spec.name).collect::<Vec<_>>();
+        let definitions = tool_definitions(true);
+        let actual_names = definitions["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_names, expected_names, "tools/list order changed");
+
+        let store = test_store();
+        let through_catalog = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
+        let direct = tool_stats(&store);
+        assert_eq!(
+            serde_json::to_value(through_catalog).unwrap(),
+            serde_json::to_value(direct).unwrap(),
+            "catalog dispatch changed the registered handler"
+        );
+
+        let without_embedder = tool_definitions(false);
+        assert!(
+            without_embedder["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool["name"] != "icm_memory_embed_all"),
+            "embed-only tool was listed without an embedder"
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|spec| spec.availability == ToolAvailability::RequiresEmbedder)
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>(),
+            vec!["icm_memory_embed_all"]
+        );
+        let hidden_but_registered =
+            call_tool(&store, None, "icm_memory_embed_all", &json!({}), false);
+        assert_eq!(
+            hidden_but_registered.content[0].text,
+            "embeddings not available"
+        );
+    }
+
+    #[test]
+    fn tool_definitions_are_annotated_without_changing_legacy_shape() {
+        let definitions = tool_definitions(true);
+        let tools = definitions["tools"].as_array().unwrap();
+
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let annotations = tool
+                .get("annotations")
+                .unwrap_or_else(|| panic!("missing annotations for {name}"));
+            for hint in [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(
+                    annotations[hint].is_boolean(),
+                    "{name} has no boolean {hint}"
+                );
+            }
+            if name != "icm_learn" {
+                assert_eq!(
+                    annotations["openWorldHint"], false,
+                    "{name} must describe ICM's closed-world memory domain"
+                );
+            }
+        }
+
+        let recall = &tool_named(&definitions, "icm_memory_recall")["annotations"];
+        assert_eq!(recall["readOnlyHint"], false);
+        assert_eq!(recall["destructiveHint"], false);
+        assert_eq!(recall["idempotentHint"], false);
+
+        let learn = &tool_named(&definitions, "icm_learn")["annotations"];
+        assert_eq!(learn["readOnlyHint"], false);
+        assert_eq!(learn["openWorldHint"], true);
+
+        let store = &tool_named(&definitions, "icm_memory_store")["annotations"];
+        assert_eq!(store["readOnlyHint"], false);
+        assert_eq!(store["destructiveHint"], true);
+        assert_eq!(store["idempotentHint"], false);
+
+        let create = &tool_named(&definitions, "icm_memoir_create")["annotations"];
+        assert_eq!(create["readOnlyHint"], false);
+        assert_eq!(create["destructiveHint"], false);
+        assert_eq!(create["idempotentHint"], false);
+
+        let embed = &tool_named(&definitions, "icm_memory_embed_all")["annotations"];
+        assert_eq!(embed["readOnlyHint"], false);
+        assert_eq!(embed["destructiveHint"], false);
+        assert_eq!(embed["idempotentHint"], true);
+
+        let legacy = tool_definitions_with_annotations(true, false);
+        let mut modern_without_annotations = definitions;
+
+        for tool in legacy["tools"].as_array().unwrap() {
+            assert!(
+                tool.get("annotations").is_none(),
+                "legacy tool unexpectedly included annotations: {}",
+                tool["name"]
+            );
+        }
+        for tool in modern_without_annotations["tools"].as_array_mut().unwrap() {
+            tool.as_object_mut().unwrap().remove("annotations");
+        }
+
+        assert_eq!(
+            legacy, modern_without_annotations,
+            "legacy clients must receive the pre-annotation tools/list shape"
+        );
     }
 
     /// Audit regression: `format_memory_output` (icm_memory_recall's text
@@ -2662,7 +3095,7 @@ mod tests {
         let store = test_store();
         let result = call_tool(&store, None, "nonexistent_tool", &json!({}), false);
         assert!(result.is_error);
-        assert!(result.content[0].text.contains("unknown tool"));
+        assert_eq!(result.content[0].text, "unknown tool: nonexistent_tool");
     }
 
     #[test]
@@ -2758,6 +3191,11 @@ mod tests {
         );
         assert!(!recall_result.is_error);
         assert!(recall_result.content[0].text.contains("Rust"));
+        let recalled = store.get_by_topic("test-project").unwrap();
+        assert_eq!(
+            recalled[0].access_count, 1,
+            "recall mutates access metadata and must not be annotated read-only"
+        );
     }
 
     /// Audit regression: a 64 KB raw_excerpt was dumped in full for every

@@ -12,6 +12,9 @@ use icm_core::{
 };
 use icm_store::Store;
 
+use crate::output::{
+    ListTopicsOutput, ListTopicsTool, RecallOutput, RecallTool, StatsOutput, StatsTool, TypedTool,
+};
 use crate::protocol::ToolResult;
 
 /// Historical default threshold for auto-consolidation. The live value comes
@@ -218,6 +221,10 @@ impl ToolDefinitionOptions {
         self.output_schemas = true;
         self
     }
+
+    pub(crate) const fn includes_output_schemas(self) -> bool {
+        self.output_schemas
+    }
 }
 
 struct ToolSpec {
@@ -235,7 +242,6 @@ impl ToolSpec {
         definition: Value,
         behavior: ToolBehavior,
         availability: ToolAvailability,
-        output_schema: Option<ToolOutputSchema>,
         handler: ToolHandler,
     ) -> Self {
         Self {
@@ -243,7 +249,23 @@ impl ToolSpec {
             definition,
             behavior,
             availability,
-            output_schema,
+            output_schema: None,
+            handler,
+        }
+    }
+
+    fn typed<T: TypedTool>(
+        definition: Value,
+        behavior: ToolBehavior,
+        availability: ToolAvailability,
+        handler: ToolHandler,
+    ) -> Self {
+        Self {
+            name: T::NAME,
+            definition,
+            behavior,
+            availability,
+            output_schema: Some(T::output_schema),
             handler,
         }
     }
@@ -268,85 +290,55 @@ impl ToolSpec {
 }
 
 macro_rules! tool_spec {
+    ($name:literal, $behavior:expr, handler = $handler:expr, { $($definition:tt)* }) => {
+        ToolSpec::new(
+            $name,
+            json!({ $($definition)* }),
+            $behavior,
+            ToolAvailability::Always,
+            $handler,
+        )
+    };
     (
-        @build
         $name:literal,
         $behavior:expr,
-        $availability:expr,
-        $output_schema:expr,
-        $handler:expr,
+        requires_embedder,
+        handler = $handler:expr,
         { $($definition:tt)* }
     ) => {
         ToolSpec::new(
             $name,
             json!({ $($definition)* }),
             $behavior,
-            $availability,
-            $output_schema,
+            ToolAvailability::RequiresEmbedder,
             $handler,
-        )
-    };
-    ($name:literal, $behavior:expr, handler = $handler:expr, { $($definition:tt)* }) => {
-        tool_spec!(
-            @build
-            $name,
-            $behavior,
-            ToolAvailability::Always,
-            None,
-            $handler,
-            { $($definition)* }
         )
     };
     (
-        $name:literal,
+        typed $tool:ty,
         $behavior:expr,
-        output_schema = $output_schema:path,
         handler = $handler:expr,
         { $($definition:tt)* }
     ) => {
-        tool_spec!(
-            @build
-            $name,
+        ToolSpec::typed::<$tool>(
+            json!({ $($definition)* }),
             $behavior,
             ToolAvailability::Always,
-            Some($output_schema),
             $handler,
-            { $($definition)* }
         )
     };
     (
-        $name:literal,
+        typed $tool:ty,
         $behavior:expr,
         requires_embedder,
         handler = $handler:expr,
         { $($definition:tt)* }
     ) => {
-        tool_spec!(
-            @build
-            $name,
+        ToolSpec::typed::<$tool>(
+            json!({ $($definition)* }),
             $behavior,
             ToolAvailability::RequiresEmbedder,
-            None,
             $handler,
-            { $($definition)* }
-        )
-    };
-    (
-        $name:literal,
-        $behavior:expr,
-        requires_embedder,
-        output_schema = $output_schema:path,
-        handler = $handler:expr,
-        { $($definition:tt)* }
-    ) => {
-        tool_spec!(
-            @build
-            $name,
-            $behavior,
-            ToolAvailability::RequiresEmbedder,
-            Some($output_schema),
-            $handler,
-            { $($definition)* }
         )
     };
 }
@@ -422,7 +414,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
         }),
         // Recall updates access counters and may run auto-decay, so it is not
         // read-only or idempotent despite returning query data.
-        tool_spec!("icm_memory_recall", ToolBehavior::additive(), handler = |context| {
+        tool_spec!(typed RecallTool, ToolBehavior::additive(), handler = |context| {
             tool_recall(
                 context.store,
                 context.embedder,
@@ -530,7 +522,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
                 "required": ["topic", "summary"]
             }
         }),
-        tool_spec!("icm_memory_list_topics", ToolBehavior::read_only(), handler = |context| {
+        tool_spec!(typed ListTopicsTool, ToolBehavior::read_only(), handler = |context| {
             tool_list_topics(context.store)
         }, {
             "description": "List all available topics in memory with their counts.",
@@ -539,7 +531,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
                 "properties": {}
             }
         }),
-        tool_spec!("icm_memory_stats", ToolBehavior::read_only(), handler = |context| {
+        tool_spec!(typed StatsTool, ToolBehavior::read_only(), handler = |context| {
             tool_stats(context.store)
         }, {
             "description": "Get global ICM memory statistics.",
@@ -1539,6 +1531,26 @@ fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
     output
 }
 
+fn recall_result(memories: &[(Memory, f32)], compact: bool) -> ToolResult {
+    RecallTool::result(
+        format_memory_output(memories, compact),
+        RecallOutput::from_memories(memories),
+        format!(
+            "{} memor{} returned in structuredContent.",
+            memories.len(),
+            if memories.len() == 1 { "y" } else { "ies" }
+        ),
+    )
+}
+
+fn empty_recall_result() -> ToolResult {
+    RecallTool::result(
+        MSG_NO_MEMORIES.into(),
+        RecallOutput::from_memories(&[]),
+        MSG_NO_MEMORIES.into(),
+    )
+}
+
 fn tool_recall(
     store: &Store,
     embedder: Option<&dyn Embedder>,
@@ -1639,10 +1651,10 @@ fn tool_recall(
                 let _ = store.batch_update_access(&ids);
 
                 if expanded.is_empty() {
-                    return ToolResult::text(MSG_NO_MEMORIES.into());
+                    return empty_recall_result();
                 }
 
-                return ToolResult::text(format_memory_output(&expanded, compact));
+                return recall_result(&expanded, compact);
             }
         }
     }
@@ -1695,13 +1707,13 @@ fn tool_recall(
     let _ = store.batch_update_access(&ids);
 
     if expanded.is_empty() {
-        return ToolResult::text(MSG_NO_MEMORIES.into());
+        return empty_recall_result();
     }
 
     // FTS-path results have synthetic scores — reset to -1.0 for display
     // so we don't claim a hybrid-search confidence we didn't compute.
     let for_display: Vec<(Memory, f32)> = expanded.into_iter().map(|(m, _)| (m, -1.0)).collect();
-    ToolResult::text(format_memory_output(&for_display, compact))
+    recall_result(&for_display, compact)
 }
 
 fn tool_forget(store: &Store, args: &Value) -> ToolResult {
@@ -1782,7 +1794,11 @@ fn tool_list_topics(store: &Store) -> ToolResult {
     match store.list_topics() {
         Ok(topics) => {
             if topics.is_empty() {
-                return ToolResult::text("No topics yet.".into());
+                return ListTopicsTool::result(
+                    "No topics yet.".into(),
+                    ListTopicsOutput::from_topics(&topics),
+                    "No topics yet.".into(),
+                );
             }
 
             // Group topics by scope prefix (before ':')
@@ -1817,7 +1833,11 @@ fn tool_list_topics(store: &Store) -> ToolResult {
                 }
             }
 
-            ToolResult::text(output)
+            ListTopicsTool::result(
+                output,
+                ListTopicsOutput::from_topics(&topics),
+                format!("{} topics returned in structuredContent.", topics.len()),
+            )
         }
         Err(e) => ToolResult::error(format!("failed to list topics: {e}")),
     }
@@ -1830,19 +1850,23 @@ fn tool_stats(store: &Store) -> ToolResult {
                 "Memories: {}\nTopics: {}\nAvg weight: {:.3}\n",
                 stats.total_memories, stats.total_topics, stats.avg_weight
             );
-            if let Some(oldest) = stats.oldest_memory {
+            if let Some(oldest) = &stats.oldest_memory {
                 output.push_str(&format!(
                     "Oldest: {}\n",
-                    format_local(&oldest, "%Y-%m-%d %H:%M")
+                    format_local(oldest, "%Y-%m-%d %H:%M")
                 ));
             }
-            if let Some(newest) = stats.newest_memory {
+            if let Some(newest) = &stats.newest_memory {
                 output.push_str(&format!(
                     "Newest: {}\n",
-                    format_local(&newest, "%Y-%m-%d %H:%M")
+                    format_local(newest, "%Y-%m-%d %H:%M")
                 ));
             }
-            ToolResult::text(output)
+            StatsTool::result(
+                output,
+                StatsOutput::from(&stats),
+                "Memory statistics returned in structuredContent.".into(),
+            )
         }
         Err(e) => ToolResult::error(format!("failed to get stats: {e}")),
     }
@@ -2934,15 +2958,10 @@ mod tests {
 
     #[test]
     fn tool_definition_options_are_independent() {
-        fn fixture_output_schema() -> Value {
-            json!({ "type": "object" })
-        }
-
         let render = |options| {
             tool_spec!(
-                "fixture",
+                typed RecallTool,
                 ToolBehavior::read_only(),
-                output_schema = fixture_output_schema,
                 handler = |_| ToolResult::text("fixture".into()),
                 {
                     "description": "Fixture tool",
@@ -2980,6 +2999,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_are_annotated_without_changing_legacy_shape() {
+        let catalog = tool_catalog();
         let definitions = tool_definitions(true);
         let tools = definitions["tools"].as_array().unwrap();
 
@@ -3005,6 +3025,16 @@ mod tests {
                     "{name} must describe ICM's closed-world memory domain"
                 );
             }
+            let expected_output_schema = catalog
+                .iter()
+                .find(|spec| spec.name == name)
+                .and_then(|spec| spec.output_schema)
+                .map(|output_schema| output_schema());
+            assert_eq!(
+                tool.get("outputSchema"),
+                expected_output_schema.as_ref(),
+                "unexpected outputSchema policy for {name}"
+            );
         }
 
         let recall = &tool_named(&definitions, "icm_memory_recall")["annotations"];
@@ -3040,15 +3070,83 @@ mod tests {
                 "legacy tool unexpectedly included annotations: {}",
                 tool["name"]
             );
+            assert!(
+                tool.get("outputSchema").is_none(),
+                "legacy tool unexpectedly included outputSchema: {}",
+                tool["name"]
+            );
         }
         for tool in modern_without_annotations["tools"].as_array_mut().unwrap() {
-            tool.as_object_mut().unwrap().remove("annotations");
+            let object = tool.as_object_mut().unwrap();
+            object.remove("annotations");
+            object.remove("outputSchema");
         }
 
         assert_eq!(
             legacy, modern_without_annotations,
-            "legacy clients must receive the pre-annotation tools/list shape"
+            "legacy clients must receive the pre-modern tools/list shape"
         );
+    }
+
+    #[test]
+    fn memory_discovery_tools_return_machine_readable_data() {
+        let store = test_store();
+        let mut memory = Memory::new(
+            "test-topic".into(),
+            "structured recall needle".into(),
+            icm_core::Importance::High,
+        );
+        memory.keywords = vec!["needle".into()];
+        let id = memory.id.clone();
+        store.store(memory).unwrap();
+
+        let recall = tool_recall(
+            &store,
+            None,
+            &json!({"query": "needle", "project": ""}),
+            false,
+        );
+        assert_structured_result_matches::<RecallTool>(&recall);
+        let recall_data = recall.structured_content.as_ref().unwrap();
+        assert_eq!(recall_data["count"], 1);
+        assert_eq!(recall_data["memories"][0]["id"], id);
+        assert_eq!(recall_data["memories"][0]["importance"], "high");
+        assert_eq!(recall_data["memories"][0]["source"]["type"], "manual");
+        assert_eq!(recall_data["memories"][0]["scope"], "user");
+        assert!(recall_data["memories"][0].get("embedding").is_none());
+
+        let topics = tool_list_topics(&store);
+        assert_structured_result_matches::<ListTopicsTool>(&topics);
+        assert_eq!(
+            topics.structured_content.as_ref().unwrap()["topics"][0]["name"],
+            "test-topic"
+        );
+
+        let stats = tool_stats(&store);
+        assert_structured_result_matches::<StatsTool>(&stats);
+        assert_eq!(
+            stats.structured_content.as_ref().unwrap()["totalMemories"],
+            1
+        );
+    }
+
+    fn assert_structured_result_matches<T: TypedTool>(result: &ToolResult) {
+        let schema = T::output_schema();
+        let validator = jsonschema::draft202012::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .unwrap();
+        let output = result
+            .structured_content
+            .as_ref()
+            .expect("typed tool result must include structuredContent");
+
+        if let Err(error) = validator.validate(output) {
+            panic!(
+                "{} output did not match its generated schema: {error}",
+                T::NAME
+            );
+        }
     }
 
     /// Audit regression: `format_memory_output` (icm_memory_recall's text

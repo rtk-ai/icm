@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::output::TypedTool;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 message types
 // ---------------------------------------------------------------------------
@@ -100,6 +102,12 @@ pub struct ToolResult {
     pub content: Vec<TextContent>,
     #[serde(rename = "isError", skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
+    /// Short text fallback used only when structured output is emitted.
+    /// Legacy clients still receive the full human-readable `content`.
+    #[serde(skip)]
+    pub structured_summary: Option<Box<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +125,8 @@ impl ToolResult {
                 text,
             }],
             is_error: false,
+            structured_content: None,
+            structured_summary: None,
         }
     }
 
@@ -127,6 +137,33 @@ impl ToolResult {
                 text,
             }],
             is_error: true,
+            structured_content: None,
+            structured_summary: None,
+        }
+    }
+
+    pub(crate) fn structured<T: TypedTool>(
+        text: String,
+        output: T::Output,
+        structured_summary: String,
+    ) -> Self {
+        match serde_json::to_value(output) {
+            Ok(data) => Self {
+                content: vec![TextContent {
+                    content_type: "text".into(),
+                    text,
+                }],
+                is_error: false,
+                structured_content: Some(data),
+                structured_summary: Some(Box::new(structured_summary)),
+            },
+            Err(error) => {
+                tracing::error!(tool = T::NAME, %error, "failed to serialize MCP structured output");
+                Self::error(format!(
+                    "failed to serialize structured output for {}",
+                    T::NAME
+                ))
+            }
         }
     }
 
@@ -135,13 +172,29 @@ impl ToolResult {
         if let Some(last) = self.content.last_mut() {
             last.text.push_str(hint);
         }
+        if let Some(summary) = self.structured_summary.as_mut() {
+            summary.push_str(hint);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use schemars::JsonSchema;
     use serde_json::json;
+
+    #[derive(JsonSchema, Serialize)]
+    struct TestOutput {
+        count: usize,
+    }
+
+    struct TestTool;
+
+    impl TypedTool for TestTool {
+        const NAME: &'static str = "test_tool";
+        type Output = TestOutput;
+    }
 
     /// Audit regression: a Request with `"id": null` (legal per JSON-RPC
     /// 2.0, if discouraged) must still be recognized as a Request needing a
@@ -178,6 +231,7 @@ mod tests {
         assert_eq!(result.content.len(), 1);
         assert_eq!(result.content[0].text, "hello");
         assert_eq!(result.content[0].content_type, "text");
+        assert!(result.structured_content.is_none());
     }
 
     #[test]
@@ -185,6 +239,7 @@ mod tests {
         let result = ToolResult::error("boom".into());
         assert!(result.is_error);
         assert_eq!(result.content[0].text, "boom");
+        assert!(result.structured_content.is_none());
     }
 
     #[test]
@@ -199,6 +254,8 @@ mod tests {
         let mut result = ToolResult {
             content: vec![],
             is_error: false,
+            structured_content: None,
+            structured_summary: None,
         };
         result.append_hint("[hint]");
         assert!(result.content.is_empty());
@@ -258,8 +315,63 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["content"][0]["type"], "text");
         assert_eq!(json["content"][0]["text"], "hello");
+        assert!(json.get("structuredContent").is_none());
         // isError should be absent when false (skip_serializing_if)
         assert!(json.get("isError").is_none());
+    }
+
+    #[test]
+    fn structured_summary_is_internal_and_preserves_hints() {
+        let mut result = TestTool::result(
+            "full legacy text".into(),
+            TestOutput { count: 1 },
+            "1 structured result".into(),
+        );
+        result.append_hint("\n[nudge]");
+        let json = serde_json::to_value(&result).unwrap();
+
+        assert_eq!(result.content[0].text, "full legacy text\n[nudge]");
+        assert_eq!(
+            result.structured_summary.as_deref().map(String::as_str),
+            Some("1 structured result\n[nudge]")
+        );
+        assert!(json.get("structured_summary").is_none());
+    }
+
+    #[test]
+    fn structured_serialization_errors_become_tool_errors() {
+        #[derive(JsonSchema)]
+        struct FailingOutput;
+
+        impl Serialize for FailingOutput {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(<S::Error as serde::ser::Error>::custom("fixture failure"))
+            }
+        }
+
+        struct FailingTool;
+
+        impl TypedTool for FailingTool {
+            const NAME: &'static str = "failing_tool";
+            type Output = FailingOutput;
+        }
+
+        let result = FailingTool::result(
+            "legacy text".into(),
+            FailingOutput,
+            "structured summary".into(),
+        );
+
+        assert!(result.is_error);
+        assert!(result.structured_content.is_none());
+        assert!(result.structured_summary.is_none());
+        assert_eq!(
+            result.content[0].text,
+            "failed to serialize structured output for failing_tool"
+        );
     }
 
     #[test]
@@ -267,5 +379,6 @@ mod tests {
         let result = ToolResult::error("fail".into());
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["isError"], true);
+        assert!(json.get("structuredContent").is_none());
     }
 }

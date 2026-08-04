@@ -6,7 +6,7 @@ use tracing::{debug, error};
 use icm_core::Embedder;
 use icm_store::Store;
 
-use crate::protocol::{JsonRpcMessage, JsonRpcResponse};
+use crate::protocol::{JsonRpcMessage, JsonRpcResponse, ToolResult};
 use crate::tools::{self, AutoConsolidate, ToolDefinitionOptions};
 
 const SERVER_NAME: &str = "icm";
@@ -49,6 +49,13 @@ enum ProtocolSelectionError {
         requested: String,
         supported: Vec<&'static str>,
     },
+}
+
+#[derive(Clone, Copy)]
+struct ToolCallOptions {
+    compact: bool,
+    auto_consolidate: AutoConsolidate,
+    include_structured_output: bool,
 }
 
 /// Number of non-store tool calls before we nudge the agent to store.
@@ -173,8 +180,11 @@ pub fn run_server(
                         &msg.params,
                         store,
                         embedder,
-                        compact,
-                        auto_consolidate,
+                        ToolCallOptions {
+                            compact,
+                            auto_consolidate,
+                            include_structured_output: true,
+                        },
                         &mut calls_since_store,
                     ),
                     other => JsonRpcResponse::method_not_found(id, other),
@@ -195,8 +205,12 @@ pub fn run_server(
                     &msg.params,
                     store,
                     embedder,
-                    compact,
-                    auto_consolidate,
+                    ToolCallOptions {
+                        compact,
+                        auto_consolidate,
+                        include_structured_output: tool_definition_options(protocol_version)
+                            .includes_output_schemas(),
+                    },
                     &mut calls_since_store,
                 ),
                 other => JsonRpcResponse::method_not_found(id, other),
@@ -453,8 +467,7 @@ fn handle_tools_call(
     params: &Option<Value>,
     store: &Store,
     embedder: Option<&dyn Embedder>,
-    compact: bool,
-    auto_consolidate: AutoConsolidate,
+    options: ToolCallOptions,
     calls_since_store: &mut u32,
 ) -> JsonRpcResponse {
     let params = match params {
@@ -480,8 +493,14 @@ fn handle_tools_call(
         *calls_since_store += 1;
     }
 
-    let mut result =
-        tools::call_tool_with_config(store, embedder, tool_name, &args, compact, auto_consolidate);
+    let mut result = tools::call_tool_with_config(
+        store,
+        embedder,
+        tool_name,
+        &args,
+        options.compact,
+        options.auto_consolidate,
+    );
 
     // Nudge: remind the agent to store on every THRESHOLD-th call without a
     // store (10, 20, 30, …) — previously the hint was appended to *every*
@@ -498,12 +517,59 @@ fn handle_tools_call(
         ));
     }
 
-    JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap_or(json!(null)))
+    JsonRpcResponse::ok(
+        id,
+        serialize_tool_result(result, options.include_structured_output),
+    )
+}
+
+fn serialize_tool_result(result: ToolResult, include_structured_output: bool) -> Value {
+    let mut result = result;
+    if include_structured_output && result.structured_content.is_some() {
+        if let Some(summary) = result.structured_summary.take() {
+            result.content = vec![crate::protocol::TextContent {
+                content_type: "text".into(),
+                text: *summary,
+            }];
+        }
+    }
+    let mut result = serde_json::to_value(result).unwrap_or(json!(null));
+    if !include_structured_output {
+        if let Some(object) = result.as_object_mut() {
+            object.remove("structuredContent");
+        }
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::TypedTool;
+    use schemars::JsonSchema;
+    use serde::Serialize;
+
+    #[derive(JsonSchema, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    #[schemars(deny_unknown_fields)]
+    struct TestStructuredOutput {
+        count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memories: Option<Vec<TestStructuredMemory>>,
+    }
+
+    #[derive(JsonSchema, Serialize)]
+    #[schemars(deny_unknown_fields)]
+    struct TestStructuredMemory {
+        summary: String,
+    }
+
+    struct TestStructuredTool;
+
+    impl TypedTool for TestStructuredTool {
+        const NAME: &'static str = "test_structured_tool";
+        type Output = TestStructuredOutput;
+    }
 
     fn initialize_params(protocol_version: Option<&str>) -> Option<Value> {
         protocol_version.map(|version| {
@@ -725,5 +791,70 @@ mod tests {
         assert_eq!(modern["resultType"], "complete");
         assert_eq!(modern["ttlMs"], DISCOVERY_TTL_MS);
         assert_eq!(modern["cacheScope"], "private");
+    }
+
+    #[test]
+    fn structured_content_is_limited_to_typed_modern_results() {
+        let result = TestStructuredTool::result(
+            "full legacy result".into(),
+            TestStructuredOutput {
+                count: 1,
+                memories: None,
+            },
+            "one structured result".into(),
+        );
+        let legacy = serialize_tool_result(result, false);
+        assert!(legacy.get("structuredContent").is_none());
+        assert_eq!(legacy["content"][0]["text"], "full legacy result");
+
+        let result = TestStructuredTool::result(
+            "full legacy result".into(),
+            TestStructuredOutput {
+                count: 1,
+                memories: None,
+            },
+            "one structured result".into(),
+        );
+        let modern = serialize_tool_result(result, true);
+        assert_eq!(modern["structuredContent"]["count"], 1);
+        assert_eq!(modern["content"][0]["text"], "one structured result");
+
+        let plain = serialize_tool_result(ToolResult::text("ok".into()), true);
+        assert!(plain.get("structuredContent").is_none());
+    }
+
+    #[test]
+    fn modern_structured_summary_does_not_duplicate_legacy_payload() {
+        let legacy_text = "detailed memory result ".repeat(100);
+        let duplicated = serialize_tool_result(
+            TestStructuredTool::result(
+                legacy_text.clone(),
+                TestStructuredOutput {
+                    count: 1,
+                    memories: Some(vec![TestStructuredMemory {
+                        summary: legacy_text.clone(),
+                    }]),
+                },
+                legacy_text.clone(),
+            ),
+            true,
+        );
+        let compact = serialize_tool_result(
+            TestStructuredTool::result(
+                legacy_text,
+                TestStructuredOutput {
+                    count: 1,
+                    memories: Some(vec![TestStructuredMemory {
+                        summary: "detailed memory result ".repeat(100),
+                    }]),
+                },
+                "1 memory returned in structuredContent.".into(),
+            ),
+            true,
+        );
+
+        let duplicated_bytes = serde_json::to_vec(&duplicated).unwrap().len();
+        let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
+        assert!(compact_bytes + 2_000 < duplicated_bytes);
     }
 }

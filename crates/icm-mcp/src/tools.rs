@@ -13,10 +13,12 @@ use icm_core::{
 use icm_store::Store;
 
 use crate::output::{
-    ListTopicsOutput, ListTopicsTool, RecallOutput, RecallTool, StatsOutput, StatsTool,
-    TranscriptRecordOutput, TranscriptRecordTool, TranscriptSearchOutput, TranscriptSearchTool,
-    TranscriptShowOutput, TranscriptShowTool, TranscriptStartSessionOutput,
-    TranscriptStartSessionTool, TranscriptStatsOutput, TranscriptStatsTool, TypedTool,
+    FeedbackRecordOutput, FeedbackRecordTool, FeedbackSearchOutput, FeedbackSearchTool,
+    FeedbackStatsOutput, FeedbackStatsTool, ListTopicsOutput, ListTopicsTool, RecallOutput,
+    RecallTool, StatsOutput, StatsTool, TranscriptRecordOutput, TranscriptRecordTool,
+    TranscriptSearchOutput, TranscriptSearchTool, TranscriptShowOutput, TranscriptShowTool,
+    TranscriptStartSessionOutput, TranscriptStartSessionTool, TranscriptStatsOutput,
+    TranscriptStatsTool, TypedTool,
 };
 use crate::protocol::ToolResult;
 
@@ -827,7 +829,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
             }
         }),
         // --- Feedback tools ---
-        tool_spec!("icm_feedback_record", ToolBehavior::additive(), handler = |context| {
+        tool_spec!(typed FeedbackRecordTool, ToolBehavior::additive(), handler = |context| {
             tool_feedback_record(
                 context.store,
                 context.embedder,
@@ -867,7 +869,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
                 "required": ["topic", "context", "predicted", "corrected"]
             }
         }),
-        tool_spec!("icm_feedback_search", ToolBehavior::read_only(), handler = |context| {
+        tool_spec!(typed FeedbackSearchTool, ToolBehavior::read_only(), handler = |context| {
             tool_feedback_search(context.store, context.embedder, context.args)
         }, {
             "description": "Search past feedback/corrections to inform current predictions. Use before making predictions to learn from past mistakes.",
@@ -893,7 +895,7 @@ fn tool_catalog() -> &'static [ToolSpec] {
                 "required": ["query"]
             }
         }),
-        tool_spec!("icm_feedback_stats", ToolBehavior::read_only(), handler = |context| {
+        tool_spec!(typed FeedbackStatsTool, ToolBehavior::read_only(), handler = |context| {
             tool_feedback_stats(context.store)
         }, {
             "description": "Get feedback statistics: total count, breakdown by topic, most applied corrections.",
@@ -2809,11 +2811,16 @@ fn tool_feedback_record(
     let id = feedback.id.clone();
     match store.store_feedback(feedback) {
         Ok(_) => {
-            if compact {
-                ToolResult::text(format!("ok {id}"))
+            let text = if compact {
+                format!("ok {id}")
             } else {
-                ToolResult::text(format!("Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"))
-            }
+                format!("Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}")
+            };
+            FeedbackRecordTool::result(
+                text,
+                FeedbackRecordOutput::new(id, topic.to_owned()),
+                "Feedback recorded; feedbackId is in structuredContent.".into(),
+            )
         }
         Err(e) => ToolResult::error(format!("failed to store feedback: {e}")),
     }
@@ -2835,7 +2842,11 @@ fn tool_feedback_search(
     match store.search_feedback(query, query_embedding.as_deref(), topic, limit) {
         Ok(results) => {
             if results.is_empty() {
-                return ToolResult::text("No feedback found.".into());
+                return FeedbackSearchTool::result(
+                    "No feedback found.".into(),
+                    FeedbackSearchOutput::from_feedback(&results),
+                    "No feedback found.".into(),
+                );
             }
             // context/predicted/corrected/reason/source can originate from
             // untrusted content (a feedback entry recorded from tool output
@@ -2864,7 +2875,16 @@ fn tool_feedback_search(
                     output.push_str(&format!("  applied: {} times\n", fb.applied_count));
                 }
             }
-            ToolResult::text(output)
+            let summary = format!(
+                "{} feedback result{} returned in structuredContent.",
+                results.len(),
+                if results.len() == 1 { "" } else { "s" }
+            );
+            FeedbackSearchTool::result(
+                output,
+                FeedbackSearchOutput::from_feedback(&results),
+                summary,
+            )
         }
         Err(e) => ToolResult::error(format!("failed to search feedback: {e}")),
     }
@@ -2886,7 +2906,11 @@ fn tool_feedback_stats(store: &Store) -> ToolResult {
                     output.push_str(&format!("  {id}: {count} times\n"));
                 }
             }
-            ToolResult::text(output)
+            FeedbackStatsTool::result(
+                output,
+                FeedbackStatsOutput::from(&stats),
+                "Feedback statistics returned in structuredContent.".into(),
+            )
         }
         Err(e) => ToolResult::error(format!("failed to get feedback stats: {e}")),
     }
@@ -3288,6 +3312,97 @@ mod tests {
         assert_eq!(
             stats["properties"]["topSessions"]["items"]["required"],
             json!(["sessionId", "count"])
+        );
+    }
+
+    #[test]
+    fn feedback_tools_return_typed_receipts_results_and_stats() {
+        let store = test_store();
+        let recorded = call_tool(
+            &store,
+            None,
+            "icm_feedback_record",
+            &json!({
+                "topic": "review",
+                "context": "structured feedback needle",
+                "predicted": "old",
+                "corrected": "new",
+                "reason": "test",
+                "source": "mcp"
+            }),
+            false,
+        );
+        assert_structured_result_matches::<FeedbackRecordTool>(&recorded);
+        let receipt = recorded.structured_content.as_ref().unwrap();
+        let feedback_id = receipt["feedbackId"].as_str().unwrap();
+        assert_eq!(receipt["topic"], "review");
+        assert_eq!(
+            recorded.content[0].text,
+            format!(
+                "Feedback recorded: {feedback_id}\n  topic: review\n  predicted: old\n  corrected: new"
+            )
+        );
+
+        let search = call_tool(
+            &store,
+            None,
+            "icm_feedback_search",
+            &json!({"query": "structured feedback needle"}),
+            false,
+        );
+        assert_structured_result_matches::<FeedbackSearchTool>(&search);
+        let search_data = search.structured_content.as_ref().unwrap();
+        assert_eq!(search_data["count"], 1);
+        assert_eq!(search_data["feedback"][0]["id"], feedback_id);
+        assert_eq!(search_data["feedback"][0]["topic"], "review");
+        assert_eq!(search_data["feedback"][0]["corrected"], "new");
+        assert_eq!(search_data["feedback"][0]["reason"], "test");
+        assert!(search_data["feedback"][0]["createdAt"]
+            .as_str()
+            .is_some_and(|created_at| created_at.ends_with("+00:00")));
+        assert!(search_data["feedback"][0].get("embedding").is_none());
+
+        let empty = call_tool(
+            &store,
+            None,
+            "icm_feedback_search",
+            &json!({"query": "unfindableterm"}),
+            false,
+        );
+        assert_structured_result_matches::<FeedbackSearchTool>(&empty);
+        assert_eq!(empty.structured_content.as_ref().unwrap()["count"], 0);
+        assert_eq!(empty.content[0].text, "No feedback found.");
+
+        let stats = call_tool(&store, None, "icm_feedback_stats", &json!({}), false);
+        assert_structured_result_matches::<FeedbackStatsTool>(&stats);
+        let stats_data = stats.structured_content.as_ref().unwrap();
+        assert_eq!(stats_data["total"], 1);
+        assert_eq!(stats_data["byTopic"][0]["topic"], "review");
+        assert_eq!(stats_data["byTopic"][0]["count"], 1);
+        assert!(stats_data["mostApplied"].is_array());
+    }
+
+    #[test]
+    fn feedback_output_schemas_are_specific_and_closed() {
+        let definitions = tool_definitions(true);
+        let search = &tool_named(&definitions, "icm_feedback_search")["outputSchema"];
+        assert_eq!(search["required"], json!(["count", "feedback"]));
+        assert_eq!(
+            search["properties"]["feedback"]["items"]["additionalProperties"],
+            false
+        );
+        assert!(search["properties"]["feedback"]["items"]["properties"]
+            .get("embedding")
+            .is_none());
+
+        let stats = &tool_named(&definitions, "icm_feedback_stats")["outputSchema"];
+        assert_eq!(
+            stats["properties"]["byTopic"]["items"]["required"],
+            json!(["topic", "count"])
+        );
+        assert_eq!(
+            stats["properties"]["mostApplied"]["items"]["required"],
+            json!(["feedbackId", "count"])
         );
     }
 

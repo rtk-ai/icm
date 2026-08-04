@@ -1,3 +1,4 @@
+mod feedback;
 mod memory;
 mod transcript;
 
@@ -7,6 +8,10 @@ use serde_json::Value;
 
 use crate::protocol::ToolResult;
 
+pub(crate) use feedback::{
+    FeedbackRecordOutput, FeedbackRecordTool, FeedbackSearchOutput, FeedbackSearchTool,
+    FeedbackStatsOutput, FeedbackStatsTool,
+};
 pub(crate) use memory::{
     ListTopicsOutput, ListTopicsTool, RecallOutput, RecallTool, StatsOutput, StatsTool,
 };

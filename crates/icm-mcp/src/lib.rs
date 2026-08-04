@@ -1,5 +1,6 @@
 mod output;
 pub mod protocol;
+mod resources;
 pub mod server;
 pub mod tools;
 

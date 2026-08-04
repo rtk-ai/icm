@@ -7,6 +7,7 @@ use icm_core::Embedder;
 use icm_store::Store;
 
 use crate::protocol::{JsonRpcMessage, JsonRpcResponse, ToolResult};
+use crate::resources::{self, ResourceError};
 use crate::tools::{self, AutoConsolidate, ToolDefinitionOptions};
 
 const SERVER_NAME: &str = "icm";
@@ -187,6 +188,9 @@ pub fn run_server(
                         },
                         &mut calls_since_store,
                     ),
+                    "resources/list" => JsonRpcResponse::ok(id, resources::list()),
+                    "resources/templates/list" => JsonRpcResponse::ok(id, resources::templates()),
+                    "resources/read" => handle_resources_read(id, &msg.params, store, true),
                     other => JsonRpcResponse::method_not_found(id, other),
                 };
                 add_modern_result_metadata(&mut response, method);
@@ -213,6 +217,9 @@ pub fn run_server(
                     },
                     &mut calls_since_store,
                 ),
+                "resources/list" => JsonRpcResponse::ok(id, resources::list()),
+                "resources/templates/list" => JsonRpcResponse::ok(id, resources::templates()),
+                "resources/read" => handle_resources_read(id, &msg.params, store, false),
                 other => JsonRpcResponse::method_not_found(id, other),
             },
         };
@@ -359,7 +366,8 @@ fn server_info() -> Value {
 
 fn server_capabilities() -> Value {
     json!({
-        "tools": {}
+        "tools": {},
+        "resources": {}
     })
 }
 
@@ -426,8 +434,14 @@ fn add_modern_result_metadata(response: &mut JsonRpcResponse, method: &str) {
         meta.insert("io.modelcontextprotocol/serverInfo".into(), server_info());
     }
 
-    if method == "tools/list" {
+    if matches!(
+        method,
+        "tools/list" | "resources/list" | "resources/templates/list"
+    ) {
         result.insert("ttlMs".into(), json!(DISCOVERY_TTL_MS));
+        result.insert("cacheScope".into(), json!("private"));
+    } else if method == "resources/read" {
+        result.insert("ttlMs".into(), json!(0));
         result.insert("cacheScope".into(), json!("private"));
     }
 }
@@ -460,6 +474,40 @@ fn handle_tools_list(
         id,
         tools::tool_definitions_with_options(has_embedder, options),
     )
+}
+
+fn handle_resources_read(
+    id: Value,
+    params: &Option<Value>,
+    store: &Store,
+    modern: bool,
+) -> JsonRpcResponse {
+    let Some(uri) = params
+        .as_ref()
+        .and_then(|params| params.get("uri"))
+        .and_then(Value::as_str)
+    else {
+        return JsonRpcResponse::err(id, -32602, "missing resource URI".into());
+    };
+    handle_resource_result(id, resources::read(store, uri), modern)
+}
+
+fn handle_resource_result(
+    id: Value,
+    result: Result<Value, ResourceError>,
+    modern: bool,
+) -> JsonRpcResponse {
+    match result {
+        Ok(result) => JsonRpcResponse::ok(id, result),
+        Err(error) => {
+            let code = match error {
+                ResourceError::NotFound(_) if modern => -32602,
+                ResourceError::NotFound(_) => -32002,
+                ResourceError::Internal(_) => -32603,
+            };
+            JsonRpcResponse::err(id, code, error.message().into())
+        }
+    }
 }
 
 fn handle_tools_call(
@@ -741,6 +789,7 @@ mod tests {
             json!(SUPPORTED_PROTOCOL_VERSIONS)
         );
         assert_eq!(result["capabilities"]["tools"], json!({}));
+        assert_eq!(result["capabilities"]["resources"], json!({}));
         assert_eq!(
             result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
             SERVER_NAME
@@ -856,5 +905,53 @@ mod tests {
         let duplicated_bytes = serde_json::to_vec(&duplicated).unwrap().len();
         let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
         assert!(compact_bytes + 2_000 < duplicated_bytes);
+    }
+
+    #[test]
+    fn resource_results_follow_modern_cache_and_error_rules() {
+        let mut response = JsonRpcResponse::ok(json!(1), resources::list());
+        add_modern_result_metadata(&mut response, "resources/list");
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["ttlMs"], DISCOVERY_TTL_MS);
+        assert_eq!(result["cacheScope"], "private");
+
+        let store = Store::in_memory().unwrap();
+        let mut response = handle_resources_read(
+            json!(2),
+            &Some(json!({"uri": "icm://context/current"})),
+            &store,
+            true,
+        );
+        add_modern_result_metadata(&mut response, "resources/read");
+        let result = response.result.unwrap();
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "private");
+
+        for params in [None, Some(json!({})), Some(json!({"uri": 7}))] {
+            let response = handle_resources_read(json!(3), &params, &store, true);
+            assert_eq!(response.error.unwrap().code, -32602);
+        }
+
+        let legacy = handle_resource_result(
+            json!(4),
+            Err(ResourceError::NotFound("missing".into())),
+            false,
+        );
+        assert_eq!(legacy.error.unwrap().code, -32002);
+
+        let modern = handle_resource_result(
+            json!(5),
+            Err(ResourceError::NotFound("missing".into())),
+            true,
+        );
+        assert_eq!(modern.error.unwrap().code, -32602);
+
+        let internal = handle_resource_result(
+            json!(6),
+            Err(ResourceError::Internal("database unavailable".into())),
+            true,
+        );
+        assert_eq!(internal.error.unwrap().code, -32603);
     }
 }

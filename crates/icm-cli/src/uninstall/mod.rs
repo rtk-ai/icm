@@ -100,7 +100,11 @@ pub mod exit_codes {
 /// for invoking `std::process::exit`.
 pub fn run(opts: UninstallOpts) -> Result<i32> {
     let dirs = locations::DirContext::from_env()?;
-    let specs = locations::build_locations(&dirs);
+    let mut specs = locations::build_locations(&dirs);
+    let install_manifest_path = crate::install_manifest::default_manifest_path();
+    let mut install_manifest =
+        crate::install_manifest::InstallManifest::load(&install_manifest_path)?;
+    locations::apply_manifest_ownership(&mut specs, &install_manifest);
     let mut plan = discover::scan(&specs, opts.purge_data)?;
     if let Some(dir) = opts.scan_dir.as_deref() {
         plan.scan_dir_hits = scan_dir::scan_dir(dir)?;
@@ -130,6 +134,9 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
 
     // --- Mutating run ---
     if plan.is_empty() {
+        if discover::reconcile_trust_ownership(&specs, &mut install_manifest) {
+            install_manifest.save(&install_manifest_path)?;
+        }
         println!("Nothing to uninstall — already clean.");
         return Ok(exit_codes::CLEAN);
     }
@@ -138,6 +145,10 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
     if !opts.yes && !mutate::confirm("Proceed with removal?") {
         println!("Aborted (no changes made).");
         return Ok(exit_codes::USER_DECLINED);
+    }
+
+    if discover::reconcile_trust_ownership(&specs, &mut install_manifest) {
+        install_manifest.save(&install_manifest_path)?;
     }
 
     // Resolve the default backup root via ProjectDirs so the layout
@@ -162,6 +173,19 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
     let outcomes = mutate::apply(&plan, &specs, &mut backup_session);
     for o in &outcomes {
         summary.record(o);
+    }
+
+    let mut ownership_consumed = false;
+    for outcome in &outcomes {
+        if matches!(
+            &outcome.result,
+            Ok(formats::StripResult::Removed { .. } | formats::StripResult::DeleteFile)
+        ) {
+            ownership_consumed |= install_manifest.clear_trust_changes(&outcome.path);
+        }
+    }
+    if ownership_consumed {
+        install_manifest.save(&install_manifest_path)?;
     }
 
     // Persist the manifest **before** any --purge-data step: when the

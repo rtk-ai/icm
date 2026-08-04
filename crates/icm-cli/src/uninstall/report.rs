@@ -64,6 +64,9 @@ fn print_section(title: &str, hits: &[super::discover::LocationHit], purge_data:
             HitDetail::JsonHook { event, command } => {
                 println!("  hook {event}: {command}");
             }
+            HitDetail::TrustPermission { client, rule } => {
+                println!("  {client} permission allow: {rule}");
+            }
             HitDetail::TomlTable { table } => {
                 println!("  TOML table {table}");
             }

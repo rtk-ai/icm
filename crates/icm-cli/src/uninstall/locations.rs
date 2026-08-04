@@ -13,12 +13,32 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::install_manifest::InstallManifest;
+use crate::trusted_mcp::{
+    JsonTrustSpec, ProviderConfig, ProviderPathContext, TomlTrustSpec, TrustChange,
+    TRUSTED_PROVIDERS,
+};
+
 /// Shape of the command field inside a hook entry. Copilot uses a
 /// top-level `bash` field; every other CLI uses `hooks[].command`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HookCommandField {
     Command,
     BashTopLevel,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct JsonTrustLocation {
+    pub spec: JsonTrustSpec,
+    /// `None` keeps legacy exact-match cleanup; `Some` is authoritative,
+    /// including an empty list that owns nothing.
+    pub owned_changes: Option<Vec<TrustChange>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TomlTrustLocation {
+    pub spec: TomlTrustSpec,
+    pub owned_changes: Option<Vec<TrustChange>>,
 }
 
 /// One *category* of artifact init produces. Drives the matching strategy
@@ -34,11 +54,22 @@ pub(crate) enum LocationKind {
         has_hooks: bool,
         hooks_field: HookCommandField,
     },
+    /// A JSON hook file that also carries provider-described trust values.
+    JsonHooksWithTrust { trust: JsonTrustLocation },
+    /// A JSON file containing only provider-described trust values.
+    JsonTrust { trust: JsonTrustLocation },
+    /// A JSON settings file containing both an ICM MCP server and
+    /// client-specific ICM permission rules.
+    JsonMcpWithTrust {
+        servers_key: &'static str,
+        trust: JsonTrustLocation,
+    },
     /// TOML file with `[<table>.<entry>]` to remove, plus dotted child
     /// keys like `<table>.<entry>.env`.
     TomlMcp {
         table: &'static str,
         entry: &'static str,
+        trust: Option<TomlTrustLocation>,
     },
     /// Continue.dev YAML — regex-stripped block under `mcpServers:`.
     YamlContinue,
@@ -153,6 +184,56 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
 
     let mut specs = Vec::with_capacity(40);
 
+    let provider_paths = ProviderPathContext {
+        home: &d.home,
+        claude_dir: &d.claude_dir,
+        codex_dir: &d.codex_dir,
+        zed_settings: &d.zed_settings,
+    };
+    for provider in TRUSTED_PROVIDERS {
+        let kind = match provider.config {
+            ProviderConfig::JsonTrust {
+                spec,
+                has_hooks: true,
+            } => K::JsonHooksWithTrust {
+                trust: JsonTrustLocation {
+                    spec,
+                    owned_changes: None,
+                },
+            },
+            ProviderConfig::JsonTrust {
+                spec,
+                has_hooks: false,
+            } => K::JsonTrust {
+                trust: JsonTrustLocation {
+                    spec,
+                    owned_changes: None,
+                },
+            },
+            ProviderConfig::JsonMcp { spec, servers_key } => K::JsonMcpWithTrust {
+                servers_key,
+                trust: JsonTrustLocation {
+                    spec,
+                    owned_changes: None,
+                },
+            },
+            ProviderConfig::TomlMcp { spec, table, entry } => K::TomlMcp {
+                table,
+                entry,
+                trust: Some(TomlTrustLocation {
+                    spec,
+                    owned_changes: None,
+                }),
+            },
+        };
+        specs.push(LocationSpec {
+            label: provider.uninstall_label,
+            path: provider.config_path(&provider_paths),
+            kind,
+            purge_data_only: false,
+        });
+    }
+
     // --- Claude Code (mcpServers + hooks + skills + cwd CLAUDE.md) ---
     specs.push(LocationSpec {
         label: "Claude Code MCP",
@@ -160,16 +241,6 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
         kind: K::JsonConfig {
             servers_key: Some("mcpServers"),
             has_hooks: false,
-            hooks_field: F::Command,
-        },
-        purge_data_only: false,
-    });
-    specs.push(LocationSpec {
-        label: "Claude Code hooks",
-        path: d.claude_dir.join("settings.json"),
-        kind: K::JsonConfig {
-            servers_key: None,
-            has_hooks: true,
             hooks_field: F::Command,
         },
         purge_data_only: false,
@@ -200,15 +271,6 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
     });
 
     // --- Codex CLI (TOML MCP + JSON hooks) ---
-    specs.push(LocationSpec {
-        label: "Codex CLI MCP",
-        path: d.codex_dir.join("config.toml"),
-        kind: K::TomlMcp {
-            table: "mcp_servers",
-            entry: "icm",
-        },
-        purge_data_only: false,
-    });
     specs.push(LocationSpec {
         label: "Codex CLI hooks",
         path: d.codex_dir.join("hooks.json"),
@@ -346,29 +408,7 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
         purge_data_only: false,
     });
 
-    // --- Zed ---
-    specs.push(LocationSpec {
-        label: "Zed MCP",
-        path: d.zed_settings.clone(),
-        kind: K::JsonConfig {
-            servers_key: Some("context_servers"),
-            has_hooks: false,
-            hooks_field: F::Command,
-        },
-        purge_data_only: false,
-    });
-
     // --- OpenCode (different JSON shape under "mcp" + TS plugin) ---
-    specs.push(LocationSpec {
-        label: "OpenCode MCP",
-        path: d.home.join(".config/opencode/opencode.json"),
-        kind: K::JsonConfig {
-            servers_key: Some("mcp"),
-            has_hooks: false,
-            hooks_field: F::Command,
-        },
-        purge_data_only: false,
-    });
     specs.push(LocationSpec {
         label: "OpenCode plugin",
         path: d.home.join(".config/opencode/plugins/icm.ts"),
@@ -487,6 +527,29 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
     specs
 }
 
+/// Attach the ownership snapshot before discovery so the read-only plan and
+/// the later mutation use the same provenance boundary.
+pub(crate) fn apply_manifest_ownership(specs: &mut [LocationSpec], manifest: &InstallManifest) {
+    for location in specs {
+        let owned = manifest
+            .trust_changes_for(&location.path)
+            .map(<[TrustChange]>::to_vec);
+        match &mut location.kind {
+            LocationKind::JsonHooksWithTrust { trust }
+            | LocationKind::JsonTrust { trust }
+            | LocationKind::JsonMcpWithTrust { trust, .. } => {
+                trust.owned_changes = owned;
+            }
+            LocationKind::TomlMcp {
+                trust: Some(trust), ..
+            } => {
+                trust.owned_changes = owned;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Convenience for tests: build a `DirContext` rooted at `root`, so the
 /// real `$HOME` is not touched.
 #[cfg(test)]
@@ -519,6 +582,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trusted_provider_registry_drives_every_uninstall_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dir_context_under(tmp.path());
+        let paths = ProviderPathContext {
+            home: &dirs.home,
+            claude_dir: &dirs.claude_dir,
+            codex_dir: &dirs.codex_dir,
+            zed_settings: &dirs.zed_settings,
+        };
+        let locations = build_locations(&dirs);
+
+        for provider in TRUSTED_PROVIDERS {
+            let expected_path = provider.config_path(&paths);
+            let matches = locations
+                .iter()
+                .filter(|location| {
+                    location.label == provider.uninstall_label && location.path == expected_path
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{} uninstall location", provider.client);
+
+            let wired = match (provider.config, &matches[0].kind) {
+                (
+                    ProviderConfig::JsonTrust {
+                        spec: expected,
+                        has_hooks: true,
+                    },
+                    LocationKind::JsonHooksWithTrust { trust },
+                )
+                | (
+                    ProviderConfig::JsonTrust {
+                        spec: expected,
+                        has_hooks: false,
+                    },
+                    LocationKind::JsonTrust { trust },
+                )
+                | (
+                    ProviderConfig::JsonMcp { spec: expected, .. },
+                    LocationKind::JsonMcpWithTrust { trust, .. },
+                ) => trust.spec == expected,
+                (
+                    ProviderConfig::TomlMcp { spec: expected, .. },
+                    LocationKind::TomlMcp {
+                        trust: Some(trust), ..
+                    },
+                ) => trust.spec == expected,
+                _ => false,
+            };
+            assert!(wired, "{} registry config was not wired", provider.client);
+        }
+    }
+
+    #[test]
     fn build_locations_covers_every_tool_family_under_fake_home() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let d = dir_context_under(tmp.path());
@@ -529,7 +645,7 @@ mod tests {
         let labels: Vec<&str> = specs.iter().map(|s| s.label).collect();
         for expected in [
             "Claude Code MCP",
-            "Claude Code hooks",
+            "Claude Code settings",
             "Claude Code /recall",
             "Claude Code /remember",
             "Claude Desktop MCP",

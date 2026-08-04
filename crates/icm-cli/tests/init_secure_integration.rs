@@ -247,6 +247,81 @@ fn hook_only_mode_no_longer_crashes_on_fresh_home() {
     );
 }
 
+#[test]
+fn local_mcp_trust_configures_only_core_tools() {
+    let (tmp, cwd) = make_home();
+    let out = icm_in(
+        tmp.path(),
+        &cwd,
+        "/dev/null",
+        &["init", "--mode", "mcp", "--force", "--trust-local-mcp"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let claude: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        claude["permissions"]["allow"],
+        serde_json::json!(["mcp__icm__icm_memory_recall", "mcp__icm__icm_memory_store"])
+    );
+
+    let codex: toml::Value = std::fs::read_to_string(tmp.path().join(".codex/config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tools = &codex["mcp_servers"]["icm"]["tools"];
+    assert_eq!(
+        tools["icm_memory_recall"]["approval_mode"].as_str(),
+        Some("approve")
+    );
+    assert_eq!(
+        tools["icm_memory_store"]["approval_mode"].as_str(),
+        Some("approve")
+    );
+    assert!(tools.get("icm_memory_forget").is_none());
+
+    let cursor: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".cursor/permissions.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cursor["mcpAllowlist"],
+        serde_json::json!(["icm:icm_memory_recall", "icm:icm_memory_store"])
+    );
+
+    let opencode: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".config/opencode/opencode.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        opencode["permission"],
+        serde_json::json!({
+            "icm_icm_memory_recall": "allow",
+            "icm_icm_memory_store": "allow"
+        })
+    );
+
+    let zed_path = if cfg!(target_os = "macos") {
+        tmp.path().join(".zed/settings.json")
+    } else {
+        tmp.path().join(".config/zed/settings.json")
+    };
+    let zed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(zed_path).unwrap()).unwrap();
+    let zed_tools = &zed["agent"]["tool_permissions"]["tools"];
+    assert_eq!(zed_tools["mcp:icm:icm_memory_recall"]["default"], "allow");
+    assert_eq!(zed_tools["mcp:icm:icm_memory_store"]["default"], "allow");
+    assert!(zed_tools.get("mcp:icm:icm_memory_forget").is_none());
+}
+
 /// Walk `home` and return every regular file path EXCLUDING data dirs
 /// `.local/share/icm/` and `.cache/icm/` (those exist by side effect of
 /// the SQLite store being opened at startup).

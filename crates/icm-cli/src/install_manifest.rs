@@ -2,9 +2,8 @@
 //!
 //! Every time `icm init` configures an AI tool, it records the touched
 //! path here. The manifest persists across invocations: subsequent
-//! `icm init` runs update entries in place, and `icm uninstall` (a
-//! future PR) consumes it to know exactly what to clean up — without
-//! having to derive the surface from a hard-coded list.
+//! `icm init` runs update entries in place, and `icm uninstall` consumes
+//! its ownership metadata to avoid removing matching user configuration.
 //!
 //! Path: `<icm-data-dir>/install-manifest.json`
 //! - Linux/WSL: `~/.local/share/icm/install-manifest.json`
@@ -14,14 +13,14 @@
 //! Schema is versioned (`schema_version` field) so future migrations
 //! stay backwards-compatible.
 
-#![allow(dead_code)] // consumed by cmd_init in the next commit
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const CURRENT_SCHEMA: u32 = 1;
+use crate::trusted_mcp::TrustChange;
+
+const CURRENT_SCHEMA: u32 = 2;
 
 /// Top-level install manifest persisted at `<data_dir>/install-manifest.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,6 +52,11 @@ pub(crate) struct ManifestEntry {
     pub sha256_before: Option<String>,
     /// File size in bytes before init touched it. 0 for pure creates.
     pub bytes_before: u64,
+    /// Exact trust values inserted by ICM. Missing on legacy manifests,
+    /// where uninstall retains its historical exact-match fallback. An
+    /// explicit empty list means init saw matching user values and owns none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_changes: Option<Vec<TrustChange>>,
 }
 
 /// What `cmd_init` did at this path.
@@ -94,7 +98,7 @@ impl InstallManifest {
         }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read manifest at {}", path.display()))?;
-        let m: InstallManifest = serde_json::from_str(&raw)
+        let mut m: InstallManifest = serde_json::from_str(&raw)
             .with_context(|| format!("invalid JSON in manifest {}", path.display()))?;
         if m.schema_version > CURRENT_SCHEMA {
             anyhow::bail!(
@@ -106,12 +110,16 @@ impl InstallManifest {
                 CURRENT_SCHEMA,
             );
         }
+        if m.schema_version == 1 {
+            m.schema_version = CURRENT_SCHEMA;
+        }
         Ok(m)
     }
 
     /// Write the manifest, creating the parent directory if needed.
     /// Bumps `updated_at` and `icm_version` on every save.
     pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.schema_version = CURRENT_SCHEMA;
         self.updated_at = iso_timestamp();
         self.icm_version = env!("CARGO_PKG_VERSION").to_string();
         if let Some(parent) = path.parent() {
@@ -146,6 +154,7 @@ impl InstallManifest {
                 kind,
                 sha256_before: None,
                 bytes_before: 0,
+                trust_changes: Some(Vec::new()),
             });
         }
         let meta =
@@ -158,7 +167,90 @@ impl InstallManifest {
             kind,
             sha256_before,
             bytes_before,
+            trust_changes: Some(Vec::new()),
         })
+    }
+
+    /// Add newly inserted trust values without discarding ownership from a
+    /// previous idempotent init run. A legacy entry stays legacy when this
+    /// invocation added nothing, preserving its documented fallback.
+    pub fn record_trust_changes(&mut self, path: &Path, changes: Vec<TrustChange>) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) else {
+            return;
+        };
+        if changes.is_empty() {
+            return;
+        }
+        let owned = entry.trust_changes.get_or_insert_with(Vec::new);
+        for change in changes {
+            if !owned.contains(&change) {
+                owned.push(change);
+            }
+        }
+    }
+
+    /// Establish an authoritative ownership record before a trust config is
+    /// mutated. Persisting this empty marker first makes an interrupted init
+    /// conservative: uninstall preserves values whose ownership was never
+    /// durably recorded instead of applying the legacy exact-match fallback.
+    pub fn ensure_trust_tracking(&mut self, path: &Path) -> Result<()> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == path)
+            .with_context(|| format!("no install manifest entry for {}", path.display()))?;
+        entry.trust_changes.get_or_insert_with(Vec::new);
+        Ok(())
+    }
+
+    /// `None` distinguishes a manifest written before trust provenance was
+    /// available from an explicit record that owns zero values.
+    pub fn trust_changes_for(&self, path: &Path) -> Option<&[TrustChange]> {
+        self.entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .and_then(|entry| entry.trust_changes.as_deref())
+    }
+
+    /// Consume trust ownership after a successful uninstall mutation. Keeping
+    /// an explicit empty list prevents a later identical user value from being
+    /// mistaken for residue by a stale manifest entry.
+    pub fn clear_trust_changes(&mut self, path: &Path) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) else {
+            return false;
+        };
+        if entry
+            .trust_changes
+            .as_ref()
+            .is_some_and(|changes| changes.is_empty())
+        {
+            return false;
+        }
+        entry.trust_changes = Some(Vec::new());
+        true
+    }
+
+    /// Reconcile a provenance-aware entry with values still present on disk.
+    /// Legacy entries remain untouched because they intentionally use fallback
+    /// discovery rather than an authoritative ownership list.
+    pub fn replace_recorded_trust_changes(
+        &mut self,
+        path: &Path,
+        present: Vec<TrustChange>,
+    ) -> bool {
+        let Some(changes) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == path)
+            .and_then(|entry| entry.trust_changes.as_mut())
+        else {
+            return false;
+        };
+        if *changes == present {
+            return false;
+        }
+        *changes = present;
+        true
     }
 
     /// Number of recorded entries.
@@ -251,6 +343,7 @@ mod tests {
             kind: EntryKind::JsonMcpServer,
             sha256_before: Some("abc".into()),
             bytes_before: 42,
+            trust_changes: Some(Vec::new()),
         });
         m.save(&path).unwrap();
 
@@ -258,6 +351,103 @@ mod tests {
         assert_eq!(m2.entries.len(), 1);
         assert_eq!(m2.entries[0].tool, "Claude Code");
         assert_eq!(m2.entries[0].kind, EntryKind::JsonMcpServer);
+        assert_eq!(m2.entries[0].trust_changes, Some(Vec::new()));
+    }
+
+    #[test]
+    fn trust_provenance_uses_a_schema_old_writers_must_reject() {
+        assert_eq!(CURRENT_SCHEMA, 2);
+
+        let mut manifest = InstallManifest::empty();
+        manifest.record(ManifestEntry {
+            path: PathBuf::from("/x/settings.json"),
+            tool: "Claude Code".into(),
+            kind: EntryKind::JsonHooks,
+            sha256_before: None,
+            bytes_before: 0,
+            trust_changes: Some(vec![TrustChange::JsonArrayMember {
+                path: vec!["permissions".into(), "allow".into()],
+                value: "mcp__icm__icm_memory_recall".into(),
+            }]),
+        });
+
+        let serialized = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(serialized["schema_version"], 2);
+        assert!(serialized["entries"][0].get("trust_changes").is_some());
+        assert!(serialized["schema_version"].as_u64().unwrap() > 1);
+    }
+
+    #[test]
+    fn load_migrates_schema_one_and_save_forces_current_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("install-manifest.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "icm_version": "0.10.61",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "entries": []
+            }"#,
+        )
+        .unwrap();
+
+        let mut manifest = InstallManifest::load(&path).unwrap();
+        assert_eq!(manifest.schema_version, 2);
+
+        manifest.schema_version = 1;
+        manifest.save(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["schema_version"], 2);
+    }
+
+    #[test]
+    fn legacy_entry_without_trust_changes_keeps_fallback_marker() {
+        let raw = r#"{
+            "schema_version": 1,
+            "icm_version": "0.10.61",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "entries": [{
+                "path": "/x/settings.json",
+                "tool": "Claude Code",
+                "kind": "JsonHooks",
+                "sha256_before": null,
+                "bytes_before": 0
+            }]
+        }"#;
+        let mut manifest: InstallManifest = serde_json::from_str(raw).unwrap();
+        assert!(manifest.entries[0].trust_changes.is_none());
+        assert!(manifest.clear_trust_changes(Path::new("/x/settings.json")));
+        assert_eq!(manifest.entries[0].trust_changes, Some(Vec::new()));
+    }
+
+    #[test]
+    fn trust_ownership_accumulates_without_claiming_idempotent_values() {
+        let path = PathBuf::from("/x/settings.json");
+        let mut manifest = InstallManifest::empty();
+        manifest.record(ManifestEntry {
+            path: path.clone(),
+            tool: "Claude Code".into(),
+            kind: EntryKind::JsonHooks,
+            sha256_before: None,
+            bytes_before: 0,
+            trust_changes: Some(Vec::new()),
+        });
+        let change = TrustChange::JsonArrayMember {
+            path: vec!["permissions".into(), "allow".into()],
+            value: "mcp__icm__icm_memory_recall".into(),
+        };
+        manifest.record_trust_changes(&path, vec![change.clone(), change.clone()]);
+        manifest.record_trust_changes(&path, Vec::new());
+        assert_eq!(manifest.trust_changes_for(&path), Some([change].as_slice()));
+        assert!(manifest.clear_trust_changes(&path));
+        assert_eq!(
+            manifest.trust_changes_for(&path),
+            Some(&[] as &[TrustChange])
+        );
+        assert!(!manifest.clear_trust_changes(&path));
+        assert!(!manifest.replace_recorded_trust_changes(&path, Vec::new()));
     }
 
     #[test]
@@ -269,6 +459,7 @@ mod tests {
             kind: EntryKind::JsonMcpServer,
             sha256_before: Some("aa".into()),
             bytes_before: 1,
+            trust_changes: Some(Vec::new()),
         };
         let entry2 = ManifestEntry {
             path: PathBuf::from("/x"),
@@ -276,6 +467,7 @@ mod tests {
             kind: EntryKind::TomlMcpServer,
             sha256_before: Some("bb".into()),
             bytes_before: 2,
+            trust_changes: Some(Vec::new()),
         };
         m.record(entry1);
         m.record(entry2);

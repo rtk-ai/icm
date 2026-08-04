@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::locations::HookCommandField;
+use super::locations::{HookCommandField, JsonTrustLocation, TomlTrustLocation};
 
 /// Outcome of a stripper run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -441,21 +441,90 @@ pub(crate) fn rewrite_json_hooks(
     Ok(result)
 }
 
+pub(crate) fn rewrite_json_trust(
+    path: &std::path::Path,
+    trust: &JsonTrustLocation,
+) -> Result<StripResult> {
+    let mut value = crate::parse_json_config(path)?;
+    let removed = crate::trusted_mcp::strip_json_trust(
+        &mut value,
+        trust.spec,
+        trust.owned_changes.as_deref(),
+    );
+    if removed > 0 {
+        let out = serde_json::to_string_pretty(&value)?;
+        super::atomic_write(path, out.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    Ok(if removed == 0 {
+        StripResult::NoOp
+    } else {
+        StripResult::Removed { removed }
+    })
+}
+
+/// Rewrite a shared JSON settings file once even when it contains hooks or an
+/// MCP server alongside trust values.
+pub(crate) fn rewrite_json_with_trust(
+    path: &std::path::Path,
+    servers_key: Option<&str>,
+    hooks_field: Option<HookCommandField>,
+    trust: &JsonTrustLocation,
+) -> Result<StripResult> {
+    let mut value = crate::parse_json_config(path)?;
+    let mut removed = 0;
+    if let Some(key) = servers_key {
+        if let StripResult::Removed { removed: count } = strip_json_mcp_server(&mut value, key) {
+            removed += count;
+        }
+    }
+    if let Some(field) = hooks_field {
+        if let StripResult::Removed { removed: count } = strip_json_hooks(&mut value, field) {
+            removed += count;
+        }
+    }
+    removed += crate::trusted_mcp::strip_json_trust(
+        &mut value,
+        trust.spec,
+        trust.owned_changes.as_deref(),
+    );
+    if removed > 0 {
+        let out = serde_json::to_string_pretty(&value)?;
+        super::atomic_write(path, out.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    Ok(if removed == 0 {
+        StripResult::NoOp
+    } else {
+        StripResult::Removed { removed }
+    })
+}
+
 pub(crate) fn rewrite_toml(
     path: &std::path::Path,
     table: &str,
     entry: &str,
+    trust: Option<&TomlTrustLocation>,
 ) -> Result<StripResult> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let mut value: toml::Value = content.parse()?;
-    let result = strip_toml_table(&mut value, table, entry);
-    if matches!(result, StripResult::Removed { .. }) {
+    let mut removed = trust.map_or(0, |trust| {
+        crate::trusted_mcp::strip_toml_trust(&mut value, trust.spec, trust.owned_changes.as_deref())
+    });
+    if let StripResult::Removed { removed: count } = strip_toml_table(&mut value, table, entry) {
+        removed += count;
+    }
+    if removed > 0 {
         let out = toml::to_string(&value)?;
         super::atomic_write(path, out.as_bytes())
             .with_context(|| format!("cannot write {}", path.display()))?;
     }
-    Ok(result)
+    Ok(if removed == 0 {
+        StripResult::NoOp
+    } else {
+        StripResult::Removed { removed }
+    })
 }
 
 pub(crate) fn rewrite_yaml_continue(path: &std::path::Path) -> Result<StripResult> {

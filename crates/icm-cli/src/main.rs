@@ -26,6 +26,7 @@ mod learn_tests;
 mod ort_runtime;
 mod recall_format;
 mod summarizer;
+mod trusted_mcp;
 #[cfg(feature = "tui")]
 mod tui;
 mod uninstall;
@@ -428,6 +429,13 @@ enum Commands {
         /// (`extract_every`, `min_score`, `store_raw=false`).
         #[arg(long)]
         with_codex_post_hook: bool,
+
+        /// Explicitly allow the local ICM recall and store MCP tools in
+        /// Codex CLI and Claude Code without per-call approval prompts.
+        /// Other ICM tools remain subject to each client's normal policy.
+        /// Requires `--mode mcp` or `--mode all`.
+        #[arg(long)]
+        trust_local_mcp: bool,
     },
 
     /// Diagnose ICM integration: hook binary paths + SQLite database integrity
@@ -2034,7 +2042,14 @@ fn main() -> Result<()> {
             force,
             per_project,
             with_codex_post_hook,
-        } => cmd_init(mode, force, per_project, with_codex_post_hook),
+            trust_local_mcp,
+        } => cmd_init(
+            mode,
+            force,
+            per_project,
+            with_codex_post_hook,
+            trust_local_mcp,
+        ),
         // Doctor and Repair are dispatched before `open_store` above; these
         // arms exist only for match exhaustiveness and are unreachable.
         Commands::Doctor => cmd_doctor(&db_path),
@@ -4511,11 +4526,86 @@ pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     cmd.contains(&format!("{pattern}.exe"))
 }
 
+fn run_tracked_trust_write<F>(
+    manifest: &mut install_manifest::InstallManifest,
+    manifest_path: &Path,
+    config_path: &Path,
+    tool: &str,
+    kind: install_manifest::EntryKind,
+    write: F,
+) -> Result<String>
+where
+    F: FnOnce() -> Result<(String, Vec<trusted_mcp::TrustChange>)>,
+{
+    let entry = install_manifest::InstallManifest::entry_from_disk(config_path, tool, kind)?;
+    manifest.record(entry);
+    manifest.ensure_trust_tracking(config_path)?;
+    manifest.save(manifest_path)?;
+
+    let (status, trust_changes) = write()?;
+    manifest.record_trust_changes(config_path, trust_changes);
+    manifest.save(manifest_path)?;
+    Ok(status)
+}
+
+fn trusted_provider_manifest_kind(
+    config: trusted_mcp::ProviderConfig,
+) -> install_manifest::EntryKind {
+    match config {
+        trusted_mcp::ProviderConfig::JsonTrust { .. } => install_manifest::EntryKind::JsonHooks,
+        trusted_mcp::ProviderConfig::JsonMcp { .. } => install_manifest::EntryKind::JsonMcpServer,
+        trusted_mcp::ProviderConfig::TomlMcp { .. } => install_manifest::EntryKind::TomlMcpServer,
+    }
+}
+
+fn write_trusted_provider_config(
+    provider: trusted_mcp::TrustedProvider,
+    config_path: &Path,
+    icm_bin: &str,
+    trust_local_mcp: bool,
+) -> Result<(String, Vec<trusted_mcp::TrustChange>)> {
+    use trusted_mcp::{ProviderConfig, ProviderId};
+
+    match provider.id() {
+        ProviderId::Claude => {
+            let ProviderConfig::JsonTrust { spec, .. } = provider.config else {
+                anyhow::bail!("Claude trust provider must use a JSON trust config");
+            };
+            inject_claude_mcp_permissions(config_path, spec)
+        }
+        ProviderId::Cursor => {
+            let ProviderConfig::JsonTrust { spec, .. } = provider.config else {
+                anyhow::bail!("Cursor trust provider must use a JSON trust config");
+            };
+            inject_cursor_mcp_permissions(config_path, spec)
+        }
+        ProviderId::Zed => {
+            let ProviderConfig::JsonMcp { spec, .. } = provider.config else {
+                anyhow::bail!("Zed trust provider must use a JSON MCP config");
+            };
+            inject_zed_mcp_server(config_path, "icm", icm_bin, trust_local_mcp, spec)
+        }
+        ProviderId::Codex => {
+            let ProviderConfig::TomlMcp { spec, .. } = provider.config else {
+                anyhow::bail!("Codex trust provider must use a TOML MCP config");
+            };
+            inject_codex_mcp_server(config_path, "icm", icm_bin, trust_local_mcp, spec)
+        }
+        ProviderId::OpenCode => {
+            let ProviderConfig::JsonMcp { spec, .. } = provider.config else {
+                anyhow::bail!("OpenCode trust provider must use a JSON MCP config");
+            };
+            inject_opencode_mcp_server(config_path, "icm", icm_bin, trust_local_mcp, spec)
+        }
+    }
+}
+
 fn cmd_init(
     mode: InitMode,
     force: bool,
     per_project: bool,
     with_codex_post_hook: bool,
+    trust_local_mcp: bool,
 ) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
@@ -4534,6 +4624,9 @@ fn cmd_init(
     let do_cli = matches!(mode, InitMode::Cli | InitMode::All | InitMode::Standard);
     let do_skill = matches!(mode, InitMode::Skill | InitMode::All | InitMode::Standard);
     let do_hook = matches!(mode, InitMode::Hook | InitMode::All | InitMode::Standard);
+    if trust_local_mcp && !do_mcp {
+        anyhow::bail!("--trust-local-mcp requires --mode mcp or --mode all");
+    }
 
     // Shared across every mode for tool detection.
     let vscode_data = if cfg!(target_os = "macos") {
@@ -4642,56 +4735,58 @@ fn cmd_init(
             println!("[mcp] {name:<16} {status}");
         }
 
-        // Zed uses nested command.path format
-        let zed_path = if cfg!(target_os = "macos") {
+        let home_path = PathBuf::from(&home);
+        let zed_settings = if cfg!(target_os = "macos") {
             PathBuf::from(&home).join(".zed/settings.json")
         } else {
             PathBuf::from(&home).join(".config/zed/settings.json")
         };
-        if !force && !detect_tool("Zed", &home, &vscode_data) {
-            println!("[mcp] {:<16} skipped (not detected)", "Zed");
-        } else {
-            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
-                &zed_path,
-                "Zed",
-                install_manifest::EntryKind::JsonMcpServer,
-            ) {
-                manifest.record(e);
-            }
-            let zed_status = inject_zed_mcp_server(&zed_path, "icm", &icm_bin_str)?;
-            println!("[mcp] {:<16} {zed_status}", "Zed");
-        }
+        let provider_paths = trusted_mcp::ProviderPathContext {
+            home: &home_path,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+            zed_settings: &zed_settings,
+        };
 
-        // Codex CLI uses TOML format
-        let codex_path = codex_dir.join("config.toml");
-        if !force && !detect_tool("Codex CLI", &home, &vscode_data) {
-            println!("[mcp] {:<16} skipped (not detected)", "Codex CLI");
-        } else {
-            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
-                &codex_path,
-                "Codex CLI",
-                install_manifest::EntryKind::TomlMcpServer,
-            ) {
-                manifest.record(e);
+        for provider in trusted_mcp::TRUSTED_PROVIDERS {
+            let includes_mcp_server = provider.config.includes_mcp_server();
+            if !trust_local_mcp && !includes_mcp_server {
+                continue;
             }
-            let codex_status = inject_codex_mcp_server(&codex_path, "icm", &icm_bin_str)?;
-            println!("[mcp] {:<16} {codex_status}", "Codex CLI");
-        }
+            if !force && !detect_tool(provider.client, &home, &vscode_data) {
+                if includes_mcp_server {
+                    println!("[mcp] {:<16} skipped (not detected)", provider.client);
+                }
+                continue;
+            }
 
-        // OpenCode uses different JSON structure (command is array, key is "mcp")
-        let opencode_path = PathBuf::from(&home).join(".config/opencode/opencode.json");
-        if !force && !detect_tool("OpenCode", &home, &vscode_data) {
-            println!("[mcp] {:<16} skipped (not detected)", "OpenCode");
-        } else {
-            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
-                &opencode_path,
-                "OpenCode",
-                install_manifest::EntryKind::JsonMcpServer,
-            ) {
-                manifest.record(e);
+            let config_path = provider.config_path(&provider_paths);
+            let manifest_kind = trusted_provider_manifest_kind(provider.config);
+            let status = if trust_local_mcp {
+                run_tracked_trust_write(
+                    &mut manifest,
+                    &manifest_path,
+                    &config_path,
+                    provider.client,
+                    manifest_kind,
+                    || write_trusted_provider_config(provider, &config_path, &icm_bin_str, true),
+                )?
+            } else {
+                if let Ok(entry) = install_manifest::InstallManifest::entry_from_disk(
+                    &config_path,
+                    provider.client,
+                    manifest_kind,
+                ) {
+                    manifest.record(entry);
+                }
+                write_trusted_provider_config(provider, &config_path, &icm_bin_str, false)?.0
+            };
+
+            if includes_mcp_server {
+                println!("[mcp] {:<16} {status}", provider.client);
+            } else {
+                println!("[trust] {:<14} {status}", provider.client);
             }
-            let opencode_status = inject_opencode_mcp_server(&opencode_path, "icm", &icm_bin_str)?;
-            println!("[mcp] {:<16} {opencode_status}", "OpenCode");
         }
 
         // Copilot CLI uses mcpServers key with explicit "type": "local"
@@ -4724,6 +4819,11 @@ fn cmd_init(
             }
             let continue_status = inject_continue_mcp_server(&continue_path, "icm", &icm_bin_str)?;
             println!("[mcp] {:<16} {continue_status}", "Continue.dev");
+        }
+        if trust_local_mcp {
+            println!(
+                "[trust] Client safety checks and higher-priority deny rules can still reject calls."
+            );
         }
     }
 
@@ -6469,8 +6569,14 @@ fn inject_mcp_server(
     Ok("configured".into())
 }
 
-/// Inject ICM MCP server into Zed settings.json (uses `context_servers` with nested `command` object).
-fn inject_zed_mcp_server(config_path: &Path, name: &str, bin_path: &str) -> Result<String> {
+/// Inject ICM MCP server into Zed settings.json (uses `context_servers`).
+fn inject_zed_mcp_server(
+    config_path: &Path,
+    name: &str,
+    bin_path: &str,
+    trust_local_mcp: bool,
+    trust_spec: trusted_mcp::JsonTrustSpec,
+) -> Result<(String, Vec<trusted_mcp::TrustChange>)> {
     let mut config: Value = if config_path.exists() {
         parse_json_config(config_path)?
     } else {
@@ -6480,37 +6586,48 @@ fn inject_zed_mcp_server(config_path: &Path, name: &str, bin_path: &str) -> Resu
         serde_json::json!({})
     };
 
-    let servers = config
+    let root = config
         .as_object_mut()
-        .context("config is not a JSON object")?
+        .context("config is not a JSON object")?;
+    let servers = root
         .entry("context_servers")
-        .or_insert_with(|| serde_json::json!({}));
-
-    if servers.get(name).is_some() {
-        return Ok("already configured".into());
-    }
-
-    let zed_entry = serde_json::json!({
-        "command": bin_path,
-        "args": ["serve"],
-        "env": {},
-    });
-
-    servers
+        .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .with_context(|| {
             format!(
                 "`context_servers` in {} is not a JSON object",
                 config_path.display()
             )
-        })?
-        .insert(name.to_string(), zed_entry);
+        })?;
+    let already_configured = servers.get(name).is_some();
+    if !already_configured {
+        servers.insert(
+            name.to_string(),
+            serde_json::json!({
+                "command": bin_path,
+                "args": ["serve"],
+                "env": {},
+            }),
+        );
+    }
+
+    let trust_changes = if trust_local_mcp {
+        trusted_mcp::apply_json_trust(&mut config, trust_spec)?
+    } else {
+        Vec::new()
+    };
 
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
         .with_context(|| format!("cannot write {}", config_path.display()))?;
 
-    Ok("configured".into())
+    let status = match (already_configured, trust_local_mcp) {
+        (true, true) => "already configured; approved recall + store",
+        (false, true) => "configured; approved recall + store",
+        (true, false) => "already configured",
+        (false, false) => "configured",
+    };
+    Ok((status.into(), trust_changes))
 }
 
 /// Inject ICM MCP server into Copilot CLI config (~/.copilot/mcp-config.json).
@@ -6685,8 +6802,60 @@ fn inject_copilot_hooks(copilot_dir: &std::path::Path, icm_bin: &str) -> Result<
     Ok("configured".into())
 }
 
-/// Inject ICM MCP server into Codex CLI TOML config. Returns a status string.
-fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Result<String> {
+/// Add narrowly scoped Claude Code permission rules for ICM's two core tools.
+fn inject_claude_mcp_permissions(
+    settings_path: &Path,
+    trust_spec: trusted_mcp::JsonTrustSpec,
+) -> Result<(String, Vec<trusted_mcp::TrustChange>)> {
+    let mut config = if settings_path.exists() {
+        parse_json_config(settings_path)?
+    } else {
+        serde_json::json!({})
+    };
+    let trust_changes = trusted_mcp::apply_json_trust(&mut config, trust_spec)?;
+    if trust_changes.is_empty() {
+        return Ok(("already trusted".into(), trust_changes));
+    }
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(settings_path, output)
+        .with_context(|| format!("cannot write {}", settings_path.display()))?;
+    Ok(("allowed recall + store".into(), trust_changes))
+}
+
+/// Add Cursor IDE allowlist entries for ICM's two core tools.
+fn inject_cursor_mcp_permissions(
+    config_path: &Path,
+    trust_spec: trusted_mcp::JsonTrustSpec,
+) -> Result<(String, Vec<trusted_mcp::TrustChange>)> {
+    let mut config = if config_path.exists() {
+        parse_json_config(config_path)?
+    } else {
+        serde_json::json!({})
+    };
+    let trust_changes = trusted_mcp::apply_json_trust(&mut config, trust_spec)?;
+    if trust_changes.is_empty() {
+        return Ok(("already trusted".into(), trust_changes));
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_path, output)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+    Ok(("allowed recall + store".into(), trust_changes))
+}
+
+/// Inject ICM MCP server into Codex CLI TOML config.
+fn inject_codex_mcp_server(
+    config_path: &Path,
+    name: &str,
+    icm_bin: &str,
+    trust_local_mcp: bool,
+    trust_spec: trusted_mcp::TomlTrustSpec,
+) -> Result<(String, Vec<trusted_mcp::TrustChange>)> {
     let mut config: toml::Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("cannot read {}", config_path.display()))?;
@@ -6708,39 +6877,58 @@ fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Res
         .entry("mcp_servers")
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
 
-    // Check if already configured with same binary
-    if let Some(existing) = mcp_servers.get(name) {
-        if existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
-            return Ok("already configured".into());
-        }
+    let mcp_servers = mcp_servers.as_table_mut().with_context(|| {
+        format!(
+            "`mcp_servers` in {} is not a TOML table",
+            config_path.display()
+        )
+    })?;
+    let already_configured = mcp_servers
+        .get(name)
+        .and_then(toml::Value::as_table)
+        .and_then(|server| server.get("command"))
+        .and_then(toml::Value::as_str)
+        == Some(icm_bin);
+    if already_configured && !trust_local_mcp {
+        return Ok(("already configured".into(), Vec::new()));
     }
 
-    let mut server = toml::map::Map::new();
-    server.insert("command".into(), toml::Value::String(icm_bin.to_string()));
-    server.insert(
-        "args".into(),
-        toml::Value::Array(vec![toml::Value::String("serve".into())]),
-    );
+    if !already_configured {
+        let mut server = toml::map::Map::new();
+        server.insert("command".into(), toml::Value::String(icm_bin.to_string()));
+        server.insert(
+            "args".into(),
+            toml::Value::Array(vec![toml::Value::String("serve".into())]),
+        );
+        mcp_servers.insert(name.to_string(), toml::Value::Table(server));
+    }
 
-    mcp_servers
-        .as_table_mut()
-        .with_context(|| {
-            format!(
-                "`mcp_servers` in {} is not a TOML table",
-                config_path.display()
-            )
-        })?
-        .insert(name.to_string(), toml::Value::Table(server));
+    let trust_changes = if trust_local_mcp {
+        trusted_mcp::apply_toml_trust(&mut config, trust_spec)?
+    } else {
+        Vec::new()
+    };
 
     let output = toml::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
         .with_context(|| format!("cannot write {}", config_path.display()))?;
 
-    Ok("configured".into())
+    let status = if trust_local_mcp {
+        "configured; approved recall + store"
+    } else {
+        "configured"
+    };
+    Ok((status.into(), trust_changes))
 }
 
 /// Inject ICM MCP server into OpenCode config (uses "mcp" key, command is array).
-fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Result<String> {
+fn inject_opencode_mcp_server(
+    config_path: &Path,
+    name: &str,
+    icm_bin: &str,
+    trust_local_mcp: bool,
+    trust_spec: trusted_mcp::JsonTrustSpec,
+) -> Result<(String, Vec<trusted_mcp::TrustChange>)> {
     let mut config: Value = if config_path.exists() {
         parse_json_config(config_path)?
     } else {
@@ -6750,23 +6938,23 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
         serde_json::json!({})
     };
 
-    let mcp = config
+    let root = config
         .as_object_mut()
-        .context("config is not a JSON object")?
+        .context("config is not a JSON object")?;
+    let mcp = root
         .entry("mcp")
-        .or_insert_with(|| serde_json::json!({}));
-
-    if let Some(existing) = mcp.get(name) {
-        if let Some(cmd) = existing.get("command").and_then(|v| v.as_array()) {
-            if cmd.first().and_then(|v| v.as_str()) == Some(icm_bin) {
-                return Ok("already configured".into());
-            }
-        }
-    }
-
-    mcp.as_object_mut()
-        .with_context(|| format!("`mcp` in {} is not a JSON object", config_path.display()))?
-        .insert(
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .with_context(|| format!("`mcp` in {} is not a JSON object", config_path.display()))?;
+    let already_configured = mcp
+        .get(name)
+        .and_then(|existing| existing.get("command"))
+        .and_then(Value::as_array)
+        .and_then(|command| command.first())
+        .and_then(Value::as_str)
+        == Some(icm_bin);
+    if !already_configured {
+        mcp.insert(
             name.to_string(),
             serde_json::json!({
                 "type": "local",
@@ -6774,12 +6962,25 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
                 "enabled": true
             }),
         );
+    }
+
+    let trust_changes = if trust_local_mcp {
+        trusted_mcp::apply_json_trust(&mut config, trust_spec)?
+    } else {
+        Vec::new()
+    };
 
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_path, output)
         .with_context(|| format!("cannot write {}", config_path.display()))?;
 
-    Ok("configured".into())
+    let status = match (already_configured, trust_local_mcp) {
+        (true, true) => "already configured; approved recall + store",
+        (false, true) => "configured; approved recall + store",
+        (true, false) => "already configured",
+        (false, false) => "configured",
+    };
+    Ok((status.into(), trust_changes))
 }
 
 fn cmd_config() -> Result<()> {
@@ -12449,5 +12650,237 @@ mod cmd_memoir_tests {
             matches!(relation, CliRelation::DependsOn),
             "relation must map to depends-on"
         );
+    }
+
+    #[test]
+    fn parses_opt_in_local_mcp_trust() {
+        let cli =
+            Cli::try_parse_from(["icm", "init", "--mode", "mcp", "--trust-local-mcp"]).unwrap();
+        let Commands::Init {
+            trust_local_mcp, ..
+        } = cli.command
+        else {
+            panic!("expected init");
+        };
+        assert!(trust_local_mcp);
+    }
+
+    #[test]
+    fn trusted_provider_registry_wires_every_init_mutator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let claude_dir = home.join(".claude");
+        let codex_dir = home.join(".codex");
+        let zed_settings = home.join(".config/zed/settings.json");
+        let paths = trusted_mcp::ProviderPathContext {
+            home,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+            zed_settings: &zed_settings,
+        };
+
+        for provider in trusted_mcp::TRUSTED_PROVIDERS {
+            let path = provider.config_path(&paths);
+            let (_, inserted) =
+                write_trusted_provider_config(provider, &path, "/usr/bin/icm", true).unwrap();
+            assert_eq!(
+                inserted.len(),
+                trusted_mcp::TRUSTED_LOCAL_TOOLS.len(),
+                "{} init mutator",
+                provider.client
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_multi_provider_init_preserves_unrecorded_trust_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("install-manifest.json");
+        let claude_path = tmp.path().join("claude/settings.json");
+        let cursor_path = tmp.path().join("cursor/permissions.json");
+        let claude = *trusted_mcp::trusted_provider(trusted_mcp::ProviderId::Claude);
+        let cursor = *trusted_mcp::trusted_provider(trusted_mcp::ProviderId::Cursor);
+        let claude_spec = claude.json_spec().unwrap();
+        let cursor_spec = cursor.json_spec().unwrap();
+        let mut manifest = install_manifest::InstallManifest::empty();
+
+        run_tracked_trust_write(
+            &mut manifest,
+            &manifest_path,
+            &claude_path,
+            claude.client,
+            install_manifest::EntryKind::JsonHooks,
+            || inject_claude_mcp_permissions(&claude_path, claude_spec),
+        )
+        .unwrap();
+
+        let interrupted = run_tracked_trust_write(
+            &mut manifest,
+            &manifest_path,
+            &cursor_path,
+            cursor.client,
+            install_manifest::EntryKind::JsonHooks,
+            || {
+                let _ = inject_cursor_mcp_permissions(&cursor_path, cursor_spec)?;
+                anyhow::bail!("simulated interruption after config write");
+            },
+        );
+        assert!(interrupted.is_err());
+
+        let persisted = install_manifest::InstallManifest::load(&manifest_path).unwrap();
+        assert_eq!(persisted.schema_version, 2);
+        assert_eq!(
+            persisted.trust_changes_for(&claude_path).unwrap().len(),
+            trusted_mcp::TRUSTED_LOCAL_TOOLS.len()
+        );
+        assert_eq!(
+            persisted.trust_changes_for(&cursor_path),
+            Some(&[] as &[trusted_mcp::TrustChange])
+        );
+
+        let mut cursor_config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cursor_path).unwrap()).unwrap();
+        let before_uninstall = cursor_config.clone();
+        let removed = trusted_mcp::strip_json_trust(
+            &mut cursor_config,
+            cursor_spec,
+            persisted.trust_changes_for(&cursor_path),
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(cursor_config, before_uninstall);
+    }
+
+    #[test]
+    fn claude_trust_is_narrow_preserving_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"permissions":{"allow":["Read"],"deny":["Bash"]},"theme":"dark"}"#,
+        )
+        .unwrap();
+
+        let spec = trusted_mcp::trusted_provider(trusted_mcp::ProviderId::Claude)
+            .json_spec()
+            .unwrap();
+        let (status, inserted) = inject_claude_mcp_permissions(&path, spec).unwrap();
+        assert_eq!(status, "allowed recall + store");
+        assert_eq!(inserted.len(), 2);
+        let (status, inserted) = inject_claude_mcp_permissions(&path, spec).unwrap();
+        assert_eq!(status, "already trusted");
+        assert!(inserted.is_empty());
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(value["permissions"]["deny"], serde_json::json!(["Bash"]));
+        assert_eq!(
+            value["permissions"]["allow"],
+            serde_json::json!([
+                "Read",
+                "mcp__icm__icm_memory_recall",
+                "mcp__icm__icm_memory_store"
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_trust_approves_only_recall_and_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "model = \"gpt-test\"\n").unwrap();
+
+        let spec = trusted_mcp::trusted_provider(trusted_mcp::ProviderId::Codex)
+            .toml_spec()
+            .unwrap();
+        inject_codex_mcp_server(&path, "icm", "/usr/bin/icm", true, spec).unwrap();
+        inject_codex_mcp_server(&path, "icm", "/usr/bin/icm", true, spec).unwrap();
+        let value: toml::Value = std::fs::read_to_string(path).unwrap().parse().unwrap();
+        let server = &value["mcp_servers"]["icm"];
+        assert_eq!(value["model"].as_str(), Some("gpt-test"));
+        assert_eq!(server["command"].as_str(), Some("/usr/bin/icm"));
+        assert_eq!(
+            server["tools"]["icm_memory_recall"]["approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            server["tools"]["icm_memory_store"]["approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert!(server["tools"].get("icm_memory_forget").is_none());
+        assert!(server.get("default_tools_approval_mode").is_none());
+    }
+
+    #[test]
+    fn cursor_opencode_and_zed_trust_only_core_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let cursor_spec = trusted_mcp::trusted_provider(trusted_mcp::ProviderId::Cursor)
+            .json_spec()
+            .unwrap();
+        let opencode_spec = trusted_mcp::trusted_provider(trusted_mcp::ProviderId::OpenCode)
+            .json_spec()
+            .unwrap();
+        let zed_spec = trusted_mcp::trusted_provider(trusted_mcp::ProviderId::Zed)
+            .json_spec()
+            .unwrap();
+
+        let cursor_path = tmp.path().join("cursor/permissions.json");
+        std::fs::create_dir_all(cursor_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cursor_path,
+            r#"{"mcpAllowlist":["other:tool"],"mcpBlocklist":["icm:icm_memory_store"]}"#,
+        )
+        .unwrap();
+        let (_, inserted) = inject_cursor_mcp_permissions(&cursor_path, cursor_spec).unwrap();
+        assert_eq!(inserted.len(), 2);
+        let (status, inserted) = inject_cursor_mcp_permissions(&cursor_path, cursor_spec).unwrap();
+        assert_eq!(status, "already trusted");
+        assert!(inserted.is_empty());
+        let cursor: Value =
+            serde_json::from_str(&std::fs::read_to_string(cursor_path).unwrap()).unwrap();
+        assert_eq!(
+            cursor["mcpAllowlist"],
+            serde_json::json!([
+                "other:tool",
+                "icm:icm_memory_recall",
+                "icm:icm_memory_store"
+            ])
+        );
+        assert_eq!(
+            cursor["mcpBlocklist"],
+            serde_json::json!(["icm:icm_memory_store"])
+        );
+
+        let opencode_path = tmp.path().join("opencode.json");
+        std::fs::write(
+            &opencode_path,
+            r#"{"permission":{"bash":"ask","icm_icm_memory_store":"deny","icm_icm_memory_forget":"deny"}}"#,
+        )
+        .unwrap();
+        inject_opencode_mcp_server(&opencode_path, "icm", "/usr/bin/icm", true, opencode_spec)
+            .unwrap();
+        inject_opencode_mcp_server(&opencode_path, "icm", "/usr/bin/icm", true, opencode_spec)
+            .unwrap();
+        let opencode: Value =
+            serde_json::from_str(&std::fs::read_to_string(opencode_path).unwrap()).unwrap();
+        assert_eq!(opencode["permission"]["bash"], "ask");
+        assert_eq!(opencode["permission"]["icm_icm_memory_recall"], "allow");
+        assert_eq!(opencode["permission"]["icm_icm_memory_store"], "deny");
+        assert_eq!(opencode["permission"]["icm_icm_memory_forget"], "deny");
+
+        let zed_path = tmp.path().join("zed/settings.json");
+        std::fs::create_dir_all(zed_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &zed_path,
+            r#"{"agent":{"tool_permissions":{"default":"confirm","tools":{"mcp:icm:icm_memory_store":{"default":"confirm"},"mcp:icm:icm_memory_forget":{"default":"deny"}}}}}"#,
+        )
+        .unwrap();
+        inject_zed_mcp_server(&zed_path, "icm", "/usr/bin/icm", true, zed_spec).unwrap();
+        inject_zed_mcp_server(&zed_path, "icm", "/usr/bin/icm", true, zed_spec).unwrap();
+        let zed: Value = serde_json::from_str(&std::fs::read_to_string(zed_path).unwrap()).unwrap();
+        let tools = &zed["agent"]["tool_permissions"]["tools"];
+        assert_eq!(tools["mcp:icm:icm_memory_recall"]["default"], "allow");
+        assert_eq!(tools["mcp:icm:icm_memory_store"]["default"], "confirm");
+        assert_eq!(tools["mcp:icm:icm_memory_forget"]["default"], "deny");
+        assert_eq!(zed["agent"]["tool_permissions"]["default"], "confirm");
     }
 }

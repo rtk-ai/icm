@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 
-use super::locations::{HookCommandField, LocationKind, LocationSpec};
+use super::locations::{HookCommandField, JsonTrustLocation, LocationKind, LocationSpec};
 
 /// Per-hit detail. Drives the report formatter and, later, the mutator.
 #[derive(Clone, Debug)]
@@ -21,6 +21,8 @@ pub(crate) enum HitDetail {
     JsonServer { pointer: String },
     /// JSON: at least one hook command matches `icm hook`.
     JsonHook { event: String, command: String },
+    /// A provider-described trust value owned by ICM was found.
+    TrustPermission { client: &'static str, rule: String },
     /// TOML: `<table>.<entry>` table was found.
     TomlTable { table: String },
     /// YAML: a candidate `- name: icm` block was found.
@@ -101,6 +103,62 @@ pub(crate) fn scan(specs: &[LocationSpec], include_data: bool) -> Result<Removal
     Ok(plan)
 }
 
+/// Drop provenance for values that are provably absent or user-modified.
+/// Parse failures deliberately keep the old record so uncertainty cannot turn
+/// into an accidental claim or a silent loss of cleanup information.
+pub(crate) fn reconcile_trust_ownership(
+    specs: &[LocationSpec],
+    manifest: &mut crate::install_manifest::InstallManifest,
+) -> bool {
+    let mut changed = false;
+    for location in specs {
+        let present = match &location.kind {
+            LocationKind::JsonHooksWithTrust { trust }
+            | LocationKind::JsonTrust { trust }
+            | LocationKind::JsonMcpWithTrust { trust, .. } => {
+                let Some(owned) = trust.owned_changes.as_deref() else {
+                    continue;
+                };
+                if owned.is_empty() {
+                    continue;
+                }
+                if location.path.exists() {
+                    let Ok(value) = crate::parse_json_config(&location.path) else {
+                        continue;
+                    };
+                    crate::trusted_mcp::discover_json_trust(&value, trust.spec, Some(owned))
+                } else {
+                    Vec::new()
+                }
+            }
+            LocationKind::TomlMcp {
+                trust: Some(trust), ..
+            } => {
+                let Some(owned) = trust.owned_changes.as_deref() else {
+                    continue;
+                };
+                if owned.is_empty() {
+                    continue;
+                }
+                if location.path.exists() {
+                    let Ok(content) = std::fs::read_to_string(&location.path) else {
+                        continue;
+                    };
+                    let Ok(value) = content.parse::<toml::Value>() else {
+                        continue;
+                    };
+                    crate::trusted_mcp::discover_toml_trust(&value, trust.spec, Some(owned))
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => continue,
+        };
+        changed |= manifest.replace_recorded_trust_changes(&location.path, present);
+    }
+    changed
+}
+
 /// Dispatch on the spec's kind. Returns zero or more hits.
 fn scan_spec(spec: &LocationSpec) -> Result<Vec<LocationHit>> {
     if !spec.path.exists() {
@@ -112,7 +170,22 @@ fn scan_spec(spec: &LocationSpec) -> Result<Vec<LocationHit>> {
             has_hooks,
             hooks_field,
         } => scan_json(spec, servers_key.as_deref(), *has_hooks, *hooks_field),
-        LocationKind::TomlMcp { table, entry } => scan_toml(spec, table, entry),
+        LocationKind::JsonHooksWithTrust { trust } => {
+            let mut hits = scan_json(spec, None, true, HookCommandField::Command)?;
+            hits.extend(scan_json_trust(spec, trust)?);
+            Ok(hits)
+        }
+        LocationKind::JsonTrust { trust } => scan_json_trust(spec, trust),
+        LocationKind::JsonMcpWithTrust { servers_key, trust } => {
+            let mut hits = scan_json(spec, Some(servers_key), false, HookCommandField::Command)?;
+            hits.extend(scan_json_trust(spec, trust)?);
+            Ok(hits)
+        }
+        LocationKind::TomlMcp {
+            table,
+            entry,
+            trust,
+        } => scan_toml(spec, table, entry, trust.as_ref()),
         LocationKind::YamlContinue => scan_yaml_continue(spec),
         LocationKind::MarkdownBlock => scan_markdown(spec),
         LocationKind::OwnedFile => Ok(vec![LocationHit {
@@ -124,6 +197,25 @@ fn scan_spec(spec: &LocationSpec) -> Result<Vec<LocationHit>> {
         }]),
         LocationKind::DataDir => scan_data_dir(spec),
     }
+}
+
+fn scan_json_trust(spec: &LocationSpec, trust: &JsonTrustLocation) -> Result<Vec<LocationHit>> {
+    let value = crate::parse_json_config(&spec.path)?;
+    Ok(
+        crate::trusted_mcp::discover_json_trust(&value, trust.spec, trust.owned_changes.as_deref())
+            .into_iter()
+            .filter_map(|change| {
+                change.permission_label().map(|rule| LocationHit {
+                    spec_label: spec.label,
+                    path: spec.path.clone(),
+                    detail: HitDetail::TrustPermission {
+                        client: trust.spec.client(),
+                        rule: rule.to_string(),
+                    },
+                })
+            })
+            .collect(),
+    )
 }
 
 fn scan_json(
@@ -206,7 +298,12 @@ fn lookup_dotted<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
-fn scan_toml(spec: &LocationSpec, table: &str, entry: &str) -> Result<Vec<LocationHit>> {
+fn scan_toml(
+    spec: &LocationSpec,
+    table: &str,
+    entry: &str,
+    trust: Option<&super::locations::TomlTrustLocation>,
+) -> Result<Vec<LocationHit>> {
     let content = std::fs::read_to_string(&spec.path)?;
     let parsed: toml::Value = content.parse()?;
     let mut hits = Vec::new();
@@ -220,6 +317,26 @@ fn scan_toml(spec: &LocationSpec, table: &str, entry: &str) -> Result<Vec<Locati
                 },
             });
         }
+    }
+    if let Some(trust) = trust {
+        hits.extend(
+            crate::trusted_mcp::discover_toml_trust(
+                &parsed,
+                trust.spec,
+                trust.owned_changes.as_deref(),
+            )
+            .into_iter()
+            .filter_map(|change| {
+                change.permission_label().map(|rule| LocationHit {
+                    spec_label: spec.label,
+                    path: spec.path.clone(),
+                    detail: HitDetail::TrustPermission {
+                        client: trust.spec.client(),
+                        rule: rule.to_string(),
+                    },
+                })
+            }),
+        );
     }
     Ok(hits)
 }
@@ -356,7 +473,9 @@ fn walk_size(path: &Path, bytes: &mut u64, files: &mut usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uninstall::locations::{build_locations, dir_context_under};
+    use crate::uninstall::locations::{
+        apply_manifest_ownership, build_locations, dir_context_under,
+    };
     use std::fs;
     use std::io::Write;
 
@@ -442,6 +561,169 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn scan_detects_only_exact_icm_permission_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dir_context_under(tmp.path());
+        let settings = dirs.claude_dir.join("settings.json");
+        write(
+            &settings,
+            r#"{"permissions":{"allow":[
+                "Read",
+                "mcp__icm__icm_memory_recall",
+                "mcp__icm__icm_memory_store",
+                "mcp__icm__icm_memory_forget"
+            ]}}"#,
+        );
+        write(
+            &dirs.home.join(".cursor/permissions.json"),
+            r#"{"mcpAllowlist":[
+                "icm:icm_memory_recall",
+                "icm:icm_memory_store",
+                "icm:icm_memory_forget"
+            ]}"#,
+        );
+        write(
+            &dirs.home.join(".config/opencode/opencode.json"),
+            r#"{"permission":{
+                "icm_icm_memory_recall":"allow",
+                "icm_icm_memory_store":"allow",
+                "icm_icm_memory_forget":"deny"
+            }}"#,
+        );
+        write(
+            &dirs.zed_settings,
+            r#"{"agent":{"tool_permissions":{"tools":{
+                "mcp:icm:icm_memory_recall":{"default":"allow"},
+                "mcp:icm:icm_memory_store":{"default":"allow"},
+                "mcp:icm:icm_memory_forget":{"default":"deny"}
+            }}}}"#,
+        );
+        let plan = scan(&build_locations(&dirs), false).unwrap();
+        let client_rules: Vec<(&str, &str)> = plan
+            .hits
+            .iter()
+            .filter_map(|hit| match &hit.detail {
+                HitDetail::TrustPermission { client, rule } => Some((*client, rule.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            client_rules,
+            vec![
+                ("Claude Code", "mcp__icm__icm_memory_recall"),
+                ("Claude Code", "mcp__icm__icm_memory_store"),
+                ("Cursor", "icm:icm_memory_recall"),
+                ("Cursor", "icm:icm_memory_store"),
+                ("Zed", "mcp:icm:icm_memory_recall"),
+                ("Zed", "mcp:icm:icm_memory_store"),
+                ("OpenCode", "icm_icm_memory_recall"),
+                ("OpenCode", "icm_icm_memory_store"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_respects_recorded_trust_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dir_context_under(tmp.path());
+        let settings = dirs.claude_dir.join("settings.json");
+        write(
+            &settings,
+            r#"{"permissions":{"allow":[
+                "mcp__icm__icm_memory_recall",
+                "mcp__icm__icm_memory_store"
+            ]}}"#,
+        );
+
+        let mut manifest = crate::install_manifest::InstallManifest::empty();
+        let entry = crate::install_manifest::InstallManifest::entry_from_disk(
+            &settings,
+            "Claude Code",
+            crate::install_manifest::EntryKind::JsonHooks,
+        )
+        .unwrap();
+        manifest.record(entry);
+
+        let mut specs = build_locations(&dirs);
+        apply_manifest_ownership(&mut specs, &manifest);
+        let plan = scan(&specs, false).unwrap();
+        assert!(
+            !plan
+                .hits
+                .iter()
+                .any(|hit| matches!(hit.detail, HitDetail::TrustPermission { .. })),
+            "Some([]) must preserve matching user-authored permissions: {plan:#?}"
+        );
+
+        let mut generated = serde_json::json!({});
+        let spec = crate::trusted_mcp::trusted_provider(crate::trusted_mcp::ProviderId::Claude)
+            .json_spec()
+            .unwrap();
+        let changes = crate::trusted_mcp::apply_json_trust(&mut generated, spec).unwrap();
+        manifest.record_trust_changes(&settings, vec![changes[0].clone()]);
+        apply_manifest_ownership(&mut specs, &manifest);
+        let plan = scan(&specs, false).unwrap();
+        let rules: Vec<_> = plan
+            .hits
+            .iter()
+            .filter_map(|hit| match &hit.detail {
+                HitDetail::TrustPermission { rule, .. } => Some(rule.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rules, vec!["mcp__icm__icm_memory_recall"]);
+    }
+
+    #[test]
+    fn absent_owned_cursor_rules_cannot_claim_later_user_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dir_context_under(tmp.path());
+        let permissions = dirs.home.join(".cursor/permissions.json");
+        write(&permissions, r#"{"mcpAllowlist":["other:tool"]}"#);
+
+        let mut manifest = crate::install_manifest::InstallManifest::empty();
+        manifest.record(
+            crate::install_manifest::InstallManifest::entry_from_disk(
+                &permissions,
+                "Cursor",
+                crate::install_manifest::EntryKind::JsonHooks,
+            )
+            .unwrap(),
+        );
+        let mut generated = serde_json::json!({});
+        let spec = crate::trusted_mcp::trusted_provider(crate::trusted_mcp::ProviderId::Cursor)
+            .json_spec()
+            .unwrap();
+        let changes = crate::trusted_mcp::apply_json_trust(&mut generated, spec).unwrap();
+        manifest.record_trust_changes(&permissions, changes);
+
+        let mut specs = build_locations(&dirs);
+        apply_manifest_ownership(&mut specs, &manifest);
+        assert!(reconcile_trust_ownership(&specs, &mut manifest));
+        assert_eq!(
+            manifest.trust_changes_for(&permissions),
+            Some(&[] as &[crate::trusted_mcp::TrustChange])
+        );
+
+        write(
+            &permissions,
+            r#"{"mcpAllowlist":[
+                "icm:icm_memory_recall",
+                "icm:icm_memory_store"
+            ]}"#,
+        );
+        apply_manifest_ownership(&mut specs, &manifest);
+        let plan = scan(&specs, false).unwrap();
+        assert!(
+            !plan
+                .hits
+                .iter()
+                .any(|hit| matches!(hit.detail, HitDetail::TrustPermission { .. })),
+            "consumed ownership must not claim a later identical user value: {plan:#?}"
+        );
     }
 
     /// Audit regression: hook detection used to accept any command

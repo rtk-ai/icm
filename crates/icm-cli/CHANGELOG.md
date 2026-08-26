@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.63](https://github.com/rtk-ai/icm/compare/icm-v0.10.62...icm-v0.10.63) (2026-08-26)
+
+
+### Bug Fixes
+
+* **export:** restore fails for non-default embedding dimensions ([#440](https://github.com/rtk-ai/icm/issues/440)) ([c523ca4](https://github.com/rtk-ai/icm/commit/c523ca4c989391c8d8f2d883527f5a76a73de52a))
+
 ## [0.10.62](https://github.com/rtk-ai/icm/compare/icm-v0.10.61...icm-v0.10.62) (2026-08-26)
 
 

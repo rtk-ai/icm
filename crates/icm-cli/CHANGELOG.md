@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.62](https://github.com/rtk-ai/icm/compare/icm-v0.10.61...icm-v0.10.62) (2026-08-26)
+
+
+### Features
+
+* **backup:** SQLite Online Backup API, auto-backup, icm export/import ([#431](https://github.com/rtk-ai/icm/issues/431)) ([7c1769e](https://github.com/rtk-ai/icm/commit/7c1769e31e751b263ada0a1494e532868bee7251))
+* **init:** install OpenCode skills natively with YAML frontmatter ([#429](https://github.com/rtk-ai/icm/issues/429)) ([d1f70ae](https://github.com/rtk-ai/icm/commit/d1f70ae69442d4ce26b7f233aa8226a89b76ce05))
+
+
+### Bug Fixes
+
+* honor disabled extraction in PostToolUse hook ([#427](https://github.com/rtk-ai/icm/issues/427)) ([2623aa4](https://github.com/rtk-ai/icm/commit/2623aa44a70a6b3b3ff699fca561d32dc97b7e6f))
+
 ## [0.10.61](https://github.com/rtk-ai/icm/compare/icm-v0.10.60...icm-v0.10.61) (2026-07-28)
 
 

@@ -1922,6 +1922,40 @@ fn main() -> Result<()> {
     if let Commands::Backup { ref output } = command {
         return cmd_backup(&db_path, output.as_deref());
     }
+    // `icm import --from-export` / the deprecated `icm import-from-export`
+    // alias must size the destination store from the snapshot's own
+    // `embedding_dims` header field, not the generically-resolved
+    // `embedding_dims` above — otherwise restoring into a fresh DB silently
+    // defaults to DEFAULT_EMBEDDING_DIMS and hard-fails with "Dimension
+    // mismatch" for any non-default embedding model (the exact scenario
+    // `icm export`/`import` exists to protect against). Peek the header
+    // before `open_store` runs so the store opens at the right dimension.
+    if let Commands::ImportFromExport {
+        ref from_export,
+        dry_run,
+    } = command
+    {
+        eprintln!(
+            "warning: `icm import-from-export` is deprecated — \
+             use `icm import --from-export {}` instead",
+            from_export
+        );
+        let mut reader = open_export_reader(from_export)?;
+        let dims = peek_export_embedding_dims(&mut reader).unwrap_or(embedding_dims);
+        let store = open_store_with_backup(cli_db.clone(), dims, &cfg.store.backup)?;
+        return cmd_import_from_export(&store, reader, dry_run);
+    }
+    if let Commands::Import {
+        from_export: Some(ref src),
+        dry_run,
+        ..
+    } = command
+    {
+        let mut reader = open_export_reader(src)?;
+        let dims = peek_export_embedding_dims(&mut reader).unwrap_or(embedding_dims);
+        let store = open_store_with_backup(cli_db.clone(), dims, &cfg.store.backup)?;
+        return cmd_import_from_export(&store, reader, dry_run);
+    }
     // `icm hook disable` only edits AI-tool settings files — it needs neither
     // the store nor the DB (and must not create an empty one), so dispatch it
     // before `open_store` too.
@@ -2285,17 +2319,11 @@ fn main() -> Result<()> {
         Commands::Export { output, format } => {
             cmd_export(&store, &db_path, output.as_deref(), format)
         }
-        Commands::ImportFromExport {
-            from_export,
-            dry_run,
-        } => {
-            eprintln!(
-                "warning: `icm import-from-export` is deprecated — \
-                 use `icm import --from-export {}` instead",
-                from_export
-            );
-            cmd_import_from_export(&store, &from_export, dry_run)
-        }
+        // `icm import-from-export` (deprecated alias) and `icm import
+        // --from-export` are both dispatched before `open_store` so the
+        // destination store can be sized from the snapshot's own
+        // `embedding_dims` header field — see the pre-open block above.
+        Commands::ImportFromExport { .. } => unreachable!("dispatched before open_store"),
         Commands::Uninstall(_) => unreachable!("dispatched before open_store"), // `icm embeddings` is dispatched before `open_store` above; this arm
         // exists only for match exhaustiveness and is unreachable.
         Commands::Embeddings { .. } => unreachable!("dispatched before open_store"),
@@ -2334,9 +2362,8 @@ fn main() -> Result<()> {
             dry_run,
             from_export,
         } => {
-            if let Some(src) = from_export {
-                // Snapshot restore path — delegate to import-from-export logic.
-                cmd_import_from_export(&store, &src, dry_run)
+            if from_export.is_some() {
+                unreachable!("Import{{from_export: Some(_)}} dispatched before open_store")
             } else {
                 // Conversation import path — existing logic unchanged.
                 let path = path.expect("PATH is required when --from-export is not given");
@@ -6183,11 +6210,21 @@ fn cmd_export(
         .list_feedback(None, usize::MAX)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Record the source DB's embedding dimension so `icm import --from-export`
+    // can size the destination store's vec0 schema correctly instead of
+    // silently defaulting to DEFAULT_EMBEDDING_DIMS (issue: restore fails
+    // outright — "Dimension mismatch" — for any non-default embedding model).
+    let embedding_dims = Store::read_stored_embedding_dims(db_path)
+        .ok()
+        .flatten()
+        .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
+
     let header = serde_json::json!({
         "type": "header",
         "icm_export_version": 1,
         "exported_at": chrono::Utc::now().to_rfc3339(),
         "db_path": db_path.display().to_string(),
+        "embedding_dims": embedding_dims,
         "counts": {
             "memories": memories.len(),
             "facts": facts.len(),
@@ -6279,23 +6316,65 @@ fn cmd_export(
     Ok(())
 }
 
+/// A [`BufRead`] that can also seek — lets [`peek_export_embedding_dims`]
+/// read the header line and then rewind so the main import loop still sees
+/// it. Stdin is buffered into a [`std::io::Cursor`] to get this (`Stdin`
+/// itself isn't seekable); a file just opens its native `Seek`.
+trait BufReadSeek: std::io::BufRead + std::io::Seek {}
+impl<T: std::io::BufRead + std::io::Seek> BufReadSeek for T {}
+
+/// Open `from_export` (a path, or `-` for stdin) as a seekable reader.
+fn open_export_reader(from_export: &str) -> Result<Box<dyn BufReadSeek>> {
+    use std::io::{BufReader, Read};
+
+    if from_export == "-" {
+        // Stdin isn't seekable, so buffer it fully — snapshots are memory
+        // dumps, not multi-GB streams, so this is a reasonable tradeoff for
+        // being able to peek the header and then still see it in the main
+        // import loop.
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading snapshot from stdin")?;
+        Ok(Box::new(std::io::Cursor::new(buf)))
+    } else {
+        let path = std::path::Path::new(from_export);
+        Ok(Box::new(BufReader::new(
+            std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?,
+        )))
+    }
+}
+
+/// Peek the export's `embedding_dims` header field without consuming the
+/// reader — rewinds to the start afterward so the main import loop still
+/// sees the header line (needed for its own version check).
+///
+/// `None` for pre-#431 exports that predate this field, or any parse
+/// failure; callers fall back to the generically-resolved dimension.
+fn peek_export_embedding_dims(reader: &mut dyn BufReadSeek) -> Option<usize> {
+    let mut first_line = String::new();
+    let read = reader.read_line(&mut first_line).ok()?;
+    let dims = (read > 0)
+        .then(|| serde_json::from_str::<serde_json::Value>(first_line.trim()).ok())
+        .flatten()
+        .and_then(|v| v.get("embedding_dims").and_then(|d| d.as_u64()))
+        .map(|d| d as usize);
+    let _ = reader.seek(std::io::SeekFrom::Start(0));
+    dims
+}
+
 /// `icm import --from-export` — restore a snapshot produced by `icm export`.
 ///
 /// Reads JSONL from a file path or `-` (stdin). Inserts each record through
 /// the normal store API. Idempotent: a record whose ID already exists is
 /// silently skipped.
-fn cmd_import_from_export(store: &Store, from_export: &str, dry_run: bool) -> Result<()> {
+fn cmd_import_from_export(
+    store: &Store,
+    reader: Box<dyn BufReadSeek>,
+    dry_run: bool,
+) -> Result<()> {
     use icm_core::{FactsStore, FeedbackStore, MemoryStore};
-    use std::io::{BufRead, BufReader};
-
-    let reader: Box<dyn BufRead> = if from_export == "-" {
-        Box::new(BufReader::new(std::io::stdin()))
-    } else {
-        let path = std::path::Path::new(from_export);
-        Box::new(BufReader::new(
-            std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?,
-        ))
-    };
+    use std::io::BufRead as _;
 
     // KRIT-3: Build the existing feedback ID set once before the loop — O(n)
     // instead of calling list_feedback per record (O(n²)).
@@ -13233,7 +13312,7 @@ mod rotate_backups_tests {
 // ──────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod export_import_roundtrip_tests {
-    use super::cmd_import_from_export;
+    use super::{cmd_import_from_export, open_export_reader};
     use icm_core::{Feedback, Importance, Memory};
     use icm_store::Store;
     use std::io::Write;
@@ -13292,6 +13371,82 @@ mod export_import_roundtrip_tests {
         lines.join("\n") + "\n"
     }
 
+    /// Same as [`build_jsonl`] but with an explicit `embedding_dims` header
+    /// field, matching what `cmd_export` now writes.
+    fn build_jsonl_with_dims(store: &Store, embedding_dims: usize) -> String {
+        let body = build_jsonl(store);
+        let mut lines: Vec<&str> = body.lines().collect();
+        let mut header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        header["embedding_dims"] = serde_json::json!(embedding_dims);
+        let header_line = header.to_string();
+        lines[0] = &header_line;
+        lines.join("\n") + "\n"
+    }
+
+    /// Regression test for the real bug this fix addresses: restoring an
+    /// export made with a non-default embedding model (e.g.
+    /// `intfloat/multilingual-e5-base`, 768 dims) into a fresh destination
+    /// DB used to hard-fail with "Dimension mismatch... Expected 384
+    /// dimensions but received 768" because the destination always opened
+    /// at `DEFAULT_EMBEDDING_DIMS` (384) regardless of what the snapshot
+    /// actually contained. The fix peeks `embedding_dims` from the export
+    /// header before opening the destination store.
+    #[test]
+    fn restore_non_default_embedding_dims_succeeds() {
+        use icm_core::MemoryStore;
+
+        const NON_DEFAULT_DIMS: usize = 768;
+        assert_ne!(
+            NON_DEFAULT_DIMS,
+            icm_core::DEFAULT_EMBEDDING_DIMS,
+            "test must exercise a genuinely non-default dimension"
+        );
+
+        // 1. Source store at the non-default dimension, one memory with a
+        //    real 768-float embedding (as fastembed would produce).
+        let src = Store::in_memory_with_dims(NON_DEFAULT_DIMS).unwrap();
+        let mut mem = Memory::new(
+            "dims-test".into(),
+            "restored across a dimension change".into(),
+            Importance::Medium,
+        );
+        mem.embedding = Some(vec![0.1_f32; NON_DEFAULT_DIMS]);
+        src.store(mem).unwrap();
+
+        let jsonl = build_jsonl_with_dims(&src, NON_DEFAULT_DIMS);
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(jsonl.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let tmp_path = tmp.path().to_str().unwrap().to_owned();
+
+        // 2. Peek the header exactly as the real dispatch path does, and
+        //    open the destination at the peeked dimension instead of the
+        //    default — this is the actual fix under test.
+        let mut reader = super::open_export_reader(&tmp_path).unwrap();
+        let peeked = super::peek_export_embedding_dims(&mut reader);
+        assert_eq!(
+            peeked,
+            Some(NON_DEFAULT_DIMS),
+            "header must round-trip the exact embedding_dims value"
+        );
+        let dst = Store::in_memory_with_dims(peeked.unwrap()).unwrap();
+
+        // 3. Import must succeed (pre-fix: hard error, 0 memories restored).
+        cmd_import_from_export(&dst, reader, false).unwrap();
+
+        let restored = dst.list_all().unwrap();
+        assert_eq!(
+            restored.len(),
+            1,
+            "memory must actually be restored, not silently dropped"
+        );
+        assert_eq!(
+            restored[0].embedding.as_ref().map(Vec::len),
+            Some(NON_DEFAULT_DIMS),
+            "restored embedding must keep its original dimension"
+        );
+    }
+
     /// Parse the "Imported: X memories, Y facts, Z feedback — skipped N" line
     /// printed by cmd_import_from_export.
     #[allow(dead_code)]
@@ -13342,7 +13497,8 @@ mod export_import_roundtrip_tests {
 
         // 4. Import into a fresh store.
         let dst = in_memory_store();
-        cmd_import_from_export(&dst, &tmp_path, false).unwrap();
+        let reader = open_export_reader(&tmp_path).unwrap();
+        cmd_import_from_export(&dst, reader, false).unwrap();
 
         // 5. Verify counts.
         assert_eq!(
@@ -13362,7 +13518,8 @@ mod export_import_roundtrip_tests {
         );
 
         // 6. Import the same JSONL a second time (idempotency check).
-        cmd_import_from_export(&dst, &tmp_path, false).unwrap();
+        let reader = open_export_reader(&tmp_path).unwrap();
+        cmd_import_from_export(&dst, reader, false).unwrap();
 
         // 7. Counts must be unchanged.
         assert_eq!(
@@ -13412,7 +13569,8 @@ mod export_import_roundtrip_tests {
 
         // 4. Import (simulates Commands::Import { from_export: Some(..) } dispatch).
         let store = in_memory_store();
-        cmd_import_from_export(&store, &tmp_path, false).unwrap();
+        let reader = open_export_reader(&tmp_path).unwrap();
+        cmd_import_from_export(&store, reader, false).unwrap();
 
         // 5. Record must be present.
         assert_eq!(
@@ -13422,7 +13580,8 @@ mod export_import_roundtrip_tests {
         );
 
         // 6. Re-import — idempotency: no duplicate.
-        cmd_import_from_export(&store, &tmp_path, false).unwrap();
+        let reader = open_export_reader(&tmp_path).unwrap();
+        cmd_import_from_export(&store, reader, false).unwrap();
         assert_eq!(
             store.list_all().unwrap().len(),
             1,

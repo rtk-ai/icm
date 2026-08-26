@@ -58,6 +58,7 @@ pub fn run_server(
     embedder: Option<&dyn Embedder>,
     compact: bool,
     auto_consolidate: AutoConsolidate,
+    extra_instructions: Option<&str>,
 ) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -110,6 +111,7 @@ pub fn run_server(
             compact,
             auto_consolidate,
             &mut calls_since_store,
+            extra_instructions,
         ) {
             write_response(&mut stdout, &response)?;
         }
@@ -118,6 +120,7 @@ pub fn run_server(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_json_rpc_message(
     msg: JsonRpcMessage,
     store: &Store,
@@ -125,6 +128,7 @@ pub fn handle_json_rpc_message(
     compact: bool,
     auto_consolidate: AutoConsolidate,
     calls_since_store: &mut u32,
+    extra_instructions: Option<&str>,
 ) -> Option<JsonRpcResponse> {
     let method = msg.method.as_deref().unwrap_or("");
     debug!("MCP request: {method}");
@@ -132,7 +136,7 @@ pub fn handle_json_rpc_message(
     let id = msg.id?;
 
     Some(match method {
-        "initialize" => handle_initialize(id),
+        "initialize" => handle_initialize(id, extra_instructions),
         "ping" => JsonRpcResponse::ok(id, json!({})),
         "tools/list" => handle_tools_list(id, embedder.is_some()),
         "tools/call" => handle_tools_call(
@@ -155,7 +159,18 @@ fn write_response(stdout: &mut io::Stdout, resp: &JsonRpcResponse) -> anyhow::Re
     Ok(())
 }
 
-fn handle_initialize(id: Value) -> JsonRpcResponse {
+/// `extra_instructions` is the operator-configured `[mcp] instructions`
+/// value (issue #179 follow-up): previously that config field was parsed
+/// but never actually reached the MCP handshake, so setting it in
+/// `config.toml` silently did nothing. Appended, not a replacement — the
+/// built-in recall/store guidance still applies to every client.
+fn handle_initialize(id: Value, extra_instructions: Option<&str>) -> JsonRpcResponse {
+    let instructions = match extra_instructions {
+        Some(extra) if !extra.trim().is_empty() => {
+            format!("{ICM_INSTRUCTIONS}\n\n{}", extra.trim())
+        }
+        _ => ICM_INSTRUCTIONS.to_string(),
+    };
     JsonRpcResponse::ok(
         id,
         json!({
@@ -167,7 +182,7 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION
             },
-            "instructions": ICM_INSTRUCTIONS
+            "instructions": instructions
         }),
     )
 }
@@ -246,4 +261,45 @@ fn handle_tools_call(
     }
 
     JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap_or(json!(null)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #179 follow-up: `[mcp] instructions` in config.toml was parsed
+    /// (`config::McpConfig::instructions`) but never actually reached the
+    /// MCP `initialize` handshake — setting it silently did nothing. This
+    /// locks in that the value now really is appended to the built-in
+    /// guidance sent to every client.
+    #[test]
+    fn initialize_appends_configured_extra_instructions() {
+        let resp = handle_initialize(json!(1), Some("Also: this project uses Rust 2021."));
+        let instructions = resp.result.unwrap()["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(instructions.contains(ICM_INSTRUCTIONS));
+        assert!(instructions.contains("Also: this project uses Rust 2021."));
+    }
+
+    #[test]
+    fn initialize_omits_extra_instructions_when_unset() {
+        let resp = handle_initialize(json!(1), None);
+        let instructions = resp.result.unwrap()["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(instructions, ICM_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn initialize_treats_blank_extra_instructions_as_unset() {
+        let resp = handle_initialize(json!(1), Some("   \n  "));
+        let instructions = resp.result.unwrap()["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(instructions, ICM_INSTRUCTIONS);
+    }
 }

@@ -2550,7 +2550,14 @@ fn main() -> Result<()> {
                     enabled: cfg.memory.auto_consolidate_enabled,
                     threshold: cfg.memory.auto_consolidate_threshold,
                 };
-                return http_api::run_http_server(store, boxed_emb, addr, token, auto_consolidate);
+                return http_api::run_http_server(
+                    store,
+                    boxed_emb,
+                    addr,
+                    token,
+                    auto_consolidate,
+                    cfg.mcp.instructions.clone(),
+                );
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -2566,7 +2573,13 @@ fn main() -> Result<()> {
                 enabled: cfg.memory.auto_consolidate_enabled,
                 threshold: cfg.memory.auto_consolidate_threshold,
             };
-            icm_mcp::run_server(&store, emb_ref, use_compact, auto_consolidate)
+            icm_mcp::run_server(
+                &store,
+                emb_ref,
+                use_compact,
+                auto_consolidate,
+                cfg.mcp.instructions.as_deref(),
+            )
         }
         Commands::HookLog {
             limit,
@@ -4066,6 +4079,27 @@ fn cmd_hook_end(
     // no need to peek the count first.
     if consolidate_cfg.summarizer.provider != "none" {
         spawn_detached_worker(&["consolidate-pending", "--limit", "20"], "consolidation");
+    }
+
+    // Issue #179 follow-up: `icm hook start` / `icm wake-up` prefer a cached
+    // LLM briefing (#165) over the plain bullet pack when one exists — but
+    // until now nothing ever populated that cache automatically. A fresh
+    // install's SessionStart hook would silently keep serving the plain
+    // pack forever unless the user remembered to run `icm briefing`
+    // manually or wired their own cron. Refresh it here, off the critical
+    // path, same as the consolidation fork — rate-limited by
+    // `BRIEFING_REFRESH_INTERVAL` so a chatty session doesn't trigger an
+    // LLM call on every single SessionEnd.
+    if consolidate_cfg.summarizer.provider != "none" {
+        let project = detect_project();
+        let stale = project != "unknown"
+            && !project.is_empty()
+            && briefing_cache_path(&project)
+                .map(|p| briefing_cache_is_stale(&p, BRIEFING_REFRESH_INTERVAL))
+                .unwrap_or(true);
+        if stale {
+            spawn_detached_worker(&["briefing", "--project", project.as_str()], "briefing");
+        }
     }
 
     // Async path: when a provider is configured, drain the
@@ -8584,6 +8618,22 @@ fn load_cached_briefing(project: Option<&str>) -> Option<String> {
     load_cached_briefing_at(&briefing_cache_path(project?)?)
 }
 
+/// Minimum age before SessionEnd bothers regenerating the cached briefing
+/// (issue #179 follow-up) — keeps a chatty session from firing an LLM call
+/// on every single SessionEnd.
+const BRIEFING_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// True if `path` is missing, unreadable, or older than `max_age` (pure,
+/// testable core of the SessionEnd auto-briefing-refresh trigger, issue #179
+/// follow-up). A cache that's never existed is treated as stale so the very
+/// first refresh actually fires.
+fn briefing_cache_is_stale(path: &std::path::Path, max_age: std::time::Duration) -> bool {
+    match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(modified) => modified.elapsed().map(|age| age > max_age).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
 /// Build the LLM prompt that compiles a project's memories into a structured
 /// wake-up briefing (issue #165).
 fn build_briefing_prompt(
@@ -10992,6 +11042,27 @@ mod hook_start_tests {
             load_cached_briefing_at(&path).unwrap(),
             "## State of work\n- shipping"
         );
+    }
+
+    #[test]
+    fn briefing_cache_is_stale_missing_fresh_and_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.md");
+
+        // Never existed → stale, so the very first refresh actually fires.
+        assert!(briefing_cache_is_stale(
+            &path,
+            std::time::Duration::from_secs(3600)
+        ));
+
+        std::fs::write(&path, "briefing").unwrap();
+        // Just written → not stale under a generous max_age.
+        assert!(!briefing_cache_is_stale(
+            &path,
+            std::time::Duration::from_secs(3600)
+        ));
+        // ... but stale under a max_age of zero (anything is "older").
+        assert!(briefing_cache_is_stale(&path, std::time::Duration::ZERO));
     }
 
     #[test]

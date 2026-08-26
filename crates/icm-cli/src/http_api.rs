@@ -67,6 +67,9 @@ pub struct AppState {
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     mcp_calls_since_store: Arc<Mutex<u32>>,
     auto_consolidate: icm_mcp::AutoConsolidate,
+    /// Operator-configured `[mcp] instructions` (issue #179 follow-up),
+    /// appended to the built-in MCP handshake instructions.
+    mcp_instructions: Option<Arc<str>>,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
 }
@@ -214,6 +217,7 @@ pub async fn run_http_server(
     addr: SocketAddr,
     token: Option<String>,
     auto_consolidate: icm_mcp::AutoConsolidate,
+    mcp_instructions: Option<String>,
 ) -> Result<()> {
     // A non-loopback bind with no token exposes the full memory store —
     // recall, store, consolidate — to anyone who can reach the interface,
@@ -228,6 +232,7 @@ pub async fn run_http_server(
         embedder: embedder.map(Arc::from),
         mcp_calls_since_store: Arc::new(Mutex::new(0)),
         auto_consolidate,
+        mcp_instructions: mcp_instructions.map(Arc::from),
         token,
     };
 
@@ -357,6 +362,7 @@ async fn handle_mcp(
         q.compact,
         state.auto_consolidate,
         &mut calls_since_store,
+        state.mcp_instructions.as_deref(),
     ) {
         Some(response) => Json(response).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
@@ -957,6 +963,7 @@ mod tests {
                 enabled: false,
                 threshold: 10,
             },
+            mcp_instructions: None,
             token: None,
         };
 
@@ -1024,6 +1031,7 @@ mod tests {
                 enabled: false,
                 threshold: 10,
             },
+            mcp_instructions: None,
             token: None,
         };
 

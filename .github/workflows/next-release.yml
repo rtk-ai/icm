@@ -1,13 +1,22 @@
 name: Update Next Release PR
 
 on:
-  pull_request:
+  # pull_request_target (not pull_request): GitHub withholds repo secrets
+  # from `pull_request` runs whenever the PR's head is a fork — which is
+  # every external contributor's PR. That silently broke this workflow's
+  # GitHub App token mint (empty client-id) on every fork PR merge since
+  # this workflow was added, going unnoticed because same-repo branches
+  # (bundled bug-hunt work) kept succeeding and dominated the changelog.
+  # Safe here: this job never checks out fork code (no `actions/checkout`
+  # step), and untrusted PR title/body only ever flow through `env:` into
+  # quoted shell variables (never `eval`'d or template-interpolated into
+  # the script), so there's no code-execution path for a malicious PR to
+  # reach the minted token. Mirrors the same workflow on rtk-ai/rtk.
+  pull_request_target:
     types: [closed]
     branches: [develop]
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 jobs:
   update-next-release:
@@ -16,11 +25,13 @@ jobs:
     steps:
       # The default workflow token cannot open PRs in this org; mint a
       # short-lived token from the configured GitHub App instead.
-      - uses: actions/create-github-app-token@v3
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         id: app-token
         with:
-          app-id: ${{ secrets.APP_CLIENT_ID }}
+          client-id: ${{ secrets.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
 
       - name: Update Next Release PR
         env:

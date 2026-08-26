@@ -208,6 +208,18 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
                 captured_at TIMESTAMPTZ NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS pending_consolidations (
+                id TEXT PRIMARY KEY,
+                topic TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_consolidations_status
+                ON pending_consolidations(status, created_at);
+
             CREATE TABLE IF NOT EXISTS code_areas (
                 id BIGSERIAL PRIMARY KEY,
                 project TEXT NOT NULL,

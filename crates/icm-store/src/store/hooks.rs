@@ -5,6 +5,21 @@
 //! coherent group of inherent methods) on that type.
 
 use super::*;
+
+fn row_to_consolidation_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConsolidationJob> {
+    let created_at: String = row.get(5)?;
+    let completed_at: Option<String> = row.get(6)?;
+    Ok(ConsolidationJob {
+        id: row.get(0)?,
+        topic: row.get(1)?,
+        project: row.get(2)?,
+        status: row.get(3)?,
+        error: row.get(4)?,
+        created_at: parse_dt(&created_at),
+        completed_at: completed_at.map(|s| parse_dt(&s)),
+    })
+}
+
 impl SqliteStore {
     /// Atomically increment the hook call counter and return the new value.
     pub fn increment_hook_counter(&self) -> IcmResult<usize> {
@@ -108,6 +123,152 @@ impl SqliteStore {
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM pending_extractions", [], |r| r.get(0))
+            .map_err(db_err)?;
+        Ok(n as usize)
+    }
+
+    // Async consolidation queue (issue #179)
+    //
+    // Mirrors the extraction queue above, but rows keep their terminal
+    // status instead of being deleted so `icm consolidate-jobs` can show
+    // history and a failed job can be retried.
+
+    /// Enqueue a topic for later LLM consolidation. Returns the generated
+    /// row id.
+    pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
+        let id = ulid::Ulid::new().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO pending_consolidations (id, topic, project, status, created_at)
+                 VALUES (?1, ?2, ?3, 'pending', ?4)",
+                rusqlite::params![id, topic, project, now],
+            )
+            .map_err(db_err)?;
+        Ok(id)
+    }
+
+    /// Pop up to `limit` oldest `pending` jobs (FIFO by enqueue time).
+    pub fn list_pending_consolidation_jobs(
+        &self,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, topic, project, status, error, created_at, completed_at
+                 FROM pending_consolidations
+                 WHERE status = 'pending'
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([limit as i64], row_to_consolidation_job)
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// List jobs, optionally filtered by status (`pending` | `done` |
+    /// `failed`); all statuses when `None`. Used by `icm consolidate-jobs`.
+    pub fn list_consolidation_jobs(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        let rows: Vec<ConsolidationJob> = match status {
+            Some(s) => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, topic, project, status, error, created_at, completed_at
+                         FROM pending_consolidations
+                         WHERE status = ?1
+                         ORDER BY created_at DESC
+                         LIMIT ?2",
+                    )
+                    .map_err(db_err)?;
+                let result = stmt
+                    .query_map(rusqlite::params![s, limit as i64], row_to_consolidation_job)
+                    .map_err(db_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_err)?;
+                result
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, topic, project, status, error, created_at, completed_at
+                         FROM pending_consolidations
+                         ORDER BY created_at DESC
+                         LIMIT ?1",
+                    )
+                    .map_err(db_err)?;
+                let result = stmt
+                    .query_map([limit as i64], row_to_consolidation_job)
+                    .map_err(db_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_err)?;
+                result
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Mark a job `done`. Non-fatal if the id no longer exists.
+    pub fn mark_consolidation_job_done(&self, id: &str) -> IcmResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE pending_consolidations SET status = 'done', completed_at = ?2, error = NULL
+                 WHERE id = ?1",
+                rusqlite::params![id, now],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Mark a job `failed`, capturing the error so `icm consolidate-jobs`
+    /// can surface it and the user can retry.
+    pub fn mark_consolidation_job_failed(&self, id: &str, error: &str) -> IcmResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE pending_consolidations SET status = 'failed', completed_at = ?2, error = ?3
+                 WHERE id = ?1",
+                rusqlite::params![id, now, error],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Reset a `failed` job back to `pending` so the next drain retries it.
+    /// Returns `false` if the id doesn't exist or isn't `failed`.
+    pub fn retry_consolidation_job(&self, id: &str) -> IcmResult<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE pending_consolidations
+                 SET status = 'pending', error = NULL, completed_at = NULL
+                 WHERE id = ?1 AND status = 'failed'",
+                rusqlite::params![id],
+            )
+            .map_err(db_err)?;
+        Ok(n > 0)
+    }
+
+    /// Total jobs currently `pending`. Used by `icm doctor`.
+    pub fn pending_consolidation_count(&self) -> IcmResult<usize> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_consolidations WHERE status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
             .map_err(db_err)?;
         Ok(n as usize)
     }

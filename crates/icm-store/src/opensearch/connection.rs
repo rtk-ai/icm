@@ -251,6 +251,17 @@ impl OpenSearchStore {
             }}}),
         )?;
         self.create_index(
+            IDX_CONSOLIDATION_JOBS,
+            json!({"mappings": {"properties": {
+                "topic": {"type": "keyword"},
+                "project": {"type": "keyword"},
+                "status": {"type": "keyword"},
+                "error": {"type": "text"},
+                "created_at": {"type": "date"},
+                "completed_at": {"type": "date"}
+            }}}),
+        )?;
+        self.create_index(
             IDX_CODE_AREAS,
             json!({"mappings": {"properties": {
                 "project": {"type": "keyword"},

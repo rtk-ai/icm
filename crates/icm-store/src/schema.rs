@@ -432,6 +432,26 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         CREATE INDEX IF NOT EXISTS idx_pending_extractions_captured
             ON pending_extractions(captured_at);
 
+        -- Async-consolidation queue (issue #179). When
+        -- `[consolidate.summarizer].provider` is set to anything other
+        -- than `none`, the auto-consolidate path enqueues a job here
+        -- instead of running the LLM inline on the hot store path. A
+        -- worker (`icm consolidate-pending` or the SessionEnd async
+        -- fork) drains it. Rows keep their terminal status (done/failed)
+        -- instead of being deleted, so `icm consolidate-jobs` can show
+        -- history and a failed job can be retried.
+        CREATE TABLE IF NOT EXISTS pending_consolidations (
+            id TEXT PRIMARY KEY,
+            topic TEXT NOT NULL,
+            project TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            error TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_consolidations_status
+            ON pending_consolidations(status, created_at);
+
         -- Structured hook telemetry. Every `icm hook <event>` invocation
         -- records one row so users can audit what fired, how long it took,
         -- what its outcome was, and whether the async extraction path was

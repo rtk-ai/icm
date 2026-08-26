@@ -44,7 +44,9 @@ use icm_core::{
 
 // Shared public row types live in `crate::common` (issue #301) so every
 // backend can be compiled into one binary without colliding definitions.
-pub use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
+pub use crate::common::{
+    CodeArea, ConsolidationJob, HookEvent, HookEventInsert, HookStatsRow, PendingRow,
+};
 
 // Index names
 
@@ -52,6 +54,7 @@ const IDX_MEMORIES: &str = "icm_memories";
 const IDX_METADATA: &str = "icm_metadata";
 const IDX_HOOKS: &str = "icm_hook_events";
 const IDX_PENDING: &str = "icm_pending_extractions";
+const IDX_CONSOLIDATION_JOBS: &str = "icm_pending_consolidations";
 const IDX_CODE_AREAS: &str = "icm_code_areas";
 
 // Store

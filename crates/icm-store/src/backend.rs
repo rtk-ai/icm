@@ -18,7 +18,9 @@ use icm_core::{
     TranscriptHit, TranscriptStats, TranscriptStore,
 };
 
-use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
+use crate::common::{
+    CodeArea, ConsolidationJob, HookEvent, HookEventInsert, HookStatsRow, PendingRow,
+};
 
 #[cfg(feature = "backend-sqlite")]
 use crate::store::SqliteStore;
@@ -443,6 +445,40 @@ impl Store {
     }
     pub fn pending_extraction_count(&self) -> IcmResult<usize> {
         dispatch!(self, pending_extraction_count())
+    }
+    /// Enqueue a topic for async LLM consolidation (issue #179). Returns
+    /// the generated job id.
+    pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
+        dispatch!(self, enqueue_pending_consolidation(topic, project))
+    }
+    pub fn list_pending_consolidation_jobs(
+        &self,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        dispatch!(self, list_pending_consolidation_jobs(limit))
+    }
+    /// List consolidation jobs, optionally filtered by status
+    /// (`pending` | `done` | `failed`). Used by `icm consolidate-jobs`.
+    pub fn list_consolidation_jobs(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        dispatch!(self, list_consolidation_jobs(status, limit))
+    }
+    pub fn mark_consolidation_job_done(&self, id: &str) -> IcmResult<()> {
+        dispatch!(self, mark_consolidation_job_done(id))
+    }
+    pub fn mark_consolidation_job_failed(&self, id: &str, error: &str) -> IcmResult<()> {
+        dispatch!(self, mark_consolidation_job_failed(id, error))
+    }
+    /// Reset a `failed` job back to `pending` so the next drain retries
+    /// it. Returns `false` if the id doesn't exist or isn't `failed`.
+    pub fn retry_consolidation_job(&self, id: &str) -> IcmResult<bool> {
+        dispatch!(self, retry_consolidation_job(id))
+    }
+    pub fn pending_consolidation_count(&self) -> IcmResult<usize> {
+        dispatch!(self, pending_consolidation_count())
     }
     pub fn upsert_code_area(
         &self,

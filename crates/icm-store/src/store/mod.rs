@@ -16,7 +16,9 @@ use icm_core::{
     StoreStats, TopicHealth, TranscriptHit, TranscriptStats, TranscriptStore,
 };
 
-pub use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
+pub use crate::common::{
+    CodeArea, ConsolidationJob, HookEvent, HookEventInsert, HookStatsRow, PendingRow,
+};
 use crate::schema::init_db_with_dims;
 pub struct SqliteStore {
     conn: Connection,

@@ -49,7 +49,9 @@ use icm_core::{
 
 // Shared public row types live in `crate::common` (issue #301) so every
 // backend can be compiled into one binary without colliding definitions.
-pub use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
+pub use crate::common::{
+    CodeArea, ConsolidationJob, HookEvent, HookEventInsert, HookStatsRow, PendingRow,
+};
 
 // Helpers (mirrored from the SQLite backend so behaviour matches)
 

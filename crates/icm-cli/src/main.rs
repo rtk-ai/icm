@@ -295,6 +295,45 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Process the async consolidation queue (LLM-backed, issue #179).
+    /// Drains topics enqueued by the auto-consolidate path when
+    /// `consolidate.summarizer.provider != none` (which skips the
+    /// synchronous ~10-15s LLM call on the hot store path). Designed to
+    /// be invoked from a cron, the SessionEnd async fork, or manually.
+    ConsolidatePending {
+        /// Maximum jobs to process in this run.
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Optional CLI override of `consolidate.summarizer.provider`.
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Optional CLI override of `consolidate.summarizer.model`.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Don't actually call the LLM — just print what would be sent.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// List async consolidation jobs (issue #179) — pending, done, or
+    /// failed, with the captured error for failures.
+    ConsolidateJobs {
+        /// Filter by status: pending | done | failed. All statuses when omitted.
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Maximum rows to show.
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+
+        /// Reset a `failed` job back to `pending` so the next drain retries it.
+        #[arg(long, value_name = "ID")]
+        retry: Option<String>,
+    },
+
     /// Apply temporal decay to memory weights
     Decay {
         /// Decay factor (default: 0.95)
@@ -1993,6 +2032,7 @@ fn main() -> Result<()> {
                 &store,
                 emb_ref,
                 &cfg.memory,
+                &cfg.consolidate,
                 topic,
                 content,
                 importance.into(),
@@ -2014,6 +2054,7 @@ fn main() -> Result<()> {
                 &store,
                 emb_ref,
                 &cfg.memory,
+                &cfg.consolidate,
                 content,
                 topic,
                 importance.into(),
@@ -2241,6 +2282,29 @@ fn main() -> Result<()> {
                 emb_ref,
             )
         }
+        Commands::ConsolidatePending {
+            limit,
+            provider,
+            model,
+            dry_run,
+        } => {
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            cmd_consolidate_pending(
+                &store,
+                emb_ref,
+                &cfg.consolidate.summarizer,
+                limit,
+                provider.as_deref(),
+                model.as_deref(),
+                dry_run,
+                &db_path,
+            )
+        }
+        Commands::ConsolidateJobs {
+            status,
+            limit,
+            retry,
+        } => cmd_consolidate_jobs(&store, status.as_deref(), limit, retry.as_deref()),
         Commands::Embed {
             topic,
             force,
@@ -2415,6 +2479,7 @@ fn main() -> Result<()> {
                 &store,
                 emb_ref,
                 &cfg.memory,
+                &cfg.consolidate,
                 &content,
                 importance.into(),
                 keywords,
@@ -2539,6 +2604,7 @@ fn main() -> Result<()> {
                         &store,
                         emb_ref,
                         &cfg.memory,
+                        &cfg.consolidate,
                         extract_every,
                         &cfg.extraction,
                         &cfg.archive,
@@ -2549,7 +2615,7 @@ fn main() -> Result<()> {
                     let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
                     #[cfg(not(feature = "embeddings"))]
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                    cmd_hook_compact(&store, emb_ref, &cfg.memory)
+                    cmd_hook_compact(&store, emb_ref, &cfg.memory, &cfg.consolidate)
                 }
                 HookCommands::Prompt => cmd_hook_prompt(&store, &cfg.archive),
                 HookCommands::Start { max_tokens } => {
@@ -2565,7 +2631,13 @@ fn main() -> Result<()> {
                     let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
                     #[cfg(not(feature = "embeddings"))]
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                    cmd_hook_end(&store, emb_ref, &cfg.memory, &cfg.extraction.summarizer)
+                    cmd_hook_end(
+                        &store,
+                        emb_ref,
+                        &cfg.memory,
+                        &cfg.consolidate,
+                        &cfg.extraction.summarizer,
+                    )
                 }
                 // Dispatched before `open_store`; this arm only exists for
                 // match exhaustiveness and is unreachable.
@@ -2622,10 +2694,40 @@ fn maybe_auto_consolidate(
     embedder: Option<&dyn icm_core::Embedder>,
     topic: &str,
     cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
 ) {
     if !cfg.auto_consolidate_enabled {
         return;
     }
+
+    // Issue #179: with an LLM summarizer configured, the synchronous
+    // consolidation below would block the hot store path for ~10-15s
+    // (a `claude -p` round trip) — fine on demand (`icm consolidate`),
+    // unacceptable inline on every `store()`/hook fire. Enqueue instead
+    // and let `icm consolidate-pending` (or the SessionEnd async fork)
+    // do the LLM call off the critical path. Lexical (`provider = "none"`,
+    // the default) keeps running inline — zero behavior change.
+    //
+    // Threshold check happens here, before enqueueing — otherwise every
+    // single store() would queue a job regardless of topic size, and
+    // `auto_consolidate_with_embedder`'s own no-op-below-threshold guard
+    // never gets a chance to run (it's skipped entirely on this branch).
+    if consolidate_cfg.summarizer.provider != "none" {
+        match store.count_by_topic(topic) {
+            Ok(n) if n > cfg.auto_consolidate_threshold => {
+                match store.enqueue_pending_consolidation(topic, "") {
+                    Ok(_) => eprintln!("[icm] enqueued topic '{topic}' for async consolidation"),
+                    Err(e) => {
+                        tracing::warn!("enqueue consolidation failed for topic '{topic}': {e}")
+                    }
+                }
+            }
+            Ok(_) => {} // below threshold — no-op, same as the sync path
+            Err(e) => tracing::warn!("count_by_topic failed for '{topic}': {e}"),
+        }
+        return;
+    }
+
     match store.auto_consolidate_with_embedder(topic, cfg.auto_consolidate_threshold, embedder) {
         Ok(true) => eprintln!(
             "[icm] auto-consolidated topic '{topic}' (exceeded {} entries)",
@@ -2641,6 +2743,7 @@ fn cmd_store(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     topic: String,
     content: String,
     importance: Importance,
@@ -2700,7 +2803,7 @@ fn cmd_store(
                 "Updated existing memory (similarity {score:.2}): {}",
                 updated.id
             );
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
             return Ok(());
         }
     }
@@ -2737,7 +2840,7 @@ fn cmd_store(
     }
 
     // Auto-consolidate the topic if config says so. Closes audit M2/AC1.
-    maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+    maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
 
     Ok(())
 }
@@ -2749,6 +2852,7 @@ fn cmd_remember(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     content: String,
     topic: Option<String>,
     importance: Importance,
@@ -2766,6 +2870,7 @@ fn cmd_remember(
         store,
         embedder,
         memory_cfg,
+        consolidate_cfg,
         resolved_topic,
         content,
         importance,
@@ -3697,10 +3802,12 @@ fn extract_tool_input_file_path(json: &Value) -> Option<String> {
 /// 2. **Inline path** (default, `provider = "none"`). Current
 ///    fastembed semantic-scoring extractor — multilingual, but pays
 ///    a ~3.7s model-load cost per process.
+#[allow(clippy::too_many_arguments)]
 fn cmd_hook_post(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     extract_every: usize,
     extraction_cfg: &crate::config::ExtractionConfig,
     archive_cfg: &crate::config::ArchiveConfig,
@@ -3835,7 +3942,7 @@ fn cmd_hook_post(
             // If the user has auto-consolidate enabled, fire it now so the
             // hook path stops bypassing the rollup.
             let topic = format!("context-{project}");
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
         }
         _ => {}
     }
@@ -3848,8 +3955,9 @@ fn cmd_hook_compact(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
 ) -> Result<()> {
-    extract_from_hook_transcript(store, embedder, memory_cfg, "pre-compact")
+    extract_from_hook_transcript(store, embedder, memory_cfg, consolidate_cfg, "pre-compact")
 }
 
 // ── Hook telemetry CLI ─────────────────────────────────────────────────
@@ -3936,6 +4044,7 @@ fn cmd_hook_end(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     extraction_summarizer: &crate::config::SummarizerConfig,
 ) -> Result<()> {
     // Reentrancy guard (#322): if this hook is firing inside an
@@ -3947,6 +4056,16 @@ fn cmd_hook_end(
     // transcript worth extracting anyway.
     if std::env::var_os("ICM_WORKER").is_some() {
         return Ok(());
+    }
+
+    // Issue #179: same detached-worker pattern as the extraction queue
+    // below, but for pending_consolidations. Independent of the
+    // extraction fork — a user can have one provider configured without
+    // the other. `consolidate-pending` is cheap to invoke even when the
+    // queue is empty (prints "No pending consolidations." and exits), so
+    // no need to peek the count first.
+    if consolidate_cfg.summarizer.provider != "none" {
+        spawn_detached_worker(&["consolidate-pending", "--limit", "20"], "consolidation");
     }
 
     // Async path: when a provider is configured, drain the
@@ -3994,6 +4113,7 @@ fn cmd_hook_end(
                         store,
                         embedder,
                         memory_cfg,
+                        consolidate_cfg,
                         "session-end",
                     );
                 }
@@ -4002,7 +4122,43 @@ fn cmd_hook_end(
         }
     }
     // Inline path (legacy): scan transcript and extract via fastembed.
-    extract_from_hook_transcript(store, embedder, memory_cfg, "session-end")
+    extract_from_hook_transcript(store, embedder, memory_cfg, consolidate_cfg, "session-end")
+}
+
+/// Fork a detached, `ICM_WORKER`-tagged copy of this binary running
+/// `args`, redirected to `/dev/null` and set to outlive the parent (Unix:
+/// new session via `setsid`). Used by the SessionEnd hook to drain async
+/// queues (extraction, consolidation) off the critical path without
+/// Claude Code killing us with "Hook cancelled". Failure is logged, not
+/// propagated — the caller has its own inline fallback (extraction) or
+/// simply skips this round (consolidation, picked up on the next
+/// SessionEnd or a manual `icm consolidate-pending`).
+fn spawn_detached_worker(args: &[&str], label: &str) {
+    let Ok(self_path) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(&self_path);
+    cmd.args(args);
+    // Mark the worker subtree (#322) so any hook fired by an LLM CLI it
+    // spawns short-circuits instead of forking again.
+    cmd.env("ICM_WORKER", "1");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    match cmd.spawn() {
+        Ok(_) => eprintln!("[icm] session-end: forked async {label} worker"),
+        Err(e) => eprintln!("[icm] session-end: {label} worker fork failed ({e}), skipping"),
+    }
 }
 
 /// Read JSON from stdin, locate the transcript file, parse the last 100
@@ -4015,6 +4171,7 @@ fn extract_from_hook_transcript(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     source: &str,
 ) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
@@ -4155,7 +4312,7 @@ fn extract_from_hook_transcript(
             // so the PreCompact / SessionEnd path stops bypassing the
             // rollup configured in `[memory] auto_consolidate_enabled`.
             let topic = format!("context-{project}");
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
         }
         _ => {}
     }
@@ -7562,11 +7719,15 @@ impl WorkerLock {
     /// Try to take the lock next to the DB. `Ok(Some(_))` = acquired,
     /// `Ok(None)` = another process already holds it, `Err` = the lockfile
     /// itself could not be created (caller may proceed without the guard).
-    fn acquire(db_path: &std::path::Path) -> Result<Option<Self>> {
+    ///
+    /// `kind` names the lockfile (e.g. `"extract"`, `"consolidate"`) so
+    /// independent async workers (issue #179) don't contend on the same
+    /// advisory lock and can run concurrently with each other.
+    fn acquire(db_path: &std::path::Path, kind: &str) -> Result<Option<Self>> {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let lock_path = db_path.with_extension("extract.lock");
+            let lock_path = db_path.with_extension(format!("{kind}.lock"));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -7591,7 +7752,7 @@ impl WorkerLock {
         }
         #[cfg(not(unix))]
         {
-            let _ = db_path;
+            let _ = (db_path, kind);
             Ok(Some(Self {}))
         }
     }
@@ -7663,7 +7824,7 @@ fn cmd_extract_pending(
     let _lock = if dry_run {
         None
     } else {
-        match WorkerLock::acquire(db_path) {
+        match WorkerLock::acquire(db_path, "extract") {
             Ok(Some(l)) => Some(l),
             Ok(None) => {
                 println!("Another extract-pending worker is already running; skipping.");
@@ -8107,6 +8268,147 @@ fn cmd_consolidate_all(
     Ok(())
 }
 
+/// `icm consolidate-pending` — drain the async consolidation queue (issue
+/// #179). Unlike `consolidate-all`'s cron-style topic scan, this only
+/// processes topics explicitly enqueued by [`maybe_auto_consolidate`] (the
+/// synchronous auto-consolidate trigger, once an LLM summarizer is
+/// configured — the whole point being to move that ~10-15s LLM call off the
+/// hot `icm store` path). Reuses [`cmd_consolidate`] per job, same as
+/// `consolidate-all` reuses it per topic; never keeps originals, for the
+/// same idempotency reason (a just-consolidated topic collapses under the
+/// threshold and won't be re-enqueued).
+#[allow(clippy::too_many_arguments)]
+fn cmd_consolidate_pending(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    cfg: &config::SummarizerConfig,
+    limit: usize,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    dry_run: bool,
+    db_path: &std::path::Path,
+) -> Result<()> {
+    // Separate lockfile from the extraction worker (see WorkerLock::acquire)
+    // so the two async queues can drain concurrently — they touch disjoint
+    // tables and neither holds a long-running transaction across rows.
+    let _lock = if dry_run {
+        None
+    } else {
+        match WorkerLock::acquire(db_path, "consolidate") {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => {
+                println!("Another consolidate-pending worker is already running; skipping.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[consolidate-pending] lock unavailable ({e}); proceeding without singleton guard"
+                );
+                None
+            }
+        }
+    };
+
+    let jobs = store.list_pending_consolidation_jobs(limit)?;
+    if jobs.is_empty() {
+        println!("No pending consolidations.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("=== Dry run ===");
+        println!("jobs: {}", jobs.len());
+        for job in &jobs {
+            println!("  {} — topic '{}'", job.id, job.topic);
+        }
+        return Ok(());
+    }
+
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for job in &jobs {
+        println!("[consolidate-pending] {} (topic '{}')…", job.id, job.topic);
+        match cmd_consolidate(
+            store,
+            &job.topic,
+            false,
+            cfg,
+            cli_provider,
+            cli_model,
+            None,
+            embedder,
+        ) {
+            Ok(()) => {
+                if let Err(e) = store.mark_consolidation_job_done(&job.id) {
+                    tracing::warn!("mark_consolidation_job_done failed for {}: {e}", job.id);
+                }
+                done += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[consolidate-pending] job {} (topic '{}') failed: {e}",
+                    job.id, job.topic
+                );
+                if let Err(e2) = store.mark_consolidation_job_failed(&job.id, &e.to_string()) {
+                    tracing::warn!("mark_consolidation_job_failed failed for {}: {e2}", job.id);
+                }
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    if failed == 0 {
+        println!("Processed {done} job(s).");
+    } else {
+        println!("Processed {done} job(s); {failed} failed (see errors above, retry with `icm consolidate-jobs --retry <id>`).");
+    }
+    Ok(())
+}
+
+/// `icm consolidate-jobs` — list async consolidation jobs (issue #179), or
+/// with `--retry <id>`, reset one `failed` job back to `pending` so the next
+/// `consolidate-pending` drain picks it up again.
+fn cmd_consolidate_jobs(
+    store: &Store,
+    status: Option<&str>,
+    limit: usize,
+    retry: Option<&str>,
+) -> Result<()> {
+    if let Some(id) = retry {
+        return if store.retry_consolidation_job(id)? {
+            println!("Job {id} reset to pending.");
+            Ok(())
+        } else {
+            bail!("job {id} not found or not in 'failed' status — nothing to retry");
+        };
+    }
+
+    let jobs = store.list_consolidation_jobs(status, limit)?;
+    if jobs.is_empty() {
+        println!("No consolidation jobs.");
+        return Ok(());
+    }
+    for job in &jobs {
+        let completed = job
+            .completed_at
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}  {:<8}  {:<30}  created={}  completed={}",
+            job.id,
+            job.status,
+            job.topic,
+            job.created_at.to_rfc3339(),
+            completed
+        );
+        if let Some(err) = &job.error {
+            println!("    error: {err}");
+        }
+    }
+    Ok(())
+}
+
 fn cmd_extract(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
@@ -8537,6 +8839,7 @@ fn cmd_save_project(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     content: &str,
     importance: Importance,
     keywords: Option<String>,
@@ -8550,6 +8853,7 @@ fn cmd_save_project(
         store,
         embedder,
         memory_cfg,
+        consolidate_cfg,
         topic,
         content.to_string(),
         importance,
@@ -10889,11 +11193,11 @@ mod hook_start_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("memories.db");
 
-        let first = WorkerLock::acquire(&db).unwrap();
+        let first = WorkerLock::acquire(&db, "extract").unwrap();
         assert!(first.is_some(), "first acquire should succeed");
 
         // Held: a concurrent acquire is refused (Ok(None)), not an error.
-        let second = WorkerLock::acquire(&db).unwrap();
+        let second = WorkerLock::acquire(&db, "extract").unwrap();
         assert!(
             second.is_none(),
             "second acquire must be refused while held"
@@ -10901,7 +11205,7 @@ mod hook_start_tests {
 
         // Release, then the lock is available again.
         drop(first);
-        let third = WorkerLock::acquire(&db).unwrap();
+        let third = WorkerLock::acquire(&db, "extract").unwrap();
         assert!(third.is_some(), "acquire should succeed after release");
     }
 
@@ -12047,6 +12351,135 @@ mod cli_contracts_tests {
         assert_eq!(http_proxy.as_deref(), Some("http://127.0.0.1:11435"));
         assert_eq!(token.as_deref(), Some("secret"));
     }
+
+    /// Issue #179 regression test: `maybe_auto_consolidate` must only
+    /// enqueue a job once the topic actually exceeds the threshold — an
+    /// earlier draft enqueued unconditionally whenever an LLM summarizer
+    /// was configured, which would have queued a job on every single
+    /// `store()` call regardless of topic size.
+    #[test]
+    fn maybe_auto_consolidate_enqueues_only_over_threshold() {
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let memory_cfg = crate::config::MemoryConfig {
+            auto_consolidate_enabled: true,
+            auto_consolidate_threshold: 3,
+            ..Default::default()
+        };
+        let mut consolidate_cfg = crate::config::ConsolidateConfig::default();
+        consolidate_cfg.summarizer.provider = "claude".to_string();
+
+        for i in 0..3 {
+            store
+                .store(Memory::new(
+                    "t".to_string(),
+                    format!("fact {i}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+
+        // At exactly the threshold — must not enqueue yet (same `> threshold`
+        // semantics as the pre-existing sync path).
+        maybe_auto_consolidate(&store, None, "t", &memory_cfg, &consolidate_cfg);
+        assert_eq!(
+            store.pending_consolidation_count().unwrap(),
+            0,
+            "must not enqueue at exactly the threshold"
+        );
+
+        store
+            .store(Memory::new(
+                "t".to_string(),
+                "fact 3".to_string(),
+                Importance::Medium,
+            ))
+            .unwrap();
+
+        // Now over threshold — must enqueue exactly one job.
+        maybe_auto_consolidate(&store, None, "t", &memory_cfg, &consolidate_cfg);
+        assert_eq!(store.pending_consolidation_count().unwrap(), 1);
+
+        let jobs = store.list_pending_consolidation_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].topic, "t");
+        assert_eq!(jobs[0].status, "pending");
+
+        // A second store() over an already-enqueued topic must not pile up
+        // duplicate jobs beyond what the drain will process — verifies the
+        // enqueue call itself is idempotent-friendly per invocation (each
+        // call adds one row; that's fine, the drain processes and marks
+        // them done rather than needing DB-level dedup).
+        maybe_auto_consolidate(&store, None, "t", &memory_cfg, &consolidate_cfg);
+        assert!(store.pending_consolidation_count().unwrap() >= 1);
+    }
+
+    /// End-to-end for issue #179: `cmd_consolidate_pending` must drain a
+    /// queued job, actually consolidate the topic (provider=none exercises
+    /// the lexical fallback so the test has no LLM CLI dependency), and
+    /// mark the job `done`. `cmd_consolidate_jobs` must then list it.
+    #[test]
+    fn consolidate_pending_drains_job_and_marks_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+
+        for i in 0..4 {
+            store
+                .store(Memory::new(
+                    "t".to_string(),
+                    format!("fact {i}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let job_id = store.enqueue_pending_consolidation("t", "").unwrap();
+
+        let cfg = config::SummarizerConfig::default(); // provider = "none" → lexical join
+        cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path).unwrap();
+
+        let jobs = store.list_consolidation_jobs(None, 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+        assert_eq!(jobs[0].status, "done");
+        assert!(jobs[0].completed_at.is_some());
+        assert!(store
+            .list_pending_consolidation_jobs(10)
+            .unwrap()
+            .is_empty());
+
+        // The topic itself must actually be consolidated (4 memories -> 1).
+        let remaining = store.get_by_topic("t").unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    /// `cmd_consolidate_pending` on a job whose topic no longer has any
+    /// memories (e.g. it was manually consolidated/deleted between enqueue
+    /// and drain) must mark the job `failed` with a captured error rather
+    /// than panicking or silently dropping the job.
+    #[test]
+    fn consolidate_pending_marks_failed_job_with_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+
+        let job_id = store
+            .enqueue_pending_consolidation("does-not-exist", "")
+            .unwrap();
+
+        let cfg = config::SummarizerConfig::default();
+        cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path).unwrap();
+
+        let jobs = store.list_consolidation_jobs(Some("failed"), 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+        assert!(jobs[0].error.is_some());
+
+        // `icm consolidate-jobs --retry <id>` must reset it back to pending.
+        cmd_consolidate_jobs(&store, None, 10, Some(&job_id)).unwrap();
+        let jobs = store.list_consolidation_jobs(Some("pending"), 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+    }
 }
 
 #[cfg(test)]
@@ -12633,11 +13066,13 @@ mod cmd_remember_tests {
         use icm_store::Store;
         let store = Store::in_memory().unwrap();
         let cfg = crate::config::MemoryConfig::default();
+        let consolidate_cfg = crate::config::ConsolidateConfig::default();
 
         cmd_store(
             &store,
             None,
             &cfg,
+            &consolidate_cfg,
             "icm".into(),
             "TODO: wire FTS5 trigger for memory updates".into(),
             Importance::Medium,
@@ -12650,6 +13085,7 @@ mod cmd_remember_tests {
             &store,
             None,
             &cfg,
+            &consolidate_cfg,
             "FTS5 trigger now syncs on update; closes the recall gap".into(),
             Some("icm".into()),
             Importance::Medium,

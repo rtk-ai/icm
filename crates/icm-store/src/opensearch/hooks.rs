@@ -97,6 +97,175 @@ impl OpenSearchStore {
         Ok(resp.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize)
     }
 
+    // Async consolidation queue (issue #179)
+
+    pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
+        let id = ulid::Ulid::new().to_string();
+        self.request(
+            "PUT",
+            &format!(
+                "{IDX_CONSOLIDATION_JOBS}/_doc/{id}?{}",
+                self.refresh_param()
+            ),
+            Some(json!({
+                "topic": topic,
+                "project": project,
+                "status": "pending",
+                "created_at": Utc::now().to_rfc3339()
+            })),
+            false,
+        )?;
+        Ok(id)
+    }
+
+    fn hit_to_consolidation_job(h: &Value) -> Option<ConsolidationJob> {
+        let id = h.get("_id")?.as_str()?.to_string();
+        let s = h.get("_source")?;
+        let created_at = s.get("created_at")?.as_str()?;
+        Some(ConsolidationJob {
+            id,
+            topic: s.get("topic")?.as_str()?.to_string(),
+            project: s
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            status: s.get("status")?.as_str()?.to_string(),
+            error: s.get("error").and_then(|v| v.as_str()).map(String::from),
+            created_at: created_at.parse().unwrap_or_else(|_| Utc::now()),
+            completed_at: s
+                .get("completed_at")
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.parse().ok()),
+        })
+    }
+
+    fn search_consolidation_jobs(
+        &self,
+        query: Value,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        let resp = self.post(&format!("{IDX_CONSOLIDATION_JOBS}/_search"), query)?;
+        Ok(resp
+            .get("hits")
+            .and_then(|h| h.get("hits"))
+            .and_then(|h| h.as_array())
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(Self::hit_to_consolidation_job)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .take(limit)
+            .collect())
+    }
+
+    pub fn list_pending_consolidation_jobs(
+        &self,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        self.search_consolidation_jobs(
+            json!({
+                "size": limit,
+                "query": {"term": {"status": "pending"}},
+                "sort": [{"created_at": "asc"}]
+            }),
+            limit,
+        )
+    }
+
+    pub fn list_consolidation_jobs(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        let query = match status {
+            Some(s) => json!({
+                "size": limit,
+                "query": {"term": {"status": s}},
+                "sort": [{"created_at": "desc"}]
+            }),
+            None => json!({
+                "size": limit,
+                "query": {"match_all": {}},
+                "sort": [{"created_at": "desc"}]
+            }),
+        };
+        self.search_consolidation_jobs(query, limit)
+    }
+
+    pub fn mark_consolidation_job_done(&self, id: &str) -> IcmResult<()> {
+        self.request(
+            "POST",
+            &format!(
+                "{IDX_CONSOLIDATION_JOBS}/_update/{id}?{}",
+                self.refresh_param()
+            ),
+            Some(json!({
+                "doc": {"status": "done", "completed_at": Utc::now().to_rfc3339(), "error": null}
+            })),
+            false,
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_consolidation_job_failed(&self, id: &str, error: &str) -> IcmResult<()> {
+        self.request(
+            "POST",
+            &format!(
+                "{IDX_CONSOLIDATION_JOBS}/_update/{id}?{}",
+                self.refresh_param()
+            ),
+            Some(json!({
+                "doc": {"status": "failed", "completed_at": Utc::now().to_rfc3339(), "error": error}
+            })),
+            false,
+        )?;
+        Ok(())
+    }
+
+    pub fn retry_consolidation_job(&self, id: &str) -> IcmResult<bool> {
+        // Scripted update (not a plain `doc` merge) so the reset is
+        // conditional on the current status being `failed` — matches the
+        // SQL backends' `WHERE status = 'failed'`, so retrying an
+        // already-pending or already-done job is a no-op, not a silent
+        // downgrade of its state.
+        let resp = self.request(
+            "POST",
+            &format!(
+                "{IDX_CONSOLIDATION_JOBS}/_update/{id}?{}",
+                self.refresh_param()
+            ),
+            Some(json!({
+                "script": {
+                    "lang": "painless",
+                    "source": "if (ctx._source.status == 'failed') { \
+                                    ctx._source.status = 'pending'; \
+                                    ctx._source.error = null; \
+                                    ctx._source.completed_at = null; \
+                                } else { \
+                                    ctx.op = 'none'; \
+                                }"
+                }
+            })),
+            false,
+        )?;
+        Ok(resp
+            .as_ref()
+            .and_then(|v| v.get("result"))
+            .and_then(|v| v.as_str())
+            == Some("updated"))
+    }
+
+    pub fn pending_consolidation_count(&self) -> IcmResult<usize> {
+        let resp = self.post(
+            &format!("{IDX_CONSOLIDATION_JOBS}/_count"),
+            json!({"query": {"term": {"status": "pending"}}}),
+        )?;
+        Ok(resp.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize)
+    }
+
     pub fn upsert_code_area(
         &self,
         project: &str,

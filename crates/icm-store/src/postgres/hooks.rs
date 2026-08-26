@@ -105,6 +105,129 @@ impl PostgresStore {
         Ok(n.max(0) as usize)
     }
 
+    // Async consolidation queue (issue #179)
+
+    pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
+        let id = ulid::Ulid::new().to_string();
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO pending_consolidations (id, topic, project, status, created_at)
+             VALUES ($1, $2, $3, 'pending', $4)",
+            &[&id, &topic, &project, &Utc::now()],
+        )
+        .map_err(pg_err)?;
+        Ok(id)
+    }
+
+    fn row_to_consolidation_job(row: &postgres::Row) -> ConsolidationJob {
+        let created_at: DateTime<Utc> = row.get(5);
+        let completed_at: Option<DateTime<Utc>> = row.get(6);
+        ConsolidationJob {
+            id: row.get(0),
+            topic: row.get(1),
+            project: row.get(2),
+            status: row.get(3),
+            error: row.get(4),
+            created_at,
+            completed_at,
+        }
+    }
+
+    pub fn list_pending_consolidation_jobs(
+        &self,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                "SELECT id, topic, project, status, error, created_at, completed_at
+                 FROM pending_consolidations
+                 WHERE status = 'pending'
+                 ORDER BY created_at ASC
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .map_err(pg_err)?;
+        Ok(rows.iter().map(Self::row_to_consolidation_job).collect())
+    }
+
+    pub fn list_consolidation_jobs(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> IcmResult<Vec<ConsolidationJob>> {
+        let mut c = self.conn()?;
+        let rows = match status {
+            Some(s) => c
+                .query(
+                    "SELECT id, topic, project, status, error, created_at, completed_at
+                     FROM pending_consolidations
+                     WHERE status = $1
+                     ORDER BY created_at DESC
+                     LIMIT $2",
+                    &[&s, &(limit as i64)],
+                )
+                .map_err(pg_err)?,
+            None => c
+                .query(
+                    "SELECT id, topic, project, status, error, created_at, completed_at
+                     FROM pending_consolidations
+                     ORDER BY created_at DESC
+                     LIMIT $1",
+                    &[&(limit as i64)],
+                )
+                .map_err(pg_err)?,
+        };
+        Ok(rows.iter().map(Self::row_to_consolidation_job).collect())
+    }
+
+    pub fn mark_consolidation_job_done(&self, id: &str) -> IcmResult<()> {
+        let mut c = self.conn()?;
+        c.execute(
+            "UPDATE pending_consolidations SET status = 'done', completed_at = $2, error = NULL
+             WHERE id = $1",
+            &[&id, &Utc::now()],
+        )
+        .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn mark_consolidation_job_failed(&self, id: &str, error: &str) -> IcmResult<()> {
+        let mut c = self.conn()?;
+        c.execute(
+            "UPDATE pending_consolidations SET status = 'failed', completed_at = $2, error = $3
+             WHERE id = $1",
+            &[&id, &Utc::now(), &error],
+        )
+        .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn retry_consolidation_job(&self, id: &str) -> IcmResult<bool> {
+        let mut c = self.conn()?;
+        let n = c
+            .execute(
+                "UPDATE pending_consolidations
+                 SET status = 'pending', error = NULL, completed_at = NULL
+                 WHERE id = $1 AND status = 'failed'",
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        Ok(n > 0)
+    }
+
+    pub fn pending_consolidation_count(&self) -> IcmResult<usize> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_one(
+                "SELECT COUNT(*) FROM pending_consolidations WHERE status = 'pending'",
+                &[],
+            )
+            .map_err(pg_err)?;
+        let n: i64 = row.get(0);
+        Ok(n.max(0) as usize)
+    }
+
     // Code areas (issue #196)
 
     /// Insert or refresh a row for `(project, file_path)`.

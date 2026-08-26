@@ -68,3 +68,19 @@ pub struct HookStatsRow {
 /// `(id, project, tool_name, raw_output, captured_at)` where
 /// `captured_at` is RFC3339.
 pub type PendingRow = (String, String, String, String, String);
+
+/// One row of the async consolidation queue (issue #179). Unlike the
+/// extraction queue's fire-and-delete rows, jobs keep their status after
+/// processing so `icm consolidate-jobs` can show completed/failed history
+/// and a failed job can be retried instead of silently vanishing.
+#[derive(Debug, Clone)]
+pub struct ConsolidationJob {
+    pub id: String,
+    pub topic: String,
+    pub project: String,
+    /// `"pending"` | `"done"` | `"failed"`.
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}

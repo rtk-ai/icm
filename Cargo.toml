@@ -25,6 +25,19 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # (ort-download-binaries for the static default build, ort-load-dynamic for the
 # homebrew-core-buildable variant — issue #345). hf-hub is re-added per-feature.
 fastembed = { version = "6", default-features = false }
+# Direct `ort` dep (fastembed already pulls it in transitively) so
+# `embeddings-cuda`/`embeddings-coreml` can register a specific execution
+# provider directly — fastembed's own InitOptions exposes
+# `with_execution_providers` but no feature wires a specific EP in.
+# Exact-pinned to match fastembed's transitive `ort` (a "-rc" prerelease
+# requires an exact version to unify as the same crate instance).
+# `default-features = false`: `ort`'s defaults include `download-binaries`
+# and a newer `api-N` than fastembed requests — Cargo unions every
+# dependent's requested features onto one shared build, so pulling those
+# in here would silently raise the onnxruntime version floor again (see
+# the `ort_runtime.rs` 1.20.1->1.29.0 incident) and fight the load-dynamic
+# build's explicit no-linked-runtime goal.
+ort = { version = "2.0.0-rc.13", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

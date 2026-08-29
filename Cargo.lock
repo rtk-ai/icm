@@ -1353,6 +1353,7 @@ dependencies = [
  "directories",
  "fastembed",
  "libc",
+ "ort",
  "serde",
  "serde_json",
  "tempfile",

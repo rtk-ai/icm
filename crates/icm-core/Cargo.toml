@@ -15,6 +15,37 @@ embeddings-static = ["embeddings", "fastembed/ort-download-binaries"]
 # binary is homebrew-core-buildable with embeddings (the runtime lib is resolved
 # at first use). See issue #345.
 embeddings-dynamic = ["embeddings", "fastembed/ort-load-dynamic"]
+# Registers the CUDA execution provider (NVIDIA GPU) with fastembed's
+# session, on top of whichever of the two features above supplies the
+# onnxruntime binary itself. Linux/Windows x86_64 only: with
+# `embeddings-static` (download-binaries), `ort-sys`'s
+# `build/download/resolve.rs` auto-detects the installed CUDA toolkit
+# version and fetches the matching onnxruntime GPU archive at *build*
+# time — no manual download needed — but no such archive is published for
+# macOS/ARM at all, so `--features embeddings-cuda` fails to *link* (not
+# just misbehave at runtime) there; confirmed by hand (2026-08-29,
+# `cargo test --features embeddings-cuda` on this Mac: "no builds
+# available that satisfy the requested feature set 'cuda13'" for
+# aarch64-apple-darwin, only 'coreml'/'coreml,webgpu'). On a supported
+# platform with no CUDA-capable GPU present at *runtime*, the CUDA EP
+# fails to initialize and `ort` falls back to CPU, so the built binary is
+# still safe to ship broadly — this restriction is about which
+# *toolchains* can produce that binary in the first place. UNVERIFIED for
+# actual GPU acceleration — no CUDA hardware was available to test
+# against; needs confirming on a real NVIDIA GPU (Linux or Windows) before
+# recommending it.
+embeddings-cuda = ["embeddings", "dep:ort", "ort/cuda"]
+# CoreML execution provider (Apple Neural Engine / GPU) for macOS.
+# Measured (2026-08-29, LoCoMo pilot host, multilingual-e5-large): SLOWER
+# than plain CPU in every configuration tried (one-shot CLI and a
+# long-running `icm serve` process, ComputeUnits::All and forced
+# ::CPUAndGPU) — CoreML paid real compile/partitioning overhead while
+# `ioreg`'s live GPU utilization counter stayed at 0% throughout, meaning
+# the EP fell back to CPU-within-CoreML for this model's ops rather than
+# actually running on the ANE/GPU. Kept behind this feature (never in any
+# default feature set) for a different model/export that might fare
+# better — do not enable expecting a speedup without re-measuring.
+embeddings-coreml = ["embeddings", "dep:ort", "ort/coreml"]
 
 [dependencies]
 chrono = { workspace = true }
@@ -27,6 +58,7 @@ fastembed = { workspace = true, optional = true }
 directories = { workspace = true, optional = true }
 cachedir = { workspace = true, optional = true }
 tracing = { workspace = true }
+ort = { workspace = true, optional = true }
 
 # Unix-only: used by the load-dynamic embeddings build to pre-flight the
 # onnxruntime dylib (dlopen) before ort initializes. See issue #345.

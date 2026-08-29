@@ -28,6 +28,18 @@ embeddings-static = ["embeddings", "icm-core/embeddings-static"]
 # so `brew install` (homebrew-core) can build it with embeddings. Used as
 # `--no-default-features --features "embeddings-dynamic,backend-sqlite,tui,http-api"`.
 embeddings-dynamic = ["embeddings", "icm-core/embeddings-dynamic", "dep:zip"]
+# CUDA execution provider (NVIDIA GPU) for hardware-accelerated embedding.
+# Composes with either onnxruntime variant above (e.g.
+# `--features embeddings-static,embeddings-cuda`) — it only changes which
+# execution provider the session registers, not how the runtime binary
+# itself is obtained. Falls back to CPU automatically on a machine without
+# a CUDA-capable GPU/toolkit.
+embeddings-cuda = ["icm-core/embeddings-cuda"]
+# CoreML execution provider (Apple Neural Engine / GPU). NOT recommended —
+# see the doc comment on `icm-core`'s `embeddings-coreml` feature: measured
+# slower than plain CPU with the ANE/GPU never actually engaging. Kept for
+# a future model/export that might fare better.
+embeddings-coreml = ["icm-core/embeddings-coreml"]
 tui = ["dep:ratatui", "dep:crossterm"]
 # Storage backends (additive). SQLite is in-process; postgres / opensearch
 # are network-accessible so several `icm` processes / Kubernetes replicas

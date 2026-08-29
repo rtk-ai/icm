@@ -103,6 +103,46 @@ fn onnxruntime_dylib_available() -> bool {
     true
 }
 
+/// Register execution providers on `opts` beyond onnxruntime's default CPU
+/// provider.
+///
+/// CUDA (NVIDIA GPU) when `embeddings-cuda` is compiled in, on every
+/// platform — falls back to CPU automatically if no CUDA-capable GPU or
+/// toolkit is present, so it's safe to enable in a build that might run on
+/// GPU-less machines. CoreML (Apple Neural Engine / GPU) when
+/// `embeddings-coreml` is compiled in on macOS — see that feature's doc
+/// comment in `icm-core/Cargo.toml` for why it's not recommended (measured
+/// slower than plain CPU, GPU never actually engaged on the host it was
+/// tested on). `ort` is only a dependency at all when one of these
+/// features is enabled (it's `optional`), so the fallback body can't
+/// reference any `ort` type — hence two same-signature functions selected
+/// by `cfg` rather than one function with a feature-gated body.
+/// Registering an EP does not remove the CPU fallback — `ort` tries each
+/// provider in order and falls back automatically if one can't handle a
+/// given op or fails to initialize.
+#[cfg(any(feature = "embeddings-cuda", feature = "embeddings-coreml"))]
+fn with_execution_providers(opts: InitOptions) -> InitOptions {
+    let mut eps = Vec::new();
+    #[cfg(feature = "embeddings-cuda")]
+    eps.push(ort::ep::CUDA::default().build());
+    #[cfg(all(feature = "embeddings-coreml", target_os = "macos"))]
+    eps.push(
+        ort::ep::CoreML::default()
+            .with_compute_units(ort::ep::coreml::ComputeUnits::All)
+            .build(),
+    );
+    if eps.is_empty() {
+        opts
+    } else {
+        opts.with_execution_providers(eps)
+    }
+}
+
+#[cfg(not(any(feature = "embeddings-cuda", feature = "embeddings-coreml")))]
+fn with_execution_providers(opts: InitOptions) -> InitOptions {
+    opts
+}
+
 pub struct FastEmbedder {
     // fastembed 6's `TextEmbedding::embed` takes `&mut self`; a single
     // mutex both lazily initializes the model on first use and serializes
@@ -209,12 +249,13 @@ impl FastEmbedder {
                         .to_string(),
                 ));
             }
-            let model = TextEmbedding::try_new(
+            let init_opts = with_execution_providers(
                 InitOptions::new(emb_model)
                     .with_show_download_progress(true)
                     .with_cache_dir(cache),
-            )
-            .map_err(|e| IcmError::Embedding(format!("failed to init model: {e}")))?;
+            );
+            let model = TextEmbedding::try_new(init_opts)
+                .map_err(|e| IcmError::Embedding(format!("failed to init model: {e}")))?;
             *guard = Some(model);
         }
         f(guard.as_mut().unwrap())

@@ -8000,36 +8000,20 @@ impl WorkerLock {
     }
 }
 
-/// Process the async extraction queue.
-///
-/// Reads up to `limit` oldest pending rows from `pending_extractions`.
-///
-/// With an LLM provider configured, it concatenates their raw outputs,
-/// asks the configured LLM CLI to extract decisions / architecture /
-/// preferences, parses the bullet response, and stores the results as
-/// Memory rows.
-///
-/// With `provider = "none"`, or when the resolved CLI is not installed,
-/// it falls back to the fastembed extractor — but runs it **once** over
-/// the whole drained batch instead of once per hook fire. That is the
-/// deferred half of the issue #239 fix: editor hooks enqueue cheaply,
-/// and the heavy model load happens here, once per drain.
-///
-/// Successfully-processed rows are deleted from the queue regardless of
-/// whether facts were extracted (so an output with no extractable
-/// content doesn't loop forever).
 /// Drain `pending` through the local fastembed extractor — no network or
 /// LLM CLI needed, so this is the fallback used both when no LLM provider
 /// is configured/available and when a configured one fails at runtime.
+/// Accepts owned rows or borrowed rows (`&[PendingRow]` or `&[&PendingRow]`).
 /// Returns `(facts_stored, rows_dequeued)`.
 fn extract_pending_drain_fastembed(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
-    pending: &[icm_store::PendingRow],
+    pending: &[impl std::borrow::Borrow<icm_store::PendingRow>],
 ) -> Result<(usize, usize)> {
-    let ids: Vec<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
+    let ids: Vec<String> = pending.iter().map(|row| row.borrow().0.clone()).collect();
     let mut stored = 0usize;
-    for (_, project, _, raw, _) in pending {
+    for row in pending {
+        let (_, project, _, raw, _) = row.borrow();
         match extract::extract_and_store_with_embedder(
             store,
             raw,
@@ -8046,6 +8030,216 @@ fn extract_pending_drain_fastembed(
     Ok((stored, deleted))
 }
 
+/// Partition queued rows by project, keeping first-appearance order across
+/// groups and the input order within each group (the store hands rows over
+/// `captured_at ASC`). One LLM prompt per group lets every extracted fact
+/// carry the project whose tool output produced it.
+fn group_pending_by_project(
+    pending: &[icm_store::PendingRow],
+) -> Vec<(String, Vec<&icm_store::PendingRow>)> {
+    let mut groups: Vec<(String, Vec<&icm_store::PendingRow>)> = Vec::new();
+    for row in pending {
+        match groups.iter_mut().find(|(project, _)| *project == row.1) {
+            Some((_, rows)) => rows.push(row),
+            None => groups.push((row.1.clone(), vec![row])),
+        }
+    }
+    groups
+}
+
+/// Build the fact-extraction prompt for one project's queued rows.
+fn build_extract_prompt(rows: &[&icm_store::PendingRow]) -> String {
+    let mut joined = String::new();
+    for (_, project, tool_name, raw, _) in rows.iter().copied() {
+        joined.push_str(&format!("=== tool={tool_name} project={project} ===\n"));
+        joined.push_str(raw);
+        joined.push_str("\n\n");
+    }
+    format!(
+        "From the tool outputs below, extract durable facts that an AI agent \
+         should remember across sessions: architecture decisions, resolved \
+         errors, user preferences, project-specific context.\n\
+         \n\
+         Output format: one fact per line, prefixed with `- `. Each fact \
+         must be a complete, standalone sentence — no pronouns referring to \
+         missing context. Skip routine noise (file listings, build progress, \
+         git status). If nothing durable is present, output exactly `- (none)`.\n\
+         \n\
+         {joined}",
+    )
+}
+
+/// Counters for one `extract-pending` drain. They live outside the group loop
+/// so an error that propagates mid-drain can still report what was committed
+/// before it.
+#[derive(Default)]
+struct DrainTally {
+    /// Facts stored, LLM-extracted and fastembed-extracted alike.
+    stored: usize,
+    /// Queue rows deleted.
+    deleted: usize,
+    /// Rows drained through the local extractor after the provider failed.
+    fallback_rows: usize,
+    /// Rows dropped because the provider returned nothing for their group.
+    discarded_rows: usize,
+}
+
+impl DrainTally {
+    /// The one-line run summary. The `fastembed fallback` phrase is a contract:
+    /// operators grep for it to detect a degraded drain.
+    fn summary_line(&self, processed: usize) -> String {
+        let mut notes: Vec<String> = Vec::new();
+        if self.fallback_rows > 0 {
+            notes.push(format!("{} via fastembed fallback", self.fallback_rows));
+        }
+        if self.discarded_rows > 0 {
+            notes.push(format!(
+                "{} dropped after empty provider output",
+                self.discarded_rows
+            ));
+        }
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join(", "))
+        };
+        format!(
+            "Processed {processed} rows{notes}, extracted {} facts, dequeued {}.",
+            self.stored, self.deleted
+        )
+    }
+}
+
+/// Drain the project groups: one provider call per group while the provider
+/// works, the local extractor for the failing group and every group after it.
+/// `tally` is updated as each group commits, so the caller can report the
+/// committed prefix even when an error propagates out of the loop.
+#[allow(clippy::too_many_arguments)]
+fn drain_pending_groups(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    provider: &dyn summarizer::Summarizer,
+    model: Option<&str>,
+    max_tokens: usize,
+    timeout: std::time::Duration,
+    groups: &[(String, Vec<&icm_store::PendingRow>)],
+    tally: &mut DrainTally,
+) -> Result<()> {
+    // After one runtime failure (auth expired, network down, rate-limited),
+    // assume the CLI keeps failing rather than pay one timeout per remaining
+    // group; those groups take the local extractor instead.
+    let mut provider_failed = false;
+
+    for (project, rows) in groups {
+        let ids: Vec<String> = rows.iter().map(|row| row.0.clone()).collect();
+
+        if provider_failed {
+            let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, rows)?;
+            eprintln!(
+                "[extract-pending] project={project}: {} rows took the fastembed fallback \
+                 (provider unavailable this run)",
+                rows.len()
+            );
+            tally.stored += stored;
+            tally.deleted += deleted;
+            tally.fallback_rows += rows.len();
+            continue;
+        }
+
+        let prompt = build_extract_prompt(rows);
+        let req = summarizer::SummarizeRequest {
+            prompt: &prompt,
+            model,
+            max_tokens,
+            timeout,
+        };
+        let response = match provider.summarize(&req) {
+            Ok(s) if !s.trim().is_empty() => s,
+            Ok(_) => {
+                // Nothing here can tell an input with nothing to extract from a
+                // provider that returned nothing. Either way the rows must not
+                // be retried on every run, so they are dropped and counted.
+                eprintln!(
+                    "[extract-pending] project={project}: provider returned empty output; \
+                     dropping {} rows",
+                    rows.len()
+                );
+                tally.deleted += store.delete_pending_extractions(&ids)?;
+                tally.discarded_rows += rows.len();
+                continue;
+            }
+            Err(e) => {
+                // A CLI missing from PATH already downgrades to fastembed before
+                // this loop (see the `cli_on_path` check) — this handles the
+                // sibling failure mode: the CLI is present but errors at
+                // runtime. Left as a hard error, the queue would never empty,
+                // because every future run would hit the same failing CLI.
+                // Fall back to the local extractor for this group and all
+                // remaining ones; groups already processed above keep their
+                // LLM-extracted facts.
+                eprintln!(
+                    "[extract-pending] project={project}: provider failed: {e} — \
+                     fastembed fallback for this group and the remaining groups"
+                );
+                provider_failed = true;
+                let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, rows)?;
+                tally.stored += stored;
+                tally.deleted += deleted;
+                tally.fallback_rows += rows.len();
+                continue;
+            }
+        };
+
+        // Parse bullet output into individual facts, each filed under the
+        // project whose rows produced it.
+        let topic = format!("context-{project}");
+        for line in response.lines() {
+            let line = line.trim();
+            let fact = line
+                .strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line)
+                .trim();
+            if fact.is_empty() || fact == "(none)" || fact.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            let mut mem = Memory::new(topic.clone(), fact.to_string(), Importance::Medium);
+            // Same bug class as #394: this LLM-backed extraction path is a
+            // sibling of extract_and_store_with_embedder and had the same gap
+            // — the embedder was available but never attached to the Memory.
+            if let Some(emb) = embedder {
+                if let Ok(vec) = emb.embed(&mem.embed_text()) {
+                    mem.embedding = Some(vec);
+                }
+            }
+            store.store(mem)?;
+            tally.stored += 1;
+        }
+        tally.deleted += store.delete_pending_extractions(&ids)?;
+    }
+    Ok(())
+}
+
+/// Process the async extraction queue.
+///
+/// Reads up to `limit` oldest pending rows from `pending_extractions` and
+/// groups them by project.
+///
+/// With an LLM provider configured, it asks the configured LLM CLI once per
+/// project to extract decisions / architecture / preferences from that
+/// project's raw outputs, parses the bullet response, and stores each fact
+/// under `context-<project>`.
+///
+/// With `provider = "none"`, or when the resolved CLI is not installed, it
+/// runs the fastembed extractor over the drained rows instead — once per
+/// drain rather than once per hook fire (the deferred half of the issue #239
+/// fix: editor hooks enqueue cheaply, and the heavy model load happens here).
+/// A CLI that fails at runtime triggers the same fallback for the failing
+/// group and every group after it.
+///
+/// Successfully-processed rows are deleted from the queue regardless of
+/// whether facts were extracted (so an output with no extractable
+/// content doesn't loop forever).
 #[allow(clippy::too_many_arguments)]
 fn cmd_extract_pending(
     store: &Store,
@@ -8123,19 +8317,10 @@ fn cmd_extract_pending(
         return Ok(());
     }
 
-    // Build a single LLM prompt covering all rows. The prompt asks for
-    // a structured bullet list so we can deterministically split into
-    // facts. Each bullet becomes one Memory.
-    let mut joined = String::new();
-    let mut ids: Vec<String> = Vec::new();
-    let mut project_for_each: Vec<String> = Vec::new();
-    for (id, project, tool_name, raw, _ts) in &pending {
-        joined.push_str(&format!("=== tool={tool_name} project={project} ===\n"));
-        joined.push_str(raw);
-        joined.push_str("\n\n");
-        ids.push(id.clone());
-        project_for_each.push(project.clone());
-    }
+    // One prompt per project. Queue rows from concurrent sessions interleave,
+    // so a drained batch usually spans several projects, and a single prompt
+    // for the whole batch could only file every fact under one of them.
+    let groups = group_pending_by_project(&pending);
 
     let model_owned: Option<String> = cli_model.map(|s| s.to_string()).or_else(|| {
         if cfg.model.is_empty() {
@@ -8146,19 +8331,6 @@ fn cmd_extract_pending(
     });
     let max_tokens = cfg.max_tokens;
 
-    let prompt = format!(
-        "From the tool outputs below, extract durable facts that an AI agent \
-         should remember across sessions: architecture decisions, resolved \
-         errors, user preferences, project-specific context.\n\
-         \n\
-         Output format: one fact per line, prefixed with `- `. Each fact \
-         must be a complete, standalone sentence — no pronouns referring to \
-         missing context. Skip routine noise (file listings, build progress, \
-         git status). If nothing durable is present, output exactly `- (none)`.\n\
-         \n\
-         {joined}",
-    );
-
     if dry_run {
         println!("=== Dry run ===");
         println!("provider: {provider_kind:?}");
@@ -8167,92 +8339,39 @@ fn cmd_extract_pending(
             model_owned.as_deref().unwrap_or("<provider default>")
         );
         println!("rows: {}", pending.len());
-        println!("--- prompt ---");
-        println!("{prompt}");
+        println!("projects: {}", groups.len());
+        for (project, rows) in &groups {
+            println!("--- prompt (project={project}, rows={}) ---", rows.len());
+            println!("{}", build_extract_prompt(rows));
+        }
         return Ok(());
     }
 
     let provider = summarizer::make_summarizer(provider_kind)?;
-    let req = summarizer::SummarizeRequest {
-        prompt: &prompt,
-        model: model_owned.as_deref(),
+    let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
+    let mut tally = DrainTally::default();
+    if let Err(e) = drain_pending_groups(
+        store,
+        embedder,
+        provider.as_ref(),
+        model_owned.as_deref(),
         max_tokens,
-        timeout: std::time::Duration::from_secs(cfg.timeout_secs),
-    };
-    let response = match provider.summarize(&req) {
-        Ok(s) if !s.trim().is_empty() => s,
-        Ok(_) => {
-            eprintln!("[extract-pending] provider returned empty output");
-            // Still drop the rows so we don't loop forever on bad inputs.
-            store.delete_pending_extractions(&ids)?;
-            return Ok(());
-        }
-        Err(e) => {
-            // A CLI missing from PATH already downgrades to fastembed above
-            // (see the `cli_on_path` check) — this handles the sibling
-            // failure mode: the CLI is present but errors at runtime (auth
-            // expired, network down, rate-limited). Left as a hard error,
-            // that's the exact "queue never empties" scenario the PATH
-            // check was built to avoid, just triggered a different way:
-            // every future extract-pending run keeps hitting the same
-            // failing CLI and the queue grows forever. Fall back to the
-            // local extractor for this batch instead.
-            eprintln!(
-                "[extract-pending] provider failed: {e} — falling back to \
-                 the fastembed extractor for this batch"
-            );
-            let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, &pending)?;
-            println!(
-                "Processed {} rows (fastembed fallback), extracted {} facts, dequeued {}.",
-                pending.len(),
-                stored,
-                deleted,
-            );
-            return Ok(());
-        }
-    };
-
-    // Parse bullet output into individual facts.
-    let mut stored = 0usize;
-    for line in response.lines() {
-        let line = line.trim();
-        let fact = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* "))
-            .unwrap_or(line)
-            .trim();
-        if fact.is_empty() || fact == "(none)" || fact.eq_ignore_ascii_case("none") {
-            continue;
-        }
-        // Use the first row's project as the topic anchor — most batches
-        // will be from a single session anyway. Multi-project batches
-        // get a slightly weaker per-fact attribution; not worth more
-        // ceremony in v1.
-        let project = project_for_each
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("project");
-        let topic = format!("context-{project}");
-        let mut mem = Memory::new(topic, fact.to_string(), Importance::Medium);
-        // Same bug class as #394: this LLM-backed extraction path is a
-        // sibling of extract_and_store_with_embedder and had the same gap
-        // — the embedder was available but never attached to the Memory.
-        if let Some(emb) = embedder {
-            if let Ok(vec) = emb.embed(&mem.embed_text()) {
-                mem.embedding = Some(vec);
-            }
-        }
-        store.store(mem)?;
-        stored += 1;
+        timeout,
+        &groups,
+        &mut tally,
+    ) {
+        // Groups drained before the error are committed (facts stored, rows
+        // deleted); say so, or a retry wrapper cannot tell zero from several.
+        eprintln!(
+            "[extract-pending] aborted after dequeuing {} of {} rows ({} facts stored): {e}",
+            tally.deleted,
+            pending.len(),
+            tally.stored
+        );
+        return Err(e);
     }
 
-    let deleted = store.delete_pending_extractions(&ids)?;
-    println!(
-        "Processed {} rows, extracted {} facts, dequeued {}.",
-        pending.len(),
-        stored,
-        deleted,
-    );
+    println!("{}", tally.summary_line(pending.len()));
     Ok(())
 }
 
@@ -12747,6 +12866,258 @@ mod cli_contracts_tests {
                 m.summary
             );
         }
+    }
+
+    #[test]
+    fn group_pending_by_project_keeps_first_appearance_and_row_order() {
+        let row = |id: &str, project: &str| -> icm_store::PendingRow {
+            (
+                id.to_string(),
+                project.to_string(),
+                "Bash".to_string(),
+                format!("output {id}"),
+                format!("2026-01-01T00:00:0{id}Z"),
+            )
+        };
+        let pending = vec![
+            row("1", "a"),
+            row("2", "b"),
+            row("3", "a"),
+            row("4", "c"),
+            row("5", "b"),
+        ];
+
+        let groups = group_pending_by_project(&pending);
+        let shape: Vec<(String, Vec<String>)> = groups
+            .iter()
+            .map(|(project, rows)| {
+                (
+                    project.clone(),
+                    rows.iter().map(|row| row.0.clone()).collect(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            shape,
+            vec![
+                ("a".to_string(), vec!["1".to_string(), "3".to_string()]),
+                ("b".to_string(), vec!["2".to_string(), "5".to_string()]),
+                ("c".to_string(), vec!["4".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_extract_prompt_carries_only_the_groups_rows() {
+        let pending: Vec<icm_store::PendingRow> = vec![
+            (
+                "1".into(),
+                "a".into(),
+                "Bash".into(),
+                "alpha output".into(),
+                "t1".into(),
+            ),
+            (
+                "2".into(),
+                "b".into(),
+                "Edit".into(),
+                "beta output".into(),
+                "t2".into(),
+            ),
+        ];
+        let groups = group_pending_by_project(&pending);
+
+        let prompt_a = build_extract_prompt(&groups[0].1);
+        assert!(prompt_a.contains("=== tool=Bash project=a ==="));
+        assert!(prompt_a.contains("alpha output"));
+        assert!(
+            !prompt_a.contains("beta output"),
+            "a project's prompt must not carry another project's rows"
+        );
+
+        let prompt_b = build_extract_prompt(&groups[1].1);
+        assert!(prompt_b.contains("=== tool=Edit project=b ==="));
+        assert!(!prompt_b.contains("alpha output"));
+    }
+
+    #[test]
+    fn extract_pending_drain_fastembed_accepts_borrowed_rows() {
+        use icm_core::{Embedder, IcmResult};
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let hit = text.to_lowercase().contains("decided");
+                let mut v = vec![0.0_f32; 64];
+                v[0] = if hit { 1.0 } else { 0.0 };
+                v[1] = if hit { 0.0 } else { 1.0 };
+                Ok(v)
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        store
+            .enqueue_pending_extraction(
+                "t",
+                "Bash",
+                "We decided to switch from REST to gRPC for internal service calls \
+                 because of latency requirements.",
+            )
+            .unwrap();
+        let pending = store.list_pending_extractions(10).unwrap();
+        let borrowed: Vec<&icm_store::PendingRow> = pending.iter().collect();
+
+        let (stored, deleted) =
+            extract_pending_drain_fastembed(&store, Some(&StubEmbedder), &borrowed).unwrap();
+        assert!(stored > 0, "borrowed rows must extract like owned rows");
+        assert_eq!(deleted, 1);
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_pending_groups_files_facts_per_project_and_counts_degraded_groups() {
+        use icm_core::{Embedder, IcmResult};
+        use std::cell::Cell;
+
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let hit = text.to_lowercase().contains("decided");
+                let mut v = vec![0.0_f32; 64];
+                v[0] = if hit { 1.0 } else { 0.0 };
+                v[1] = if hit { 0.0 } else { 1.0 };
+                Ok(v)
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        /// alpha: two bullets, one of them `(none)`. beta: whitespace only.
+        /// gamma and everything after: runtime failure.
+        struct ScriptedProvider {
+            calls: Cell<usize>,
+        }
+        impl summarizer::Summarizer for ScriptedProvider {
+            fn name(&self) -> &'static str {
+                "scripted"
+            }
+            fn summarize(&self, req: &summarizer::SummarizeRequest<'_>) -> Result<String> {
+                self.calls.set(self.calls.get() + 1);
+                if req.prompt.contains("project=alpha") {
+                    Ok("- alpha stores its ledger in PostgreSQL.\n- (none)\n".to_string())
+                } else if req.prompt.contains("project=beta") {
+                    Ok("   \n".to_string())
+                } else {
+                    Err(anyhow::anyhow!("provider down"))
+                }
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let rows = [
+            ("alpha", "alpha tool output"),
+            ("beta", "beta tool output"),
+            (
+                "gamma",
+                "We decided to switch from REST to gRPC for gamma because of latency requirements.",
+            ),
+            (
+                "delta",
+                "We decided to shard delta by tenant because of write contention.",
+            ),
+        ];
+        for (project, text) in rows {
+            store
+                .enqueue_pending_extraction(project, "Bash", text)
+                .unwrap();
+        }
+        let pending = store.list_pending_extractions(10).unwrap();
+        assert_eq!(pending.len(), 4);
+        let groups = group_pending_by_project(&pending);
+        assert_eq!(groups.len(), 4);
+
+        let provider = ScriptedProvider {
+            calls: Cell::new(0),
+        };
+        let mut tally = DrainTally::default();
+        drain_pending_groups(
+            &store,
+            Some(&StubEmbedder),
+            &provider,
+            None,
+            256,
+            std::time::Duration::from_secs(5),
+            &groups,
+            &mut tally,
+        )
+        .unwrap();
+
+        // alpha: the real bullet is filed under alpha, `(none)` is skipped.
+        let alpha = store.get_by_topic("context-alpha").unwrap();
+        assert_eq!(alpha.len(), 1);
+        assert!(alpha[0].summary.contains("PostgreSQL"));
+        // beta: empty output drops the row and is counted, nothing stored.
+        assert!(store.get_by_topic("context-beta").unwrap().is_empty());
+        assert_eq!(tally.discarded_rows, 1);
+        // gamma failed; delta never reached the provider (latched) and both
+        // took the local extractor under their own topics.
+        assert_eq!(
+            provider.calls.get(),
+            3,
+            "the provider must not be called again after a runtime failure"
+        );
+        assert_eq!(tally.fallback_rows, 2);
+        assert!(!store.get_by_topic("context-gamma").unwrap().is_empty());
+        assert!(!store.get_by_topic("context-delta").unwrap().is_empty());
+        // every row left the queue exactly once.
+        assert_eq!(tally.deleted, 4);
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+        let line = tally.summary_line(4);
+        assert!(line.contains("2 via fastembed fallback"), "{line}");
+        assert!(
+            line.contains("1 dropped after empty provider output"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn drain_tally_summary_line_names_degraded_outcomes() {
+        let clean = DrainTally {
+            stored: 12,
+            deleted: 25,
+            ..DrainTally::default()
+        };
+        assert_eq!(
+            clean.summary_line(25),
+            "Processed 25 rows, extracted 12 facts, dequeued 25."
+        );
+
+        let degraded = DrainTally {
+            stored: 9,
+            deleted: 25,
+            fallback_rows: 3,
+            discarded_rows: 4,
+        };
+        let line = degraded.summary_line(25);
+        assert!(
+            line.contains("fastembed fallback"),
+            "operators grep for this phrase: {line}"
+        );
+        assert_eq!(
+            line,
+            "Processed 25 rows (3 via fastembed fallback, 4 dropped after empty provider output), \
+             extracted 9 facts, dequeued 25."
+        );
     }
 
     /// Issue #186: `icm health` must expose `--summarizer-provider` to

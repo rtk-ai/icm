@@ -245,6 +245,9 @@ ICM can be used via CLI (`icm` commands) or MCP server (`icm serve`). Both acces
 ```bash
 # Persistent local server — embedding model loads once, stays warm.
 icm serve --http 127.0.0.1:11435 --db ~/.local/share/icm/memories.db &
+# Tokenless mode only answers requests whose Host header is loopback
+# (127.0.0.1 / [::1] / localhost) — DNS-rebinding defense. Pass --token
+# to serve any other hostname (reverse proxy, LAN clients, browsers).
 
 curl -s -X POST 127.0.0.1:11435/store \
   -H 'content-type: application/json' \

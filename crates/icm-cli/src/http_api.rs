@@ -300,6 +300,29 @@ async fn auth_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // DNS-rebinding defense (security report 2026-08-31, Syed Anas
+    // Mohiuddin): the documented tokenless loopback mode trusted the TCP
+    // bind alone. A malicious page can rebind its own hostname to
+    // 127.0.0.1; the victim's browser then sends *same-origin* requests
+    // to this API (no CORS preflight applies, JSON content type included)
+    // and can read every response — full read/write on the store from any
+    // website, firewall irrelevant, because the requests originate on the
+    // victim's machine. The one thing the attacker cannot control is the
+    // Host header (the browser sets their hostname), so reject any
+    // request whose Host is not a literal loopback name. Only enforced in
+    // tokenless mode: with a token, the Bearer check already defeats a
+    // browser-originated request (a page can't guess it), and legitimate
+    // reverse-proxy setups forward arbitrary Host values.
+    // Applied before the /health bypass on purpose — a rebound page could
+    // otherwise still probe liveness.
+    if state.token.is_none() && !host_is_loopback(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Host header is not loopback; refusing (DNS-rebinding defense). \
+             Start the server with --token to serve non-localhost clients.\n",
+        )
+            .into_response();
+    }
     // Health is always reachable so an unauth'd liveness probe works.
     if request.uri().path() == "/health" {
         return next.run(request).await;
@@ -324,6 +347,40 @@ async fn auth_middleware(
             "missing or invalid Bearer token\n",
         )
             .into_response(),
+    }
+}
+
+/// Is the request's Host header a literal loopback address (`127.0.0.0/8`,
+/// `[::1]`, or `localhost`, any port)? Absent or unparsable Host counts as
+/// NOT loopback — every legitimate HTTP/1.1 client sends one, and failing
+/// open would defeat the rebinding defense in `auth_middleware`.
+fn host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = host.trim();
+    // Split off the port. IPv6 literals are bracketed (`[::1]:8080`).
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((v6, port)) if port.is_empty() || port.starts_with(':') => v6,
+            _ => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, port)| {
+            // A second colon means an unbracketed IPv6 literal, not a port.
+            if name.contains(':') || port.parse::<u16>().is_err() {
+                host
+            } else {
+                name
+            }
+        })
+    };
+    if name.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match name.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
     }
 }
 
@@ -921,6 +978,44 @@ mod tests {
 
         let addr: SocketAddr = "203.0.113.5:8420".parse().unwrap();
         assert!(check_bind_requires_token(&addr, &None).is_err());
+    }
+
+    fn hm(host: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = host {
+            h.insert(header::HOST, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    /// The DNS-rebinding defense: only literal loopback Hosts pass.
+    #[test]
+    fn host_is_loopback_accepts_only_loopback_literals() {
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.1:11435",
+            "127.1.2.3:80",
+            "localhost",
+            "LocalHost:11435",
+            "[::1]",
+            "[::1]:11435",
+        ] {
+            assert!(host_is_loopback(&hm(Some(ok))), "should accept {ok}");
+        }
+        for bad in [
+            "attacker.example",
+            "attacker.example:11435",
+            "192.168.1.10:11435",
+            "[2001:db8::1]:11435",
+            "localhost.attacker.example",
+            "127.0.0.1.attacker.example",
+            "[::1",
+            "",
+        ] {
+            assert!(!host_is_loopback(&hm(Some(bad))), "should reject {bad}");
+        }
+        // No Host header at all fails closed.
+        assert!(!host_is_loopback(&hm(None)));
     }
 
     #[test]

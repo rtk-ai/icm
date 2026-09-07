@@ -1859,6 +1859,72 @@ fn resolve_embedding_dims(
     }
 }
 
+#[cfg(feature = "embeddings")]
+fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
+    Some(icm_core::FastEmbedder::with_model(model))
+}
+
+/// Placeholder embedder for builds without the `embeddings` feature.
+///
+/// It is never instantiated (`init_embedder` always returns `None` and the
+/// runtime guards on `embeddings_enabled`), but giving the no-embeddings
+/// build a concrete `Embedder` type lets the many
+/// `embedder.as_ref().map(|e| e as &dyn Embedder)` call sites compile
+/// without per-site `#[cfg]` gates.
+#[cfg(not(feature = "embeddings"))]
+struct DisabledEmbedder;
+
+#[cfg(not(feature = "embeddings"))]
+impl icm_core::Embedder for DisabledEmbedder {
+    fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
+        Err(icm_core::IcmError::Embedding(
+            "this build was compiled without the `embeddings` feature".into(),
+        ))
+    }
+    fn embed_batch(&self, _texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+        Err(icm_core::IcmError::Embedding(
+            "this build was compiled without the `embeddings` feature".into(),
+        ))
+    }
+    fn dimensions(&self) -> usize {
+        icm_core::DEFAULT_EMBEDDING_DIMS
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn init_embedder(_model: &str) -> Option<DisabledEmbedder> {
+    None
+}
+
+/// `icm embeddings status|download` — manage the semantic-search runtime.
+/// Behavior depends on how this binary was built (issue #345).
+fn cmd_embeddings(action: &EmbeddingsAction) -> Result<()> {
+    match action {
+        EmbeddingsAction::Status => {
+            #[cfg(feature = "embeddings-dynamic")]
+            ort_runtime::cmd_status();
+            #[cfg(all(feature = "embeddings", not(feature = "embeddings-dynamic")))]
+            println!(
+                "onnxruntime is statically linked into this build — semantic search is \
+                 always available."
+            );
+            #[cfg(not(feature = "embeddings"))]
+            println!("This build was compiled without embeddings (keyword-only search).");
+        }
+        EmbeddingsAction::Download => {
+            #[cfg(feature = "embeddings-dynamic")]
+            {
+                ort_runtime::cmd_download()?;
+            }
+            #[cfg(all(feature = "embeddings", not(feature = "embeddings-dynamic")))]
+            println!("Nothing to download: onnxruntime is statically linked into this build.");
+            #[cfg(not(feature = "embeddings"))]
+            println!("This build was compiled without embeddings; nothing to download.");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Reset SIGPIPE to default so piped commands (e.g. `icm export | head`)
     // don't panic on broken pipe.
@@ -5947,20 +6013,19 @@ description: ICM persistent memory — /{name}
     //   <git-root>/.icm/config.toml  with  [store] path = ".icm/memories.db"
     // On subsequent invocations, the resolver will pick this up.
     if per_project {
-        let project_root = detect_project_root()
-            .or_else(|| std::env::current_dir().ok());
+        let project_root = detect_project_root().or_else(|| std::env::current_dir().ok());
         if let Some(root) = project_root {
             let icm_dir = root.join(".icm");
             if !icm_dir.is_dir() {
                 std::fs::create_dir_all(&icm_dir)
                     .with_context(|| format!("creating {}", icm_dir.display()))?;
                 let project_cfg = icm_dir.join("config.toml");
-                std::fs::write(
-                    &project_cfg,
-                    "[store]\npath = \".icm/memories.db\"\n",
-                )
-                .with_context(|| format!("writing {}", project_cfg.display()))?;
-                println!("[project] created project-local .icm/ at {}", root.display());
+                std::fs::write(&project_cfg, "[store]\npath = \".icm/memories.db\"\n")
+                    .with_context(|| format!("writing {}", project_cfg.display()))?;
+                println!(
+                    "[project] created project-local .icm/ at {}",
+                    root.display()
+                );
             } else {
                 println!("[project] .icm/ already exists at {}", root.display());
             }
@@ -7739,7 +7804,10 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
     let project_root = detect_project_root();
     let resolved = resolve_db_path(cli_db, cfg);
     println!("  resolved = {}", resolved.display());
-    println!("  path (config) = {}", cfg.store.path.as_deref().unwrap_or("(not set)"));
+    println!(
+        "  path (config) = {}",
+        cfg.store.path.as_deref().unwrap_or("(not set)")
+    );
     if let Some(ref env) = env_db {
         println!("  ICM_DB (env)  = {env}");
     } else {
@@ -11894,6 +11962,154 @@ mod read_only_requested_tests {
     fn no_flag_no_env_means_writable() {
         with_env(None, || {
             assert!(!read_only_requested(false));
+        });
+    }
+}
+
+#[cfg(test)]
+mod resolve_db_path_tests {
+    use super::*;
+
+    /// `resolve_db_path` reads `$ICM_DB` and shells out to `git rev-parse`
+    /// against the process cwd — both process-global state — so every test
+    /// here holds this lock and restores cwd/env before releasing it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_isolated_cwd<F: FnOnce(&std::path::Path)>(body: F) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_cwd = std::env::current_dir().unwrap();
+        let prev_icm_db = std::env::var("ICM_DB").ok();
+        std::env::remove_var("ICM_DB");
+
+        let dir = tempfile::tempdir().unwrap();
+        // macOS: /tmp (and TMPDIR) is a symlink into /private/tmp — the
+        // `git rev-parse --show-toplevel` that `detect_project_root` shells
+        // out to always returns the canonicalized path, so comparing
+        // against the raw tempdir path here would spuriously fail on a
+        // string mismatch (`/var/folders/...` vs `/private/var/folders/...`)
+        // that has nothing to do with `resolve_db_path`'s actual behavior.
+        let canonical = dir.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        body(&canonical);
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        match prev_icm_db {
+            Some(v) => std::env::set_var("ICM_DB", v),
+            None => std::env::remove_var("ICM_DB"),
+        }
+    }
+
+    #[test]
+    fn cli_flag_wins_over_everything() {
+        with_isolated_cwd(|_| {
+            std::env::set_var("ICM_DB", "/should/not/win");
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(Some(PathBuf::from("/explicit/flag.db")), &cfg);
+            assert_eq!(resolved, PathBuf::from("/explicit/flag.db"));
+        });
+    }
+
+    #[test]
+    fn env_var_wins_when_no_flag() {
+        with_isolated_cwd(|_| {
+            std::env::set_var("ICM_DB", "/from/env.db");
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, PathBuf::from("/from/env.db"));
+        });
+    }
+
+    #[test]
+    fn config_path_wins_over_project_local_and_default() {
+        with_isolated_cwd(|dir| {
+            // Even inside a git repo with a project-local .icm/memories.db,
+            // an explicit config [store].path must win (level 3 > 4/5).
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            std::fs::create_dir_all(dir.join(".icm")).unwrap();
+            std::fs::write(dir.join(".icm").join("memories.db"), "").unwrap();
+
+            let mut cfg = config::Config::default();
+            cfg.store.path = Some("/from/config.db".to_string());
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, PathBuf::from("/from/config.db"));
+        });
+    }
+
+    #[test]
+    fn project_local_config_toml_wins_over_bare_memories_db() {
+        with_isolated_cwd(|dir| {
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            let icm_dir = dir.join(".icm");
+            std::fs::create_dir_all(&icm_dir).unwrap();
+            // Both a config.toml (level 4) and a bare memories.db (level 5)
+            // exist — the config.toml's path must win.
+            std::fs::write(icm_dir.join("memories.db"), "").unwrap();
+            std::fs::write(
+                icm_dir.join("config.toml"),
+                "[store]\npath = \"custom-name.db\"\n",
+            )
+            .unwrap();
+
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, dir.join("custom-name.db"));
+        });
+    }
+
+    #[test]
+    fn project_local_memories_db_used_when_no_config_toml() {
+        with_isolated_cwd(|dir| {
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            let icm_dir = dir.join(".icm");
+            std::fs::create_dir_all(&icm_dir).unwrap();
+            std::fs::write(icm_dir.join("memories.db"), "").unwrap();
+
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, icm_dir.join("memories.db"));
+        });
+    }
+
+    #[test]
+    fn falls_back_to_default_outside_any_git_repo_without_icm_dir() {
+        with_isolated_cwd(|_| {
+            // No git init here — not a repo, no .icm/ — must fall through
+            // to the platform default rather than panicking or picking up
+            // an unrelated ancestor repo's .icm/ (e.g. this very checkout's).
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, default_db_path());
+        });
+    }
+
+    #[test]
+    fn git_repo_without_icm_dir_falls_back_to_default() {
+        with_isolated_cwd(|dir| {
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            // A real git repo, but no .icm/ directory created yet.
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, default_db_path());
         });
     }
 }

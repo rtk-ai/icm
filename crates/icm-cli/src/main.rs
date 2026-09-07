@@ -12062,7 +12062,15 @@ mod resolve_db_path_tests {
 
             let cfg = config::Config::default();
             let resolved = resolve_db_path(None, &cfg);
-            assert_eq!(resolved, dir.join("custom-name.db"));
+            // Compare against `detect_project_root()`'s own output rather
+            // than the raw tempdir path: `git rev-parse --show-toplevel`
+            // canonicalizes (symlink resolution on macOS — /var vs
+            // /private/var — and a `\\?\`-prefixed extended path on
+            // Windows), so building the expectation from the same function
+            // under test avoids a platform-specific string mismatch that
+            // has nothing to do with `resolve_db_path`'s actual behavior.
+            let project_root = detect_project_root().unwrap();
+            assert_eq!(resolved, project_root.join("custom-name.db"));
         });
     }
 
@@ -12081,7 +12089,8 @@ mod resolve_db_path_tests {
 
             let cfg = config::Config::default();
             let resolved = resolve_db_path(None, &cfg);
-            assert_eq!(resolved, icm_dir.join("memories.db"));
+            let project_root = detect_project_root().unwrap();
+            assert_eq!(resolved, project_root.join(".icm").join("memories.db"));
         });
     }
 

@@ -6,7 +6,7 @@
 # lockfile update will silently sit unreleased on develop/main.
 [package]
 name = "icm-cli"
-version = "0.10.64"
+version = "0.10.65"
 edition = "2021"
 description = "Permanent memory for AI agents"
 license = "Apache-2.0"

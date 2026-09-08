@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.65](https://github.com/rtk-ai/icm/compare/icm-v0.10.64...icm-v0.10.65) (2026-09-08)
+
+
+### Bug Fixes
+
+* **release:** document that Cargo.lock changes need a paired crate commit ([#463](https://github.com/rtk-ai/icm/issues/463)) ([0a485c3](https://github.com/rtk-ai/icm/commit/0a485c3459c85439e1231f8e708973fa0726f4bd))
+
 ## [0.10.64](https://github.com/rtk-ai/icm/compare/icm-v0.10.63...icm-v0.10.64) (2026-09-08)
 
 

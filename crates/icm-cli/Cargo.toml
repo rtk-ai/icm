@@ -64,6 +64,11 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }
+# Cross-platform PATH-based executable lookup (issue #428): the hand-rolled
+# check this replaced hardcoded the Unix `:` PATH separator and never tried
+# a `.exe`/`PATHEXT` suffix, so it silently found nothing on Windows for
+# every tool `icm init` detects, not just OpenCode Desktop.
+which = { version = "8", default-features = false, features = ["real-sys"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

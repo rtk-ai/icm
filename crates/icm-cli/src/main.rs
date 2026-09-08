@@ -7333,12 +7333,15 @@ pub(crate) fn parse_json_config(config_path: &std::path::Path) -> Result<Value> 
     Ok(strict)
 }
 
-/// Returns true if `name` resolves to an executable file somewhere in $PATH.
+/// Cross-platform PATH-based executable lookup (issue #428). Delegates to
+/// the `which` crate rather than hand-rolling it: a previous version split
+/// `$PATH` on a hardcoded `:` and checked the bare name with no extension —
+/// correct on Unix, but on Windows `PATH` entries are `;`-separated and
+/// every real executable needs a `PATHEXT` suffix (`.exe`, `.cmd`, …), so
+/// this silently found nothing for *every* tool `icm init`/`doctor` detect,
+/// not just the OpenCode Desktop app the issue reported.
 fn binary_in_path(name: &str) -> bool {
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .any(|dir| std::path::Path::new(dir).join(name).is_file())
+    which::which(name).is_ok()
 }
 
 /// Heuristic: is this AI tool installed on the current machine?
@@ -7437,6 +7440,28 @@ fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
         // pnpm-global env quirks). See issue #259.
         "Pi" => binary_in_path("pi") || PathBuf::from(home).join(".pi/agent").exists(),
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod binary_in_path_tests {
+    use super::*;
+
+    /// Issue #428: `binary_in_path` must find a real, definitely-installed
+    /// binary. `cargo` itself is the safest choice — every CI job (and any
+    /// dev machine running `cargo test`) has it on `$PATH` by construction,
+    /// on every platform this crate ships for (unlike a Unix-only tool like
+    /// `sh`, which isn't a given on `windows-latest`).
+    #[test]
+    fn finds_a_real_binary_that_is_definitely_on_path() {
+        assert!(binary_in_path("cargo"));
+    }
+
+    #[test]
+    fn does_not_find_a_binary_that_does_not_exist() {
+        assert!(!binary_in_path(
+            "icm-test-binary-that-almost-certainly-does-not-exist-anywhere"
+        ));
     }
 }
 
@@ -7921,34 +7946,6 @@ fn resolve_consolidate_provider(
     })
 }
 
-/// Check whether `name` resolves to an executable file on `$PATH`.
-///
-/// Used by the extraction drain to decide whether a configured LLM CLI
-/// (claude/codex/gemini/ollama) is actually usable, or whether it should
-/// fall back to the fastembed extractor.
-fn cli_on_path(name: &str) -> bool {
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(name);
-        if !candidate.is_file() {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(&candidate)
-                .map(|m| m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
-    })
-}
-
 /// Best-effort inter-process singleton lock for the extract-pending worker
 /// (#322). Held for the lifetime of the value; the OS releases the advisory
 /// `flock` when the file descriptor closes on drop.
@@ -8170,7 +8167,7 @@ fn drain_pending_groups(
             }
             Err(e) => {
                 // A CLI missing from PATH already downgrades to fastembed before
-                // this loop (see the `cli_on_path` check) — this handles the
+                // this loop (see the `binary_in_path` check) — this handles the
                 // sibling failure mode: the CLI is present but errors at
                 // runtime. Left as a hard error, the queue would never empty,
                 // because every future run would hit the same failing CLI.
@@ -8288,7 +8285,7 @@ fn cmd_extract_pending(
     // never empty — so downgrade to the batched fastembed path when the
     // binary is missing.
     if !matches!(provider_kind, summarizer::ProviderKind::None)
-        && !cli_on_path(provider_kind.as_str())
+        && !binary_in_path(provider_kind.as_str())
     {
         eprintln!(
             "[extract-pending] '{}' CLI not found on PATH — draining with \

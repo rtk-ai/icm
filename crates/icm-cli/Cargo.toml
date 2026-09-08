@@ -1,3 +1,9 @@
+# release-please only tracks commits touching crates/icm-cli (see
+# release-please-config.json): a workspace-root Cargo.lock change on its
+# own is invisible to it and will never trigger a release by itself
+# (issue #458). If you change a dependency that only touches Cargo.lock,
+# pair it with a real fix/feat commit under this crate's path, or the
+# lockfile update will silently sit unreleased on develop/main.
 [package]
 name = "icm-cli"
 version = "0.10.64"

@@ -8,7 +8,13 @@ default = []
 # `embeddings` = the embedder code + model download (hf-hub). It does NOT pick
 # an ort backend by itself; a consumer selects exactly one of the two below
 # (issue #345). This keeps every `#[cfg(feature = "embeddings")]` unchanged.
-embeddings = ["fastembed", "directories", "cachedir", "fastembed/hf-hub-native-tls"]
+# rustls-tls (not native-tls): native-tls pulls openssl-sys on Linux, which
+# needs a system OpenSSL + pkg-config at build time — breaks builds on
+# environments with no OpenSSL dev headers (e.g. homebrew-core's Linux
+# bottling CI, issue #345). rustls is vendored, so this removes the
+# dependency entirely rather than just working around it in one packaging
+# channel.
+embeddings = ["fastembed", "directories", "cachedir", "fastembed/hf-hub-rustls-tls"]
 # Static onnxruntime downloaded at build time (default; needs network at build).
 embeddings-static = ["embeddings", "fastembed/ort-download-binaries"]
 # onnxruntime loaded dynamically at runtime — builds with NO network, so the

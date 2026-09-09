@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use icm_core::learn::learn_project;
     use icm_core::MemoirStore;
+    use icm_core::learn::learn_project;
     use icm_store::Store;
     use std::fs;
     use tempfile::TempDir;

@@ -100,8 +100,7 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     })
 }
 
-pub(crate) const SELECT_COLS: &str =
-    "id, created_at, updated_at, last_accessed, access_count, weight, \
+pub(crate) const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_count, weight, \
                            topic, summary, raw_excerpt, keywords, \
                            importance, source_type, source_data, related_ids, embedding";
 

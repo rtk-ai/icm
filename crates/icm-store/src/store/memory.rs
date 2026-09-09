@@ -377,8 +377,7 @@ impl MemoryStore for SqliteStore {
         let sanitized = sanitize_fts_query_any(query);
 
         // 1. Get FTS results with rank scores
-        let fts_sql =
-            "SELECT m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
+        let fts_sql = "SELECT m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
                     m.topic, m.summary, m.raw_excerpt, m.keywords, \
                     m.importance, m.source_type, m.source_data, m.related_ids, m.embedding, \
                     fts.rank \
@@ -391,28 +390,27 @@ impl MemoryStore for SqliteStore {
         let mut fts_scores: HashMap<String, f32> = HashMap::with_capacity(pool_size);
         let mut all_memories: HashMap<String, Memory> = HashMap::with_capacity(pool_size);
 
-        if !sanitized.is_empty() {
-            if let Ok(mut stmt) = self.conn.prepare(fts_sql) {
-                if let Ok(rows) = stmt.query_map(params![sanitized, pool_size as i64], |row| {
-                    let memory = row_to_memory(row)?;
-                    let rank: f32 = row.get(15)?;
-                    Ok((memory, rank))
-                }) {
-                    for row in rows.flatten() {
-                        let (memory, rank) = row;
-                        // FTS5 bm25 rank is <= 0, MORE negative = MORE
-                        // relevant. `1.0 / (1.0 + |rank|)` inverted this: it
-                        // DECREASES as relevance increases (audit finding,
-                        // proven wrong e.g. rank=-4.83 (strong match) scored
-                        // 0.17 while rank=-0.2 (weak match) scored 0.83).
-                        // `|rank| / (1.0 + |rank|)` keeps the same bounded
-                        // [0,1) shape but is correctly monotonically
-                        // INCREASING in relevance.
-                        let score = rank.abs() / (1.0 + rank.abs());
-                        fts_scores.insert(memory.id.clone(), score);
-                        all_memories.insert(memory.id.clone(), memory);
-                    }
-                }
+        if !sanitized.is_empty()
+            && let Ok(mut stmt) = self.conn.prepare(fts_sql)
+            && let Ok(rows) = stmt.query_map(params![sanitized, pool_size as i64], |row| {
+                let memory = row_to_memory(row)?;
+                let rank: f32 = row.get(15)?;
+                Ok((memory, rank))
+            })
+        {
+            for row in rows.flatten() {
+                let (memory, rank) = row;
+                // FTS5 bm25 rank is <= 0, MORE negative = MORE
+                // relevant. `1.0 / (1.0 + |rank|)` inverted this: it
+                // DECREASES as relevance increases (audit finding,
+                // proven wrong e.g. rank=-4.83 (strong match) scored
+                // 0.17 while rank=-0.2 (weak match) scored 0.83).
+                // `|rank| / (1.0 + |rank|)` keeps the same bounded
+                // [0,1) shape but is correctly monotonically
+                // INCREASING in relevance.
+                let score = rank.abs() / (1.0 + rank.abs());
+                fts_scores.insert(memory.id.clone(), score);
+                all_memories.insert(memory.id.clone(), memory);
             }
         } // sanitized.is_empty()
 

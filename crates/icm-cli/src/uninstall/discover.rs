@@ -135,58 +135,55 @@ fn scan_json(
     let value = crate::parse_json_config(&spec.path)?;
     let mut hits = Vec::new();
 
-    if let Some(key) = servers_key {
-        if let Some(servers) = lookup_dotted(&value, key) {
-            if servers.get("icm").is_some() {
-                hits.push(LocationHit {
-                    spec_label: spec.label,
-                    path: spec.path.clone(),
-                    detail: HitDetail::JsonServer {
-                        pointer: format!("/{}/icm", key.replace('.', "/")),
-                    },
-                });
-            }
-        }
+    if let Some(key) = servers_key
+        && let Some(servers) = lookup_dotted(&value, key)
+        && servers.get("icm").is_some()
+    {
+        hits.push(LocationHit {
+            spec_label: spec.label,
+            path: spec.path.clone(),
+            detail: HitDetail::JsonServer {
+                pointer: format!("/{}/icm", key.replace('.', "/")),
+            },
+        });
     }
 
-    if has_hooks {
-        if let Some(hooks_obj) = value.get("hooks").and_then(|h| h.as_object()) {
-            for (event, arr) in hooks_obj {
-                let Some(arr) = arr.as_array() else { continue };
-                for entry in arr {
-                    match hooks_field {
-                        HookCommandField::Command => {
-                            let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) else {
-                                continue;
-                            };
-                            for h in inner {
-                                if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
-                                    if crate::check_icm_hook_command(cmd).is_some() {
-                                        hits.push(LocationHit {
-                                            spec_label: spec.label,
-                                            path: spec.path.clone(),
-                                            detail: HitDetail::JsonHook {
-                                                event: event.clone(),
-                                                command: cmd.to_string(),
-                                            },
-                                        });
-                                    }
-                                }
+    if has_hooks && let Some(hooks_obj) = value.get("hooks").and_then(|h| h.as_object()) {
+        for (event, arr) in hooks_obj {
+            let Some(arr) = arr.as_array() else { continue };
+            for entry in arr {
+                match hooks_field {
+                    HookCommandField::Command => {
+                        let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) else {
+                            continue;
+                        };
+                        for h in inner {
+                            if let Some(cmd) = h.get("command").and_then(|c| c.as_str())
+                                && crate::check_icm_hook_command(cmd).is_some()
+                            {
+                                hits.push(LocationHit {
+                                    spec_label: spec.label,
+                                    path: spec.path.clone(),
+                                    detail: HitDetail::JsonHook {
+                                        event: event.clone(),
+                                        command: cmd.to_string(),
+                                    },
+                                });
                             }
                         }
-                        HookCommandField::BashTopLevel => {
-                            if let Some(cmd) = entry.get("bash").and_then(|b| b.as_str()) {
-                                if crate::check_icm_hook_command(cmd).is_some() {
-                                    hits.push(LocationHit {
-                                        spec_label: spec.label,
-                                        path: spec.path.clone(),
-                                        detail: HitDetail::JsonHook {
-                                            event: event.clone(),
-                                            command: cmd.to_string(),
-                                        },
-                                    });
-                                }
-                            }
+                    }
+                    HookCommandField::BashTopLevel => {
+                        if let Some(cmd) = entry.get("bash").and_then(|b| b.as_str())
+                            && crate::check_icm_hook_command(cmd).is_some()
+                        {
+                            hits.push(LocationHit {
+                                spec_label: spec.label,
+                                path: spec.path.clone(),
+                                detail: HitDetail::JsonHook {
+                                    event: event.clone(),
+                                    command: cmd.to_string(),
+                                },
+                            });
                         }
                     }
                 }
@@ -210,16 +207,16 @@ fn scan_toml(spec: &LocationSpec, table: &str, entry: &str) -> Result<Vec<Locati
     let content = std::fs::read_to_string(&spec.path)?;
     let parsed: toml::Value = content.parse()?;
     let mut hits = Vec::new();
-    if let Some(t) = parsed.get(table).and_then(|v| v.as_table()) {
-        if t.contains_key(entry) {
-            hits.push(LocationHit {
-                spec_label: spec.label,
-                path: spec.path.clone(),
-                detail: HitDetail::TomlTable {
-                    table: format!("[{table}.{entry}]"),
-                },
-            });
-        }
+    if let Some(t) = parsed.get(table).and_then(|v| v.as_table())
+        && t.contains_key(entry)
+    {
+        hits.push(LocationHit {
+            spec_label: spec.label,
+            path: spec.path.clone(),
+            detail: HitDetail::TomlTable {
+                table: format!("[{table}.{entry}]"),
+            },
+        });
     }
     Ok(hits)
 }

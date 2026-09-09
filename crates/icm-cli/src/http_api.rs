@@ -31,21 +31,21 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::{
+    Json, Router,
     extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use icm_mcp::protocol::{JsonRpcMessage, JsonRpcResponse};
 
 use icm_core::{
-    is_preference_topic, keyword_matches, project_matches, topic_matches, Embedder, Importance,
-    Memory, MemoryStore, MSG_NO_MEMORIES,
+    Embedder, Importance, MSG_NO_MEMORIES, Memory, MemoryStore, is_preference_topic,
+    keyword_matches, project_matches, topic_matches,
 };
 use icm_store::Store;
 
@@ -568,10 +568,10 @@ async fn handle_store(
     if let Some(raw) = req.raw.as_deref().filter(|s| !s.is_empty()) {
         mem.raw_excerpt = Some(raw.to_string());
     }
-    if let Some(emb) = state.embedder_ref() {
-        if let Ok(v) = emb.embed(&format!("{} {}", mem.topic, mem.summary)) {
-            mem.embedding = Some(v);
-        }
+    if let Some(emb) = state.embedder_ref()
+        && let Ok(v) = emb.embed(&format!("{} {}", mem.topic, mem.summary))
+    {
+        mem.embedding = Some(v);
     }
 
     let outcome = lock_store(&state).store(mem.clone());
@@ -641,7 +641,7 @@ async fn handle_consolidate(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("topic lookup failed: {e}"),
                 format,
-            )
+            );
         }
     };
     if topic_memories.is_empty() {
@@ -660,10 +660,10 @@ async fn handle_consolidate(
     // Same bug class as #400 (cmd_consolidate/tool_consolidate): this is a
     // third, independent /consolidate implementation that had the same gap
     // — never attached an embedding to the merged memory it creates.
-    if let Some(emb) = state.embedder_ref() {
-        if let Ok(v) = emb.embed(&consolidated.embed_text()) {
-            consolidated.embedding = Some(v);
-        }
+    if let Some(emb) = state.embedder_ref()
+        && let Ok(v) = emb.embed(&consolidated.embed_text())
+    {
+        consolidated.embedding = Some(v);
     }
 
     let result = if req.keep_originals {
@@ -743,10 +743,11 @@ async fn handle_topics(
     let store = lock_store(&state);
     match store.list_topics() {
         Ok(rows) => match format {
-            OutputFormat::Json => json_value_response(json!(rows
-                .iter()
-                .map(|(t, n)| json!({"topic": t, "count": n}))
-                .collect::<Vec<_>>())),
+            OutputFormat::Json => json_value_response(json!(
+                rows.iter()
+                    .map(|(t, n)| json!({"topic": t, "count": n}))
+                    .collect::<Vec<_>>()
+            )),
             OutputFormat::Toon => {
                 let mut body = format!("topics[{}]{{topic,count}}:\n", rows.len());
                 for (t, n) in &rows {

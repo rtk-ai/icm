@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use icm_core::{is_preference_topic, project_matches, Embedder, Importance, Memory, MemoryStore};
+use icm_core::{Embedder, Importance, Memory, MemoryStore, is_preference_topic, project_matches};
 use icm_store::Store;
 
 use crate::extract_semantic::{AnchorKind, SemanticScorer};
@@ -96,10 +96,10 @@ pub fn extract_and_store_with_embedder(
         // extracted fact was permanently invisible to vector search and,
         // worse, systematically outranked in `search_hybrid` (70% vector
         // weight) by unrelated memories that happened to have one.
-        if let Some(emb) = embedder {
-            if let Ok(vec) = emb.embed(&mem.embed_text()) {
-                mem.embedding = Some(vec);
-            }
+        if let Some(emb) = embedder
+            && let Ok(vec) = emb.embed(&mem.embed_text())
+        {
+            mem.embedding = Some(vec);
         }
         store.store(mem)?;
         stored += 1;
@@ -113,10 +113,10 @@ pub fn extract_and_store_with_embedder(
             raw.to_string(),
             Importance::Low,
         );
-        if let Some(emb) = embedder {
-            if let Ok(vec) = emb.embed(&mem.embed_text()) {
-                mem.embedding = Some(vec);
-            }
+        if let Some(emb) = embedder
+            && let Ok(vec) = emb.embed(&mem.embed_text())
+        {
+            mem.embedding = Some(vec);
         }
         store.store(mem)?;
         stored = 1;
@@ -199,11 +199,7 @@ fn cap_importance(value: Importance, cap: Importance) -> Importance {
         Importance::Medium => 2,
         Importance::Low => 1,
     };
-    if rank(value) > rank(cap) {
-        cap
-    } else {
-        value
-    }
+    if rank(value) > rank(cap) { cap } else { value }
 }
 
 /// Query tokens worth matching against `search_by_keywords`: alphanumeric
@@ -426,12 +422,11 @@ pub fn extract_facts_public_with_embedder(
     project: &str,
     embedder: Option<&dyn Embedder>,
 ) -> Vec<(String, String, Importance, Option<AnchorKind>)> {
-    if let Some(emb) = embedder {
-        if let Ok(scorer) = SemanticScorer::new(emb) {
-            if let Ok(facts) = extract_facts_semantic(text, project, emb, &scorer) {
-                return facts;
-            }
-        }
+    if let Some(emb) = embedder
+        && let Ok(scorer) = SemanticScorer::new(emb)
+        && let Ok(facts) = extract_facts_semantic(text, project, emb, &scorer)
+    {
+        return facts;
     }
     extract_facts_with_kind(text, project)
 }
@@ -1137,10 +1132,11 @@ fn is_keepable_fragment(s: &str) -> bool {
     // tokens further down. Digits, quotes and other non-alphabetic
     // starts are allowed (e.g. `0.10.42 shipped with the dedup fix`,
     // `"DECISION:" lines from a transcript dump`).
-    if let Some(first) = stripped.chars().next() {
-        if first.is_alphabetic() && first.is_lowercase() {
-            return false;
-        }
+    if let Some(first) = stripped.chars().next()
+        && first.is_alphabetic()
+        && first.is_lowercase()
+    {
+        return false;
     }
 
     // Catch dangling URL/path tokens at the end. Boundary detection
@@ -1649,8 +1645,7 @@ mod tests {
 
     #[test]
     fn test_extract_conversational_constraint() {
-        let text =
-            "The fastembed crate does not work with cross-compilation for ARM64 on Linux CI runners";
+        let text = "The fastembed crate does not work with cross-compilation for ARM64 on Linux CI runners";
         let facts = extract_facts(text, "test");
         assert!(!facts.is_empty(), "should extract constraint");
     }

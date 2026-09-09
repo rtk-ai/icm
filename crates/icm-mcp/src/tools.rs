@@ -1,12 +1,12 @@
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use icm_core::{
-    add_backrefs, auto_link_memory, build_wake_up, find_similar_memory, format_local,
-    is_preference_topic, keyword_matches, project_matches, topic_matches, AutoLinkOptions, Concept,
-    ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, DEDUP_SIMILARITY_THRESHOLD,
-    MSG_NO_MEMORIES,
+    AutoLinkOptions, Concept, ConceptLink, DEDUP_SIMILARITY_THRESHOLD, Embedder, Feedback,
+    FeedbackStore, Label, MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Relation,
+    WakeUpFormat, WakeUpOptions, add_backrefs, auto_link_memory, build_wake_up,
+    find_similar_memory, format_local, is_preference_topic, keyword_matches, project_matches,
+    topic_matches,
 };
 use icm_store::Store;
 
@@ -853,7 +853,7 @@ fn tool_transcript_record(store: &Store, args: &Value) -> ToolResult {
         None => {
             return ToolResult::error(format!(
                 "invalid role '{role_str}'; must be user|assistant|system|tool"
-            ))
+            ));
         }
     };
     let content = match args.get("content").and_then(|v| v.as_str()) {
@@ -1058,55 +1058,55 @@ fn tool_store(
     }
 
     // Dedup check: if a very similar memory exists in the same topic, update it instead
-    if let Some(ref query_emb) = embed_vec {
-        if let Ok(Some((existing, score))) = find_similar_memory(
+    if let Some(ref query_emb) = embed_vec
+        && let Ok(Some((existing, score))) = find_similar_memory(
             store,
             &embed_text,
             query_emb,
             topic,
             DEDUP_SIMILARITY_THRESHOLD,
-        ) {
-            let updated = Memory {
-                id: existing.id.clone(),
-                created_at: existing.created_at,
-                last_accessed: existing.last_accessed,
-                access_count: existing.access_count,
-                weight: 1.0,
-                topic: existing.topic.clone(),
-                // Never wholesale-replace: `existing` and the incoming
-                // content are only known to be semantically close (cosine
-                // similarity), not the same statement — see
-                // `merge_summaries`'s docs for a measured case (two distinct
-                // LoCoMo greeting turns scored 0.98) where that destroyed
-                // the earlier memory's content.
-                summary: icm_core::merge_summaries(&existing.summary, content),
-                raw_excerpt: get_str(args, "raw_excerpt")
-                    .map(|r| r.into())
-                    .or_else(|| existing.raw_excerpt.clone()),
-                keywords: icm_core::union_keywords(&existing.keywords, &parse_keywords(args)),
-                embedding: Some(query_emb.clone()),
-                // Never let a near-dup merge downgrade importance: an MCP
-                // caller that omits `importance` defaults to Medium, which
-                // would otherwise silently demote an existing Critical
-                // memory into decay/prune eligibility (audit finding).
-                importance: icm_core::max_importance(existing.importance, importance),
-                source: existing.source.clone(),
-                related_ids: existing.related_ids.clone(),
-                updated_at: Utc::now(),
-                scope: existing.scope,
-            };
-            if let Err(e) = store.update(&updated) {
-                return ToolResult::error(format!("failed to update: {e}"));
-            }
-            return if compact {
-                ToolResult::text(format!("ok:{}", updated.id))
-            } else {
-                ToolResult::text(format!(
-                    "Updated existing memory (similarity {score:.2}): {}",
-                    updated.id
-                ))
-            };
+        )
+    {
+        let updated = Memory {
+            id: existing.id.clone(),
+            created_at: existing.created_at,
+            last_accessed: existing.last_accessed,
+            access_count: existing.access_count,
+            weight: 1.0,
+            topic: existing.topic.clone(),
+            // Never wholesale-replace: `existing` and the incoming
+            // content are only known to be semantically close (cosine
+            // similarity), not the same statement — see
+            // `merge_summaries`'s docs for a measured case (two distinct
+            // LoCoMo greeting turns scored 0.98) where that destroyed
+            // the earlier memory's content.
+            summary: icm_core::merge_summaries(&existing.summary, content),
+            raw_excerpt: get_str(args, "raw_excerpt")
+                .map(|r| r.into())
+                .or_else(|| existing.raw_excerpt.clone()),
+            keywords: icm_core::union_keywords(&existing.keywords, &parse_keywords(args)),
+            embedding: Some(query_emb.clone()),
+            // Never let a near-dup merge downgrade importance: an MCP
+            // caller that omits `importance` defaults to Medium, which
+            // would otherwise silently demote an existing Critical
+            // memory into decay/prune eligibility (audit finding).
+            importance: icm_core::max_importance(existing.importance, importance),
+            source: existing.source.clone(),
+            related_ids: existing.related_ids.clone(),
+            updated_at: Utc::now(),
+            scope: existing.scope,
+        };
+        if let Err(e) = store.update(&updated) {
+            return ToolResult::error(format!("failed to update: {e}"));
         }
+        return if compact {
+            ToolResult::text(format!("ok:{}", updated.id))
+        } else {
+            ToolResult::text(format!(
+                "Updated existing memory (similarity {score:.2}): {}",
+                updated.id
+            ))
+        };
     }
 
     // Auto-link: populate `related_ids` with similar existing memories BEFORE
@@ -1127,10 +1127,10 @@ fn tool_store(
         Ok(id) => {
             // Best-effort back-ref update. Failure here leaves an asymmetric
             // edge (forward-only) but does not fail the store call.
-            if !linked_ids.is_empty() {
-                if let Err(e) = add_backrefs(store, &id, &linked_ids) {
-                    tracing::warn!("auto-link back-ref update failed: {e}");
-                }
+            if !linked_ids.is_empty()
+                && let Err(e) = add_backrefs(store, &id, &linked_ids)
+            {
+                tracing::warn!("auto-link back-ref update failed: {e}");
             }
 
             let link_suffix = if linked_ids.is_empty() {
@@ -1299,52 +1299,51 @@ fn tool_recall(
     };
 
     // Try hybrid search if embedder is available
-    if let Some(emb) = embedder {
-        if let Ok(query_emb) = emb.embed_query(query) {
-            if let Ok(results) = store.search_hybrid(query, &query_emb, query_limit) {
-                let mut scored_results = results;
-                scored_results.retain(|(m, _)| project_filter(m));
-                if let Some(t) = topic {
-                    scored_results.retain(|(m, _)| topic_matches(&m.topic, t));
-                }
-                if let Some(kw) = keyword {
-                    scored_results.retain(|(m, _)| keyword_matches(&m.keywords, kw));
-                }
-
-                // Graph-aware expansion: follow `related_ids` one hop from
-                // each primary hit and fold neighbors into the result set.
-                // Neighbors carry a discounted score so they rank below
-                // direct matches but can displace weak primary results.
-                //
-                // Audit R13b: neighbors are fetched by id without going
-                // through the project / topic / keyword filters above,
-                // so a project-A primary hit can pull in a project-B
-                // neighbor via auto-linked `related_ids`. Re-apply the
-                // filters to `expanded` so the caller's scope is honored.
-                let max_neighbors = (query_limit / 3).max(1);
-                let mut expanded = store
-                    .expand_with_neighbors(&scored_results, max_neighbors, 0.5, query_limit)
-                    .unwrap_or(scored_results);
-                expanded.retain(|(m, _)| project_filter(m));
-                if let Some(t) = topic {
-                    expanded.retain(|(m, _)| topic_matches(&m.topic, t));
-                }
-                if let Some(kw) = keyword {
-                    expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
-                }
-                expanded.truncate(limit);
-
-                // Batch update access counts (includes expanded neighbors)
-                let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
-                let _ = store.batch_update_access(&ids);
-
-                if expanded.is_empty() {
-                    return ToolResult::text(MSG_NO_MEMORIES.into());
-                }
-
-                return ToolResult::text(format_memory_output(&expanded, compact));
-            }
+    if let Some(emb) = embedder
+        && let Ok(query_emb) = emb.embed_query(query)
+        && let Ok(results) = store.search_hybrid(query, &query_emb, query_limit)
+    {
+        let mut scored_results = results;
+        scored_results.retain(|(m, _)| project_filter(m));
+        if let Some(t) = topic {
+            scored_results.retain(|(m, _)| topic_matches(&m.topic, t));
         }
+        if let Some(kw) = keyword {
+            scored_results.retain(|(m, _)| keyword_matches(&m.keywords, kw));
+        }
+
+        // Graph-aware expansion: follow `related_ids` one hop from
+        // each primary hit and fold neighbors into the result set.
+        // Neighbors carry a discounted score so they rank below
+        // direct matches but can displace weak primary results.
+        //
+        // Audit R13b: neighbors are fetched by id without going
+        // through the project / topic / keyword filters above,
+        // so a project-A primary hit can pull in a project-B
+        // neighbor via auto-linked `related_ids`. Re-apply the
+        // filters to `expanded` so the caller's scope is honored.
+        let max_neighbors = (query_limit / 3).max(1);
+        let mut expanded = store
+            .expand_with_neighbors(&scored_results, max_neighbors, 0.5, query_limit)
+            .unwrap_or(scored_results);
+        expanded.retain(|(m, _)| project_filter(m));
+        if let Some(t) = topic {
+            expanded.retain(|(m, _)| topic_matches(&m.topic, t));
+        }
+        if let Some(kw) = keyword {
+            expanded.retain(|(m, _)| keyword_matches(&m.keywords, kw));
+        }
+        expanded.truncate(limit);
+
+        // Batch update access counts (includes expanded neighbors)
+        let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
+        let _ = store.batch_update_access(&ids);
+
+        if expanded.is_empty() {
+            return ToolResult::text(MSG_NO_MEMORIES.into());
+        }
+
+        return ToolResult::text(format_memory_output(&expanded, compact));
     }
 
     // Fallback: FTS then keywords
@@ -1466,10 +1465,10 @@ fn tool_consolidate(store: &Store, embedder: Option<&dyn Embedder>, args: &Value
     let mut consolidated = Memory::new(topic.into(), summary.into(), icm_core::Importance::High);
     // Same bug class as #394/#395/cmd_consolidate: this tool never attached
     // an embedding to the merged memory it creates.
-    if let Some(emb) = embedder {
-        if let Ok(vec) = emb.embed(&consolidated.embed_text()) {
-            consolidated.embedding = Some(vec);
-        }
+    if let Some(emb) = embedder
+        && let Ok(vec) = emb.embed(&consolidated.embed_text())
+    {
+        consolidated.embedding = Some(vec);
     }
 
     match store.consolidate_topic(topic, consolidated) {
@@ -1568,10 +1567,10 @@ fn tool_update(store: &Store, embedder: Option<&dyn Embedder>, args: &Value) -> 
     memory.updated_at = Utc::now();
     memory.weight = 1.0; // Reset weight on update (refreshed content)
 
-    if let Some(imp_str) = get_str(args, "importance") {
-        if let Ok(imp) = imp_str.parse() {
-            memory.importance = imp;
-        }
+    if let Some(imp_str) = get_str(args, "importance")
+        && let Ok(imp) = imp_str.parse()
+    {
+        memory.importance = imp;
     }
 
     let kw = parse_keywords(args);
@@ -1580,10 +1579,10 @@ fn tool_update(store: &Store, embedder: Option<&dyn Embedder>, args: &Value) -> 
     }
 
     // Re-embed if embedder available
-    if let Some(emb) = embedder {
-        if let Ok(vec) = emb.embed(&memory.embed_text()) {
-            memory.embedding = Some(vec);
-        }
+    if let Some(emb) = embedder
+        && let Ok(vec) = emb.embed(&memory.embed_text())
+    {
+        memory.embedding = Some(vec);
     }
 
     match store.update(&memory) {
@@ -2441,10 +2440,10 @@ fn tool_feedback_record(
     // all — pure FTS5 with implicit AND, so a query missing even one exact
     // token returned nothing. Attach an embedding here so search_feedback
     // can blend semantic similarity in, mirroring icm_memory_store.
-    if let Some(emb) = embedder {
-        if let Ok(v) = emb.embed(&feedback.embed_text()) {
-            feedback.embedding = Some(v);
-        }
+    if let Some(emb) = embedder
+        && let Ok(v) = emb.embed(&feedback.embed_text())
+    {
+        feedback.embedding = Some(v);
     }
 
     let id = feedback.id.clone();
@@ -2453,7 +2452,9 @@ fn tool_feedback_record(
             if compact {
                 ToolResult::text(format!("ok {id}"))
             } else {
-                ToolResult::text(format!("Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"))
+                ToolResult::text(format!(
+                    "Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"
+                ))
             }
         }
         Err(e) => ToolResult::error(format!("failed to store feedback: {e}")),
@@ -3139,9 +3140,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("content exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("content exceeds maximum length")
+        );
     }
 
     #[test]
@@ -3839,9 +3842,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("topic exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("topic exceeds maximum length")
+        );
     }
 
     #[test]
@@ -3856,9 +3861,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("content exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("content exceeds maximum length")
+        );
     }
 
     #[test]

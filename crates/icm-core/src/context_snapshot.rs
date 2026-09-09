@@ -569,10 +569,11 @@ mod tests {
         );
         // Sanity check: result is bounded and identity section landed.
         assert!(snap.total_chars <= snap.max_chars);
-        assert!(snap
-            .sections
-            .iter()
-            .any(|s| s.title.starts_with("Identity")));
+        assert!(
+            snap.sections
+                .iter()
+                .any(|s| s.title.starts_with("Identity"))
+        );
     }
 
     #[test]

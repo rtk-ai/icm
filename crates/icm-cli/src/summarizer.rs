@@ -12,7 +12,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 /// Concrete provider kinds. `Auto` is resolved to one of the others at call
@@ -59,12 +59,11 @@ impl ProviderKind {
 /// left by the invoking tool. Falls back to the configured `fallback` when
 /// no hint matches.
 pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
-    if let Ok(forced) = std::env::var("ICM_INVOKER") {
-        if let Ok(p) = ProviderKind::parse(&forced) {
-            if p != ProviderKind::Auto {
-                return p;
-            }
-        }
+    if let Ok(forced) = std::env::var("ICM_INVOKER")
+        && let Ok(p) = ProviderKind::parse(&forced)
+        && p != ProviderKind::Auto
+    {
+        return p;
     }
     if std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CLI").is_ok() {
         return ProviderKind::Claude;
@@ -571,7 +570,8 @@ mod tests {
         .map(|k| (*k, std::env::var(k).ok()))
         .collect();
         for (k, _) in &snapshot {
-            std::env::remove_var(k);
+            // SAFETY: single-threaded test; env is snapshotted/restored here.
+            unsafe { std::env::remove_var(k) };
         }
 
         let result = detect_provider(ProviderKind::Auto);
@@ -579,7 +579,8 @@ mod tests {
         // Restore env before asserting so failures don't poison later tests.
         for (k, v) in snapshot {
             if let Some(val) = v {
-                std::env::set_var(k, val);
+                // SAFETY: single-threaded test; env is snapshotted/restored here.
+                unsafe { std::env::set_var(k, val) };
             }
         }
 
@@ -608,12 +609,13 @@ mod tests {
     fn detect_honors_explicit_invoker_env() {
         // Save then override.
         let prior = std::env::var("ICM_INVOKER").ok();
-        std::env::set_var("ICM_INVOKER", "ollama");
+        // SAFETY: single-threaded test; env is snapshotted/restored here.
+        unsafe { std::env::set_var("ICM_INVOKER", "ollama") };
         let got = detect_provider(ProviderKind::Claude);
         if let Some(v) = prior {
-            std::env::set_var("ICM_INVOKER", v);
+            unsafe { std::env::set_var("ICM_INVOKER", v) };
         } else {
-            std::env::remove_var("ICM_INVOKER");
+            unsafe { std::env::remove_var("ICM_INVOKER") };
         }
         assert_eq!(got, ProviderKind::Ollama);
     }

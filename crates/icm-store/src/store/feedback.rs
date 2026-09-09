@@ -24,8 +24,7 @@ fn row_to_feedback(row: &rusqlite::Row) -> rusqlite::Result<Feedback> {
     })
 }
 
-const FEEDBACK_COLS: &str =
-    "id, topic, context, predicted, corrected, reason, source, created_at, applied_count, embedding";
+const FEEDBACK_COLS: &str = "id, topic, context, predicted, corrected, reason, source, created_at, applied_count, embedding";
 /// Same columns, qualified for the `feedback f JOIN feedback_fts fts` query
 /// in `search_feedback` — both tables have an `id` column post-join, so the
 /// unqualified `FEEDBACK_COLS` is ambiguous there (found via real testing:
@@ -210,14 +209,14 @@ impl FeedbackStore for SqliteStore {
             topic
         {
             (
-                    format!(
-                        "SELECT {FEEDBACK_COLS} FROM feedback WHERE topic = ?1 ORDER BY created_at DESC LIMIT ?2"
-                    ),
-                    vec![
-                        Box::new(t.to_string()) as Box<dyn rusqlite::types::ToSql>,
-                        Box::new(limit as i64),
-                    ],
-                )
+                format!(
+                    "SELECT {FEEDBACK_COLS} FROM feedback WHERE topic = ?1 ORDER BY created_at DESC LIMIT ?2"
+                ),
+                vec![
+                    Box::new(t.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit as i64),
+                ],
+            )
         } else {
             (
                 format!("SELECT {FEEDBACK_COLS} FROM feedback ORDER BY created_at DESC LIMIT ?1"),

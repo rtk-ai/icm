@@ -12,9 +12,10 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::CrosstermBackend,
     style::{Color, Modifier, Style, Stylize},
@@ -23,12 +24,11 @@ use ratatui::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
         Tabs, Wrap,
     },
-    Frame, Terminal,
 };
 
 use icm_core::{
-    format_local, Embedder, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore,
-    StoreStats, TopicHealth,
+    Embedder, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore, StoreStats, TopicHealth,
+    format_local,
 };
 use icm_store::Store;
 

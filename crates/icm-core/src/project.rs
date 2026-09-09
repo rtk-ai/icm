@@ -42,12 +42,12 @@ pub fn project_from_path(path: &str) -> Option<String> {
     if let Ok(repo) = gix::discover(p) {
         // Prefer origin remote URL: the most unique identifier, stable
         // across worktrees and renamed checkouts.
-        if let Ok(remote) = repo.find_remote("origin") {
-            if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
-                let url_str = url.to_bstring().to_string();
-                if let Some(name) = repo_name_from_url(&url_str) {
-                    return Some(name);
-                }
+        if let Ok(remote) = repo.find_remote("origin")
+            && let Some(url) = remote.url(gix::remote::Direction::Fetch)
+        {
+            let url_str = url.to_bstring().to_string();
+            if let Some(name) = repo_name_from_url(&url_str) {
+                return Some(name);
             }
         }
 

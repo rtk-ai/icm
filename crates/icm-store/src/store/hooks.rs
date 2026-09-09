@@ -190,12 +190,11 @@ impl SqliteStore {
                          LIMIT ?2",
                     )
                     .map_err(db_err)?;
-                let result = stmt
-                    .query_map(rusqlite::params![s, limit as i64], row_to_consolidation_job)
+
+                stmt.query_map(rusqlite::params![s, limit as i64], row_to_consolidation_job)
                     .map_err(db_err)?
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(db_err)?;
-                result
+                    .map_err(db_err)?
             }
             None => {
                 let mut stmt = self
@@ -207,12 +206,11 @@ impl SqliteStore {
                          LIMIT ?1",
                     )
                     .map_err(db_err)?;
-                let result = stmt
-                    .query_map([limit as i64], row_to_consolidation_job)
+
+                stmt.query_map([limit as i64], row_to_consolidation_job)
                     .map_err(db_err)?
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(db_err)?;
-                result
+                    .map_err(db_err)?
             }
         };
         Ok(rows)

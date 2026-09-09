@@ -37,15 +37,15 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    build_wake_up, find_similar_memory, format_local, is_preference_topic, keyword_matches,
-    project_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance,
-    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions,
-    DEDUP_SIMILARITY_THRESHOLD, MSG_NO_MEMORIES,
+    Concept, ConceptLink, DEDUP_SIMILARITY_THRESHOLD, Feedback, FeedbackStore, Importance, Label,
+    MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
+    WakeUpOptions, build_wake_up, find_similar_memory, format_local, is_preference_topic,
+    keyword_matches, project_matches, topic_matches,
 };
 use icm_store::Store;
 
@@ -1614,24 +1614,21 @@ fn resolve_db_path(cli_db: Option<PathBuf>, cfg: &config::Config) -> PathBuf {
         if icm_dir.is_dir() {
             // 4a. .icm/config.toml with [store].path
             let project_cfg = icm_dir.join("config.toml");
-            if project_cfg.exists() {
-                if let Ok(content) = std::fs::read_to_string(&project_cfg) {
-                    if let Ok(value) = content.parse::<toml::Value>() {
-                        if let Some(path_str) = value
-                            .get("store")
-                            .and_then(|s| s.get("path"))
-                            .and_then(|p| p.as_str())
-                        {
-                            let path = if Path::new(path_str).is_absolute() {
-                                PathBuf::from(path_str)
-                            } else {
-                                project_root.join(path_str)
-                            };
-                            if !path.as_os_str().is_empty() {
-                                return path;
-                            }
-                        }
-                    }
+            if project_cfg.exists()
+                && let Ok(content) = std::fs::read_to_string(&project_cfg)
+                && let Ok(value) = content.parse::<toml::Value>()
+                && let Some(path_str) = value
+                    .get("store")
+                    .and_then(|s| s.get("path"))
+                    .and_then(|p| p.as_str())
+            {
+                let path = if Path::new(path_str).is_absolute() {
+                    PathBuf::from(path_str)
+                } else {
+                    project_root.join(path_str)
+                };
+                if !path.as_os_str().is_empty() {
+                    return path;
                 }
             }
 
@@ -2867,48 +2864,48 @@ fn cmd_store(
     }
 
     // Dedup: if a very similar memory already exists in the same topic, update it instead
-    if let Some(ref emb) = memory.embedding {
-        if let Ok(Some((existing, score))) = find_similar_memory(
+    if let Some(ref emb) = memory.embedding
+        && let Ok(Some((existing, score))) = find_similar_memory(
             store,
             &memory.embed_text(),
             emb,
             &topic,
             DEDUP_SIMILARITY_THRESHOLD,
-        ) {
-            let updated = Memory {
-                id: existing.id.clone(),
-                created_at: existing.created_at,
-                updated_at: chrono::Utc::now(),
-                last_accessed: existing.last_accessed,
-                access_count: existing.access_count,
-                weight: 1.0,
-                topic: existing.topic.clone(),
-                // Never wholesale-replace: `existing` and `memory` are only
-                // known to be semantically close (cosine similarity), not
-                // the same statement — see `merge_summaries`'s docs for a
-                // measured case (two distinct LoCoMo greeting turns scored
-                // 0.98) where that destroyed the earlier memory's content.
-                summary: icm_core::merge_summaries(&existing.summary, &memory.summary),
-                raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
-                keywords: icm_core::union_keywords(&existing.keywords, &memory.keywords),
-                embedding: memory.embedding.clone(),
-                // Never let a near-dup merge downgrade importance — a
-                // `--importance` omission defaults to Medium and would
-                // otherwise silently demote an existing Critical memory
-                // into decay/prune eligibility (audit finding).
-                importance: icm_core::max_importance(existing.importance, importance),
-                source: existing.source,
-                related_ids: existing.related_ids,
-                scope: existing.scope,
-            };
-            store.update(&updated)?;
-            println!(
-                "Updated existing memory (similarity {score:.2}): {}",
-                updated.id
-            );
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
-            return Ok(());
-        }
+        )
+    {
+        let updated = Memory {
+            id: existing.id.clone(),
+            created_at: existing.created_at,
+            updated_at: chrono::Utc::now(),
+            last_accessed: existing.last_accessed,
+            access_count: existing.access_count,
+            weight: 1.0,
+            topic: existing.topic.clone(),
+            // Never wholesale-replace: `existing` and `memory` are only
+            // known to be semantically close (cosine similarity), not
+            // the same statement — see `merge_summaries`'s docs for a
+            // measured case (two distinct LoCoMo greeting turns scored
+            // 0.98) where that destroyed the earlier memory's content.
+            summary: icm_core::merge_summaries(&existing.summary, &memory.summary),
+            raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
+            keywords: icm_core::union_keywords(&existing.keywords, &memory.keywords),
+            embedding: memory.embedding.clone(),
+            // Never let a near-dup merge downgrade importance — a
+            // `--importance` omission defaults to Medium and would
+            // otherwise silently demote an existing Critical memory
+            // into decay/prune eligibility (audit finding).
+            importance: icm_core::max_importance(existing.importance, importance),
+            source: existing.source,
+            related_ids: existing.related_ids,
+            scope: existing.scope,
+        };
+        store.update(&updated)?;
+        println!(
+            "Updated existing memory (similarity {score:.2}): {}",
+            updated.id
+        );
+        maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
+        return Ok(());
     }
 
     // Auto-link: wire the new memory into the existing graph before
@@ -2926,10 +2923,10 @@ fn cmd_store(
     let id = store.store(memory)?;
 
     // Back-refs: update each linked memory so the edges are bidirectional.
-    if !linked_ids.is_empty() {
-        if let Err(e) = icm_core::add_backrefs(store, &id, &linked_ids) {
-            eprintln!("warning: auto-link back-refs failed: {e}");
-        }
+    if !linked_ids.is_empty()
+        && let Err(e) = icm_core::add_backrefs(store, &id, &linked_ids)
+    {
+        eprintln!("warning: auto-link back-refs failed: {e}");
     }
 
     if linked_ids.is_empty() {
@@ -3067,15 +3064,15 @@ fn cmd_recall(
         if !project_filter(m) {
             return false;
         }
-        if let Some(t) = topic {
-            if !topic_matches(&m.topic, t) {
-                return false;
-            }
+        if let Some(t) = topic
+            && !topic_matches(&m.topic, t)
+        {
+            return false;
         }
-        if let Some(kw) = keyword {
-            if !keyword_matches(&m.keywords, kw) {
-                return false;
-            }
+        if let Some(kw) = keyword
+            && !keyword_matches(&m.keywords, kw)
+        {
+            return false;
         }
         true
     };
@@ -3350,10 +3347,10 @@ fn cmd_feedback_record(
     // Manual-testing finding: feedback search had no semantic fallback at
     // all — attach an embedding here so search_feedback can blend
     // semantic similarity in, mirroring cmd_store.
-    if let Some(emb) = embedder {
-        if let Ok(v) = emb.embed(&feedback.embed_text()) {
-            feedback.embedding = Some(v);
-        }
+    if let Some(emb) = embedder
+        && let Ok(v) = emb.embed(&feedback.embed_text())
+    {
+        feedback.embedding = Some(v);
     }
     let id = store.store_feedback(feedback)?;
     println!("Feedback recorded: {id}");
@@ -3881,10 +3878,10 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
     }
 
     // 6. Read tool nests under `file.content`.
-    if let Some(file) = tr.get("file") {
-        if let Some(s) = nonempty_str(file, "content") {
-            return Some(s);
-        }
+    if let Some(file) = tr.get("file")
+        && let Some(s) = nonempty_str(file, "content")
+    {
+        return Some(s);
     }
 
     None
@@ -3902,26 +3899,25 @@ fn extract_tool_input_file_path(json: &Value) -> Option<String> {
     }
 
     // Claude Code 2.x: `tool_input.file_path`.
-    if let Some(s) = json.get("tool_input").and_then(|t| t.get("file_path")) {
-        if let Some(s) = nonempty(s) {
-            return Some(s);
-        }
+    if let Some(s) = json.get("tool_input").and_then(|t| t.get("file_path"))
+        && let Some(s) = nonempty(s)
+    {
+        return Some(s);
     }
     // Claude Code 1.x legacy and some Codex variants: top-level.
-    if let Some(s) = json.get("file_path") {
-        if let Some(s) = nonempty(s) {
-            return Some(s);
-        }
+    if let Some(s) = json.get("file_path")
+        && let Some(s) = nonempty(s)
+    {
+        return Some(s);
     }
     // Some MCP servers nest the input under `arguments`.
     if let Some(s) = json
         .get("tool_input")
         .and_then(|t| t.get("arguments"))
         .and_then(|a| a.get("file_path"))
+        && let Some(s) = nonempty(s)
     {
-        if let Some(s) = nonempty(s) {
-            return Some(s);
-        }
+        return Some(s);
     }
     None
 }
@@ -3988,18 +3984,18 @@ fn cmd_hook_post(
     // Independent of the extract counter: every Edit/Write tool call
     // gets one row in `code_areas` (touch_count++ on re-touch).
     // Failure is non-fatal — never block the hook on stats inserts.
-    if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
-        if let Some(file_path) = extract_tool_input_file_path(&json) {
-            let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
-            let session_id = json.get("session_id").and_then(|v| v.as_str());
-            let _ = store.upsert_code_area(
-                &project,
-                &file_path,
-                None, // description left empty in MVP; #165 will wire LLM summaries later
-                session_id,
-                Some(tool_name),
-            );
-        }
+    if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+        && let Some(file_path) = extract_tool_input_file_path(&json)
+    {
+        let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
+        let session_id = json.get("session_id").and_then(|v| v.as_str());
+        let _ = store.upsert_code_area(
+            &project,
+            &file_path,
+            None, // description left empty in MVP; #165 will wire LLM summaries later
+            session_id,
+            Some(tool_name),
+        );
     }
 
     // `[extraction].enabled = false` (issue #424) stops here — archive
@@ -4232,53 +4228,53 @@ fn cmd_hook_end(
     // immediately so Claude Code doesn't kill us with "Hook cancelled".
     // The transcript-extract path below stays for back-compat (it's
     // still cheap when --no-embeddings is set).
-    if extraction_summarizer.provider != "none" {
-        if let Ok(self_path) = std::env::current_exe() {
-            // `nohup`-style detach: redirect std{in,out,err} to /dev/null
-            // and let the child outlive us. The child reads the same
-            // config so it picks up the same provider.
-            let mut cmd = std::process::Command::new(&self_path);
-            cmd.arg("extract-pending").arg("--limit").arg("20");
-            // Mark the worker subtree (#322) so any hook fired by an LLM
-            // CLI it spawns short-circuits instead of forking again.
-            cmd.env("ICM_WORKER", "1");
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            // On Unix, set a new session so the child survives our exit.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                unsafe {
-                    cmd.pre_exec(|| {
-                        // Detach from controlling tty / process group.
-                        libc::setsid();
-                        Ok(())
-                    });
-                }
+    if extraction_summarizer.provider != "none"
+        && let Ok(self_path) = std::env::current_exe()
+    {
+        // `nohup`-style detach: redirect std{in,out,err} to /dev/null
+        // and let the child outlive us. The child reads the same
+        // config so it picks up the same provider.
+        let mut cmd = std::process::Command::new(&self_path);
+        cmd.arg("extract-pending").arg("--limit").arg("20");
+        // Mark the worker subtree (#322) so any hook fired by an LLM
+        // CLI it spawns short-circuits instead of forking again.
+        cmd.env("ICM_WORKER", "1");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // On Unix, set a new session so the child survives our exit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    // Detach from controlling tty / process group.
+                    libc::setsid();
+                    Ok(())
+                });
             }
-            match cmd.spawn() {
-                Ok(_) => {
-                    eprintln!(
-                        "[icm] session-end: forked async LLM worker (provider={})",
-                        extraction_summarizer.provider,
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[icm] session-end: fork failed ({e}), falling back to inline transcript extract",
-                    );
-                    return extract_from_hook_transcript(
-                        store,
-                        embedder,
-                        memory_cfg,
-                        consolidate_cfg,
-                        "session-end",
-                    );
-                }
-            }
-            return Ok(());
         }
+        match cmd.spawn() {
+            Ok(_) => {
+                eprintln!(
+                    "[icm] session-end: forked async LLM worker (provider={})",
+                    extraction_summarizer.provider,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[icm] session-end: fork failed ({e}), falling back to inline transcript extract",
+                );
+                return extract_from_hook_transcript(
+                    store,
+                    embedder,
+                    memory_cfg,
+                    consolidate_cfg,
+                    "session-end",
+                );
+            }
+        }
+        return Ok(());
     }
     // Inline path (legacy): scan transcript and extract via fastembed.
     extract_from_hook_transcript(store, embedder, memory_cfg, consolidate_cfg, "session-end")
@@ -4407,11 +4403,11 @@ fn extract_from_hook_transcript(
             // Content as array of {type: "text", text: "..."}
             if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
                 for block in arr {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                            assistant_text.push_str(text);
-                            assistant_text.push('\n');
-                        }
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(text) = block.get("text").and_then(|t| t.as_str())
+                    {
+                        assistant_text.push_str(text);
+                        assistant_text.push('\n');
                     }
                 }
             }
@@ -6777,10 +6773,10 @@ fn cmd_import_from_export(
         match record_type {
             "header" => {
                 // Validate version; warn on mismatch but continue.
-                if let Some(v) = obj.get("icm_export_version").and_then(|v| v.as_u64()) {
-                    if v != 1 {
-                        eprintln!("warning: export version {v} (expected 1) — proceeding anyway");
-                    }
+                if let Some(v) = obj.get("icm_export_version").and_then(|v| v.as_u64())
+                    && v != 1
+                {
+                    eprintln!("warning: export version {v} (expected 1) — proceeding anyway");
                 }
                 continue;
             }
@@ -7504,12 +7500,11 @@ fn inject_mcp_server(
     };
 
     // Check if already configured with same binary
-    if let Some(existing) = mcp_servers.get(name) {
-        if existing.get("command").and_then(|v| v.as_str())
+    if let Some(existing) = mcp_servers.get(name)
+        && existing.get("command").and_then(|v| v.as_str())
             == entry.get("command").and_then(|v| v.as_str())
-        {
-            return Ok("already configured".into());
-        }
+    {
+        return Ok("already configured".into());
     }
 
     mcp_servers
@@ -7595,10 +7590,10 @@ fn inject_copilot_cli_mcp_server(
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}));
 
-    if let Some(existing) = servers.get(name) {
-        if existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
-            return Ok("already configured".into());
-        }
+    if let Some(existing) = servers.get(name)
+        && existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin)
+    {
+        return Ok("already configured".into());
     }
 
     servers
@@ -7769,10 +7764,10 @@ fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Res
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
 
     // Check if already configured with same binary
-    if let Some(existing) = mcp_servers.get(name) {
-        if existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
-            return Ok("already configured".into());
-        }
+    if let Some(existing) = mcp_servers.get(name)
+        && existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin)
+    {
+        return Ok("already configured".into());
     }
 
     let mut server = toml::map::Map::new();
@@ -7816,12 +7811,11 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
         .entry("mcp")
         .or_insert_with(|| serde_json::json!({}));
 
-    if let Some(existing) = mcp.get(name) {
-        if let Some(cmd) = existing.get("command").and_then(|v| v.as_array()) {
-            if cmd.first().and_then(|v| v.as_str()) == Some(icm_bin) {
-                return Ok("already configured".into());
-            }
-        }
+    if let Some(existing) = mcp.get(name)
+        && let Some(cmd) = existing.get("command").and_then(|v| v.as_array())
+        && cmd.first().and_then(|v| v.as_str()) == Some(icm_bin)
+    {
+        return Ok("already configured".into());
     }
 
     mcp.as_object_mut()
@@ -7867,18 +7861,15 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
         if icm_dir.is_dir() {
             println!("  .icm/ exists");
             let project_cfg = icm_dir.join("config.toml");
-            if project_cfg.exists() {
-                if let Ok(content) = std::fs::read_to_string(&project_cfg) {
-                    if let Ok(value) = content.parse::<toml::Value>() {
-                        if let Some(path_str) = value
-                            .get("store")
-                            .and_then(|s| s.get("path"))
-                            .and_then(|p| p.as_str())
-                        {
-                            println!("  .icm/config.toml [store].path = {path_str}");
-                        }
-                    }
-                }
+            if project_cfg.exists()
+                && let Ok(content) = std::fs::read_to_string(&project_cfg)
+                && let Ok(value) = content.parse::<toml::Value>()
+                && let Some(path_str) = value
+                    .get("store")
+                    .and_then(|s| s.get("path"))
+                    .and_then(|p| p.as_str())
+            {
+                println!("  .icm/config.toml [store].path = {path_str}");
             }
             let project_db = icm_dir.join("memories.db");
             if project_db.exists() {
@@ -8204,10 +8195,10 @@ fn drain_pending_groups(
             // Same bug class as #394: this LLM-backed extraction path is a
             // sibling of extract_and_store_with_embedder and had the same gap
             // — the embedder was available but never attached to the Memory.
-            if let Some(emb) = embedder {
-                if let Ok(vec) = emb.embed(&mem.embed_text()) {
-                    mem.embedding = Some(vec);
-                }
+            if let Some(emb) = embedder
+                && let Ok(vec) = emb.embed(&mem.embed_text())
+            {
+                mem.embedding = Some(vec);
             }
             store.store(mem)?;
             tally.stored += 1;
@@ -8498,10 +8489,10 @@ fn cmd_consolidate(
     // Same bug class as #394/#395: cmd_consolidate had no embedder param at
     // all, so the merged memory was always born with embedding: None — a
     // real gap found via manual testing against a real Postgres backend.
-    if let Some(emb) = embedder {
-        if let Ok(vec) = emb.embed(&consolidated.embed_text()) {
-            consolidated.embedding = Some(vec);
-        }
+    if let Some(emb) = embedder
+        && let Ok(vec) = emb.embed(&consolidated.embed_text())
+    {
+        consolidated.embedding = Some(vec);
     }
 
     if keep_originals {
@@ -8719,7 +8710,9 @@ fn cmd_consolidate_pending(
     if failed == 0 {
         println!("Processed {done} job(s).");
     } else {
-        println!("Processed {done} job(s); {failed} failed (see errors above, retry with `icm consolidate-jobs --retry <id>`).");
+        println!(
+            "Processed {done} job(s); {failed} failed (see errors above, retry with `icm consolidate-jobs --retry <id>`)."
+        );
     }
     Ok(())
 }
@@ -9953,11 +9946,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
 
 #[cfg(feature = "bench")]
 fn pct_delta(a: f64, b: f64) -> f64 {
-    if a == 0.0 {
-        0.0
-    } else {
-        ((b - a) / a) * 100.0
-    }
+    if a == 0.0 { 0.0 } else { ((b - a) / a) * 100.0 }
 }
 
 #[cfg(feature = "bench")]
@@ -11328,8 +11317,8 @@ mod hook_start_tests {
                 .unwrap();
         }
         let cfg = config::SummarizerConfig::default(); // provider defaults to "none"
-                                                       // Bare run (no explicit provider) resolves to none → refuse (a batch
-                                                       // lexical join + delete of originals across the whole store).
+        // Bare run (no explicit provider) resolves to none → refuse (a batch
+        // lexical join + delete of originals across the whole store).
         assert!(cmd_consolidate_all(&store, 3, &cfg, None, None, None, false, None).is_err());
         // threshold 0 → refuse.
         assert!(
@@ -11540,10 +11529,12 @@ mod hook_start_tests {
         // The non-ICM hook survives.
         let post = after["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(post.len(), 1);
-        assert!(post[0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("othertool"));
+        assert!(
+            post[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("othertool")
+        );
         // The ICM-only event is dropped entirely.
         assert!(after["hooks"].get("SessionEnd").is_none());
         // MCP config and unrelated settings are untouched.
@@ -12056,14 +12047,16 @@ mod read_only_requested_tests {
     fn with_env<F: FnOnce()>(value: Option<&str>, body: F) {
         let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("ICM_READONLY").ok();
+        // SAFETY: `ENV_LOCK` serializes all env mutation in tests, so no other
+        // thread observes the intermediate state.
         match value {
-            Some(v) => std::env::set_var("ICM_READONLY", v),
-            None => std::env::remove_var("ICM_READONLY"),
+            Some(v) => unsafe { std::env::set_var("ICM_READONLY", v) },
+            None => unsafe { std::env::remove_var("ICM_READONLY") },
         }
         body();
         match prev {
-            Some(v) => std::env::set_var("ICM_READONLY", v),
-            None => std::env::remove_var("ICM_READONLY"),
+            Some(v) => unsafe { std::env::set_var("ICM_READONLY", v) },
+            None => unsafe { std::env::remove_var("ICM_READONLY") },
         }
     }
 
@@ -12116,7 +12109,9 @@ mod resolve_db_path_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_cwd = std::env::current_dir().unwrap();
         let prev_icm_db = std::env::var("ICM_DB").ok();
-        std::env::remove_var("ICM_DB");
+        // SAFETY: `ENV_LOCK` serializes all cwd/env mutation in tests, so no
+        // other thread observes the intermediate state.
+        unsafe { std::env::remove_var("ICM_DB") };
 
         let dir = tempfile::tempdir().unwrap();
         // macOS: /tmp (and TMPDIR) is a symlink into /private/tmp — the
@@ -12131,15 +12126,15 @@ mod resolve_db_path_tests {
 
         std::env::set_current_dir(prev_cwd).unwrap();
         match prev_icm_db {
-            Some(v) => std::env::set_var("ICM_DB", v),
-            None => std::env::remove_var("ICM_DB"),
+            Some(v) => unsafe { std::env::set_var("ICM_DB", v) },
+            None => unsafe { std::env::remove_var("ICM_DB") },
         }
     }
 
     #[test]
     fn cli_flag_wins_over_everything() {
         with_isolated_cwd(|_| {
-            std::env::set_var("ICM_DB", "/should/not/win");
+            unsafe { std::env::set_var("ICM_DB", "/should/not/win") };
             let cfg = config::Config::default();
             let resolved = resolve_db_path(Some(PathBuf::from("/explicit/flag.db")), &cfg);
             assert_eq!(resolved, PathBuf::from("/explicit/flag.db"));
@@ -12149,7 +12144,7 @@ mod resolve_db_path_tests {
     #[test]
     fn env_var_wins_when_no_flag() {
         with_isolated_cwd(|_| {
-            std::env::set_var("ICM_DB", "/from/env.db");
+            unsafe { std::env::set_var("ICM_DB", "/from/env.db") };
             let cfg = config::Config::default();
             let resolved = resolve_db_path(None, &cfg);
             assert_eq!(resolved, PathBuf::from("/from/env.db"));
@@ -12268,7 +12263,7 @@ mod cli_config_dir_tests {
     fn falls_back_to_home_when_env_unset() {
         // Use a uniquely-named env var so we don't race with a real one.
         let var = "ICM_TEST_FAKE_ENV_VAR_THAT_DOES_NOT_EXIST";
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
         assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
     }
@@ -12276,9 +12271,9 @@ mod cli_config_dir_tests {
     #[test]
     fn uses_env_var_when_set() {
         let var = "ICM_TEST_CLI_CONFIG_DIR_OVERRIDE";
-        std::env::set_var(var, "/tmp/custom-cli-home");
+        unsafe { std::env::set_var(var, "/tmp/custom-cli-home") };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(dir, PathBuf::from("/tmp/custom-cli-home"));
     }
 
@@ -12286,9 +12281,9 @@ mod cli_config_dir_tests {
     fn empty_env_var_falls_back_to_home() {
         // An accidentally-empty `export FOO=` should not produce a useless empty path.
         let var = "ICM_TEST_CLI_CONFIG_DIR_EMPTY";
-        std::env::set_var(var, "");
+        unsafe { std::env::set_var(var, "") };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
     }
 }
@@ -13246,10 +13241,12 @@ mod cli_contracts_tests {
         assert_eq!(jobs[0].id, job_id);
         assert_eq!(jobs[0].status, "done");
         assert!(jobs[0].completed_at.is_some());
-        assert!(store
-            .list_pending_consolidation_jobs(10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_pending_consolidation_jobs(10)
+                .unwrap()
+                .is_empty()
+        );
 
         // The topic itself must actually be consolidated (4 memories -> 1).
         let remaining = store.get_by_topic("t").unwrap();
@@ -13900,9 +13897,11 @@ mod cmd_remember_tests {
         let memories = store.get_by_topic("icm").unwrap();
         assert_eq!(memories.len(), 2, "remember appends, never overwrites");
         assert!(memories.iter().any(|m| m.summary.contains("TODO")));
-        assert!(memories
-            .iter()
-            .any(|m| m.summary.contains("closes the recall gap")));
+        assert!(
+            memories
+                .iter()
+                .any(|m| m.summary.contains("closes the recall gap"))
+        );
     }
 }
 

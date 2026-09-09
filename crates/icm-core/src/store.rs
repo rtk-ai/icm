@@ -107,7 +107,7 @@ pub trait MemoryStore {
     fn search_by_keywords(&self, keywords: &[&str], limit: usize) -> IcmResult<Vec<Memory>>;
     fn search_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Memory>>;
     fn search_by_embedding(&self, embedding: &[f32], limit: usize)
-        -> IcmResult<Vec<(Memory, f32)>>;
+    -> IcmResult<Vec<(Memory, f32)>>;
     fn search_hybrid(
         &self,
         query: &str,

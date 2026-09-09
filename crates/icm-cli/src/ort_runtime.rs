@@ -23,7 +23,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 /// onnxruntime release to fetch. MUST stay ABI-compatible with the `ort`
@@ -137,7 +137,8 @@ pub fn activate_if_present() -> bool {
     }
     if let Some(lib) = managed_lib_path() {
         if lib.is_file() {
-            std::env::set_var(ORT_DYLIB_ENV, &lib);
+            // SAFETY: single-threaded startup path, before any threads spawn.
+            unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib) };
             return true;
         }
     }
@@ -330,7 +331,8 @@ pub fn download(progress: bool) -> Result<PathBuf> {
     if let Some(marker) = declined_marker() {
         let _ = std::fs::remove_file(marker);
     }
-    std::env::set_var(ORT_DYLIB_ENV, &lib_path);
+    // SAFETY: single-threaded startup path, before any threads spawn.
+    unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib_path) };
     if progress {
         eprintln!(
             "Installed onnxruntime {ORT_VERSION} → {}",
@@ -482,8 +484,8 @@ mod tests {
         // Build a tiny .tgz: a providers sibling (must be ignored) + the real
         // versioned library. No symlink entry (tar builder appends regular
         // files), which still exercises the prefix/underscore filtering.
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
 
         fn tar_entry(builder: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8]) {
             let mut header = tar::Header::new_gnu();

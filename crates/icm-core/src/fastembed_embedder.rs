@@ -74,7 +74,7 @@ fn onnxruntime_dylib_available() -> bool {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut core::ffi::c_void;
         fn FreeLibrary(h_lib_module: *mut core::ffi::c_void) -> i32;
     }
@@ -351,14 +351,15 @@ mod tests {
             "/nonexistent/icm-test/libonnxruntime-does-not-exist.so"
         };
         let prev = std::env::var("ORT_DYLIB_PATH").ok();
-        std::env::set_var("ORT_DYLIB_PATH", bogus);
+        // SAFETY: single-threaded test; env is snapshotted/restored here.
+        unsafe { std::env::set_var("ORT_DYLIB_PATH", bogus) };
         assert!(
             !onnxruntime_dylib_available(),
             "a non-existent ORT_DYLIB_PATH must be detected as unavailable"
         );
         match prev {
-            Some(v) => std::env::set_var("ORT_DYLIB_PATH", v),
-            None => std::env::remove_var("ORT_DYLIB_PATH"),
+            Some(v) => unsafe { std::env::set_var("ORT_DYLIB_PATH", v) },
+            None => unsafe { std::env::remove_var("ORT_DYLIB_PATH") },
         }
     }
 }

@@ -9,8 +9,8 @@ use anyhow::Result;
 use super::backup::BackupSession;
 use super::discover::{HitDetail, LocationHit, RemovalPlan};
 use super::formats::{
-    rewrite_json_hooks, rewrite_json_mcp, rewrite_markdown, rewrite_toml, rewrite_yaml_continue,
-    StripResult,
+    StripResult, rewrite_json_hooks, rewrite_json_mcp, rewrite_markdown, rewrite_toml,
+    rewrite_yaml_continue,
 };
 use super::locations::{HookCommandField, LocationKind, LocationSpec};
 
@@ -62,15 +62,15 @@ pub(crate) fn apply(
             // session deliberately doesn't dereference them, and writing
             // through a symlink would silently mutate a shared target
             // (e.g. a dotfiles repo) without any safety net.
-            if let Ok(m) = std::fs::symlink_metadata(&hit.path) {
-                if m.file_type().is_symlink() {
-                    return Ok(StripResult::Ambiguous {
-                        reason: format!(
-                            "{} is a symlink — refusing to mutate the target without an explicit backup; resolve manually.",
-                            hit.path.display()
-                        ),
-                    });
-                }
+            if let Ok(m) = std::fs::symlink_metadata(&hit.path)
+                && m.file_type().is_symlink()
+            {
+                return Ok(StripResult::Ambiguous {
+                    reason: format!(
+                        "{} is a symlink — refusing to mutate the target without an explicit backup; resolve manually.",
+                        hit.path.display()
+                    ),
+                });
             }
             if let Some(b) = backup.as_mut() {
                 b.stage(&hit.path)?;
@@ -115,13 +115,11 @@ fn apply_json(
     let try_mcp = matches!(hit.detail, HitDetail::JsonServer { .. }) || servers_key.is_some();
     let try_hooks = matches!(hit.detail, HitDetail::JsonHook { .. }) || has_hooks;
 
-    if try_mcp {
-        if let Some(key) = servers_key {
-            match rewrite_json_mcp(path, key)? {
-                StripResult::Removed { removed } => total_removed += removed,
-                StripResult::DeleteFile => deleted_file = true,
-                _ => {}
-            }
+    if try_mcp && let Some(key) = servers_key {
+        match rewrite_json_mcp(path, key)? {
+            StripResult::Removed { removed } => total_removed += removed,
+            StripResult::DeleteFile => deleted_file = true,
+            _ => {}
         }
     }
     if try_hooks && !deleted_file {

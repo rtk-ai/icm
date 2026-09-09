@@ -479,8 +479,8 @@ impl MemoryStore for OpenSearchStore {
             }}}),
         )?;
 
-        if !deleted_ids.is_empty() {
-            if let Err(e) = self.post(
+        if !deleted_ids.is_empty()
+            && let Err(e) = self.post(
                 &format!(
                     "{IDX_MEMORIES}/_update_by_query?conflicts=proceed&{}",
                     self.refresh_param()
@@ -495,7 +495,6 @@ impl MemoryStore for OpenSearchStore {
             ) {
                 tracing::warn!(topic, error = %e, "consolidate_topic: failed to clean up dangling related_ids");
             }
-        }
 
         Ok(())
     }
@@ -626,10 +625,10 @@ impl MemoryStore for OpenSearchStore {
 /// the epoch-millis `value`. Returns `None` when the bucket is empty.
 fn agg_date(aggs: &Value, name: &str) -> Option<DateTime<Utc>> {
     let node = aggs.get(name)?;
-    if let Some(s) = node.get("value_as_string").and_then(|v| v.as_str()) {
-        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-            return Some(dt.with_timezone(&Utc));
-        }
+    if let Some(s) = node.get("value_as_string").and_then(|v| v.as_str())
+        && let Ok(dt) = DateTime::parse_from_rfc3339(s)
+    {
+        return Some(dt.with_timezone(&Utc));
     }
     let ms = node.get("value").and_then(|v| v.as_f64())?;
     if ms <= 0.0 {

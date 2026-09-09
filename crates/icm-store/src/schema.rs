@@ -153,11 +153,11 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         )
         .optional()
         .map_err(db_err)?;
-    if let Some(sql) = old_index_sql {
-        if sql.contains("LOWER(topic)") {
-            conn.execute_batch("DROP INDEX idx_memories_topic_hash;")
-                .map_err(db_err)?;
-        }
+    if let Some(sql) = old_index_sql
+        && sql.contains("LOWER(topic)")
+    {
+        conn.execute_batch("DROP INDEX idx_memories_topic_hash;")
+            .map_err(db_err)?;
     }
     // Audit finding: any DB that hit the accented-topic dedup bug the old
     // composite index let through (see comment above) already has two or

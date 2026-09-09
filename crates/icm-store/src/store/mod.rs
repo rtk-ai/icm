@@ -5,7 +5,7 @@ use std::sync::{Mutex, Once};
 
 use chrono::{DateTime, Utc};
 use lru::LruCache;
-use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, ffi::sqlite3_auto_extension, params};
 use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 

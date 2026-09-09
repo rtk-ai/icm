@@ -13,12 +13,11 @@ impl OpenSearchStore {
         let mut out = HashMap::new();
         if let Some(docs) = resp.get("docs").and_then(|d| d.as_array()) {
             for d in docs {
-                if d.get("found").and_then(|f| f.as_bool()).unwrap_or(false) {
-                    if let (Some(id), Some(src)) =
+                if d.get("found").and_then(|f| f.as_bool()).unwrap_or(false)
+                    && let (Some(id), Some(src)) =
                         (d.get("_id").and_then(|v| v.as_str()), d.get("_source"))
-                    {
-                        out.insert(id.to_string(), Self::source_to_memory(id, src));
-                    }
+                {
+                    out.insert(id.to_string(), Self::source_to_memory(id, src));
                 }
             }
         }

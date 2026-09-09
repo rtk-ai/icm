@@ -47,14 +47,14 @@ impl PostgresStore {
     /// declared dimension, with a clearer message than the raw PostgreSQL
     /// "expected N dimensions, not M" error.
     pub(crate) fn check_dims(&self, memory: &Memory) -> IcmResult<()> {
-        if let Some(emb) = memory.embedding.as_ref() {
-            if emb.len() != self.embedding_dims {
-                return Err(IcmError::InvalidInput(format!(
-                    "embedding has {} dimensions, but this store uses {}",
-                    emb.len(),
-                    self.embedding_dims
-                )));
-            }
+        if let Some(emb) = memory.embedding.as_ref()
+            && emb.len() != self.embedding_dims
+        {
+            return Err(IcmError::InvalidInput(format!(
+                "embedding has {} dimensions, but this store uses {}",
+                emb.len(),
+                self.embedding_dims
+            )));
         }
         Ok(())
     }
@@ -158,12 +158,12 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
         )
         .map_err(pg_err)?
         .map(|row| row.get(0));
-    if let Some(def) = old_index_def {
-        if def.to_lowercase().contains("lower(topic") {
-            client
-                .batch_execute("DROP INDEX idx_memories_topic_hash;")
-                .map_err(pg_err)?;
-        }
+    if let Some(def) = old_index_def
+        && def.to_lowercase().contains("lower(topic")
+    {
+        client
+            .batch_execute("DROP INDEX idx_memories_topic_hash;")
+            .map_err(pg_err)?;
     }
 
     client

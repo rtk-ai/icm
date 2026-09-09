@@ -651,9 +651,11 @@ fn test_consolidate_no_stale_fts_results() {
     // The consolidated memory should be findable
     let consolidated_results = store.search_fts("errors resolved parser", 10).unwrap();
     assert_eq!(consolidated_results.len(), 1);
-    assert!(consolidated_results[0]
-        .summary
-        .contains("All errors resolved"));
+    assert!(
+        consolidated_results[0]
+            .summary
+            .contains("All errors resolved")
+    );
 
     // Verify topic has exactly 1 memory
     let topic_mems = store.get_by_topic("errors-resolved").unwrap();

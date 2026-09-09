@@ -147,7 +147,7 @@ fn extract_binary(archive: &[u8], is_zip: bool) -> Result<Vec<u8>> {
 /// download gets written through it, clobbering an unrelated file (not
 /// RCE - the payload is the legitimate SHA256-verified binary - but a real
 /// file-clobber/DoS gap, the same TOCTOU class already hardened in
-/// `cloud.rs::write_secret_file`). Remove any existing entry first via
+/// `config.rs::write_secret_file`). Remove any existing entry first via
 /// `symlink_metadata` (which reports the symlink itself, not its target) so
 /// a stale symlink or a leftover from an interrupted previous upgrade
 /// doesn't get followed, then open with `create_new` (`O_EXCL`) so even an

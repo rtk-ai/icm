@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.63"
+version = "0.10.65"
 dependencies = [
  "anyhow",
  "axum",
@@ -2073,7 +2073,6 @@ dependencies = [
  "mime_guess",
  "openssl",
  "ratatui",
- "rpassword",
  "rust-embed",
  "serde",
  "serde_json",
@@ -3386,16 +3385,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rpassword"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffc936cf8a7ea60c58f030fd36a612a48f440610214dc54bc36431f9ea0c3efb"
-dependencies = [
- "libc",
- "winapi",
 ]
 
 [[package]]

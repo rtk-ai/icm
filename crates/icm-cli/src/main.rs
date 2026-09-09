@@ -9,7 +9,6 @@ mod bench_format;
 #[cfg(feature = "bench")]
 mod bench_knowledge;
 
-pub mod cloud;
 mod config;
 mod extract;
 mod extract_semantic;
@@ -830,12 +829,6 @@ enum Commands {
         check: bool,
     },
 
-    /// RTK Cloud commands (login, sync, status)
-    Cloud {
-        #[command(subcommand)]
-        command: CloudCommands,
-    },
-
     /// Launch MCP server (stdio transport for Claude Code)
     Serve {
         /// Compact output mode (shorter responses to save tokens)
@@ -959,41 +952,6 @@ enum HookCommands {
         /// Preview what would be removed without modifying anything.
         #[arg(long)]
         dry_run: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum CloudCommands {
-    /// Login to RTK Cloud (OAuth browser or email/password)
-    Login {
-        /// RTK Cloud endpoint
-        #[arg(short, long, default_value = "https://cloud.rtk-ai.app")]
-        endpoint: String,
-        /// Use email/password instead of browser OAuth
-        #[arg(long)]
-        password: bool,
-    },
-    /// Logout from RTK Cloud
-    Logout,
-    /// Show cloud connection status
-    Status,
-    /// Push local memories to cloud (project/org scope)
-    Push {
-        /// Scope to push (project or org)
-        #[arg(short, long, default_value = "project")]
-        scope: String,
-        /// Only push memories from this topic
-        #[arg(short, long)]
-        topic: Option<String>,
-    },
-    /// Pull shared memories from cloud
-    Pull {
-        /// Scope to pull (project or org)
-        #[arg(short, long, default_value = "project")]
-        scope: String,
-        /// Only pull memories updated since this ISO timestamp
-        #[arg(long)]
-        since: Option<String>,
     },
 }
 
@@ -2605,7 +2563,6 @@ fn main() -> Result<()> {
             model,
             no_api,
         } => bench_format::cmd_bench_format(count, &model, no_api),
-        Commands::Cloud { command } => cmd_cloud(command, &store),
         Commands::Serve {
             compact,
             #[cfg(feature = "web")]
@@ -10956,178 +10913,6 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", truncate_at_char_boundary(s, max.saturating_sub(3)))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Cloud commands
-// ---------------------------------------------------------------------------
-
-/// Merge a cloud-pulled memory into an already-existing local one, instead
-/// of overwriting it outright.
-///
-/// `weight`, `access_count`, `embedding`, and `related_ids` are
-/// locally-mastered state that the cloud push side never sends (and the
-/// pull API payload may not carry at all) — a blind `store.update(&pulled)`
-/// previously reset weight to ~0.0 (immediately eligible for the next
-/// `prune`), wiped the local embedding (breaking vector search until
-/// re-embedded), and dropped `related_ids`: real data loss on the very
-/// first `icm cloud pull` against a store that already had these memories
-/// (audit finding). Only the fields genuinely meant to sync — topic,
-/// summary, raw_excerpt, keywords, importance, scope, source, timestamps —
-/// come from the cloud version.
-fn merge_pulled_memory(existing: icm_core::Memory, pulled: icm_core::Memory) -> icm_core::Memory {
-    icm_core::Memory {
-        weight: existing.weight,
-        access_count: existing.access_count,
-        embedding: existing.embedding.or(pulled.embedding),
-        related_ids: if pulled.related_ids.is_empty() {
-            existing.related_ids
-        } else {
-            pulled.related_ids
-        },
-        ..pulled
-    }
-}
-
-#[cfg(test)]
-mod merge_pulled_memory_tests {
-    use super::*;
-    use icm_core::{Importance, Memory};
-
-    fn mem_with(weight: f32, access_count: u32, embedding: Option<Vec<f32>>) -> Memory {
-        let mut m = Memory::new("t".into(), "s".into(), Importance::Medium);
-        m.weight = weight;
-        m.access_count = access_count;
-        m.embedding = embedding;
-        m
-    }
-
-    #[test]
-    fn preserves_local_weight_access_count_and_embedding() {
-        let existing = mem_with(0.73, 12, Some(vec![0.1, 0.2, 0.3]));
-        // Simulates what a cloud pull payload actually looks like: weight
-        // defaults away from what push never sent, access_count reset,
-        // embedding never round-tripped.
-        let pulled = mem_with(1.0, 0, None);
-
-        let merged = merge_pulled_memory(existing.clone(), pulled);
-        assert_eq!(merged.weight, 0.73, "must keep the local weight");
-        assert_eq!(merged.access_count, 12, "must keep the local access_count");
-        assert_eq!(
-            merged.embedding,
-            Some(vec![0.1, 0.2, 0.3]),
-            "must keep the local embedding when the pulled one is absent"
-        );
-    }
-
-    #[test]
-    fn pulled_embedding_used_only_if_local_has_none() {
-        let existing = mem_with(1.0, 0, None);
-        let pulled = mem_with(1.0, 0, Some(vec![0.9]));
-        let merged = merge_pulled_memory(existing, pulled);
-        assert_eq!(merged.embedding, Some(vec![0.9]));
-    }
-
-    #[test]
-    fn related_ids_kept_locally_unless_pulled_has_some() {
-        let mut existing = mem_with(1.0, 0, None);
-        existing.related_ids = vec!["a".into(), "b".into()];
-        let pulled = mem_with(1.0, 0, None); // empty related_ids
-
-        let merged = merge_pulled_memory(existing, pulled);
-        assert_eq!(merged.related_ids, vec!["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn shared_fields_come_from_the_pulled_version() {
-        let existing = mem_with(1.0, 0, None);
-        let mut pulled = mem_with(1.0, 0, None);
-        pulled.summary = "updated from cloud".into();
-        pulled.topic = "new-topic".into();
-
-        let merged = merge_pulled_memory(existing, pulled);
-        assert_eq!(merged.summary, "updated from cloud");
-        assert_eq!(merged.topic, "new-topic");
-    }
-}
-
-fn cmd_cloud(command: CloudCommands, store: &Store) -> Result<()> {
-    use icm_core::Scope;
-
-    match command {
-        CloudCommands::Login { endpoint, password } => {
-            if password {
-                // Email/password login (for generic emails, self-hosted, no OAuth)
-                eprint!("Email: ");
-                let mut email = String::new();
-                std::io::stdin().read_line(&mut email)?;
-                let email = email.trim().to_string();
-
-                eprint!("Password: ");
-                let pwd = rpassword::read_password().context("failed to read password")?;
-
-                cloud::login_password(&endpoint, &email, &pwd)?;
-            } else {
-                cloud::login_browser(&endpoint)?;
-            }
-            Ok(())
-        }
-        CloudCommands::Logout => cloud::logout(),
-        CloudCommands::Status => cloud::status(),
-        CloudCommands::Push { scope, topic } => {
-            let scope: Scope = scope.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-
-            let creds = cloud::require_credentials_for_scope(scope)
-                .context("Cloud login required for push. Run: icm cloud login")?;
-
-            let memories: Vec<Memory> = if let Some(ref t) = topic {
-                use icm_core::MemoryStore;
-                store.get_by_topic(t)?
-            } else {
-                use icm_core::MemoryStore;
-                store.list_all()?
-            };
-
-            let mut synced = 0;
-            for mut mem in memories {
-                mem.scope = scope;
-                if let Err(e) = cloud::sync_memory(&creds, &mem) {
-                    eprintln!("Failed to sync {}: {}", mem.id, e);
-                } else {
-                    synced += 1;
-                }
-            }
-
-            eprintln!("Pushed {} memories to cloud (scope: {})", synced, scope);
-            Ok(())
-        }
-        CloudCommands::Pull { scope, since } => {
-            let scope: Scope = scope.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-
-            let creds = cloud::require_credentials_for_scope(scope)
-                .context("Cloud login required for pull. Run: icm cloud login")?;
-
-            let memories = cloud::pull_memories(&creds, scope, since.as_deref())?;
-
-            let mut imported = 0;
-            for mem in memories {
-                use icm_core::MemoryStore;
-                // Upsert: if memory exists locally, update it; otherwise store it
-                match store.get(&mem.id)? {
-                    Some(existing) => {
-                        store.update(&merge_pulled_memory(existing, mem))?;
-                    }
-                    None => {
-                        store.store(mem)?;
-                    }
-                }
-                imported += 1;
-            }
-
-            eprintln!("Pulled {} memories from cloud (scope: {})", imported, scope);
-            Ok(())
-        }
     }
 }
 

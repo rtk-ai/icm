@@ -13,6 +13,30 @@
 
 use std::path::PathBuf;
 
+/// Write `content` to `path` with owner-only (0600) permissions from creation,
+/// not as a follow-up `set_permissions` call — that ordering would leave a
+/// window (created with the process umask, often world-readable) where a
+/// crash between the two calls leaves the file durably readable by other
+/// local users.
+pub(crate) fn write_secret_file(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, content)?;
+
+    Ok(())
+}
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 

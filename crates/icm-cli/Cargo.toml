@@ -84,8 +84,9 @@ tracing-subscriber = { workspace = true }
 # explanation in [features] above). Cross-builds need it; native
 # builds don't pull it in.
 openssl = { version = "0.10", optional = true }
+# Used by summarizer.rs (local Ollama calls) and upgrade.rs (self-update
+# download) — NOT cloud-sync-exclusive, keep even though cloud.rs is gone.
 ureq = { workspace = true }
-rpassword = { workspace = true }
 sha2 = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }

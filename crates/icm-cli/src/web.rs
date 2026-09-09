@@ -15,12 +15,13 @@ use axum::{
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
-use icm_core::{FeedbackStore, MemoirStore, MemoryStore};
+use icm_core::{FeedbackStore, Importance, MemoirStore, MemoryStore};
 use icm_store::Store;
 
 use crate::cloud::write_secret_file;
 
 use crate::config::WebConfig;
+use crate::graph_layout;
 use crate::truncate_at_char_boundary;
 
 // ---------------------------------------------------------------------------
@@ -282,6 +283,9 @@ fn api_router() -> Router<AppState> {
         .route("/api/memories", get(api_memories))
         .route("/api/memories/search", get(api_memories_search))
         .route("/api/memories/{id}", delete(api_memory_delete))
+        // Graph (memory-relationship view; issue: visualize auto_link.rs's
+        // related_ids graph, which existed only as unused data before this)
+        .route("/api/graph", get(api_graph))
         // Health
         .route("/api/health", get(api_health_all))
         .route("/api/health/decay", post(api_decay))
@@ -433,6 +437,74 @@ fn default_search_limit() -> usize {
 struct ActionResult {
     ok: bool,
     message: String,
+}
+
+#[derive(Deserialize)]
+struct GraphParams {
+    /// Restrict the graph to one topic. Without it, every memory is a node
+    /// (auto_link.rs only links within reasonable similarity anyway, so
+    /// most graphs are naturally sparse even unfiltered).
+    topic: Option<String>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct GraphNode {
+    id: String,
+    topic: String,
+    importance: &'static str,
+    weight: f32,
+    summary: String,
+    /// Pre-computed layout position (see `graph_layout::compute_force_layout_3d`).
+    /// Computed here rather than in the browser: tested against a real
+    /// 3286-memory store, client-side JS physics needed ~5.4M pairwise
+    /// force calculations *per animation frame* and never visibly
+    /// converged. The client just renders these positions directly.
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct GraphEdge {
+    source: String,
+    target: String,
+    /// Cosine similarity between the two memories' embeddings, recomputed
+    /// here rather than stored at link time (auto_link.rs only persists
+    /// which ids are related, not the score) — always reflects the current
+    /// embeddings, and needs no schema/migration to add.
+    similarity: f32,
+}
+
+/// Cosine similarity between two embedding vectors. `None` if either is
+/// missing/empty or they don't (which shouldn't happen for two memories
+/// produced by the same embedder, but a mismatched length would panic on
+/// the zip otherwise) share a dimension.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return None;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return None;
+    }
+    Some(dot / (norm_a * norm_b))
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct GraphResponse {
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+}
+
+fn importance_str(imp: Importance) -> &'static str {
+    match imp {
+        Importance::Critical => "critical",
+        Importance::High => "high",
+        Importance::Medium => "medium",
+        Importance::Low => "low",
+    }
 }
 
 /// Lock the store, recovering from a poisoned mutex. The store keeps its own
@@ -619,6 +691,125 @@ async fn api_memories_search(
         Ok(memories) => Json(memories).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Nodes + edges for the memory-relationship graph. `related_ids` (populated
+/// by `auto_link.rs` at store time from embedding cosine similarity) is the
+/// edge data; this endpoint is the first thing that actually exposes it —
+/// previously it only fed `main.rs`'s one-hop "graph-aware expansion"
+/// during recall, with no way to see the graph itself.
+async fn api_graph(
+    State(state): State<AppState>,
+    Query(params): Query<GraphParams>,
+) -> impl IntoResponse {
+    let store = lock_store(&state);
+    let memories = match &params.topic {
+        Some(t) => store.get_by_topic(t),
+        None => store.list_all(),
+    };
+    match memories {
+        Ok(m) => Json(build_graph_response(&m)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Pure node/edge-building logic, split out from [`api_graph`] so it's
+/// testable without spinning up an async handler + `AppState`.
+fn build_graph_response(memories: &[icm_core::Memory]) -> GraphResponse {
+    let ids: std::collections::HashSet<&str> = memories.iter().map(|m| m.id.as_str()).collect();
+    let embeddings: std::collections::HashMap<&str, &[f32]> = memories
+        .iter()
+        .filter_map(|m| m.embedding.as_deref().map(|e| (m.id.as_str(), e)))
+        .collect();
+    let index_of: std::collections::HashMap<&str, usize> = memories
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.as_str(), i))
+        .collect();
+
+    // auto_link.rs adds backrefs (a links to b => b also links back to a),
+    // so dedupe to one undirected edge per pair. Drop any related_id that
+    // points outside the current (possibly topic-filtered) node set rather
+    // than erroring — a dangling/foreign reference isn't this endpoint's
+    // problem to fail on.
+    let mut seen = std::collections::HashSet::new();
+    let mut edges = Vec::new();
+    let mut index_edges = Vec::new();
+    for m in memories {
+        for related in &m.related_ids {
+            if !ids.contains(related.as_str()) || related == &m.id {
+                continue;
+            }
+            let key = if m.id < *related {
+                (m.id.clone(), related.clone())
+            } else {
+                (related.clone(), m.id.clone())
+            };
+            if seen.insert(key.clone()) {
+                let similarity = match (
+                    embeddings.get(key.0.as_str()),
+                    embeddings.get(key.1.as_str()),
+                ) {
+                    (Some(a), Some(b)) => cosine_similarity(a, b).unwrap_or(0.0),
+                    // Missing embeddings (e.g. --no-embeddings stores) means
+                    // there's no real score to show; 0.0 reads as "unknown"
+                    // rather than a false "identical" (1.0) or "unrelated".
+                    _ => 0.0,
+                };
+                if let (Some(&a), Some(&b)) =
+                    (index_of.get(key.0.as_str()), index_of.get(key.1.as_str()))
+                {
+                    index_edges.push((a, b));
+                }
+                edges.push(GraphEdge {
+                    source: key.0,
+                    target: key.1,
+                    similarity,
+                });
+            }
+        }
+    }
+
+    let node_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+    // Dense 0..k topic index per node, assigned in first-appearance order
+    // (order doesn't matter to the layout — anchors are placed on a
+    // sphere regardless of index — only that same-topic nodes share an
+    // index). Drives the layout's topic-clustering force: see
+    // `compute_force_layout_3d`'s doc comment for why plain repulsion
+    // alone produces an unreadable hollow-sphere shape at real-store
+    // scale.
+    let mut topic_index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let clusters: Vec<usize> = memories
+        .iter()
+        .map(|m| {
+            let next = topic_index.len();
+            *topic_index.entry(m.topic.as_str()).or_insert(next)
+        })
+        .collect();
+    // 200 iterations is the same budget the TUI's 2D layout uses — enough
+    // for ALPHA_DECAY to reach a negligible temperature (see the constant's
+    // doc comment) regardless of node count, since it's a fixed schedule,
+    // not a convergence check that could loop indefinitely.
+    let positions = graph_layout::compute_force_layout_3d(&node_ids, &index_edges, &clusters, 200);
+
+    let nodes: Vec<GraphNode> = memories
+        .iter()
+        .map(|m| {
+            let (x, y, z) = positions.get(&m.id).copied().unwrap_or((0.0, 0.0, 0.0));
+            GraphNode {
+                id: m.id.clone(),
+                topic: m.topic.clone(),
+                importance: importance_str(m.importance),
+                weight: m.weight,
+                summary: truncate_at_char_boundary(&m.summary, 80).to_string(),
+                x,
+                y,
+                z,
+            }
+        })
+        .collect();
+
+    GraphResponse { nodes, edges }
 }
 
 async fn api_memory_delete(
@@ -821,5 +1012,97 @@ mod tests {
         // Neither header: a non-browser client (curl/scripts) using Basic
         // Auth directly, not a forged browser request — allowed.
         assert!(is_same_origin(&req(None, None)));
+    }
+
+    fn mem(topic: &str, summary: &str, imp: Importance, related: &[&str]) -> icm_core::Memory {
+        let mut m = icm_core::Memory::new(topic.into(), summary.into(), imp);
+        m.related_ids = related.iter().map(|s| s.to_string()).collect();
+        m
+    }
+
+    #[test]
+    fn builds_one_node_per_memory_and_dedupes_backref_edges() {
+        let a = mem("t", "alpha", Importance::High, &[]);
+        let mut b = mem("t", "beta", Importance::Medium, &[]);
+        // auto_link.rs links both directions: a -> b and b -> a.
+        let mut a = a;
+        a.related_ids.push(b.id.clone());
+        b.related_ids.push(a.id.clone());
+        let c = mem("t", "gamma", Importance::Low, &[]);
+
+        let memories = vec![a.clone(), b.clone(), c.clone()];
+        let graph = build_graph_response(&memories);
+
+        assert_eq!(graph.nodes.len(), 3);
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.id == a.id && n.importance == "high"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.id == c.id && n.importance == "low"));
+
+        // Exactly one edge for the a<->b pair, not two.
+        assert_eq!(graph.edges.len(), 1);
+        let edge = &graph.edges[0];
+        let endpoints = [&edge.source, &edge.target];
+        assert!(endpoints.contains(&&a.id));
+        assert!(endpoints.contains(&&b.id));
+    }
+
+    #[test]
+    fn edge_similarity_is_the_real_cosine_similarity_of_the_embeddings() {
+        let mut a = mem("t", "alpha", Importance::High, &[]);
+        let mut b = mem("t", "beta", Importance::Medium, &[]);
+        a.embedding = Some(vec![1.0, 0.0]);
+        b.embedding = Some(vec![1.0, 1.0]);
+        a.related_ids.push(b.id.clone());
+        b.related_ids.push(a.id.clone());
+
+        let graph = build_graph_response(&[a, b]);
+
+        assert_eq!(graph.edges.len(), 1);
+        // cos(45 deg) between (1,0) and (1,1), normalized: 1/sqrt(2).
+        let expected = 1.0 / std::f32::consts::SQRT_2;
+        assert!(
+            (graph.edges[0].similarity - expected).abs() < 1e-6,
+            "expected {expected}, got {}",
+            graph.edges[0].similarity
+        );
+    }
+
+    #[test]
+    fn edge_similarity_falls_back_to_zero_without_embeddings() {
+        let mut a = mem("t", "alpha", Importance::High, &[]);
+        let mut b = mem("t", "beta", Importance::Medium, &[]);
+        a.related_ids.push(b.id.clone());
+        b.related_ids.push(a.id.clone());
+        let graph = build_graph_response(&[a, b]);
+        assert_eq!(graph.edges[0].similarity, 0.0);
+    }
+
+    #[test]
+    fn drops_related_ids_pointing_outside_the_node_set() {
+        let a = mem("t", "alpha", Importance::High, &["does-not-exist"]);
+        let graph = build_graph_response(&[a]);
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(graph.edges.is_empty());
+    }
+
+    #[test]
+    fn ignores_a_self_referencing_related_id() {
+        let mut a = mem("t", "alpha", Importance::High, &[]);
+        let self_id = a.id.clone();
+        a.related_ids.push(self_id);
+        let graph = build_graph_response(&[a]);
+        assert!(graph.edges.is_empty());
+    }
+
+    #[test]
+    fn empty_store_yields_an_empty_graph_not_an_error() {
+        let graph = build_graph_response(&[]);
+        assert!(graph.nodes.is_empty());
+        assert!(graph.edges.is_empty());
     }
 }

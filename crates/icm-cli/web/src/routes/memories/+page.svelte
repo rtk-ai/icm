@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
+	import { askConfirm } from '$lib/confirm.svelte';
 	import type { Memory } from '$lib/types';
 
 	let memories: Memory[] = $state([]);
@@ -22,7 +23,7 @@
 	}
 
 	async function deleteMemory(id: string) {
-		if (!confirm(`Delete memory ${id.slice(0, 12)}...?`)) return;
+		if (!(await askConfirm(`Delete memory ${id.slice(0, 12)}...?`))) return;
 		const result = await api.deleteMemory(id);
 		if (result.ok) {
 			memories = memories.filter(m => m.id !== id);

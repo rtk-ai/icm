@@ -20,11 +20,14 @@ use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
+        canvas::{Canvas, Line as CanvasLine, Points},
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
         Tabs, Wrap,
     },
     Frame, Terminal,
 };
+
+use crate::graph_layout::compute_force_layout;
 
 use icm_core::{
     format_local, Embedder, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore,
@@ -40,6 +43,8 @@ const TAB_TOPICS: usize = 1;
 const TAB_MEMORIES: usize = 2;
 const TAB_HEALTH: usize = 3;
 const TAB_MEMOIRS: usize = 4;
+const TAB_GRAPH: usize = 5;
+const TAB_COUNT: usize = 6;
 
 /// Confirmation dialog state
 #[derive(Clone)]
@@ -95,6 +100,37 @@ struct App<'a> {
     /// instance of the bug fixed in cmd_consolidate/tool_consolidate/
     /// handle_consolidate (#400, #402).
     embedder: Option<&'a dyn Embedder>,
+    /// Memory-relationship graph (all memories + their `related_ids`
+    /// links). Loaded lazily the first time the Graph tab is opened,
+    /// not eagerly at startup, since it's a full-store scan — no point
+    /// paying that cost for a session that never opens the tab.
+    graph: GraphViewState,
+}
+
+/// State for the Graph tab: the node set, precomputed layout, and the
+/// pan/zoom/selection the user has applied. Kept separate from the rest of
+/// `App` since it has a very different shape (2D coordinates, camera) from
+/// every other tab's list/table state.
+#[derive(Default)]
+struct GraphViewState {
+    loaded: bool,
+    nodes: Vec<Memory>,
+    /// `edges.0`/`edges.1` are indices into `nodes`.
+    edges: Vec<(usize, usize)>,
+    /// Force-directed position per node index, roughly in `[-1.0, 1.0]`.
+    positions: Vec<(f64, f64)>,
+    selected: usize,
+    zoom: f64,
+    pan: (f64, f64),
+}
+
+impl GraphViewState {
+    fn new() -> Self {
+        Self {
+            zoom: 1.0,
+            ..Default::default()
+        }
+    }
 }
 
 impl<'a> App<'a> {
@@ -144,6 +180,7 @@ impl<'a> App<'a> {
             status: None,
             summarizer_cfg: crate::config::SummarizerConfig::default(),
             embedder,
+            graph: GraphViewState::new(),
         };
 
         app.load_topic_memories(store);
@@ -212,6 +249,14 @@ impl<'a> App<'a> {
             self.load_topic_memories(store);
         }
 
+        // The graph is a full-store scan (see load_graph's doc comment) —
+        // only pay to recompute it if the Graph tab is actually open, not
+        // on every 30s auto-refresh tick regardless of which tab is active.
+        if self.tab == TAB_GRAPH {
+            self.graph.loaded = false;
+            self.load_graph(store);
+        }
+
         if !failed.is_empty() {
             self.set_status(
                 format!("Refresh incomplete: {} failed to reload", failed.join(", ")),
@@ -245,6 +290,58 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Load every memory and its `related_ids` links, then run the
+    /// force-directed layout once. Idempotent — call `graph.loaded = false`
+    /// first (e.g. on `r` refresh) to force a reload.
+    fn load_graph(&mut self, store: &Store) {
+        if self.graph.loaded {
+            return;
+        }
+        let nodes = store.list_all().unwrap_or_default();
+
+        let index_of: std::collections::HashMap<&str, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.id.as_str(), i))
+            .collect();
+
+        // auto_link.rs adds backrefs, so `a` linking to `b` also gives `b`
+        // a link back to `a` — dedupe to one undirected edge per pair
+        // rather than drawing (and force-simulating) every link twice.
+        let mut seen = std::collections::HashSet::new();
+        let mut edges = Vec::new();
+        for (i, m) in nodes.iter().enumerate() {
+            for related in &m.related_ids {
+                if let Some(&j) = index_of.get(related.as_str()) {
+                    if i == j {
+                        continue;
+                    }
+                    let key = (i.min(j), i.max(j));
+                    if seen.insert(key) {
+                        edges.push(key);
+                    }
+                }
+            }
+        }
+
+        let ids: Vec<String> = nodes.iter().map(|m| m.id.clone()).collect();
+        let positions_by_id = compute_force_layout(&ids, &edges, 200);
+        let positions = ids
+            .iter()
+            .map(|id| positions_by_id.get(id).copied().unwrap_or((0.0, 0.0)))
+            .collect();
+
+        self.graph = GraphViewState {
+            loaded: true,
+            nodes,
+            edges,
+            positions,
+            selected: 0,
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+        };
+    }
+
     fn selected_topic_name(&self) -> Option<&str> {
         self.topic_state
             .selected()
@@ -264,11 +361,15 @@ impl<'a> App<'a> {
     }
 
     fn next_tab(&mut self) {
-        self.tab = (self.tab + 1) % 5;
+        self.tab = (self.tab + 1) % TAB_COUNT;
     }
 
     fn prev_tab(&mut self) {
-        self.tab = if self.tab == 0 { 4 } else { self.tab - 1 };
+        self.tab = if self.tab == 0 {
+            TAB_COUNT - 1
+        } else {
+            self.tab - 1
+        };
     }
 
     fn select_next(selected: Option<usize>, len: usize) -> Option<usize> {
@@ -471,13 +572,27 @@ fn run_loop(
                     // Help
                     KeyCode::Char('?') => app.show_help = true,
                     // Tab navigation
-                    KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => app.next_tab(),
-                    KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.prev_tab(),
+                    KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                        app.next_tab();
+                        if app.tab == TAB_GRAPH {
+                            app.load_graph(store);
+                        }
+                    }
+                    KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                        app.prev_tab();
+                        if app.tab == TAB_GRAPH {
+                            app.load_graph(store);
+                        }
+                    }
                     KeyCode::Char('1') => app.tab = TAB_OVERVIEW,
                     KeyCode::Char('2') => app.tab = TAB_TOPICS,
                     KeyCode::Char('3') => app.tab = TAB_MEMORIES,
                     KeyCode::Char('4') => app.tab = TAB_HEALTH,
                     KeyCode::Char('5') => app.tab = TAB_MEMOIRS,
+                    KeyCode::Char('6') => {
+                        app.tab = TAB_GRAPH;
+                        app.load_graph(store);
+                    }
                     // List navigation
                     KeyCode::Down | KeyCode::Char('j') => match app.tab {
                         TAB_TOPICS => {
@@ -502,6 +617,9 @@ fn run_loop(
                                 App::select_next(app.memoir_state.selected(), app.memoirs.len());
                             app.memoir_state.select(sel);
                         }
+                        TAB_GRAPH if !app.graph.nodes.is_empty() => {
+                            app.graph.selected = (app.graph.selected + 1) % app.graph.nodes.len();
+                        }
                         _ => {}
                     },
                     KeyCode::Up | KeyCode::Char('k') => match app.tab {
@@ -523,8 +641,22 @@ fn run_loop(
                             let sel = App::select_prev(app.memoir_state.selected());
                             app.memoir_state.select(sel);
                         }
+                        TAB_GRAPH if !app.graph.nodes.is_empty() => {
+                            app.graph.selected = app
+                                .graph
+                                .selected
+                                .checked_sub(1)
+                                .unwrap_or(app.graph.nodes.len() - 1);
+                        }
                         _ => {}
                     },
+                    // Zoom (Graph tab)
+                    KeyCode::Char('+') | KeyCode::Char('=') if app.tab == TAB_GRAPH => {
+                        app.graph.zoom = (app.graph.zoom * 1.25).min(20.0);
+                    }
+                    KeyCode::Char('-') if app.tab == TAB_GRAPH => {
+                        app.graph.zoom = (app.graph.zoom / 1.25).max(0.1);
+                    }
                     // Scroll
                     KeyCode::PageDown => app.memory_scroll = app.memory_scroll.saturating_add(5),
                     KeyCode::PageUp => app.memory_scroll = app.memory_scroll.saturating_sub(5),
@@ -776,6 +908,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         TAB_MEMORIES => draw_memories(f, app, chunks[1]),
         TAB_HEALTH => draw_health(f, app, chunks[1]),
         TAB_MEMOIRS => draw_memoirs(f, app, chunks[1]),
+        TAB_GRAPH => draw_graph(f, app, chunks[1]),
         _ => {}
     }
 
@@ -794,7 +927,9 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let titles = vec!["Overview", "Topics", "Memories", "Health", "Memoirs"];
+    let titles = vec![
+        "Overview", "Topics", "Memories", "Health", "Memoirs", "Graph",
+    ];
     let tabs = Tabs::new(titles)
         .block(
             Block::default()
@@ -825,9 +960,10 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
             TAB_MEMORIES => " | d: delete",
             TAB_HEALTH => " | c: consolidate | p: prune",
             TAB_MEMOIRS => "",
+            TAB_GRAPH => " | j/k: select node | +/-: zoom",
             _ => "",
         };
-        format!(" q: quit | Tab/1-5: tabs | j/k: nav | /: search | r: refresh | ?: help{actions}")
+        format!(" q: quit | Tab/1-6: tabs | j/k: nav | /: search | r: refresh | ?: help{actions}")
     };
     let bar = Paragraph::new(help).style(Style::default().fg(Color::DarkGray).bg(Color::Black));
     f.render_widget(bar, area);
@@ -1195,6 +1331,142 @@ fn draw_memoirs(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.memoir_state);
 }
 
+/// Memory-relationship graph: every memory as a node, `related_ids` (from
+/// `auto_link.rs`'s embedding-similarity linking) as edges. Braille-marker
+/// `Canvas` is the only way to draw real 2D shapes in a terminal — there's
+/// no true "circle size" available at this resolution, so weight is shown
+/// via the detail panel and the selected-node highlight rather than by
+/// varying point size.
+fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.graph.nodes.is_empty() {
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from("  No memories yet — nothing to graph."),
+            Line::from("  Store a few related memories, then reopen this tab (r to refresh)."),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Graph ")
+                .title_style(Style::default().fg(Color::Yellow).bold()),
+        );
+        f.render_widget(empty, area);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(area);
+
+    // Bounds shrink as zoom increases (zoom in = smaller window onto the
+    // same [-1.4, 1.4]-ish layout space); positions are pre-normalized by
+    // compute_force_layout to roughly [-1.0, 1.0], so a fixed 1.4 base
+    // half-extent gives nodes some breathing room at zoom = 1.0.
+    let half_extent = 1.4 / app.graph.zoom;
+    let (pan_x, pan_y) = app.graph.pan;
+
+    let by_importance = |imp: Importance| -> Vec<(f64, f64)> {
+        app.graph
+            .nodes
+            .iter()
+            .zip(app.graph.positions.iter())
+            .enumerate()
+            .filter(|(i, (m, _))| m.importance == imp && *i != app.graph.selected)
+            .map(|(_, (_, pos))| *pos)
+            .collect()
+    };
+
+    let critical: Vec<(f64, f64)> = by_importance(Importance::Critical);
+    let high: Vec<(f64, f64)> = by_importance(Importance::High);
+    let medium: Vec<(f64, f64)> = by_importance(Importance::Medium);
+    let low: Vec<(f64, f64)> = by_importance(Importance::Low);
+    let selected_pos = app.graph.positions.get(app.graph.selected).copied();
+    let selected_point = selected_pos.into_iter().collect::<Vec<_>>();
+
+    let edges = &app.graph.edges;
+    let positions = &app.graph.positions;
+    let node_count = app.graph.nodes.len();
+    let edge_count = edges.len();
+
+    let canvas = Canvas::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Graph -- {node_count} memories, {edge_count} links (zoom {:.1}x) ",
+                    app.graph.zoom
+                ))
+                .title_style(Style::default().fg(Color::Yellow).bold()),
+        )
+        .x_bounds([pan_x - half_extent, pan_x + half_extent])
+        .y_bounds([pan_y - half_extent, pan_y + half_extent])
+        .paint(|ctx| {
+            for &(a, b) in edges {
+                if let (Some(&(x1, y1)), Some(&(x2, y2))) = (positions.get(a), positions.get(b)) {
+                    ctx.draw(&CanvasLine {
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        color: Color::DarkGray,
+                    });
+                }
+            }
+            ctx.draw(&Points {
+                coords: &low,
+                color: importance_color(&Importance::Low),
+            });
+            ctx.draw(&Points {
+                coords: &medium,
+                color: importance_color(&Importance::Medium),
+            });
+            ctx.draw(&Points {
+                coords: &high,
+                color: importance_color(&Importance::High),
+            });
+            ctx.draw(&Points {
+                coords: &critical,
+                color: importance_color(&Importance::Critical),
+            });
+            // Selected node drawn last (on top) in white so it stands out
+            // regardless of its own importance color.
+            ctx.draw(&Points {
+                coords: &selected_point,
+                color: Color::White,
+            });
+            if let Some((x, y)) = selected_pos {
+                if let Some(m) = app.graph.nodes.get(app.graph.selected) {
+                    ctx.print(
+                        x,
+                        y,
+                        Span::styled(
+                            format!(" {}", truncate(&m.topic, 24)),
+                            Style::default().fg(Color::White),
+                        ),
+                    );
+                }
+            }
+        });
+    f.render_widget(canvas, chunks[0]);
+
+    let detail = app
+        .graph
+        .nodes
+        .get(app.graph.selected)
+        .map(memory_detail_text)
+        .unwrap_or_else(|| vec![Line::from("  No node selected")]);
+    let detail_block = Paragraph::new(detail)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Selected Node ")
+                .title_style(Style::default().fg(Color::Yellow).bold()),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(detail_block, chunks[1]);
+}
+
 fn draw_search_overlay(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let overlay_height = (area.height / 2).max(10);
@@ -1267,7 +1539,7 @@ fn draw_help_overlay(f: &mut Frame) {
     // arithmetic panic; `.intersection` clips the final rect to the
     // frame regardless.
     let w = 60u16.min(area.width.saturating_sub(4));
-    let h = 29u16.min(area.height.saturating_sub(4));
+    let h = 33u16.min(area.height.saturating_sub(4));
     let overlay = Rect {
         x: area.width.saturating_sub(w) / 2,
         y: area.height.saturating_sub(h) / 2,
@@ -1284,11 +1556,18 @@ fn draw_help_overlay(f: &mut Frame) {
             "  Navigation",
             Style::default().fg(Color::Yellow).bold(),
         )),
-        Line::from("  Tab / 1-5       Switch tab"),
+        Line::from("  Tab / 1-6       Switch tab"),
         Line::from("  j/k or Up/Down  Navigate list"),
         Line::from("  g / G           Jump to top / bottom"),
         Line::from("  Enter           Select (Topics -> Memories)"),
         Line::from("  PgUp/PgDn       Scroll detail view"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Graph",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from("  j/k             Select next/prev node   [Graph]"),
+        Line::from("  + / -           Zoom in / out           [Graph]"),
         Line::from(""),
         Line::from(Span::styled(
             "  Search",

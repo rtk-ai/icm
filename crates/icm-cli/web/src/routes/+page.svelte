@@ -5,6 +5,12 @@
 
 	let stats: Stats | null = $state(null);
 	let topics: TopicEntry[] = $state([]);
+	// "Top Topics" means top by memory count — the API returns topics in
+	// whatever order the store lists them (alphabetical), so the widget
+	// silently just showed the first 15 alphabetically instead of the
+	// actual biggest topics (a real store's single largest topic can hold
+	// over half of all memories and never appear in it at all).
+	let topTopics = $derived([...topics].sort((a, b) => b.count - a.count).slice(0, 15));
 
 	onMount(async () => {
 		[stats, topics] = await Promise.all([api.stats(), api.topics()]);
@@ -20,35 +26,38 @@
 
 {#if stats}
 	<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)]">
-			<div class="text-3xl font-bold text-[var(--accent-light)]">{stats.total_memories}</div>
+		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)] min-w-0">
+			<div class="text-2xl sm:text-3xl font-bold truncate text-[var(--accent-light)]">{stats.total_memories}</div>
 			<div class="text-sm text-[var(--muted)]">Memories</div>
 		</div>
-		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)]">
-			<div class="text-3xl font-bold text-[var(--blue)]">{stats.total_topics}</div>
+		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)] min-w-0">
+			<div class="text-2xl sm:text-3xl font-bold truncate text-[var(--blue)]">{stats.total_topics}</div>
 			<div class="text-sm text-[var(--muted)]">Topics</div>
 		</div>
-		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)]">
-			<div class="text-3xl font-bold text-[var(--green)]">{stats.avg_weight.toFixed(2)}</div>
+		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)] min-w-0">
+			<div class="text-2xl sm:text-3xl font-bold truncate text-[var(--green)]">{stats.avg_weight.toFixed(2)}</div>
 			<div class="text-sm text-[var(--muted)]">Avg Weight</div>
 		</div>
-		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)]">
-			<div class="text-3xl font-bold text-[var(--yellow)]">{stats.total_memoirs}</div>
+		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)] min-w-0">
+			<div class="text-2xl sm:text-3xl font-bold truncate text-[var(--yellow)]">{stats.total_memoirs}</div>
 			<div class="text-sm text-[var(--muted)]">Memoirs</div>
 		</div>
-		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)]">
-			<div class="text-3xl font-bold">{stats.total_concepts}</div>
+		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)] min-w-0">
+			<div class="text-2xl sm:text-3xl font-bold truncate">{stats.total_concepts}</div>
 			<div class="text-sm text-[var(--muted)]">Concepts</div>
 		</div>
-		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)]">
-			<div class="text-3xl font-bold">{stats.total_links}</div>
-			<div class="text-sm text-[var(--muted)]">Links</div>
+		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)] min-w-0">
+			<div class="text-2xl sm:text-3xl font-bold truncate">{stats.total_links}</div>
+			<!-- Not the Graph page's "links" (auto_link.rs's memory-relationship
+			     edges) — this is concept-to-concept links inside memoirs, a
+			     completely different count that happens to share a name. -->
+			<div class="text-sm text-[var(--muted)]" title="Concept-to-concept links inside memoirs — not the memory-relationship links shown on the Graph page">Memoir Links</div>
 		</div>
-		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)]">
-			<div class="text-3xl font-bold">{stats.total_feedback}</div>
+		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)] min-w-0">
+			<div class="text-2xl sm:text-3xl font-bold truncate">{stats.total_feedback}</div>
 			<div class="text-sm text-[var(--muted)]">Feedback</div>
 		</div>
-		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)]">
+		<div class="bg-[var(--card)] rounded-lg p-4 border border-[var(--border)] min-w-0">
 			<div class="text-sm font-mono">{fmtDate(stats.oldest_memory)}</div>
 			<div class="text-sm font-mono">{fmtDate(stats.newest_memory)}</div>
 			<div class="text-sm text-[var(--muted)]">Date Range</div>
@@ -57,9 +66,9 @@
 
 	<h3 class="text-lg font-semibold mb-3">Top Topics</h3>
 	<div class="bg-[var(--card)] rounded-lg border border-[var(--border)] p-4">
-		{#each topics.slice(0, 15) as topic}
+		{#each topTopics as topic}
 			<div class="flex items-center gap-3 mb-2">
-				<span class="w-36 text-sm truncate">{topic.name}</span>
+				<span class="w-36 text-sm truncate" title={topic.name}>{topic.name}</span>
 				<div class="flex-1 bg-[var(--bg)] rounded-full h-4 overflow-hidden">
 					<div
 						class="h-full bg-[var(--accent)] rounded-full transition-all"

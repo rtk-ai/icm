@@ -24,9 +24,20 @@
 	const COLLAPSE_KEY = 'icm-dashboard-sidebar-collapsed';
 	// Read synchronously at module init (not in onMount) so the sidebar
 	// renders collapsed on first paint when that's the saved state, instead
-	// of flashing open then snapping shut a frame later.
+	// of flashing open then snapping shut a frame later. A real mobile
+	// width (~375px) with no saved preference used to always render the
+	// full 208px expanded sidebar, leaving so little room for content
+	// (~168px) that stat-card numbers and topic names were clipped mid-
+	// character app-wide, not just wrapping awkwardly — worse than the
+	// already-known header-wrapping issue at a wider ~900px. Defaulting
+	// to collapsed below a real phone-width breakpoint, only when the
+	// user hasn't already made an explicit choice, fixes the first-visit
+	// case; the toggle still lets anyone expand it back.
+	const MOBILE_BREAKPOINT = 640;
 	let collapsed = $state(
-		typeof localStorage !== 'undefined' && localStorage.getItem(COLLAPSE_KEY) === '1',
+		typeof localStorage !== 'undefined'
+			? (localStorage.getItem(COLLAPSE_KEY) ?? (window.innerWidth < MOBILE_BREAKPOINT ? '1' : '0')) === '1'
+			: false,
 	);
 
 	function toggleCollapsed() {

@@ -132,7 +132,9 @@
 	let nodeGeometry: THREE.BufferGeometry | null = null;
 	let labelObjects: CSS2DObject[] = [];
 	let pointerDownPos: { x: number; y: number } | null = null;
-	let clock = new THREE.Clock();
+	// THREE.Clock is deprecated in favor of Timer as of three r180-ish —
+	// using it spammed a console warning on every Graph page load.
+	let clock = new THREE.Timer();
 
 	// Edge "size" = real line width (not just opacity — WebGL's native
 	// gl.LINES has no reliable width across GL drivers, but three.js's fat
@@ -526,8 +528,9 @@
 	function renderFrame() {
 		if (!scene || !camera || !renderer || !labelRenderer || !controls) return;
 		controls.update();
+		clock.update();
 		const pulseMat = pulseObj?.material as THREE.ShaderMaterial | undefined;
-		if (pulseMat) pulseMat.uniforms.u_time.value = clock.getElapsedTime();
+		if (pulseMat) pulseMat.uniforms.u_time.value = clock.getElapsed();
 		renderer.render(scene, camera);
 		labelRenderer.render(scene, camera);
 		resolveLabelOverlaps();

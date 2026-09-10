@@ -2,6 +2,7 @@
 	import { page } from '$app/stores';
 	import '../app.css';
 	import ConfirmDialog from '$lib/ConfirmDialog.svelte';
+	import { confirmState } from '$lib/confirm.svelte';
 
 	let { children } = $props();
 
@@ -51,7 +52,7 @@
 {#if isLoginPage}
 	{@render children()}
 {:else}
-<div class="flex h-screen">
+<div class="flex h-screen" inert={confirmState.current !== null}>
 	<!-- Sidebar -->
 	<nav
 		class="relative bg-[var(--card)] border-r border-[var(--border)] flex flex-col shrink-0 transition-[width] duration-150 {collapsed ? 'w-14' : 'w-52'}"

@@ -13,6 +13,34 @@
 
 use std::path::PathBuf;
 
+/// Write `content` to `path` with owner-only (0600) permissions from creation,
+/// not as a follow-up `set_permissions` call — that ordering would leave a
+/// window (created with the process umask, often world-readable) where a
+/// crash between the two calls leaves the file durably readable by other
+/// local users.
+///
+/// Only used by the `web` feature's dashboard password file, which is off
+/// by default — hence the cfg gate (a default build has no caller).
+#[cfg(feature = "web")]
+pub(crate) fn write_secret_file(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, content)?;
+
+    Ok(())
+}
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 

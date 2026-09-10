@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use icm_core::{FeedbackStore, MemoirStore, MemoryStore};
 use icm_store::Store;
 
-use crate::cloud::write_secret_file;
+use crate::config::write_secret_file;
 
 use crate::config::WebConfig;
 use crate::truncate_at_char_boundary;

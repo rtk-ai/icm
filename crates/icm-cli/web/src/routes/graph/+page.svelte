@@ -472,6 +472,11 @@
 				// center, so the label doesn't sit visually buried inside
 				// the cluster's own node dots.
 				obj.position.set(centroid.x, centroid.y + radius * 1.1, centroid.z);
+				// Bigger topics win the overlap-resolution pass in
+				// renderFrame() below — a small topic's label disappearing
+				// when it happens to project behind a big one is a much
+				// smaller loss than the reverse.
+				obj.userData.labelPriority = indices.length;
 				scene!.add(obj);
 				labelObjects.push(obj);
 			}
@@ -487,7 +492,10 @@
 					return graph.nodes[b].weight - graph.nodes[a].weight;
 				})
 				.slice(0, MAX_LABELS);
-			for (const i of labelIndices) {
+			// labelIndices is already sorted best-first (critical > high >
+			// ... > weight); reversing it into a priority number keeps that
+			// same order in renderFrame()'s overlap-resolution pass below.
+			labelIndices.forEach((i, rank) => {
 				const node = graph.nodes[i];
 				const div = document.createElement('div');
 				div.textContent = truncateLabel(node.summary);
@@ -496,9 +504,10 @@
 					'px-1.5 py-0.5 rounded text-[10px] max-w-[160px] truncate pointer-events-none bg-black/60 text-slate-200';
 				const obj = new CSS2DObject(div);
 				obj.position.set(simNodes[i].x, simNodes[i].y, simNodes[i].z);
+				obj.userData.labelPriority = labelIndices.length - rank;
 				scene!.add(obj);
 				labelObjects.push(obj);
-			}
+			});
 		}
 	}
 
@@ -521,6 +530,31 @@
 		if (pulseMat) pulseMat.uniforms.u_time.value = clock.getElapsedTime();
 		renderer.render(scene, camera);
 		labelRenderer.render(scene, camera);
+		resolveLabelOverlaps();
+	}
+
+	// CSS2DRenderer recomputes every label's on-screen transform from its
+	// 3D position each frame, so there's no stable per-label pixel offset
+	// to nudge — any manual repositioning would just be overwritten next
+	// tick. Hiding instead of moving is simpler and correctly favors
+	// keeping the more important label fully readable over cramming both
+	// in illegibly: run after every render, since orbiting the camera can
+	// change which labels' *projected* positions collide even though
+	// their real 3D positions never move.
+	function resolveLabelOverlaps() {
+		const kept: DOMRect[] = [];
+		const byPriority = [...labelObjects].sort(
+			(a, b) => (b.userData.labelPriority ?? 0) - (a.userData.labelPriority ?? 0),
+		);
+		for (const obj of byPriority) {
+			const el = obj.element;
+			const rect = el.getBoundingClientRect();
+			const overlapsKept = kept.some(
+				r => rect.left < r.right && rect.right > r.left && rect.top < r.bottom && rect.bottom > r.top,
+			);
+			el.style.visibility = overlapsKept ? 'hidden' : '';
+			if (!overlapsKept) kept.push(rect);
+		}
 	}
 
 	function loop() {

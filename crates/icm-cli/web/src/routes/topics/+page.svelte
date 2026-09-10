@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
+	import { importanceBadgeColor } from '$lib/importance';
 	import type { TopicEntry, Memory } from '$lib/types';
 
 	let topics: TopicEntry[] = $state([]);
@@ -16,13 +17,6 @@
 		memories = await api.topicDetail(name);
 	}
 
-	function importanceBadge(imp: string) {
-		const colors: Record<string, string> = {
-			Critical: 'bg-red-600', High: 'bg-orange-500',
-			Medium: 'bg-blue-500', Low: 'bg-gray-500'
-		};
-		return colors[imp] || 'bg-gray-500';
-	}
 </script>
 
 <h2 class="text-2xl font-bold mb-6">Topics</h2>
@@ -51,7 +45,7 @@
 			{#each memories as mem}
 				<div class="mb-3 p-3 bg-[var(--bg)] rounded border border-[var(--border)]">
 					<div class="flex items-center gap-2 mb-1">
-						<span class="text-xs px-2 py-0.5 rounded {importanceBadge(mem.importance)} text-white">{mem.importance}</span>
+						<span class="text-xs px-2 py-0.5 rounded {importanceBadgeColor(mem.importance)} text-white">{mem.importance}</span>
 						<span class="text-xs text-[var(--muted)]">w={mem.weight.toFixed(3)}</span>
 						<span class="text-xs text-[var(--muted)]">x{mem.access_count}</span>
 						<span class="text-xs text-[var(--muted)] ml-auto font-mono">{mem.id.slice(0, 12)}</span>

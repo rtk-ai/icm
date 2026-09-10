@@ -185,8 +185,8 @@ async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    // /health is public
-    if req.uri().path() == "/health" {
+    // /healthz is public (liveness probe)
+    if req.uri().path() == "/healthz" {
         return next.run(req).await;
     }
 
@@ -293,8 +293,14 @@ fn api_router() -> Router<AppState> {
         // Memoirs
         .route("/api/memoirs", get(api_memoirs))
         .route("/api/memoirs/{id}", get(api_memoir_detail))
-        // Public
-        .route("/health", get(api_health_check))
+        // Public. NOT "/health" — the SvelteKit dashboard has its own
+        // page at that exact path (routes/health/+page.svelte), and
+        // axum matches an exact route before ever falling through to the
+        // SPA's catch-all: a bare GET /health (a page reload, a
+        // bookmark, a shared link) hit this liveness JSON instead of the
+        // dashboard page, with no error and no visible sign anything was
+        // wrong (audit finding from a UX review).
+        .route("/healthz", get(api_health_check))
 }
 
 fn spa_router() -> Router<AppState> {
@@ -306,6 +312,37 @@ fn spa_router() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 // Server entry point
 // ---------------------------------------------------------------------------
+
+/// Builds the full router: API (auth-gated) merged with the SPA shell
+/// (public). Split out from [`run_web_server`] so a test can exercise it
+/// with `tower::ServiceExt::oneshot` without binding a real TCP listener.
+///
+/// Auth wraps ONLY the API sub-router, not the merged whole. This used
+/// to wrap the merged app, which meant the SPA shell itself — the
+/// static HTML/JS/CSS, including the custom /login page's own assets —
+/// required a valid `Authorization: Basic` header before axum would
+/// serve so much as a byte of it. A raw `curl /login` against the real
+/// binary (not the Vite dev proxy, which never exercises this) 401'd:
+/// in a real browser, a first-ever visit with no cached credentials
+/// for this origin hits that 401 (which carries `WWW-Authenticate:
+/// Basic`) on a top-level navigation, which every browser answers with
+/// its own native credential prompt — before any SvelteKit JS, and
+/// therefore the custom login page it was built to replace, ever runs
+/// (audit finding from a UX review; the bug predates this fix and was
+/// invisible all session because testing went through Vite's dev
+/// proxy, which only forwards /api/* and doesn't reproduce this gate
+/// on other paths). Static shell content isn't sensitive on its own —
+/// gating only the API, which is what actually returns memory data,
+/// is the standard SPA security model and is what the client's
+/// `api.ts` already assumes (it attaches the header itself and
+/// redirects to /login on a real 401).
+fn build_app(state: AppState) -> Router {
+    let api = api_router().layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware,
+    ));
+    api.merge(spa_router()).with_state(state)
+}
 
 #[tokio::main]
 pub async fn run_web_server(
@@ -320,14 +357,7 @@ pub async fn run_web_server(
         username,
         password,
     };
-
-    let app = api_router()
-        .merge(spa_router())
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state);
+    let app = build_app(state);
 
     let bind = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -928,6 +958,59 @@ async fn api_memoir_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            username: "admin".into(),
+            password: "secret".into(),
+        }
+    }
+
+    /// Regression for a real bug found by a UX review, not introduced by
+    /// this test: auth used to wrap the merged app (API + SPA shell), so
+    /// the SPA's own static HTML/JS/CSS — including the custom /login
+    /// page's assets — required valid Basic Auth credentials before axum
+    /// would serve any of it. A first-ever browser visit with no cached
+    /// credentials for the origin hits that 401 on a top-level
+    /// navigation, which every browser answers with its own native
+    /// credential prompt, before the custom login page (built
+    /// specifically to avoid that prompt) ever has a chance to run. The
+    /// SPA shell must be reachable with no `Authorization` header at all;
+    /// only the API — which is what actually returns memory data — stays
+    /// gated.
+    #[tokio::test]
+    async fn spa_shell_is_public_but_api_requires_auth() {
+        let app = build_app(test_state());
+
+        let unauthenticated_get =
+            |path: &str| Request::builder().uri(path).body(Body::empty()).unwrap();
+
+        for path in ["/", "/login", "/graph", "/healthz"] {
+            let res = app
+                .clone()
+                .oneshot(unauthenticated_get(path))
+                .await
+                .unwrap();
+            assert_ne!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must be reachable without credentials (SPA shell / public liveness check)"
+            );
+        }
+
+        let res = app
+            .clone()
+            .oneshot(unauthenticated_get("/api/stats"))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "/api/* must still require credentials"
+        );
+    }
 
     /// Audit regression: a panic inside one handler used to poison the store
     /// mutex, making every subsequent `lock().unwrap()` panic in cascade for

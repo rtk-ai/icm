@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
 	import { askConfirm } from '$lib/confirm.svelte';
+	import { importanceTextColor } from '$lib/importance';
 	import type { Memory } from '$lib/types';
 
 	let memories: Memory[] = $state([]);
@@ -30,13 +31,6 @@
 		}
 	}
 
-	function importanceColor(imp: string) {
-		const colors: Record<string, string> = {
-			Critical: 'text-red-400', High: 'text-orange-400',
-			Medium: 'text-blue-400', Low: 'text-gray-400'
-		};
-		return colors[imp] || 'text-gray-400';
-	}
 </script>
 
 <h2 class="text-2xl font-bold mb-6">Memories</h2>
@@ -65,7 +59,7 @@
 				<div class="flex-1">
 					<div class="flex items-center gap-2 mb-1">
 						<span class="text-xs px-1.5 py-0.5 rounded bg-[var(--border)]">{mem.topic}</span>
-						<span class="text-xs {importanceColor(mem.importance)}">{mem.importance}</span>
+						<span class="text-xs {importanceTextColor(mem.importance)}">{mem.importance}</span>
 						<span class="text-xs text-[var(--muted)]">w={mem.weight.toFixed(3)}</span>
 						<span class="text-xs text-[var(--muted)]">x{mem.access_count}</span>
 					</div>

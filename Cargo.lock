@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.63"
+version = "0.10.65"
 dependencies = [
  "anyhow",
  "axum",
@@ -2083,6 +2083,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

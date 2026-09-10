@@ -18,6 +18,10 @@ use std::path::PathBuf;
 /// window (created with the process umask, often world-readable) where a
 /// crash between the two calls leaves the file durably readable by other
 /// local users.
+///
+/// Only used by the `web` feature's dashboard password file, which is off
+/// by default — hence the cfg gate (a default build has no caller).
+#[cfg(feature = "web")]
 pub(crate) fn write_secret_file(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {

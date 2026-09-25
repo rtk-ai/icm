@@ -153,7 +153,7 @@ icm init --per-project    # database under .icm/ at the git root
 icm init --mode all       # also register the MCP server in every tool that supports it
 ```
 
-De standaardmodus (`standard`) schrijft instructies, skills en hooks, zonder MCP-server. `--mode all` voegt de MCP-server toe; daarmee (plus `--per-project` voor Aider, waarvan het conventiesbestand per project is) zijn de 18 tools hieronder gedekt ([integratiegids](docs/integrations.md)):
+De standaardmodus (`standard`) schrijft instructies, skills en hooks, zonder MCP-server. `--mode all` voegt de MCP-server toe; daarmee (plus `--per-project` voor Aider, waarvan het conventiesbestand per project is) zijn de 19 tools hieronder gedekt ([integratiegids](docs/integrations.md)):
 
 | Tool | MCP-server | Hooks |
 |------|:---:|:-----:|
@@ -175,6 +175,7 @@ De standaardmodus (`standard`) schrijft instructies, skills en hooks, zonder MCP
 | Continue.dev | ja | — |
 | Aider | — | — |
 | Pi | — | — |
+| Mistral Vibe | ja | ja (pre/post tool) |
 
 Of registreer de MCP-server handmatig: `claude mcp add icm -- icm serve` (elke MCP-client: commando `icm`, argumenten `["serve"]`).
 

@@ -148,7 +148,7 @@ icm init --per-project    # database under .icm/ at the git root
 icm init --mode all       # also register the MCP server in every tool that supports it
 ```
 
-デフォルトのモード（`standard`）は、MCP サーバーなしで指示、スキル、フックを書き込みます。`--mode all` は MCP サーバーを追加します。これを使うと（さらに、規約ファイルがプロジェクトごとにある Aider には `--per-project` も使うと）、以下の 18 のツールをカバーします（[統合ガイド](docs/integrations.md)）:
+デフォルトのモード（`standard`）は、MCP サーバーなしで指示、スキル、フックを書き込みます。`--mode all` は MCP サーバーを追加します。これを使うと（さらに、規約ファイルがプロジェクトごとにある Aider には `--per-project` も使うと）、以下の 19 のツールをカバーします（[統合ガイド](docs/integrations.md)）:
 
 | ツール | MCP サーバー | フック |
 |------|:---:|:-----:|
@@ -170,6 +170,7 @@ icm init --mode all       # also register the MCP server in every tool that supp
 | Continue.dev | 対応 | — |
 | Aider | — | — |
 | Pi | — | — |
+| Mistral Vibe | 対応 | 対応 (pre/post tool) |
 
 または MCP サーバーを手動で登録します: `claude mcp add icm -- icm serve`（任意の MCP クライアント: コマンド `icm`、引数 `["serve"]`）。
 

@@ -192,6 +192,64 @@ pub(crate) fn strip_toml_table(value: &mut toml::Value, table: &str, entry: &str
 }
 
 // =========================================================================
+// TOML: [[array]] entries (Mistral Vibe)
+// =========================================================================
+
+/// Remove the `[[<array>]]` entry whose `name` is `name` from a Mistral
+/// Vibe config (canonically the `[[mcp_servers]] name = "icm"` entry).
+/// Cleans up an emptied parent array. Round-trips through `toml`, which
+/// loses comments — symmetric with `inject_vibe_mcp_server` in `main.rs`.
+pub(crate) fn strip_toml_mcp_array(
+    value: &mut toml::Value,
+    array: &str,
+    name: &str,
+) -> StripResult {
+    let Some(root) = value.as_table_mut() else {
+        return StripResult::NoOp;
+    };
+    let Some(entries) = root.get_mut(array).and_then(|v| v.as_array_mut()) else {
+        return StripResult::NoOp;
+    };
+    let before = entries.len();
+    entries.retain(|e| e.get("name").and_then(|v| v.as_str()) != Some(name));
+    let removed = before - entries.len();
+    if removed == 0 {
+        return StripResult::NoOp;
+    }
+    if entries.is_empty() {
+        root.remove(array);
+    }
+    StripResult::Removed { removed }
+}
+
+/// Remove every ICM-bearing `[[hooks]]` entry from a Mistral Vibe
+/// hooks.toml (entries whose `command` invokes the icm binary). Drops
+/// the `hooks` array entirely when nothing non-ICM survives.
+pub(crate) fn strip_toml_hooks_array(value: &mut toml::Value) -> StripResult {
+    let Some(root) = value.as_table_mut() else {
+        return StripResult::NoOp;
+    };
+    let Some(entries) = root.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+        return StripResult::NoOp;
+    };
+    let before = entries.len();
+    entries.retain(|e| {
+        e.get("command")
+            .and_then(|c| c.as_str())
+            .map(|cmd| crate::check_icm_hook_command(cmd).is_none())
+            .unwrap_or(true)
+    });
+    let removed = before - entries.len();
+    if removed == 0 {
+        return StripResult::NoOp;
+    }
+    if entries.is_empty() {
+        root.remove("hooks");
+    }
+    StripResult::Removed { removed }
+}
+
+// =========================================================================
 // YAML: Continue.dev `- name: icm` block
 // =========================================================================
 
@@ -458,6 +516,36 @@ pub(crate) fn rewrite_toml(
     Ok(result)
 }
 
+pub(crate) fn rewrite_toml_mcp_array(
+    path: &std::path::Path,
+    array: &str,
+    name: &str,
+) -> Result<StripResult> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut value: toml::Value = content.parse()?;
+    let result = strip_toml_mcp_array(&mut value, array, name);
+    if matches!(result, StripResult::Removed { .. }) {
+        let out = toml::to_string_pretty(&value)?;
+        super::atomic_write(path, out.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    Ok(result)
+}
+
+pub(crate) fn rewrite_toml_hooks_array(path: &std::path::Path) -> Result<StripResult> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut value: toml::Value = content.parse()?;
+    let result = strip_toml_hooks_array(&mut value);
+    if matches!(result, StripResult::Removed { .. }) {
+        let out = toml::to_string_pretty(&value)?;
+        super::atomic_write(path, out.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    Ok(result)
+}
+
 pub(crate) fn rewrite_yaml_continue(path: &std::path::Path) -> Result<StripResult> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -628,6 +716,107 @@ command = "/x/o"
         assert_eq!(r, StripResult::Removed { removed: 1 });
         assert!(v["mcp_servers"].get("other").is_some());
         assert!(v["mcp_servers"].get("icm").is_none());
+    }
+
+    #[test]
+    fn strip_toml_mcp_array_removes_icm_entry_and_cascades() {
+        let src = r#"
+active_model = "mistral-medium-3.5"
+
+[[mcp_servers]]
+name = "icm"
+transport = "stdio"
+command = "/x/icm"
+args = ["serve"]
+"#;
+        let mut v: toml::Value = src.parse().unwrap();
+        let r = strip_toml_mcp_array(&mut v, "mcp_servers", "icm");
+        assert_eq!(r, StripResult::Removed { removed: 1 });
+        // Array had only icm -> dropped.
+        assert!(v.get("mcp_servers").is_none());
+        // Sibling scalar preserved.
+        assert_eq!(v["active_model"].as_str().unwrap(), "mistral-medium-3.5");
+    }
+
+    #[test]
+    fn strip_toml_mcp_array_keeps_sibling_entries() {
+        let src = r#"
+[[mcp_servers]]
+name = "icm"
+command = "/x/icm"
+
+[[mcp_servers]]
+name = "other"
+command = "/x/o"
+"#;
+        let mut v: toml::Value = src.parse().unwrap();
+        let r = strip_toml_mcp_array(&mut v, "mcp_servers", "icm");
+        assert_eq!(r, StripResult::Removed { removed: 1 });
+        let entries = v["mcp_servers"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"].as_str().unwrap(), "other");
+    }
+
+    #[test]
+    fn strip_toml_mcp_array_noop_when_absent() {
+        let src = "[[mcp_servers]]\nname = \"other\"\n";
+        let mut v: toml::Value = src.parse().unwrap();
+        assert_eq!(
+            strip_toml_mcp_array(&mut v, "mcp_servers", "icm"),
+            StripResult::NoOp
+        );
+    }
+
+    #[test]
+    fn strip_toml_hooks_array_removes_icm_keeps_non_icm() {
+        let src = r#"
+[[hooks]]
+name = "rtk-rewrite"
+type = "pre_tool"
+match = "bash"
+command = "rtk hook vibe"
+
+[[hooks]]
+name = "icm-pretool"
+type = "pre_tool"
+match = "bash"
+command = "/x/icm hook pre"
+"#;
+        let mut v: toml::Value = src.parse().unwrap();
+        let r = strip_toml_hooks_array(&mut v);
+        assert_eq!(r, StripResult::Removed { removed: 1 });
+        let entries = v["hooks"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"].as_str().unwrap(), "rtk-rewrite");
+    }
+
+    #[test]
+    fn strip_toml_hooks_array_drops_hooks_key_when_only_icm_remains() {
+        let src = r#"
+[[hooks]]
+name = "icm-post-tool"
+type = "post_tool"
+command = "/x/icm hook post"
+"#;
+        let mut v: toml::Value = src.parse().unwrap();
+        let r = strip_toml_hooks_array(&mut v);
+        assert_eq!(r, StripResult::Removed { removed: 1 });
+        assert!(v.get("hooks").is_none());
+    }
+
+    #[test]
+    fn strip_toml_hooks_array_ignores_wrapper_that_mentions_icm_hook() {
+        // Symmetric with the JSON hardening (#342): a command that merely
+        // mentions "icm hook" but doesn't invoke an icm binary must not
+        // be flagged for removal.
+        let src = r#"
+[[hooks]]
+name = "notes"
+type = "post_agent"
+command = "bash -c 'echo icm hook is mentioned; /usr/bin/my-tool run'"
+"#;
+        let mut v: toml::Value = src.parse().unwrap();
+        assert_eq!(strip_toml_hooks_array(&mut v), StripResult::NoOp);
     }
 
     #[test]

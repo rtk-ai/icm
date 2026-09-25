@@ -23,6 +23,10 @@ pub(crate) enum HitDetail {
     JsonHook { event: String, command: String },
     /// TOML: `<table>.<entry>` table was found.
     TomlTable { table: String },
+    /// TOML: an `[[<array>]]` array-of-tables entry was found — either an
+    /// MCP server (identified by its `name`, e.g. `[[mcp_servers]]`) or a
+    /// Vibe hook (identified by its hook `name`).
+    TomlArrayEntry { array: String, entry: String },
     /// YAML: a candidate `- name: icm` block was found.
     YamlBlock { start_line: usize, lines: usize },
     /// Markdown: `<!-- icm:start -->` block was found.
@@ -113,6 +117,8 @@ fn scan_spec(spec: &LocationSpec) -> Result<Vec<LocationHit>> {
             hooks_field,
         } => scan_json(spec, servers_key.as_deref(), *has_hooks, *hooks_field),
         LocationKind::TomlMcp { table, entry } => scan_toml(spec, table, entry),
+        LocationKind::TomlMcpArray { array, name } => scan_toml_mcp_array(spec, array, name),
+        LocationKind::TomlHooksArray { array } => scan_toml_hooks_array(spec, array),
         LocationKind::YamlContinue => scan_yaml_continue(spec),
         LocationKind::MarkdownBlock => scan_markdown(spec),
         LocationKind::OwnedFile => Ok(vec![LocationHit {
@@ -219,6 +225,60 @@ fn scan_toml(spec: &LocationSpec, table: &str, entry: &str) -> Result<Vec<Locati
                     table: format!("[{table}.{entry}]"),
                 },
             });
+        }
+    }
+    Ok(hits)
+}
+
+/// Mistral Vibe MCP detection: an `[[<array>]]` entry whose `name` is
+/// `name` (canonically `[[mcp_servers]] name = "icm"`).
+fn scan_toml_mcp_array(spec: &LocationSpec, array: &str, name: &str) -> Result<Vec<LocationHit>> {
+    let content = std::fs::read_to_string(&spec.path)?;
+    let parsed: toml::Value = content.parse()?;
+    let mut hits = Vec::new();
+    if let Some(entries) = parsed.get(array).and_then(|v| v.as_array()) {
+        for entry in entries {
+            if entry.get("name").and_then(|v| v.as_str()) == Some(name) {
+                hits.push(LocationHit {
+                    spec_label: spec.label,
+                    path: spec.path.clone(),
+                    detail: HitDetail::TomlArrayEntry {
+                        array: format!("[[{array}]]"),
+                        entry: name.to_string(),
+                    },
+                });
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// Mistral Vibe hook detection: `[[hooks]]` entries whose `command`
+/// invokes the icm binary. One hit per ICM entry.
+fn scan_toml_hooks_array(spec: &LocationSpec, array: &str) -> Result<Vec<LocationHit>> {
+    let content = std::fs::read_to_string(&spec.path)?;
+    let parsed: toml::Value = content.parse()?;
+    let mut hits = Vec::new();
+    if let Some(entries) = parsed.get(array).and_then(|v| v.as_array()) {
+        for entry in entries {
+            let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) else {
+                continue;
+            };
+            if crate::check_icm_hook_command(cmd).is_some() {
+                let hook_name = entry
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unnamed")
+                    .to_string();
+                hits.push(LocationHit {
+                    spec_label: spec.label,
+                    path: spec.path.clone(),
+                    detail: HitDetail::TomlArrayEntry {
+                        array: format!("[[{array}]]"),
+                        entry: hook_name,
+                    },
+                });
+            }
         }
     }
     Ok(hits)
@@ -533,6 +593,92 @@ args = ["serve"]
             HitDetail::TomlTable { table } => assert_eq!(table, "[mcp_servers.icm]"),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn scan_detects_vibe_mcp_array_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dir_context_under(tmp.path());
+        let toml_path = dirs.vibe_dir.join("config.toml");
+        write(
+            &toml_path,
+            r#"
+active_model = "mistral-medium-3.5"
+
+[[mcp_servers]]
+name = "other"
+transport = "stdio"
+command = "/x/other"
+
+[[mcp_servers]]
+name = "icm"
+transport = "stdio"
+command = "/x/icm"
+args = ["serve"]
+"#,
+        );
+        let specs = build_locations(&dirs);
+        let plan = scan(&specs, false).unwrap();
+        let hits: Vec<_> = plan
+            .hits
+            .iter()
+            .filter(|h| h.spec_label == "Mistral Vibe MCP")
+            .collect();
+        assert_eq!(hits.len(), 1, "{plan:#?}");
+        match &hits[0].detail {
+            HitDetail::TomlArrayEntry { array, entry } => {
+                assert_eq!(array, "[[mcp_servers]]");
+                assert_eq!(entry, "icm");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn scan_detects_vibe_hooks_array_entries_and_ignores_non_icm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dir_context_under(tmp.path());
+        let hooks_path = dirs.vibe_dir.join("hooks.toml");
+        write(
+            &hooks_path,
+            r#"
+[[hooks]]
+name = "rtk-rewrite"
+type = "pre_tool"
+match = "bash"
+command = "rtk hook vibe"
+
+[[hooks]]
+name = "icm-pretool"
+type = "pre_tool"
+match = "bash"
+command = "/x/icm hook pre"
+timeout = 5.0
+
+[[hooks]]
+name = "icm-post-tool"
+type = "post_tool"
+command = "/x/icm hook post"
+timeout = 10.0
+"#,
+        );
+        let specs = build_locations(&dirs);
+        let plan = scan(&specs, false).unwrap();
+        let hits: Vec<_> = plan
+            .hits
+            .iter()
+            .filter(|h| h.spec_label == "Mistral Vibe hooks")
+            .collect();
+        assert_eq!(hits.len(), 2, "{plan:#?}");
+        let names: Vec<&str> = hits
+            .iter()
+            .map(|h| match &h.detail {
+                HitDetail::TomlArrayEntry { entry, .. } => entry.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(names.contains(&"icm-pretool"));
+        assert!(names.contains(&"icm-post-tool"));
     }
 
     #[test]

@@ -148,7 +148,7 @@ icm init --per-project    # database under .icm/ at the git root
 icm init --mode all       # also register the MCP server in every tool that supports it
 ```
 
-기본 모드(`standard`)는 MCP 서버 없이 지침, 스킬, 훅을 기록합니다. `--mode all`은 MCP 서버를 추가합니다. 이 옵션을 쓰면(그리고 규칙 파일이 프로젝트별로 있는 Aider에는 `--per-project`도 함께 쓰면) 아래 18개 도구를 지원합니다([통합 가이드](docs/integrations.md)):
+기본 모드(`standard`)는 MCP 서버 없이 지침, 스킬, 훅을 기록합니다. `--mode all`은 MCP 서버를 추가합니다. 이 옵션을 쓰면(그리고 규칙 파일이 프로젝트별로 있는 Aider에는 `--per-project`도 함께 쓰면) 아래 19개 도구를 지원합니다([통합 가이드](docs/integrations.md)):
 
 | 도구 | MCP 서버 | 훅 |
 |------|:---:|:-----:|
@@ -170,6 +170,7 @@ icm init --mode all       # also register the MCP server in every tool that supp
 | Continue.dev | 지원 | — |
 | Aider | — | — |
 | Pi | — | — |
+| Mistral Vibe | 지원 | 지원 (pre/post tool) |
 
 또는 MCP 서버를 직접 등록하세요: `claude mcp add icm -- icm serve` (모든 MCP 클라이언트: 명령 `icm`, 인수 `["serve"]`).
 

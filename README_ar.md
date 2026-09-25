@@ -148,7 +148,7 @@ icm init --per-project    # database under .icm/ at the git root
 icm init --mode all       # also register the MCP server in every tool that supports it
 ```
 
-الوضع الافتراضي (`standard`) يكتب التعليمات والمهارات (skills) والخطافات، من دون خادم MCP. يضيف `--mode all` خادم MCP؛ ومعه (إضافةً إلى `--per-project` لـ Aider، الذي يكون ملف اصطلاحاته خاصًا بكل مشروع) يغطي ذلك الأدوات الـ 18 أدناه ([دليل التكامل](docs/integrations.md)):
+الوضع الافتراضي (`standard`) يكتب التعليمات والمهارات (skills) والخطافات، من دون خادم MCP. يضيف `--mode all` خادم MCP؛ ومعه (إضافةً إلى `--per-project` لـ Aider، الذي يكون ملف اصطلاحاته خاصًا بكل مشروع) يغطي ذلك الأدوات الـ 19 أدناه ([دليل التكامل](docs/integrations.md)):
 
 | الأداة | خادم MCP | الخطافات |
 |------|:---:|:-----:|
@@ -170,6 +170,7 @@ icm init --mode all       # also register the MCP server in every tool that supp
 | Continue.dev | نعم | — |
 | Aider | — | — |
 | Pi | — | — |
+| Mistral Vibe | نعم | نعم (pre/post tool) |
 
 أو سجّل خادم MCP يدويًا: `claude mcp add icm -- icm serve` (أي عميل MCP: الأمر `icm`، والوسائط `["serve"]`).
 

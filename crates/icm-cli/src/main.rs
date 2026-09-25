@@ -556,7 +556,8 @@ enum Commands {
     ///
     /// Rows are populated automatically by the PostToolUse hook
     /// (`icm hook post`) whenever Claude Code / Codex / Gemini /
-    /// Copilot calls Edit / Write / MultiEdit / NotebookEdit on a
+    /// Copilot / Mistral Vibe calls Edit / Write / MultiEdit /
+    /// NotebookEdit (or their lowercase Vibe equivalents) on a
     /// file. Same `(project, file_path)` increments `touch_count`
     /// instead of duplicating rows. See issue #196.
     CodeAreas {
@@ -4114,9 +4115,10 @@ fn cmd_hook_pre() -> Result<()> {
     };
 
     // Only handle Bash/shell tool calls (name varies by tool:
-    //   Claude Code/Codex: "Bash", Gemini CLI: "run_shell_command")
+    //   Claude Code/Codex: "Bash", Gemini CLI: "run_shell_command",
+    //   Mistral Vibe: "bash")
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(tool_name, "Bash" | "run_shell_command") {
+    if !matches!(tool_name, "Bash" | "run_shell_command" | "bash") {
         return Ok(());
     }
 
@@ -4145,13 +4147,32 @@ fn cmd_hook_pre() -> Result<()> {
     // the response with "PreToolUse hook returned unsupported
     // updatedInput" (issue #237), and the Claude Code spec lists the
     // field as optional. Omitting it is forward-compatible.
-    let response = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "permissionDecisionReason": "ICM auto-allow"
-        }
-    });
+    //
+    // Mistral Vibe pre_tool payloads carry `hook_event_name: "pre_tool"`
+    // and expect a different decision shape: `{"decision": "allow"}`.
+    // Vibe tolerates unknown fields, so the Claude-specific
+    // `hookSpecificOutput` object is harmless there — we just add the
+    // top-level `decision` Vibe reads.
+    let is_vibe = json.get("hook_event_name").and_then(|v| v.as_str()) == Some("pre_tool");
+    let response = if is_vibe {
+        serde_json::json!({
+            "decision": "allow",
+            "system_message": "ICM auto-allow",
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "ICM auto-allow"
+            }
+        })
+    } else {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "ICM auto-allow"
+            }
+        })
+    };
 
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
@@ -4312,6 +4333,11 @@ fn has_shell_metacharacter(cmd: &str) -> bool {
 ///   | Write  | `tool_response.content`       |
 ///   | Edit   | `tool_response.content`       |
 ///
+///   Mistral Vibe post_tool payloads are shaped differently again: the
+///   canonical text is the top-level `tool_output_text` (what the model
+///   actually sees, possibly rewritten by earlier hooks in the chain),
+///   with `tool_output` as the serialized result object.
+///
 /// We probe in priority order so older clients keep working unchanged.
 /// `tool_response.output` stays in the list for Codex / older Gemini
 /// builds. The Read shape (`tool_response.file.content`) is checked
@@ -4328,14 +4354,29 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
         return Some(s);
     }
 
+    // 2. Mistral Vibe: `tool_output_text` is the canonical payload.
+    if let Some(s) = nonempty_str(json, "tool_output_text") {
+        return Some(s);
+    }
+
+    // 3. Mistral Vibe: `tool_output` is the serialized result *object*
+    //    (e.g. `{"output": "..."}` for the bash tool).
+    if let Some(to) = json.get("tool_output") {
+        for key in ["output", "stdout", "content"] {
+            if let Some(s) = nonempty_str(to, key) {
+                return Some(s);
+            }
+        }
+    }
+
     let tr = json.get("tool_response")?;
 
-    // 2. tool_response itself is a string (some Codex variants).
+    // 4. tool_response itself is a string (some Codex variants).
     if let Some(s) = tr.as_str().filter(|s| !s.is_empty()) {
         return Some(s);
     }
 
-    // 3-5. Probe known content fields. Order matters: `stdout` first
+    // 5-7. Probe known content fields. Order matters: `stdout` first
     // because Bash output is the most common; then `output` and
     // `content` (covers Codex `output`, Write/Edit `content`, and
     // Codex/Gemini variants we've seen).
@@ -4345,7 +4386,7 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
         }
     }
 
-    // 6. Read tool nests under `file.content`.
+    // 8. Read tool nests under `file.content`.
     if let Some(file) = tr.get("file") {
         if let Some(s) = nonempty_str(file, "content") {
             return Some(s);
@@ -4453,7 +4494,11 @@ fn cmd_hook_post(
     // Independent of the extract counter: every Edit/Write tool call
     // gets one row in `code_areas` (touch_count++ on re-touch).
     // Failure is non-fatal — never block the hook on stats inserts.
-    if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+    // Mistral Vibe names its file tools `edit` / `write_file`.
+    if matches!(
+        tool_name,
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "edit" | "write_file"
+    ) {
         if let Some(file_path) = extract_tool_input_file_path(&json) {
             let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
             let session_id = json.get("session_id").and_then(|v| v.as_str());
@@ -5624,6 +5669,8 @@ fn cmd_init(
     let gemini_dir = cli_config_dir("GEMINI_CONFIG_DIR", ".gemini", &home);
     let codex_dir = cli_config_dir("CODEX_HOME", ".codex", &home);
     let copilot_dir = cli_config_dir("COPILOT_HOME", ".copilot", &home);
+    // Mistral Vibe relocates its whole home with VIBE_HOME (default ~/.vibe).
+    let vibe_dir = cli_config_dir("VIBE_HOME", ".vibe", &home);
 
     // `standard` enables cli + skill + hook (everything *except* MCP).
     // `all` keeps the legacy meaning: cli + skill + hook + mcp.
@@ -5822,6 +5869,23 @@ fn cmd_init(
             let continue_status = inject_continue_mcp_server(&continue_path, "icm", &icm_bin_str)?;
             println!("[mcp] {:<16} {continue_status}", "Continue.dev");
         }
+
+        // Mistral Vibe uses a TOML config with an array of tables:
+        // `[[mcp_servers]]` where each entry carries its own `name`.
+        let vibe_path = vibe_dir.join("config.toml");
+        if !force && !detect_tool("Mistral Vibe", &home, &vscode_data) {
+            println!("[mcp] {:<16} skipped (not detected)", "Mistral Vibe");
+        } else {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &vibe_path,
+                "Mistral Vibe",
+                install_manifest::EntryKind::TomlMcpServer,
+            ) {
+                manifest.record(e);
+            }
+            let vibe_status = inject_vibe_mcp_server(&vibe_path, "icm", &icm_bin_str)?;
+            println!("[mcp] {:<16} {vibe_status}", "Mistral Vibe");
+        }
     }
 
     // --- CLI mode: inject instructions into each tool's file ---
@@ -5911,6 +5975,10 @@ icm topics                                # list all topics\n\
             // Pi reads AGENTS.md from ~/.pi/agent/ and parent dirs.
             // Global instruction file follows the same shape as Codex.
             ("Pi", "Pi", PathBuf::from(&home).join(".pi/agent/AGENTS.md")),
+            // Mistral Vibe loads ~/.vibe/AGENTS.md into every session's
+            // system prompt at startup — the same global-instruction
+            // surface as Claude Code's CLAUDE.md.
+            ("Mistral Vibe", "Mistral Vibe", vibe_dir.join("AGENTS.md")),
         ];
 
         // Project-only write targets (no global equivalent at the tool):
@@ -5949,12 +6017,15 @@ icm topics                                # list all topics\n\
                     "Claude Code" => Some(cwd.join("CLAUDE.md")),
                     // Codex AND Pi both read AGENTS.md by walking up
                     // from cwd to $HOME, so a single per-project
-                    // `cwd/AGENTS.md` covers both. `inject_icm_block`
+                    // `cwd/AGENTS.md` covers both. Mistral Vibe
+                    // discovers AGENTS.md from the project root up
+                    // through its trust chain, so the same shared
+                    // file covers it too. `inject_icm_block`
                     // is idempotent on the icm:start marker so if
-                    // both tools are detected the second pass turns
+                    // several tools are detected the second pass turns
                     // into "already configured" without duplicating
                     // the block.
-                    "Codex" | "Pi" => Some(cwd.join("AGENTS.md")),
+                    "Codex" | "Pi" | "Mistral Vibe" => Some(cwd.join("AGENTS.md")),
                     _ => None,
                 };
                 if let Some(p) = cwd_path {
@@ -6200,6 +6271,47 @@ Do this BEFORE responding to the user. Not optional.
             )?;
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Pi");
+        }
+
+        // Mistral Vibe: ~/.vibe/skills/<name>/SKILL.md with YAML frontmatter.
+        // Same directory-per-skill layout as OpenCode, plus Vibe's
+        // `user-invocable: true` so the skill surfaces as a /icm-* slash
+        // command (see the Vibe skills docs).
+        let vibe_skills_base = vibe_dir.join("skills");
+        if force || detect_tool("Mistral Vibe", &home, &vscode_data) {
+            let mut install = |name: &str, prompt: &str| -> Result<()> {
+                let skill_dir = vibe_skills_base.join(format!("icm-{name}"));
+                let skill_path = skill_dir.join("SKILL.md");
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &skill_path,
+                    "Mistral Vibe skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+                let content = format!(
+                    "\
+---
+name: icm-{name}
+description: ICM persistent memory — /icm-{name}
+user-invocable: true
+allowed-tools: bash
+---
+
+{prompt}"
+                );
+                install_skill(
+                    &skill_dir,
+                    "SKILL.md",
+                    &content,
+                    &format!("Mistral Vibe /icm-{name}"),
+                )
+            };
+            install("recall", icm_recall_prompt)?;
+            install("remember", icm_remember_prompt)?;
+            install("remember-session", icm_remember_session_prompt)?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "Mistral Vibe");
         }
 
         // OpenCode: https://opencode.ai/docs/skills/
@@ -6496,6 +6608,53 @@ description: ICM persistent memory — /{name}
             println!("[hook] Copilot CLI (all hooks): {copilot_status}");
         } else {
             println!("[hook] {:<16} skipped (not detected)", "Copilot CLI");
+        }
+
+        // --- Mistral Vibe hooks (TOML ~/.vibe/hooks.toml) ---
+        //
+        // Vibe's hook system only offers `pre_tool`, `post_tool` and
+        // `post_agent` lifecycle events — there is no SessionStart /
+        // SessionEnd / UserPromptSubmit / PreCompact equivalent. So the
+        // Claude-style wake-up pack and prompt-recall hooks have no Vibe
+        // counterpart; the AGENTS.md instructions from CLI mode cover
+        // recall-at-session-start instead. Here we register what Vibe
+        // does support:
+        //   pre_tool  (matcher "bash") -> `icm hook pre`  (auto-allow)
+        //   post_tool (all tools)      -> `icm hook post` (auto-extract)
+        let vibe_hooks_path = vibe_dir.join("hooks.toml");
+        if force || detect_tool("Mistral Vibe", &home, &vscode_data) {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &vibe_hooks_path,
+                "Mistral Vibe hooks",
+                install_manifest::EntryKind::TomlHooks,
+            ) {
+                manifest.record(e);
+            }
+            let pre_status = inject_vibe_hook(
+                &vibe_hooks_path,
+                "icm-pretool",
+                "pre_tool",
+                Some("bash"),
+                &format!("{} hook pre", icm_bin_str),
+                5.0,
+                &["icm hook pre", "icm-pretool"],
+                force,
+            )?;
+            println!("[hook] Mistral Vibe pre_tool (auto-allow): {pre_status}");
+
+            let post_status = inject_vibe_hook(
+                &vibe_hooks_path,
+                "icm-post-tool",
+                "post_tool",
+                None,
+                &format!("{} hook post", icm_bin_str),
+                10.0,
+                &["icm hook post", "icm-post-tool", "icm hook"],
+                force,
+            )?;
+            println!("[hook] Mistral Vibe post_tool (auto-extract): {post_status}");
+        } else {
+            println!("[hook] {:<16} skipped (not detected)", "Mistral Vibe");
         }
 
         // --- Pi (pi.dev) hooks need a TypeScript extension against the
@@ -6893,6 +7052,115 @@ fn disable_opencode_plugin(home: &str, dry_run: bool) -> Result<usize> {
     Ok(1)
 }
 
+/// Vibe's hook layout: a TOML array of tables at `~/.vibe/hooks.toml` —
+/// it doesn't fit the JSON `DoctorTarget` shape, so it gets its own
+/// check/disable pair, following the OpenCode-plugin precedent.
+fn vibe_hooks_path(home: &str) -> PathBuf {
+    crate::cli_config_dir("VIBE_HOME", ".vibe", home).join("hooks.toml")
+}
+
+/// Inspect Mistral Vibe's hooks.toml for ICM hook entries (`icm doctor`).
+/// Returns `(checked, broken)` like `check_json_target`.
+fn check_vibe_hooks(home: &str) -> (usize, usize) {
+    let path = vibe_hooks_path(home);
+    if !path.exists() {
+        return (0, 0);
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[Mistral Vibe] {}: read error ({e})", path.display());
+            return (0, 0);
+        }
+    };
+    let parsed: toml::Value = match content.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[Mistral Vibe] {}: parse error ({e})", path.display());
+            return (0, 1);
+        }
+    };
+    let Some(hooks) = parsed.get("hooks").and_then(|h| h.as_array()) else {
+        return (0, 0);
+    };
+
+    let mut checked = 0usize;
+    let mut broken = 0usize;
+    for entry in hooks {
+        let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        let Some((bin_path, exists)) = check_icm_hook_command(cmd) else {
+            continue;
+        };
+        let hook_name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("hook");
+        checked += 1;
+        if exists {
+            println!("[Mistral Vibe] {hook_name:<19} ✓  {bin_path}");
+        } else {
+            println!("[Mistral Vibe] {hook_name:<19} ✗  {bin_path}  (missing)");
+            broken += 1;
+        }
+    }
+    (checked, broken)
+}
+
+/// Remove ICM hook entries from Mistral Vibe's hooks.toml (#268),
+/// preserving every non-ICM hook. Returns how many were removed.
+fn disable_vibe_hooks(home: &str, dry_run: bool) -> Result<usize> {
+    let path = vibe_hooks_path(home);
+    if !path.exists() {
+        return Ok(0);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let mut config: toml::Value = content
+        .parse()
+        .with_context(|| format!("invalid TOML in {}", path.display()))?;
+
+    let Some(root) = config.as_table_mut() else {
+        return Ok(0);
+    };
+    let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+        println!("[Mistral Vibe] no ICM hooks");
+        return Ok(0);
+    };
+
+    let before = hooks.len();
+    hooks.retain(|entry| {
+        entry
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|cmd| check_icm_hook_command(cmd).is_none())
+            .unwrap_or(true)
+    });
+    let removed = before - hooks.len();
+
+    if removed == 0 {
+        println!("[Mistral Vibe] no ICM hooks");
+        return Ok(0);
+    }
+    if dry_run {
+        println!(
+            "[Mistral Vibe] would remove {removed} ICM hook(s) from {}",
+            path.display()
+        );
+        return Ok(removed);
+    }
+    // Drop the now-empty hooks array so we don't leave `hooks = []` behind.
+    if hooks.is_empty() {
+        root.remove("hooks");
+    }
+    let backup = backup_settings_file(&path)?;
+    let output = toml::to_string_pretty(&config)?;
+    std::fs::write(&path, output).with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "[Mistral Vibe] removed {removed} ICM hook(s) (backup: {})",
+        backup.display()
+    );
+    Ok(removed)
+}
+
 /// `icm hook disable` — remove ICM's hooks from every detected AI tool while
 /// preserving the MCP server config and your memory DB (#268). Reversible via
 /// `icm init --mode hook`.
@@ -6903,6 +7171,7 @@ fn cmd_hook_disable(dry_run: bool) -> Result<()> {
         total += disable_hooks_in_target(&target, dry_run)?;
     }
     total += disable_opencode_plugin(&home, dry_run)?;
+    total += disable_vibe_hooks(&home, dry_run)?;
 
     let plural = if total == 1 { "y" } else { "ies" };
     println!();
@@ -7002,6 +7271,9 @@ fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
         broken += b;
     }
     checked += check_opencode_plugin(&home);
+    let (vc, vb) = check_vibe_hooks(&home);
+    checked += vc;
+    broken += vb;
 
     println!();
     if checked == 0 {
@@ -8065,6 +8337,12 @@ fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
         // path the binary alone can't always reach (e.g. Volta /
         // pnpm-global env quirks). See issue #259.
         "Pi" => binary_in_path("pi") || PathBuf::from(home).join(".pi/agent").exists(),
+        // Mistral Vibe (https://docs.mistral.ai/vibe/code/overview) —
+        // check the binary, falling back to the config dir, which Vibe
+        // creates on first run (~/.vibe or $VIBE_HOME).
+        "Mistral Vibe" => {
+            binary_in_path("vibe") || crate::cli_config_dir("VIBE_HOME", ".vibe", home).exists()
+        }
         _ => true,
     }
 }
@@ -8367,6 +8645,212 @@ fn inject_copilot_hooks(copilot_dir: &std::path::Path, icm_bin: &str) -> Result<
     let output = serde_json::to_string_pretty(&config)?;
     std::fs::write(&settings_path, output)
         .with_context(|| format!("cannot write {}", settings_path.display()))?;
+
+    Ok("configured".into())
+}
+
+/// Inject ICM MCP server into Mistral Vibe's TOML config
+/// (`~/.vibe/config.toml`). Returns a status string.
+///
+/// Vibe stores MCP servers as an array of tables — `[[mcp_servers]]` —
+/// where each entry carries its own `name`, unlike Codex's
+/// `[mcp_servers.<name>]` sub-tables:
+///
+/// ```toml
+/// [[mcp_servers]]
+/// name = "icm"
+/// transport = "stdio"
+/// command = "/path/to/icm"
+/// args = ["serve"]
+/// ```
+fn inject_vibe_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Result<String> {
+    let mut config: toml::Value = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        content
+            .parse::<toml::Value>()
+            .with_context(|| format!("invalid TOML in {}", config_path.display()))?
+    } else {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    let root = config
+        .as_table_mut()
+        .context("config is not a TOML table")?;
+
+    let servers = root
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let servers_arr = servers.as_array_mut().with_context(|| {
+        format!(
+            "`mcp_servers` in {} is not a TOML array",
+            config_path.display()
+        )
+    })?;
+
+    // Idempotency: an existing entry with our name and the current binary
+    // is already configured. An entry with our name but a different
+    // (stale) binary path is replaced in place — same semantics as
+    // `inject_codex_mcp_server`.
+    let mut server = toml::map::Map::new();
+    server.insert("name".into(), toml::Value::String(name.to_string()));
+    server.insert("transport".into(), toml::Value::String("stdio".into()));
+    server.insert("command".into(), toml::Value::String(icm_bin.to_string()));
+    server.insert(
+        "args".into(),
+        toml::Value::Array(vec![toml::Value::String("serve".into())]),
+    );
+    let server = toml::Value::Table(server);
+
+    let mut replaced = false;
+    for entry in servers_arr.iter_mut() {
+        if entry.get("name").and_then(|v| v.as_str()) == Some(name) {
+            if entry.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
+                return Ok("already configured".into());
+            }
+            *entry = server.clone();
+            replaced = true;
+        }
+    }
+    if !replaced {
+        servers_arr.push(server);
+    }
+
+    let output = toml::to_string_pretty(&config)?;
+    std::fs::write(config_path, output)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+
+    if replaced {
+        Ok("updated (stale entry)".into())
+    } else {
+        Ok("configured".into())
+    }
+}
+
+/// Inject one ICM hook into Mistral Vibe's `~/.vibe/hooks.toml`.
+///
+/// Vibe hooks are an array of tables:
+///
+/// ```toml
+/// [[hooks]]
+/// name = "icm-post-tool"
+/// type = "post_tool"          # pre_tool | post_tool | post_agent
+/// match = "bash"              # optional fnmatch/regex tool matcher
+/// command = "/path/to/icm hook post"
+/// timeout = 10.0
+/// ```
+///
+/// Idempotency and stale-binary handling mirror `inject_settings_hook`:
+/// an existing entry of the same hook type whose `command` matches an ICM
+/// pattern is classified as already-correct or stale; stale entries are
+/// only rewritten with `--force`. Note the TOML round-trip drops
+/// comments, symmetric with the Codex config.toml injector — Vibe keeps
+/// no canonical formatting we must preserve.
+#[allow(clippy::too_many_arguments)]
+fn inject_vibe_hook(
+    hooks_path: &Path,
+    hook_name: &str,
+    hook_type: &str,
+    matcher: Option<&str>,
+    hook_command: &str,
+    timeout_secs: f64,
+    detect_patterns: &[&str],
+    force: bool,
+) -> Result<String> {
+    let mut config: toml::Value = if hooks_path.exists() {
+        let content = std::fs::read_to_string(hooks_path)
+            .with_context(|| format!("cannot read {}", hooks_path.display()))?;
+        content
+            .parse::<toml::Value>()
+            .with_context(|| format!("invalid TOML in {}", hooks_path.display()))?
+    } else {
+        if let Some(parent) = hooks_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    let root = config
+        .as_table_mut()
+        .context("hooks.toml is not a TOML table")?;
+
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let hooks_arr = hooks
+        .as_array_mut()
+        .with_context(|| format!("`hooks` in {} is not a TOML array", hooks_path.display()))?;
+
+    // Walk existing entries of the same hook type: classify each ICM
+    // command as already-correct or stale (different binary path).
+    let mut updated = 0usize;
+    let mut already_correct = false;
+    let mut stale_present = false;
+
+    for entry in hooks_arr.iter_mut() {
+        if entry.get("type").and_then(|v| v.as_str()) != Some(hook_type) {
+            continue;
+        }
+        let Some(current) = entry.get("command").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        if !detect_patterns
+            .iter()
+            .any(|p| cmd_matches_icm_pattern(current, p))
+        {
+            continue;
+        }
+        if current == hook_command {
+            already_correct = true;
+        } else if force {
+            if let Some(t) = entry.as_table_mut() {
+                t.insert(
+                    "command".into(),
+                    toml::Value::String(hook_command.to_string()),
+                );
+            }
+            updated += 1;
+        } else {
+            stale_present = true;
+        }
+    }
+
+    if updated > 0 {
+        let output = toml::to_string_pretty(&config)?;
+        std::fs::write(hooks_path, output)
+            .with_context(|| format!("cannot write {}", hooks_path.display()))?;
+        let plural = if updated == 1 { "entry" } else { "entries" };
+        return Ok(format!("updated ({updated} stale {plural})"));
+    }
+
+    if already_correct {
+        return Ok("already configured".into());
+    }
+
+    if stale_present {
+        return Ok("already configured (stale path; use --force to update)".into());
+    }
+
+    // No matching entry — add a fresh one.
+    let mut entry = toml::map::Map::new();
+    entry.insert("name".into(), toml::Value::String(hook_name.to_string()));
+    entry.insert("type".into(), toml::Value::String(hook_type.to_string()));
+    if let Some(m) = matcher {
+        entry.insert("match".into(), toml::Value::String(m.to_string()));
+    }
+    entry.insert(
+        "command".into(),
+        toml::Value::String(hook_command.to_string()),
+    );
+    entry.insert("timeout".into(), toml::Value::Float(timeout_secs));
+    hooks_arr.push(toml::Value::Table(entry));
+
+    let output = toml::to_string_pretty(&config)?;
+    std::fs::write(hooks_path, output)
+        .with_context(|| format!("cannot write {}", hooks_path.display()))?;
 
     Ok("configured".into())
 }
@@ -13311,6 +13795,280 @@ mod inject_settings_hook_tests {
             cfg["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap(),
             "Bash"
         );
+    }
+}
+
+#[cfg(test)]
+mod inject_vibe_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn read_toml(path: &Path) -> toml::Value {
+        let raw = std::fs::read_to_string(path).unwrap();
+        raw.parse().unwrap()
+    }
+
+    #[test]
+    fn vibe_mcp_creates_entry_when_config_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let status = inject_vibe_mcp_server(&path, "icm", "/opt/homebrew/bin/icm").unwrap();
+
+        assert_eq!(status, "configured");
+        let cfg = read_toml(&path);
+        let entries = cfg["mcp_servers"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"].as_str().unwrap(), "icm");
+        assert_eq!(entries[0]["transport"].as_str().unwrap(), "stdio");
+        assert_eq!(
+            entries[0]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm"
+        );
+        assert_eq!(
+            entries[0]["args"].as_array().unwrap()[0].as_str().unwrap(),
+            "serve"
+        );
+    }
+
+    #[test]
+    fn vibe_mcp_is_idempotent_and_preserves_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "active_model = \"mistral-medium-3.5\"\n\n\
+             [[mcp_servers]]\nname = \"other\"\ncommand = \"/x/other\"\n",
+        )
+        .unwrap();
+
+        let first = inject_vibe_mcp_server(&path, "icm", "/opt/homebrew/bin/icm").unwrap();
+        let second = inject_vibe_mcp_server(&path, "icm", "/opt/homebrew/bin/icm").unwrap();
+
+        assert_eq!(first, "configured");
+        assert_eq!(second, "already configured");
+        let cfg = read_toml(&path);
+        let entries = cfg["mcp_servers"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(cfg["active_model"].as_str().unwrap(), "mistral-medium-3.5");
+    }
+
+    #[test]
+    fn vibe_mcp_replaces_stale_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        inject_vibe_mcp_server(&path, "icm", "/Users/x/dev/icm/target/release/icm").unwrap();
+
+        let status = inject_vibe_mcp_server(&path, "icm", "/opt/homebrew/bin/icm").unwrap();
+
+        assert_eq!(status, "updated (stale entry)");
+        let cfg = read_toml(&path);
+        let entries = cfg["mcp_servers"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm"
+        );
+    }
+
+    #[test]
+    fn vibe_hook_appends_to_existing_non_icm_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.toml");
+        std::fs::write(
+            &path,
+            "[[hooks]]\nname = \"rtk-rewrite\"\ntype = \"pre_tool\"\nmatch = \"bash\"\n\
+             command = \"rtk hook vibe\"\ntimeout = 10.0\n",
+        )
+        .unwrap();
+
+        let status = inject_vibe_hook(
+            &path,
+            "icm-pretool",
+            "pre_tool",
+            Some("bash"),
+            "/opt/homebrew/bin/icm hook pre",
+            5.0,
+            &["icm hook pre", "icm-pretool"],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(status, "configured");
+        let cfg = read_toml(&path);
+        let hooks = cfg["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0]["name"].as_str().unwrap(), "rtk-rewrite");
+        assert_eq!(hooks[1]["name"].as_str().unwrap(), "icm-pretool");
+        assert_eq!(hooks[1]["type"].as_str().unwrap(), "pre_tool");
+        assert_eq!(hooks[1]["match"].as_str().unwrap(), "bash");
+        assert_eq!(
+            hooks[1]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm hook pre"
+        );
+        assert_eq!(hooks[1]["timeout"].as_float().unwrap(), 5.0);
+    }
+
+    #[test]
+    fn vibe_hook_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.toml");
+
+        inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+        let status = inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(status, "already configured");
+        let cfg = read_toml(&path);
+        assert_eq!(cfg["hooks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn vibe_hook_reports_stale_without_force_and_updates_with_force() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.toml");
+
+        inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/Users/x/dev/icm/target/release/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        let stale = inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            stale,
+            "already configured (stale path; use --force to update)"
+        );
+
+        let forced = inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            true,
+        )
+        .unwrap();
+        assert_eq!(forced, "updated (1 stale entry)");
+        let cfg = read_toml(&path);
+        let hooks = cfg["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(
+            hooks[0]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm hook post"
+        );
+    }
+
+    #[test]
+    fn vibe_hook_ignores_icm_entry_of_different_type() {
+        // A pre_tool ICM entry must not satisfy a post_tool inject —
+        // the two hooks are separate lifecycle events.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.toml");
+
+        inject_vibe_hook(
+            &path,
+            "icm-pretool",
+            "pre_tool",
+            Some("bash"),
+            "/opt/homebrew/bin/icm hook pre",
+            5.0,
+            &["icm hook pre", "icm-pretool"],
+            false,
+        )
+        .unwrap();
+        let status = inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(status, "configured");
+        let cfg = read_toml(&path);
+        assert_eq!(cfg["hooks"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn extract_tool_output_understands_vibe_payload() {
+        let vibe_bash = serde_json::json!({
+            "hook_event_name": "post_tool",
+            "tool_name": "bash",
+            "tool_status": "success",
+            "tool_input": {"command": "ls"},
+            "tool_output": {"output": "file-a\nfile-b"},
+            "tool_output_text": "file-a\nfile-b"
+        });
+        assert_eq!(
+            extract_tool_output(&vibe_bash),
+            Some("file-a\nfile-b"),
+            "tool_output_text must win for Vibe payloads"
+        );
+
+        let vibe_no_text = serde_json::json!({
+            "hook_event_name": "post_tool",
+            "tool_name": "bash",
+            "tool_output": {"output": "fallback content"},
+        });
+        assert_eq!(extract_tool_output(&vibe_no_text), Some("fallback content"));
+    }
+
+    #[test]
+    fn hook_pre_auto_allows_vibe_bash_tool() {
+        // Mirrors the Claude "Bash" case from is_icm_command, but with
+        // Vibe's lowercase tool name in the payload.
+        let payload = serde_json::json!({
+            "hook_event_name": "pre_tool",
+            "tool_name": "bash",
+            "tool_input": {"command": "icm topics"}
+        });
+        let cmd = payload
+            .pointer("/tool_input/command")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(is_icm_command(cmd));
     }
 }
 

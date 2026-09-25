@@ -148,7 +148,7 @@ icm init --per-project    # database under .icm/ at the git root
 icm init --mode all       # also register the MCP server in every tool that supports it
 ```
 
-Режим по умолчанию (`standard`) записывает инструкции, навыки (skills) и хуки, без MCP-сервера. `--mode all` добавляет MCP-сервер; с ним (и с `--per-project` для Aider, у которого файл соглашений свой в каждом проекте) это покрывает 18 инструментов ниже ([руководство по интеграции](docs/integrations.md)):
+Режим по умолчанию (`standard`) записывает инструкции, навыки (skills) и хуки, без MCP-сервера. `--mode all` добавляет MCP-сервер; с ним (и с `--per-project` для Aider, у которого файл соглашений свой в каждом проекте) это покрывает 19 инструментов ниже ([руководство по интеграции](docs/integrations.md)):
 
 | Инструмент | MCP-сервер | Хуки |
 |------|:---:|:-----:|
@@ -170,6 +170,7 @@ icm init --mode all       # also register the MCP server in every tool that supp
 | Continue.dev | да | — |
 | Aider | — | — |
 | Pi | — | — |
+| Mistral Vibe | да | да (pre/post tool) |
 
 Или зарегистрируйте MCP-сервер вручную: `claude mcp add icm -- icm serve` (любой MCP-клиент: команда `icm`, аргументы `["serve"]`).
 

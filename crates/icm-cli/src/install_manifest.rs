@@ -64,8 +64,13 @@ pub(crate) enum EntryKind {
     JsonHooks,
     /// JSON file with Copilot's `bash` field hooks.
     JsonCopilotHooks,
-    /// TOML file (Codex `config.toml`) with `[mcp_servers.icm]`.
+    /// TOML file (Codex `config.toml`) with `[mcp_servers.icm]`, or
+    /// (Mistral Vibe `config.toml`) an `[[mcp_servers]]` entry named
+    /// `icm`.
     TomlMcpServer,
+    /// TOML file (Mistral Vibe `hooks.toml`) with `[[hooks]]` entries
+    /// whose `command` invokes the icm binary.
+    TomlHooks,
     /// YAML file (Continue.dev) with a `- name: icm` block appended.
     YamlContinue,
     /// Markdown file with an `<!-- icm:start --> ... <!-- icm:end -->`

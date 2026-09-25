@@ -1,6 +1,6 @@
 # ICM Integrations
 
-ICM integrates with **16 AI tools** across 4 integration modes: MCP server, CLI instructions, skills/rules, and hooks.
+ICM integrates with **17 AI tools** across 4 integration modes: MCP server, CLI instructions, skills/rules, and hooks.
 
 ## Quick Setup
 
@@ -212,6 +212,47 @@ icm init --mode hook    # Installs JS plugin with hooks
 
 ---
 
+#### Mistral Vibe
+
+```bash
+icm init --mode mcp     # TOML config ([[mcp_servers]] array)
+icm init --mode cli     # Injects into ~/.vibe/AGENTS.md
+icm init --mode skill   # Installs /icm-recall, /icm-remember,
+                        # /icm-remember-session skills
+icm init --mode hook    # pre_tool + post_tool hooks
+```
+
+**Config:** `~/.vibe/config.toml` (or `$VIBE_HOME/config.toml`)
+
+```toml
+[[mcp_servers]]
+name = "icm"
+transport = "stdio"
+command = "/path/to/icm"
+args = ["serve"]
+```
+
+**Instructions:** `~/.vibe/AGENTS.md` — loaded into every Vibe session's
+system prompt at startup.
+
+**Skills:** `~/.vibe/skills/icm-{recall,remember,remember-session}/SKILL.md`
+(`user-invocable: true`, so they surface as `/icm-*` slash commands).
+
+**Hooks:** `~/.vibe/hooks.toml` (TOML, `[[hooks]]` array of tables):
+
+| Hook | Event | What it does |
+|------|-------|-------------|
+| `icm hook pre` | `pre_tool` (matcher `bash`) | Auto-allow `icm` commands |
+| `icm hook post` | `post_tool` (all tools) | Extract facts from tool output |
+
+Vibe's hook system only offers `pre_tool`, `post_tool` and `post_agent`
+lifecycle events — there is no SessionStart / UserPromptSubmit /
+PreCompact equivalent, so no wake-up pack or prompt-recall hook exists
+for Vibe. Recall at session start is covered by the `~/.vibe/AGENTS.md`
+instructions from `cli` mode instead.
+
+---
+
 ### VS Code Extensions
 
 #### Cline
@@ -251,10 +292,10 @@ icm init --mode mcp
 
 | Mode | What it does | Tools |
 |------|-------------|-------|
-| `mcp` | Configures MCP server in each tool's config | All 14 tools |
-| `cli` | Injects ICM instructions into instruction files | Claude Code, Codex, Gemini, Copilot, Windsurf |
-| `skill` | Creates slash commands and rule files | Claude Code, Cursor, Roo Code, Amp |
-| `hook` | Installs hooks/plugins for automatic extraction | Claude Code (5 hooks), Gemini CLI (5 hooks), Codex CLI (3 hooks; PostToolUse opt-in, #288), Copilot CLI (4 hooks), OpenCode (TS plugin) |
+| `mcp` | Configures MCP server in each tool's config | All 15 tools |
+| `cli` | Injects ICM instructions into instruction files | Claude Code, Codex, Gemini, Copilot, Windsurf, Mistral Vibe |
+| `skill` | Creates slash commands and rule files | Claude Code, Cursor, Roo Code, Amp, Mistral Vibe |
+| `hook` | Installs hooks/plugins for automatic extraction | Claude Code (5 hooks), Gemini CLI (5 hooks), Codex CLI (3 hooks; PostToolUse opt-in, #288), Copilot CLI (4 hooks), OpenCode (TS plugin), Mistral Vibe (2 hooks) |
 
 ## Manual Setup
 

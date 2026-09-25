@@ -9,8 +9,8 @@ use anyhow::Result;
 use super::backup::BackupSession;
 use super::discover::{HitDetail, LocationHit, RemovalPlan};
 use super::formats::{
-    rewrite_json_hooks, rewrite_json_mcp, rewrite_markdown, rewrite_toml, rewrite_yaml_continue,
-    StripResult,
+    rewrite_json_hooks, rewrite_json_mcp, rewrite_markdown, rewrite_toml, rewrite_toml_hooks_array,
+    rewrite_toml_mcp_array, rewrite_yaml_continue, StripResult,
 };
 use super::locations::{HookCommandField, LocationKind, LocationSpec};
 
@@ -82,6 +82,10 @@ pub(crate) fn apply(
                     hooks_field,
                 } => apply_json(&hit.path, servers_key, has_hooks, hooks_field, hit),
                 LocationKind::TomlMcp { table, entry } => rewrite_toml(&hit.path, table, entry),
+                LocationKind::TomlMcpArray { array, name } => {
+                    rewrite_toml_mcp_array(&hit.path, array, name)
+                }
+                LocationKind::TomlHooksArray { .. } => rewrite_toml_hooks_array(&hit.path),
                 LocationKind::YamlContinue => rewrite_yaml_continue(&hit.path),
                 LocationKind::MarkdownBlock => rewrite_markdown(&hit.path),
                 LocationKind::OwnedFile => {

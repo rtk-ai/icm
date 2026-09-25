@@ -7,7 +7,8 @@
 //! have to re-derive the surface from a hard-coded list (issue #229).
 //!
 //! Path resolution honors the same environment overrides as `cmd_init`:
-//! `CLAUDE_CONFIG_DIR`, `GEMINI_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`.
+//! `CLAUDE_CONFIG_DIR`, `GEMINI_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`,
+//! `VIBE_HOME`.
 
 use std::path::PathBuf;
 
@@ -40,6 +41,15 @@ pub(crate) enum LocationKind {
         table: &'static str,
         entry: &'static str,
     },
+    /// TOML file (Mistral Vibe `config.toml`) with an `[[<array>]]`
+    /// array-of-tables entry identified by `name` to remove.
+    TomlMcpArray {
+        array: &'static str,
+        name: &'static str,
+    },
+    /// TOML file (Mistral Vibe `hooks.toml`) with `[[<array>]]` entries
+    /// whose `command` invokes the icm binary; those entries are removed.
+    TomlHooksArray { array: &'static str },
     /// Continue.dev YAML — regex-stripped block under `mcpServers:`.
     YamlContinue,
     /// Markdown file with an `<!-- icm:start --> ... <!-- icm:end -->`
@@ -74,6 +84,7 @@ pub(crate) struct DirContext {
     pub gemini_dir: PathBuf,
     pub codex_dir: PathBuf,
     pub copilot_dir: PathBuf,
+    pub vibe_dir: PathBuf,
     pub vscode_data: PathBuf,
     pub zed_settings: PathBuf,
     pub cwd: PathBuf,
@@ -89,6 +100,7 @@ impl DirContext {
         let gemini_dir = crate::cli_config_dir("GEMINI_CONFIG_DIR", ".gemini", &home_str);
         let codex_dir = crate::cli_config_dir("CODEX_HOME", ".codex", &home_str);
         let copilot_dir = crate::cli_config_dir("COPILOT_HOME", ".copilot", &home_str);
+        let vibe_dir = crate::cli_config_dir("VIBE_HOME", ".vibe", &home_str);
         let vscode_data = if cfg!(target_os = "macos") {
             home.join("Library/Application Support/Code/User")
         } else {
@@ -106,6 +118,7 @@ impl DirContext {
             gemini_dir,
             codex_dir,
             copilot_dir,
+            vibe_dir,
             vscode_data,
             zed_settings,
             cwd,
@@ -474,6 +487,45 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
         purge_data_only: false,
     });
 
+    // --- Mistral Vibe (~/.vibe: TOML MCP array, TOML hooks, AGENTS.md, skills) ---
+    specs.push(LocationSpec {
+        label: "Mistral Vibe MCP",
+        path: d.vibe_dir.join("config.toml"),
+        kind: K::TomlMcpArray {
+            array: "mcp_servers",
+            name: "icm",
+        },
+        purge_data_only: false,
+    });
+    specs.push(LocationSpec {
+        label: "Mistral Vibe hooks",
+        path: d.vibe_dir.join("hooks.toml"),
+        kind: K::TomlHooksArray { array: "hooks" },
+        purge_data_only: false,
+    });
+    specs.push(LocationSpec {
+        label: "Mistral Vibe AGENTS.md",
+        path: d.vibe_dir.join("AGENTS.md"),
+        kind: K::MarkdownBlock,
+        purge_data_only: false,
+    });
+    let vibe_skills: &[(&str, &str)] = &[
+        ("Mistral Vibe /icm-recall", "skills/icm-recall/SKILL.md"),
+        ("Mistral Vibe /icm-remember", "skills/icm-remember/SKILL.md"),
+        (
+            "Mistral Vibe /icm-remember-session",
+            "skills/icm-remember-session/SKILL.md",
+        ),
+    ];
+    for (label, rel) in vibe_skills {
+        specs.push(LocationSpec {
+            label,
+            path: d.vibe_dir.join(rel),
+            kind: K::OwnedFile,
+            purge_data_only: false,
+        });
+    }
+
     // --- Amazon Q ---
     specs.push(LocationSpec {
         label: "Amazon Q MCP",
@@ -556,6 +608,7 @@ pub(crate) fn dir_context_under(root: &std::path::Path) -> DirContext {
         gemini_dir: home.join(".gemini"),
         codex_dir: home.join(".codex"),
         copilot_dir: home.join(".copilot"),
+        vibe_dir: home.join(".vibe"),
         vscode_data,
         zed_settings,
         cwd: home.join("proj"),
@@ -611,6 +664,12 @@ mod tests {
             "Pi AGENTS.md",
             "Pi /icm-recall",
             "Pi /icm-remember",
+            "Mistral Vibe MCP",
+            "Mistral Vibe hooks",
+            "Mistral Vibe AGENTS.md",
+            "Mistral Vibe /icm-recall",
+            "Mistral Vibe /icm-remember",
+            "Mistral Vibe /icm-remember-session",
             "Amazon Q MCP",
             "Continue.dev",
             "CLAUDE.md (cwd)",

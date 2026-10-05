@@ -2537,8 +2537,12 @@ mod tests {
                 .summarize_with_key(KEY, &request(any_model(kind)))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("request failed"), "{kind:?}: {err}");
-            assert!(err.contains("check network access"), "{kind:?}: {err}");
+            // A closed port is refused at once on Unix. Windows retries the
+            // connection instead, and it ends as a host that does not answer.
+            let refused = err.contains("request failed") && err.contains("check network access");
+            let unanswered =
+                err.contains("could not connect to") && err.contains("the host is not answering");
+            assert!(refused || unanswered, "{kind:?}: {err}");
             assert_no_key("transport", &err);
         }
     }

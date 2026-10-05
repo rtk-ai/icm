@@ -13,6 +13,7 @@ compile_error!(
 );
 
 pub mod auto_link;
+pub mod budget;
 pub mod context_snapshot;
 pub mod embedder;
 pub mod embedding_policy;
@@ -23,12 +24,14 @@ pub mod facts_store;
 pub mod fastembed_embedder;
 pub mod feedback;
 pub mod feedback_store;
+pub mod fusion;
 pub mod learn;
 pub mod memoir;
 pub mod memoir_store;
 pub mod memory;
 pub mod project;
 pub mod store;
+pub mod temporal;
 pub mod transcript;
 pub mod transcript_store;
 pub mod wake_up;
@@ -37,6 +40,7 @@ pub mod wake_up;
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 pub use auto_link::{add_backrefs, auto_link_memory, AutoLinkOptions};
+pub use budget::{estimate_tokens, select_within_budget, BudgetSelection, ITEM_OVERHEAD_TOKENS};
 pub use context_snapshot::{
     build_context_snapshot, build_context_snapshot_from_memories, ContextSnapshot,
     ContextSnapshotOptions, SnapshotFormat, SnapshotSection, SNAPSHOT_HEADER,
@@ -50,6 +54,7 @@ pub use facts_store::FactsStore;
 pub use fastembed_embedder::{FastEmbedder, DEFAULT_MODEL as DEFAULT_EMBEDDING_MODEL};
 pub use feedback::{Feedback, FeedbackStats};
 pub use feedback_store::FeedbackStore;
+pub use fusion::{rrf_fuse, FusedHit, RankedHit, RankedList, RankedQuery, RRF_K};
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
 pub use memoir_store::MemoirStore;
 pub use memory::{
@@ -59,6 +64,7 @@ pub use memory::{
 pub use store::{
     find_similar_memory, merge_summaries, union_keywords, MemoryStore, DEDUP_SIMILARITY_THRESHOLD,
 };
+pub use temporal::{parse_instant, parse_query_window, TimeWindow};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;
 pub use wake_up::{

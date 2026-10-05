@@ -14,8 +14,8 @@ use chrono::{DateTime, Utc};
 use icm_core::{
     Concept, ConceptLink, Embedder, EmbeddingState, Fact, FactsStats, FactsStore, Feedback,
     FeedbackStats, FeedbackStore, IcmError, IcmResult, Label, Memoir, MemoirStats, MemoirStore,
-    Memory, MemoryStore, Message, PatternCluster, Relation, Role, Session, StoreStats, TopicHealth,
-    TranscriptHit, TranscriptStats, TranscriptStore,
+    Memory, MemoryStore, Message, PatternCluster, RankedHit, RankedQuery, Relation, Role, Session,
+    StoreStats, TopicHealth, TranscriptHit, TranscriptStats, TranscriptStore,
 };
 
 use crate::common::{
@@ -536,6 +536,62 @@ impl Store {
                 None => Ok(false),
             },
         }
+    }
+
+    /// Rank-fused search for the v2 recall engine: deep candidates, `keep`
+    /// applied before the cut, optional temporal arm. Only SQLite implements
+    /// it; the remote backends fall back to their existing search.
+    pub fn search_ranked(
+        &self,
+        q: &RankedQuery<'_>,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> IcmResult<Vec<RankedHit>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.search_ranked(q, keep),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(_) => self.search_ranked_fallback(q, keep),
+            #[cfg(feature = "opensearch")]
+            Store::OpenSearch(_) => self.search_ranked_fallback(q, keep),
+        }
+    }
+
+    /// [`Self::search_ranked`] for backends without rank fusion: the
+    /// backend's own `search_hybrid` when a query embedding is supplied, its
+    /// full-text search otherwise. `keep` still runs before the cut to
+    /// `q.limit`, but there are no per-arm ranks and `q.window` is ignored.
+    #[cfg(any(feature = "postgres", feature = "opensearch"))]
+    fn search_ranked_fallback(
+        &self,
+        q: &RankedQuery<'_>,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> IcmResult<Vec<RankedHit>> {
+        let scored: Vec<(Memory, f32)> = match q.embedding {
+            Some(embedding) => self.search_hybrid(q.text, embedding, q.depth)?,
+            // Full-text search has no score: derive one from the position,
+            // on the scale `rrf_fuse` gives a single list (first = 1.0).
+            None => self
+                .search_fts(q.text, q.depth.min(100))?
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let k = icm_core::RRF_K;
+                    (m, (k + 1.0) / (k + 1.0 + i as f32))
+                })
+                .collect(),
+        };
+        Ok(scored
+            .into_iter()
+            .filter(|(m, _)| keep(m))
+            .take(q.limit)
+            .map(|(memory, score)| RankedHit {
+                memory,
+                score,
+                fts_rank: None,
+                vec_rank: None,
+                time_rank: None,
+            })
+            .collect())
     }
 
     /// Whether the active store was opened read-only.

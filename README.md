@@ -87,10 +87,9 @@ location (e.g. `~/.local/share/icm/memories.db` on Linux,
 - Topics (`decisions-myapp`, `preferences`, `errors-resolved`, ...)
   are global — there is no per-tool partition.
 
-The [multi-agent benchmark](#multi-agent-unified-memory) below confirms
-it end-to-end: facts seeded through ICM are recalled with 100% accuracy
-by Claude Code, Gemini CLI, Copilot CLI, Cursor Agent, and Aider —
-**98% cross-agent efficiency** on the standard test.
+In a small [demonstration](#multi-agent-unified-memory) with 10 seeded facts,
+Claude Code, Gemini CLI, Copilot CLI, Cursor Agent, and Aider each recalled
+all 10 facts stored through ICM by another tool.
 
 If you want isolation (per-project, per-tool, etc.) pass `--db <path>`,
 set `ICM_DB`, or use `icm init --per-project` to create a project-local
@@ -120,19 +119,30 @@ Re-run the install command to upgrade to the latest release. To pin a version, p
 
 ### Semantic search runtime
 
-Keyword search works out of the box. **Semantic (vector) search** needs the ONNX Runtime. The prebuilt binaries and `install.sh` bundle it — nothing to do. The **Homebrew** build ships lean without it (it builds in a network-less sandbox), and offers a one-time download on first use in a terminal:
+Keyword search works out of the box everywhere. **Semantic (vector) search** needs the ONNX Runtime, and whether it is already there depends on the build you installed (releases after 0.10.65; `icm embeddings status` tells you which case you are in):
+
+| Build | Semantic search |
+|---|---|
+| macOS Apple Silicon and Windows x86_64 archives, `.rpm` | Built in — nothing to do |
+| Linux x86_64 / aarch64 archives and `.deb` (glibc ≥ 2.35: Debian 12+, Ubuntu 22.04+) | After `icm embeddings download`, once per user (~11 MB) |
+| macOS Intel archive | Bring your own ONNX Runtime ≥ 1.24 via `ORT_DYLIB_PATH` — none is published for this platform |
+| Linux x86_64 static musl archive (older glibc, Alpine) | Not available — keyword search only |
+
+`install.sh`, `icm upgrade` and the Homebrew tap install these same archives; `install.sh` picks the static musl one by itself on older systems.
 
 ```bash
-# Explicitly enable semantic search (downloads onnxruntime ~7 MB, one time)
+# Enable semantic search on a build that loads the runtime on demand
 icm embeddings download
 
 # Check the runtime state
 icm embeddings status
 ```
 
-If declined (or in a non-interactive context — MCP server, hooks, CI), ICM stays keyword-only until you run `icm embeddings download`. To use your own runtime, set `ORT_DYLIB_PATH` to an ONNX Runtime **1.20.x** library.
+Builds that load the runtime on demand offer the download once, on first use in a terminal. If declined (or in a non-interactive context — MCP server, hooks, CI), ICM stays keyword-only until you run `icm embeddings download`, and says nothing about it: an agent that only talks to `icm serve` or to the hooks never sees a prompt. To use your own runtime, set `ORT_DYLIB_PATH` to an ONNX Runtime **1.24 or newer** library (the download fetches 1.29.0).
 
-The download supports macOS (arm64/x86_64), Linux (x86_64/aarch64), and Windows (x86_64). On Windows the runtime is the larger `onnxruntime.dll` package (~65 MB); everywhere else it's ~7 MB.
+**After an update from 0.10.63 or older on Linux (archive, `.deb`, `icm upgrade`, Homebrew) or on an Intel Mac:** those releases bundled the runtime, the current ones do not, so the update turns semantic search off until you run `icm embeddings download` once (on an Intel Mac: until you set `ORT_DYLIB_PATH`). `install.sh`, the `.deb` and Homebrew print a reminder when they install such a build; `icm upgrade` does not, so run `icm embeddings status` after it.
+
+Why the Linux archives no longer bundle the runtime: the prebuilt ONNX Runtime that the embedding stack links statically now needs glibc 2.38, which would leave Debian 12 and Ubuntu 22.04 without a working binary. The on-demand runtime only needs glibc 2.28.
 
 ## Setup
 
@@ -379,7 +389,7 @@ memories and memoirs.
 | `icm_memory_update` | Edit a memory in-place (content, importance, keywords) |
 | `icm_memory_forget` | Delete a memory by ID |
 | `icm_memory_forget_topic` | Delete all memories in a given topic |
-| `icm_memory_consolidate` | Merge all memories of a topic into one summary |
+| `icm_memory_consolidate` | Replace the memories you list (`ids`) with your summary; without `ids`, lists the topic |
 | `icm_memory_extract_patterns` | Detect recurring patterns within a topic and surface them as concepts |
 | `icm_memory_list_topics` | List all topics with counts |
 | `icm_memory_stats` | Global memory statistics |
@@ -455,19 +465,21 @@ Decay is **access-aware**: frequently recalled memories decay slower (`decay / (
 
 ### Hybrid search
 
-With embeddings enabled, ICM uses hybrid search:
-- **FTS5 BM25** (30%) — full-text keyword matching
-- **Cosine similarity** (70%) — semantic vector search via sqlite-vec
+Recall fuses up to three ranked lists by reciprocal rank (RRF):
+- **FTS5 BM25** — full-text keyword matching, always on
+- **Cosine similarity** — semantic vector search via sqlite-vec, when an embedding model is loaded
+- **Date window** — when the query names a period ("last week", "in March 2024")
 
-Default model: `intfloat/multilingual-e5-base` (768d, 100+ languages). Configurable in your [config file](#configuration):
+Project, topic and keyword filters apply before the cut. Without an embedding model recall is keyword-only; on LoCoMo that is as good as the hybrid (see [Benchmark comparison](#benchmark-comparison)).
+
+Default model: `Qdrant/multilingual-e5-large-onnx` (1024d, 100+ languages). Configurable in your [config file](#configuration):
 
 ```toml
 [embeddings]
 # enabled = false                          # Disable entirely (no model download)
-model = "intfloat/multilingual-e5-base"    # 768d, multilingual (default)
-# model = "intfloat/multilingual-e5-small" # 384d, multilingual (lighter)
-# model = "intfloat/multilingual-e5-large" # 1024d, multilingual (best accuracy)
-# model = "Xenova/bge-small-en-v1.5"      # 384d, English-only (fastest)
+# model = "intfloat/multilingual-e5-base"  # 768d, multilingual (lighter)
+# model = "intfloat/multilingual-e5-small" # 384d, multilingual (lightest)
+# model = "Xenova/bge-small-en-v1.5"       # 384d, English-only (fastest)
 # model = "jinaai/jina-embeddings-v2-base-code"  # 768d, code-optimized
 ```
 
@@ -476,9 +488,9 @@ To skip the embedding model download entirely, use any of these:
 icm --no-embeddings serve          # CLI flag
 ICM_NO_EMBEDDINGS=1 icm serve     # Environment variable
 ```
-Or set `enabled = false` in your config file. ICM will fall back to FTS5 keyword search (still works, just no semantic matching).
+Or set `enabled = false` in your config file.
 
-Changing the model automatically re-creates the vector index (existing embeddings are cleared and can be regenerated with `icm_memory_embed_all`).
+The model that produced the stored vectors is recorded in the database and wins over the config file, so editing `model` never clears anything. To change model, run `icm embed --migrate`: it writes a backup, resets the vector index at the new dimension and re-embeds every memory.
 
 ### Storage
 
@@ -604,7 +616,9 @@ All 3 layers are installed automatically by `icm init --mode hook`.
 
 ## Benchmarks
 
-### Storage performance
+The measured comparison with other memory systems is in [Benchmark comparison](#benchmark-comparison). The sections below are micro-benchmarks and small demonstrations: useful to see the mechanism, not evidence of how ICM ranks.
+
+### Storage micro-benchmark
 
 ```
 ICM Benchmark (1000 memories, 384d embeddings)
@@ -618,11 +632,11 @@ Decay (batch)                 1 ops       5.8 ms       5.8 ms/op
 ──────────────────────────────────────────────────────────
 ```
 
-Apple M1 Pro, in-memory SQLite, single-threaded. `icm bench --count 1000`
+Apple M1 Pro, in-memory SQLite, 1,000 synthetic memories, single-threaded (`icm bench --count 1000`). This isolates the storage layer. End-to-end recall on a real database, embedding the query included, takes 52 to 65 ms (median, warm server, Apple Silicon) and 141 ms on a 4-vCPU cloud VM.
 
-### Agent efficiency
+### Agent efficiency (demonstration)
 
-Multi-session workflow with a real Rust project (12 files, ~550 lines). Sessions 2+ show the biggest gains as ICM recalls instead of re-reading files.
+Three runs, one model, one small project: an illustration, not a benchmark. Multi-session workflow with a real Rust project (12 files, ~550 lines). Sessions 2+ show the biggest gains as ICM recalls instead of re-reading files.
 
 ```
 ICM Agent Benchmark (10 sessions, model: haiku, 3 runs averaged)
@@ -642,9 +656,9 @@ Session 3 (recall)
 
 `icm bench-agent --sessions 10 --model haiku`
 
-### Knowledge retention
+### Knowledge retention (demonstration)
 
-Agent recalls specific facts from a dense technical document across sessions. Session 1 reads and memorizes; sessions 2+ answer 10 factual questions **without** the source text.
+Five runs, ten questions, scored by keyword matching. Agent recalls specific facts from a dense technical document across sessions. Session 1 reads and memorizes; sessions 2+ answer 10 factual questions **without** the source text.
 
 ```
 ICM Recall Benchmark (10 questions, model: haiku, 5 runs averaged)
@@ -678,32 +692,6 @@ qwen2.5:3b             3B       2%       58%       +56%
 
 `scripts/bench-ollama.sh qwen2.5:14b`
 
-### LongMemEval (ICLR 2025)
-
-Standard academic benchmark — 500 questions across 6 memory abilities, from the [LongMemEval paper](https://arxiv.org/abs/2410.10813) (ICLR 2025).
-
-```
-LongMemEval Results — ICM (oracle variant, 500 questions)
-════════════════════════════════════════════════════════════════
-Category                        Retrieval     Answer (Sonnet)
-────────────────────────────────────────────────────────────────
-single-session-user                100.0%           91.4%
-temporal-reasoning                 100.0%           85.0%
-single-session-assistant           100.0%           83.9%
-multi-session                      100.0%           81.2%
-knowledge-update                   100.0%           80.8%
-single-session-preference          100.0%           50.0%
-────────────────────────────────────────────────────────────────
-OVERALL                            100.0%           82.0%
-════════════════════════════════════════════════════════════════
-```
-
-- **Retrieval** = does ICM find the right information? **100% across all categories.**
-- **Answer** = can the LLM produce the correct answer from retrieved context? Depends on the LLM, not ICM.
-- The retrieval score is the ICM benchmark. The answer score reflects the downstream LLM capability.
-
-`scripts/bench-longmemeval.py --judge claude --workers 8`
-
 ### Test protocol
 
 All benchmarks use **real API calls** — no mocks, no simulated responses, no cached answers.
@@ -714,42 +702,61 @@ All benchmarks use **real API calls** — no mocks, no simulated responses, no c
 
 ### Multi-agent unified memory
 
-All 17 tools share the same SQLite database. A memory stored by Claude is instantly available to Gemini, Codex, Copilot, Cursor, and every other tool.
+All supported tools share the same SQLite database. A memory stored by Claude is instantly available to Gemini, Codex, Copilot, Cursor, and every other tool.
 
-```
-ICM Multi-Agent Efficiency Benchmark (10 seeded facts, 5 CLI agents)
-╔══════════════╦═══════╦══════════╦════════╦═══════════╦═══════╗
-║ Agent        ║ Facts ║ Accuracy ║ Detail ║ Latency   ║ Score ║
-╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
-║ Claude Code  ║ 10/10 ║   100%   ║  5/5   ║    ~15s   ║   99  ║
-║ Gemini CLI   ║ 10/10 ║   100%   ║  5/5   ║    ~33s   ║   94  ║
-║ Copilot CLI  ║ 10/10 ║   100%   ║  5/5   ║    ~10s   ║  100  ║
-║ Cursor Agent ║ 10/10 ║   100%   ║  5/5   ║    ~16s   ║   99  ║
-║ Aider        ║ 10/10 ║   100%   ║  5/5   ║     ~5s   ║  100  ║
-╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
-║ AVERAGE      ║       ║          ║        ║           ║   98  ║
-╚══════════════╩═══════╩══════════╩════════╩═══════════╩═══════╝
-```
+A demonstration with 10 facts seeded through ICM, then asked back from five CLI agents:
 
-Score = 60% recall accuracy + 30% fact detail + 10% speed. **98% multi-agent efficiency.**
+| Agent | Facts recalled | Latency |
+|-------|:--------------:|:-------:|
+| Claude Code | 10 / 10 | ~15 s |
+| Gemini CLI | 10 / 10 | ~33 s |
+| Copilot CLI | 10 / 10 | ~10 s |
+| Cursor Agent | 10 / 10 | ~16 s |
+| Aider | 10 / 10 | ~5 s |
 
-## Why ICM
+Ten facts and one run per agent: this shows the shared database works across tools, not how well recall scales.
 
-| Capability | ICM | Mem0 | Engram | AgentMemory |
-|-----------|:---:|:----:|:------:|:-----------:|
-| Tool support | **17** | SDK only | ~6-8 | ~10 |
-| One-command setup | `icm init` | manual SDK | manual | manual |
-| Hooks (auto-recall at startup) | 5 tools | none | via MCP | 1 tool |
-| Hybrid search (FTS5 + vector) | 30/70 weighted | vector only | FTS5 only | FTS5+vector |
-| Multilingual embeddings | 100+ langs (768d) | depends | none | English 384d |
-| Knowledge graph | Memoir system | none | none | none |
-| Temporal decay + consolidation | access-aware | none | basic | basic |
-| TUI dashboard | `icm dashboard` | none | yes | web viewer |
-| Auto-extraction from tool output | 3 layers, zero LLM | none | none | none |
-| Feedback/correction loop | `icm_feedback_*` | none | none | none |
-| Runtime | Rust single binary | Python | Go | Node.js |
-| Local-first, zero dependencies | SQLite file | cloud-first | SQLite | SQLite |
-| Multi-agent recall accuracy | **98%** | N/A | N/A | 95.2% |
+## Benchmark comparison
+
+Answer accuracy on [LoCoMo](https://github.com/snap-research/locomo) (10 long conversations, 1,540 questions), measured with the public [Agent Memory Benchmark](https://github.com/vectorize-io/agent-memory-benchmark) harness: the memory system retrieves context, `gemini-3.1-pro-preview` answers from it, `gemini-2.5-flash-lite` judges the answer.
+
+| System | LoCoMo accuracy | Context per question | LLM calls to store a memory | Runs as | Result |
+|--------|:---------------:|:--------------------:|:---------------------------:|---------|--------|
+| **ICM** (recall engine v2) | **92.8%** (1,429 / 1,540) | 24.1k tokens | none | one Rust binary, SQLite file | our run, 2026-10-05 |
+| Hindsight | 92.0% (1,417 / 1,540) | 36.2k tokens | LLM fact extraction | Python service, PostgreSQL + pgvector | published by the harness |
+| Hybrid search baseline (dense + sparse, RRF) | 79.1% (1,218 / 1,540) | 22.2k tokens | none | Qdrant | published by the harness |
+
+On [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 multiple-choice questions about a user's evolving preferences, same harness and answering model, scored by letter match):
+
+| System | PersonaMem accuracy | Context per question | Result |
+|--------|:-------------------:|:--------------------:|--------|
+| Hindsight | 86.6% (510 / 589) | 15.8k tokens | published by the harness |
+| Hybrid search baseline | 84.4% (497 / 589) | 24.2k tokens | published by the harness |
+| **ICM** (recall engine v2) | **82.9%** (488 / 589) | 16.2k tokens | our run, 2026-10-05 |
+
+On LoCoMo, ICM by question type, with the harness's labels: open-domain 96.7% (813 / 841), temporal 91.0% (292 / 321), single-hop 89.0% (251 / 282), multi-hop 76.0% (73 / 96). Median recall latency 141 ms on a 4-vCPU cloud VM; 272 sessions ingested with no LLM call.
+
+Retrieval alone, same dataset, no answering model. Share of questions for which at least one gold session is in the top results:
+
+| Top results | Previous engine (`legacy`) | Recall engine v2 | Previous engine, no embedding model | Recall engine v2, no embedding model |
+|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
+| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
+| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
+| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+
+Same figures on Apple Silicon and on Linux x86-64. Median recall latency with embeddings: 65 ms and 136 ms; keyword-only: 1.6 ms and 6.8 ms.
+
+What these numbers do and do not show:
+
+- **ICM and Hindsight are tied on LoCoMo.** The 0.8-point gap is 12 questions, inside the sampling error (95% interval for ICM: 91.5 to 94.1). ICM gets there with a third less context and without calling an LLM when a memory is stored.
+- **On PersonaMem, Hindsight is ahead** by 3.7 points; ICM is level with the hybrid search baseline (95% interval for ICM: 79.8 to 85.9) while reading a third less context than it. ICM's weakest category there is suggesting new ideas from known preferences (59.1%).
+- **Not identical conditions.** The harness is maintained by Vectorize, the vendor of Hindsight. The published LoCoMo results predate a change that set the answer and judge temperature to 0; our run uses the current harness (commit `f618ed7`) and Vertex AI.
+- **At 50 chunks, much of each conversation is returned,** so this accuracy also measures the answering model. The retrieval table is the evidence for the recall engine itself.
+- **Session dates are written into the memory text** by the benchmark adapter, as Hindsight does. The hybrid search baseline does not get them, which accounts for part of its gap on temporal questions.
+- **The weakest category is the 96 questions the harness labels multi-hop** (76.0%). Category names do not line up across benchmarks: other LoCoMo evaluations call this category open-domain, and call multi-hop the 282 questions the harness labels single-hop (89.0% here). Compare by question count, not by label.
+- **Recall engine v2 is the default** for `icm recall`, the MCP `icm_memory_recall` tool, HTTP `/recall` and the prompt hook. The previous engine stays available to roll back or to compare: `icm recall --engine legacy`, `"engine": "legacy"` on HTTP `/recall`, or `ICM_RECALL_ENGINE=legacy`.
+
+Per-question results for both datasets are in [`bench/amb/results/`](bench/amb/results/); the adapter, the exact settings and the commands to reproduce are in [`bench/amb/README.md`](bench/amb/README.md).
 
 ## Documentation
 

@@ -5,3 +5,6 @@
 .env
 .fastembed_cache/
 result
+
+# Python bytecode (bench tooling)
+__pycache__/

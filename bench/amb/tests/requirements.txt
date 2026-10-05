@@ -1,0 +1,6 @@
+# What the tests need on top of ../requirements.txt:
+#   uv pip install -r bench/amb/requirements.txt -r bench/amb/tests/requirements.txt
+# PyYAML parses the rendered Job; jsonschema validates it against the Kubernetes Job
+# schema when K8S_JOB_SCHEMA points at one (see test_k8s_runs.py).
+pyyaml>=6
+jsonschema>=4

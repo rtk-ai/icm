@@ -311,7 +311,7 @@ model = "intfloat/multilingual-e5-base"       # 768d, 100+ languages
 # model = "jinaai/jina-embeddings-v2-base-code"  # 768d
 ```
 
-Changing the model automatically migrates the vector index on next startup (existing embeddings are cleared). Regenerate with:
+The model that produced the stored vectors is recorded in the database and wins over the config file: editing `model` clears nothing. To change model, run `icm embed --migrate` (backup, new index, every memory re-embedded). Other uses of `icm embed`:
 
 ```bash
 icm embed                     # Embed all memories without embeddings
@@ -870,7 +870,7 @@ Le CLI fusionne automatiquement les summaries (concatenation avec ` | `). Le MCP
 
 ### Q6 : Puis-je changer de modele d'embedding sans perdre mes donnees ?
 
-**Oui.** Les souvenirs (texte) sont toujours conserves. Seuls les vecteurs sont effaces et recreees. Apres avoir change le modele dans `config.toml`, lancez `icm embed --force` pour regenerer tous les vecteurs.
+**Oui.** Les souvenirs (texte) sont toujours conserves, et les vecteurs aussi tant que vous ne migrez pas : le modele qui a produit les vecteurs est enregistre dans la base et prime sur `config.toml`. Pour changer de modele, lancez `icm embed --migrate` : il ecrit une sauvegarde, recree l'index a la nouvelle dimension et recalcule tous les vecteurs.
 
 ### Q7 : Combien de souvenirs ICM peut-il gerer ?
 

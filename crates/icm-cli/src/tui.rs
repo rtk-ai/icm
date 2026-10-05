@@ -46,6 +46,13 @@ const TAB_MEMOIRS: usize = 4;
 const TAB_GRAPH: usize = 5;
 const TAB_COUNT: usize = 6;
 
+/// Most nodes the Graph tab lays out and draws. The layout is O(n^2) and
+/// runs on the UI thread (measured: 300 nodes ~50ms, 3300 ~4s, 12500 ~50s
+/// of frozen terminal), and a braille canvas a few hundred cells wide
+/// can't show more than a few hundred distinct points anyway. Past this
+/// the tab shows the highest-weight memories and says so in its title.
+const GRAPH_MAX_NODES: usize = 500;
+
 /// Confirmation dialog state
 #[derive(Clone)]
 enum Confirm {
@@ -115,6 +122,9 @@ struct App<'a> {
 struct GraphViewState {
     loaded: bool,
     nodes: Vec<Memory>,
+    /// Memories in the store, of which `nodes` is the top
+    /// [`GRAPH_MAX_NODES`] by weight.
+    total: usize,
     /// `edges.0`/`edges.1` are indices into `nodes`.
     edges: Vec<(usize, usize)>,
     /// Force-directed position per node index, roughly in `[-1.0, 1.0]`.
@@ -249,12 +259,14 @@ impl<'a> App<'a> {
             self.load_topic_memories(store);
         }
 
-        // The graph is a full-store scan (see load_graph's doc comment) —
-        // only pay to recompute it if the Graph tab is actually open, not
-        // on every 30s auto-refresh tick regardless of which tab is active.
-        if self.tab == TAB_GRAPH {
+        // The graph is a full-store scan plus a layout (see load_graph's doc
+        // comment), and this runs on the 30s auto-refresh tick too. So never
+        // rebuild it here: mark it stale and let the next entry into the
+        // Graph tab reload it. While the tab is on screen it stays as is —
+        // `r` reloads it explicitly (see the key handler) — rather than
+        // freezing and redrawing under the user every 30 seconds.
+        if self.tab != TAB_GRAPH {
             self.graph.loaded = false;
-            self.load_graph(store);
         }
 
         if !failed.is_empty() {
@@ -290,14 +302,21 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Load every memory and its `related_ids` links, then run the
-    /// force-directed layout once. Idempotent — call `graph.loaded = false`
-    /// first (e.g. on `r` refresh) to force a reload.
+    /// Load the top [`GRAPH_MAX_NODES`] memories by weight and the
+    /// `related_ids` links between them, then run the force-directed layout
+    /// once. Idempotent — call `graph.loaded = false` first (e.g. on `r`
+    /// refresh) to force a reload. A reload keeps the user's zoom, pan and
+    /// selected memory.
     fn load_graph(&mut self, store: &Store) {
         if self.graph.loaded {
             return;
         }
-        let nodes = store.list_all().unwrap_or_default();
+        let mut nodes = store.list_all().unwrap_or_default();
+        let total = nodes.len();
+        // Sorted here rather than relying on list_all's order, which is a
+        // per-backend detail.
+        nodes.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+        nodes.truncate(GRAPH_MAX_NODES);
 
         let index_of: std::collections::HashMap<&str, usize> = nodes
             .iter()
@@ -331,14 +350,21 @@ impl<'a> App<'a> {
             .map(|id| positions_by_id.get(id).copied().unwrap_or((0.0, 0.0)))
             .collect();
 
+        let selected = self
+            .graph
+            .nodes
+            .get(self.graph.selected)
+            .and_then(|prev| nodes.iter().position(|m| m.id == prev.id))
+            .unwrap_or(0);
         self.graph = GraphViewState {
             loaded: true,
             nodes,
+            total,
             edges,
             positions,
-            selected: 0,
-            zoom: 1.0,
-            pan: (0.0, 0.0),
+            selected,
+            zoom: self.graph.zoom,
+            pan: self.graph.pan,
         };
     }
 
@@ -701,6 +727,10 @@ fn run_loop(
                     // Refresh
                     KeyCode::Char('r') => {
                         app.refresh(store, db_path);
+                        if app.tab == TAB_GRAPH {
+                            app.graph.loaded = false;
+                            app.load_graph(store);
+                        }
                         app.set_status("Refreshed", Color::Green);
                     }
                     // === Actions ===
@@ -1360,9 +1390,10 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
 
     // Bounds shrink as zoom increases (zoom in = smaller window onto the
-    // same [-1.4, 1.4]-ish layout space); positions are pre-normalized by
-    // compute_force_layout to roughly [-1.0, 1.0], so a fixed 1.4 base
-    // half-extent gives nodes some breathing room at zoom = 1.0.
+    // same [-1.4, 1.4] layout space); positions are normalized by
+    // compute_force_layout to exactly fit [-1.0, 1.0], so a fixed 1.4 base
+    // half-extent shows the whole graph with some breathing room at
+    // zoom = 1.0.
     let half_extent = 1.4 / app.graph.zoom;
     let (pan_x, pan_y) = app.graph.pan;
 
@@ -1388,13 +1419,18 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
     let positions = &app.graph.positions;
     let node_count = app.graph.nodes.len();
     let edge_count = edges.len();
+    let shown = if app.graph.total > node_count {
+        format!("top {node_count} of {} memories by weight", app.graph.total)
+    } else {
+        format!("{node_count} memories")
+    };
 
     let canvas = Canvas::default()
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " Graph -- {node_count} memories, {edge_count} links (zoom {:.1}x) ",
+                    " Graph -- {shown}, {edge_count} links (zoom {:.1}x) ",
                     app.graph.zoom
                 ))
                 .title_style(Style::default().fg(Color::Yellow).bold()),
@@ -2026,6 +2062,79 @@ mod tests {
             2,
             "refresh() must reload the open topic's memories, not just stats/topics/health"
         );
+    }
+
+    /// The Graph tab must stay usable on a store far larger than a terminal
+    /// can draw: it lays out at most GRAPH_MAX_NODES memories (the heaviest
+    /// ones), every one of them inside the window the canvas shows at
+    /// zoom 1.0, and it reports the real total.
+    #[test]
+    fn graph_tab_caps_nodes_to_the_heaviest_and_keeps_them_in_view() {
+        let store = Store::in_memory().unwrap();
+        let extra = 20;
+        for i in 0..GRAPH_MAX_NODES + extra {
+            let mut m = Memory::new("t".into(), format!("m{i}"), Importance::Medium);
+            // The first `extra` stored are the lightest: they must be the
+            // ones left out.
+            m.weight = if i < extra { 0.1 } else { 0.9 };
+            store.store(m).unwrap();
+        }
+        let mut app = App::new(&store, None, None).unwrap();
+        app.load_graph(&store);
+
+        assert_eq!(app.graph.total, GRAPH_MAX_NODES + extra);
+        assert_eq!(app.graph.nodes.len(), GRAPH_MAX_NODES);
+        assert!(app.graph.nodes.iter().all(|m| m.weight > 0.5));
+        assert_eq!(app.graph.positions.len(), GRAPH_MAX_NODES);
+        assert!(
+            app.graph
+                .positions
+                .iter()
+                .all(|p| p.0.abs() <= 1.0 + 1e-9 && p.1.abs() <= 1.0 + 1e-9),
+            "every node must fall inside the [-1.4, 1.4] window drawn at zoom 1.0"
+        );
+    }
+
+    /// The 30s auto-refresh used to rebuild the graph (a full-store scan
+    /// plus an O(n^2) layout) while the tab was open, resetting zoom and
+    /// selection each time. refresh() must leave an on-screen graph alone,
+    /// and an explicit reload must keep the user's view.
+    #[test]
+    fn refresh_leaves_the_open_graph_alone_and_reload_keeps_the_view() {
+        let store = Store::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new("t".into(), format!("m{i}"), Importance::Medium))
+                .unwrap();
+        }
+        let mut app = App::new(&store, None, None).unwrap();
+        app.tab = TAB_GRAPH;
+        app.load_graph(&store);
+        app.graph.zoom = 2.5;
+        app.graph.selected = 3;
+        let selected_id = app.graph.nodes[3].id.clone();
+
+        store
+            .store(Memory::new("t".into(), "new".into(), Importance::Medium))
+            .unwrap();
+        app.refresh(&store, None);
+        assert!(
+            app.graph.loaded,
+            "refresh() must not invalidate the open graph"
+        );
+        assert_eq!(app.graph.nodes.len(), 5);
+
+        // What the `r` key does on the Graph tab.
+        app.graph.loaded = false;
+        app.load_graph(&store);
+        assert_eq!(app.graph.nodes.len(), 6);
+        assert_eq!(app.graph.zoom, 2.5);
+        assert_eq!(app.graph.nodes[app.graph.selected].id, selected_id);
+
+        // Off the tab, refresh() marks it stale so the next visit reloads.
+        app.tab = TAB_OVERVIEW;
+        app.refresh(&store, None);
+        assert!(!app.graph.loaded);
     }
 
     /// Audit regression: deleting a memory selected from the Search overlay

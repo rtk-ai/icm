@@ -728,18 +728,36 @@ async fn api_memories_search(
 /// edge data; this endpoint is the first thing that actually exposes it —
 /// previously it only fed `main.rs`'s one-hop "graph-aware expansion"
 /// during recall, with no way to see the graph itself.
+///
+/// The layout is CPU-bound and, unfiltered on a large store, takes seconds
+/// (see `compute_force_layout_3d`). So it runs on the blocking pool, not on
+/// an async worker, and the store lock is released as soon as the rows are
+/// read: holding it across the layout froze every other endpoint for the
+/// whole computation (measured: `/api/stats` waited 16.8s behind one
+/// unfiltered `/api/graph` on a 12.5k-memory store).
 async fn api_graph(
     State(state): State<AppState>,
     Query(params): Query<GraphParams>,
 ) -> impl IntoResponse {
-    let store = lock_store(&state);
-    let memories = match &params.topic {
-        Some(t) => store.get_by_topic(t),
-        None => store.list_all(),
-    };
-    match memories {
-        Ok(m) => Json(build_graph_response(&m)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let built = tokio::task::spawn_blocking(move || {
+        let memories = {
+            let store = lock_store(&state);
+            match &params.topic {
+                Some(t) => store.get_by_topic(t),
+                None => store.list_all(),
+            }
+        };
+        memories.map(|m| build_graph_response(&m))
+    })
+    .await;
+    match built {
+        Ok(Ok(graph)) => Json(graph).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("graph layout task failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -1095,6 +1113,54 @@ mod tests {
         // Neither header: a non-browser client (curl/scripts) using Basic
         // Auth directly, not a forged browser request — allowed.
         assert!(is_same_origin(&req(None, None)));
+    }
+
+    /// `/api/graph` end to end through the router: auth, the blocking-pool
+    /// hop, and the JSON shape the dashboard reads. Also pins that the
+    /// handler leaves the store lock free once it has answered (it used to
+    /// hold the guard across the whole layout).
+    #[tokio::test]
+    async fn api_graph_returns_laid_out_nodes_and_releases_the_store_lock() {
+        let state = test_state();
+        {
+            let store = lock_store(&state);
+            for (topic, summary) in [("t1", "alpha"), ("t1", "beta"), ("t2", "gamma")] {
+                store
+                    .store(icm_core::Memory::new(
+                        topic.into(),
+                        summary.into(),
+                        Importance::Medium,
+                    ))
+                    .unwrap();
+            }
+        }
+        let app = build_app(state.clone());
+        let get = |path: &str| {
+            Request::builder()
+                .uri(path)
+                // admin:secret
+                .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        for (path, expected_nodes) in [("/api/graph", 3), ("/api/graph?topic=t1", 2)] {
+            let res = app.clone().oneshot(get(path)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let nodes = json["nodes"].as_array().unwrap();
+            assert_eq!(nodes.len(), expected_nodes, "{path}");
+            assert!(nodes
+                .iter()
+                .all(|n| n["x"].is_f64() && n["y"].is_f64() && n["z"].is_f64()));
+        }
+        assert!(
+            state.store.try_lock().is_ok(),
+            "store lock must be free after the request"
+        );
     }
 
     fn mem(topic: &str, summary: &str, imp: Importance, related: &[&str]) -> icm_core::Memory {

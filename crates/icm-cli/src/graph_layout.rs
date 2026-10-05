@@ -10,15 +10,18 @@ use std::collections::HashMap;
 
 /// Compute 2D positions for `ids` from a deterministic circular start.
 ///
-/// `edges` are index pairs into `ids`. Returned coordinates settle to
-/// roughly `[-1.0, 1.0]` on both axes after `iterations` steps. Starting
-/// from a fixed circular layout (rather than random jitter) means
-/// re-entering the view without new data reproduces the same picture.
+/// `edges` are index pairs into `ids`. Returned coordinates are rescaled to
+/// fit `[-1.0, 1.0]` on both axes (see [`normalize_to_unit_square`]): the
+/// raw equilibrium extent grows with node count and shrinks with edge
+/// density, so it can't be assumed. Starting from a fixed circular layout
+/// (rather than random jitter) means re-entering the view without new data
+/// reproduces the same picture.
 ///
-/// Perf: this is O(n^2 * iterations) for the repulsion pass. A few hundred
-/// nodes at 200 iterations is sub-millisecond; a few thousand nodes is low
-/// hundreds of milliseconds — fine as a one-shot cost when the view is
-/// opened, not something to run every frame.
+/// Perf: this is O(n^2 * iterations) for the repulsion pass. Measured at
+/// 200 iterations in a release build: 300 nodes ~50ms, 3300 nodes ~4s,
+/// 12500 nodes ~50s. Callers must cap the node count (the TUI does, see
+/// `GRAPH_MAX_NODES` in tui.rs) — it is a one-shot cost when the view is
+/// opened, not something to run on a whole large store or every frame.
 #[cfg(feature = "tui")]
 pub fn compute_force_layout(
     ids: &[String],
@@ -106,7 +109,39 @@ pub fn compute_force_layout(
         alpha *= 1.0 - ALPHA_DECAY;
     }
 
+    normalize_to_unit_square(&mut pos);
     ids.iter().cloned().zip(pos).collect()
+}
+
+/// Recenter `pos` on its bounding box and scale it uniformly (same factor
+/// on both axes, so shapes aren't distorted) so the larger side spans
+/// exactly `[-1.0, 1.0]`.
+///
+/// The simulation has no fixed scale: a sparse graph (most real stores —
+/// the bulk of memories have no `related_ids` at all) is dominated by
+/// repulsion and spreads to tens or hundreds of units, while a dense one
+/// stays within a couple. The TUI draws a fixed window around the origin,
+/// so without this a sparse graph rendered as one or two dots with every
+/// other node off-screen.
+#[cfg(feature = "tui")]
+fn normalize_to_unit_square(pos: &mut [(f64, f64)]) {
+    let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in pos.iter() {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let half_extent = ((max_x - min_x) / 2.0).max((max_y - min_y) / 2.0);
+    if !half_extent.is_finite() || half_extent <= 0.0 {
+        return;
+    }
+    let (center_x, center_y) = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
+    for p in pos.iter_mut() {
+        p.0 = (p.0 - center_x) / half_extent;
+        p.1 = (p.1 - center_y) / half_extent;
+    }
 }
 
 /// 3D counterpart of [`compute_force_layout`], used by the web dashboard's
@@ -154,8 +189,8 @@ pub fn compute_force_layout(
 /// doesn't compact it) had anything real to work with.
 ///
 /// The third attempt (this one) makes repulsion cluster-local (skip pairs
-/// from different topics entirely — see the `cluster_of(i) != cluster_of(j)`
-/// check below), so topics stop fighting each other into one shared
+/// from different topics entirely — see the per-cluster `members` loop
+/// below), so topics stop fighting each other into one shared
 /// shell and each settles into its own locally-repelled blob. Cross-topic
 /// edges (a real link between two different-topic memories) still apply
 /// their spring regardless of cluster — that's real information, not
@@ -181,6 +216,21 @@ pub fn compute_force_layout_3d(
     edges: &[(usize, usize)],
     clusters: &[usize],
     iterations: usize,
+) -> HashMap<String, (f64, f64, f64)> {
+    let max_workers = std::thread::available_parallelism().map_or(1, |p| p.get());
+    layout_3d(ids, edges, clusters, iterations, max_workers)
+}
+
+/// [`compute_force_layout_3d`] with the thread budget passed in rather than
+/// read from the machine, so a test can check the result is the same
+/// whatever the split.
+#[cfg(feature = "web")]
+fn layout_3d(
+    ids: &[String],
+    edges: &[(usize, usize)],
+    clusters: &[usize],
+    iterations: usize,
+    max_workers: usize,
 ) -> HashMap<String, (f64, f64, f64)> {
     let n = ids.len();
     if n == 0 {
@@ -273,36 +323,112 @@ pub fn compute_force_layout_3d(
             .collect()
     };
 
+    // Node indices grouped by cluster, each group in ascending index order.
+    // Repulsion only acts within a topic (see `repulsion_on`), so each
+    // node only ever needs its own cluster's members — not a scan of all
+    // n^2 pairs that skips the cross-topic ones, which on a 12.5k-memory,
+    // 117-topic store was ~78M pair checks per iteration for ~8M that
+    // actually apply.
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); cluster_count];
+    for i in 0..n {
+        members[cluster_of(i)].push(i);
+    }
+
+    // Net repulsion on node `i` from every other member of its own cluster.
+    //
+    // Repulsion only within a topic: unrestricted repulsion is
+    // pairwise-antisymmetric, so summed over a whole cluster it nets to
+    // zero on that cluster's centroid — it can only spread a cluster's own
+    // members apart, never move the cluster as a whole. Restricting it is
+    // what lets the anchor pull below actually place each topic, instead
+    // of fighting an opponent it can't win against once every node repels
+    // every other node.
+    //
+    // Computed per node (reading positions, writing nothing shared) rather
+    // than per pair with `force[i] += f; force[j] -= f`: that visits each
+    // pair twice, but it is what lets rows be spread across threads below.
+    fn repulsion_on(i: usize, group: &[usize], pos: &[(f64, f64, f64)]) -> (f64, f64, f64) {
+        let mut sum = (0.0_f64, 0.0_f64, 0.0_f64);
+        for &j in group {
+            if j == i {
+                continue;
+            }
+            let dx = pos[i].0 - pos[j].0;
+            let dy = pos[i].1 - pos[j].1;
+            let dz = pos[i].2 - pos[j].2;
+            let dist_sq = (dx * dx + dy * dy + dz * dz).max(MIN_DIST * MIN_DIST);
+            let dist = dist_sq.sqrt();
+            let scale = (REPULSION / dist_sq).min(MAX_FORCE) / dist;
+            sum.0 += scale * dx;
+            sum.1 += scale * dy;
+            sum.2 += scale * dz;
+        }
+        sum
+    }
+
+    // Repulsion is the whole cost of this function: O(sum of cluster
+    // size^2) per iteration, and one dominant topic (thousands of
+    // memories is real) makes that tens of millions of pairs. Measured on
+    // a real 12.5k-memory store, single-threaded, it took ~19s per
+    // request. Rows are independent, so above a size where it pays for
+    // the per-iteration thread spawns, split them across cores. The
+    // result does not depend on the split: each row sums the same terms
+    // in the same order whichever thread runs it.
+    const PARALLEL_MIN_COST: usize = 1_000_000;
+    let total_cost: usize = members.iter().map(|g| g.len() * g.len()).sum();
+    let workers = if total_cost < PARALLEL_MIN_COST {
+        1
+    } else {
+        max_workers.max(1)
+    };
+    // Nodes in cluster order, cut into at most `workers` runs of roughly
+    // equal cost (a node's row costs its cluster's size), so one thread
+    // doesn't end up holding the whole dominant topic.
+    let cost_per_chunk = total_cost.div_ceil(workers).max(1);
+    let mut chunks: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut chunk_cost = 0;
+    for group in &members {
+        for &i in group {
+            if chunk_cost >= cost_per_chunk && chunks.len() < workers {
+                chunks.push(Vec::new());
+                chunk_cost = 0;
+            }
+            let last = chunks.len() - 1;
+            chunks[last].push(i);
+            chunk_cost += group.len();
+        }
+    }
+
     for _ in 0..iterations {
         let mut force = vec![(0.0_f64, 0.0_f64, 0.0_f64); n];
 
-        for i in 0..n {
-            for j in (i + 1)..n {
-                // Repulsion only within a topic: unrestricted repulsion
-                // is pairwise-antisymmetric, so summed over a whole
-                // cluster it nets to zero on that cluster's centroid — it
-                // can only spread a cluster's own members apart, never
-                // move the cluster as a whole. Restricting it here is
-                // what lets the anchor pull below actually place each
-                // topic, instead of fighting an opponent it can't win
-                // against once every node repels every other node.
-                if cluster_of(i) != cluster_of(j) {
-                    continue;
-                }
-                let dx = pos[i].0 - pos[j].0;
-                let dy = pos[i].1 - pos[j].1;
-                let dz = pos[i].2 - pos[j].2;
-                let dist_sq = (dx * dx + dy * dy + dz * dz).max(MIN_DIST * MIN_DIST);
-                let dist = dist_sq.sqrt();
-                let f = (REPULSION / dist_sq).min(MAX_FORCE);
-                let (fx, fy, fz) = (f * dx / dist, f * dy / dist, f * dz / dist);
-                force[i].0 += fx;
-                force[i].1 += fy;
-                force[i].2 += fz;
-                force[j].0 -= fx;
-                force[j].1 -= fy;
-                force[j].2 -= fz;
+        let rows = |chunk: &[usize]| -> Vec<(f64, f64, f64)> {
+            chunk
+                .iter()
+                .map(|&i| repulsion_on(i, &members[cluster_of(i)], &pos))
+                .collect()
+        };
+        if chunks.len() == 1 {
+            for (&i, f) in chunks[0].iter().zip(rows(&chunks[0])) {
+                force[i] = f;
             }
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .map(|chunk| scope.spawn(|| rows(chunk)))
+                    .collect();
+                for (chunk, handle) in chunks.iter().zip(handles) {
+                    match handle.join() {
+                        Ok(computed) => {
+                            for (&i, f) in chunk.iter().zip(computed) {
+                                force[i] = f;
+                            }
+                        }
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    }
+                }
+            });
         }
 
         for &(a, b) in edges {
@@ -396,6 +522,31 @@ mod tests_2d {
         let pos = compute_force_layout(&ids, &[(0, 99)], 10);
         assert_eq!(pos.len(), 2);
     }
+
+    /// Regression: the raw simulation has no fixed scale. A sparse graph
+    /// (few edges, like most real stores) spread to tens of units, so the
+    /// TUI's fixed window around the origin showed 0-2 nodes out of
+    /// hundreds. Whatever the density, the result must fill — and stay
+    /// inside — the unit square the TUI draws.
+    #[test]
+    fn sparse_and_dense_graphs_both_fill_the_unit_square() {
+        let ids: Vec<String> = (0..300).map(|i| i.to_string()).collect();
+        let sparse: Vec<(usize, usize)> = (0..30).map(|i| (i, (i * 7 + 3) % 300)).collect();
+        let dense: Vec<(usize, usize)> = (0..300)
+            .flat_map(|i| (1..6).map(move |k| (i, (i + k) % 300)))
+            .collect();
+        for (name, edges) in [("no edges", vec![]), ("sparse", sparse), ("dense", dense)] {
+            let pos = compute_force_layout(&ids, &edges, 200);
+            let extent = pos
+                .values()
+                .map(|p| p.0.abs().max(p.1.abs()))
+                .fold(0.0, f64::max);
+            assert!(
+                (extent - 1.0).abs() < 1e-9,
+                "{name}: expected the layout to span exactly [-1, 1], got max |coord| {extent}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "web"))]
@@ -485,5 +636,55 @@ mod tests_3d {
             same_cluster < cross_cluster,
             "expected same-topic nodes closer together: same={same_cluster} cross={cross_cluster}"
         );
+    }
+
+    /// Cluster indices arrive interleaved in real data (memories are listed
+    /// by weight, not grouped by topic), so the per-cluster grouping must
+    /// not assume contiguous runs: nodes sharing a topic still end up
+    /// together, and nodes in different topics on separate anchors.
+    #[test]
+    fn compute_force_layout_3d_groups_interleaved_cluster_indices() {
+        let ids: Vec<String> = (0..6).map(|i| format!("n{i}")).collect();
+        let pos = compute_force_layout_3d(&ids, &[], &[0, 1, 0, 1, 0, 1], 300);
+        let dist = |a: &str, b: &str| {
+            let (p, q) = (pos[a], pos[b]);
+            ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2)).sqrt()
+        };
+        for (same, other) in [("n2", "n1"), ("n4", "n3"), ("n2", "n5")] {
+            assert!(
+                dist("n0", same) < dist("n0", other),
+                "n0 must be closer to same-topic {same} than to other-topic {other}"
+            );
+        }
+        // Same-topic nodes repel each other; they must not collapse onto
+        // one point.
+        assert!(dist("n0", "n2") > 0.05);
+    }
+
+    /// Large clusters are laid out across threads. The split must not
+    /// change the result: a graph big enough to take the threaded path
+    /// (one dominant topic plus small ones, some cross-topic links) has to
+    /// come out bit-for-bit identical on 1, 2 and 7 workers.
+    #[test]
+    fn layout_3d_result_does_not_depend_on_the_worker_count() {
+        let n = 1300;
+        let ids: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        let clusters: Vec<usize> = (0..n)
+            .map(|i| if i % 13 == 0 { 1 + i % 3 } else { 0 })
+            .collect();
+        let edges: Vec<(usize, usize)> = (0..200).map(|i| (i, (i * 31 + 7) % n)).collect();
+
+        let single = layout_3d(&ids, &edges, &clusters, 2, 1);
+        assert_eq!(single.len(), n);
+        assert!(single
+            .values()
+            .all(|p| p.0.is_finite() && p.1.is_finite() && p.2.is_finite()));
+        for workers in [2, 7] {
+            assert_eq!(
+                layout_3d(&ids, &edges, &clusters, 2, workers),
+                single,
+                "layout differs with {workers} workers"
+            );
+        }
     }
 }

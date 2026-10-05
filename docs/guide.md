@@ -75,7 +75,14 @@ icm store -t "credentials" -c "Production DB is on port 5433, not 5432" -i criti
 icm recall "API design choices"
 icm recall "nginx" --topic "errors-resolved"
 icm recall "database" --keyword "postgres"
+
+# As many of the best matches as fit in 2000 tokens of output
+icm recall "deploy pipeline" --max-tokens 2000
 ```
+
+**Recall engine.** Recall ranks with the v2 engine: a full-text arm (BM25), a vector arm when embeddings are enabled, and a date arm when the query names a period ("last week", "in March 2024"), fused by rank; `--topic`, `--keyword` and `--project` are applied before results are cut. `--limit` cuts by count (default 5). `--max-tokens N` cuts by a token budget instead, estimated at four characters per token on the output format you chose, with `--limit` as a ceiling on the count.
+
+The engine before v2 is still available, to roll back or to compare: `icm recall --engine legacy`, or `ICM_RECALL_ENGINE=legacy` in the environment (this also switches the MCP tool, the HTTP API and the prompt hook). It has no token budget: `--max-tokens` with `legacy` is an error.
 
 **Importance levels:**
 
@@ -220,6 +227,8 @@ icm recall-context "authentication" --limit 20
 
 Returns a formatted block ready for prompt prepending. Used by the SessionStart hook for automatic context loading.
 
+The prompt hook runs the same search on every message, on the default recall engine with keywords only: it never loads the embedding model and never writes to the database. `ICM_RECALL_ENGINE=legacy` switches it back to the previous search.
+
 ## Embedding Configuration
 
 Default: multilingual embeddings for semantic search across 100+ languages.
@@ -263,7 +272,7 @@ icm embed --topic "decisions" # Only one topic
 | Tool | What it does |
 |------|-------------|
 | `icm_memory_store` | Store a memory. Auto-dedup: >85% similar in same topic → update. Warns at >7 entries. |
-| `icm_memory_recall` | Search by query. Filters: `topic`, `keyword`, `limit`. Auto-decay if >24h. |
+| `icm_memory_recall` | Search by query. Filters: `topic`, `keyword`, `project`, `limit` (1 to 20). `max_tokens` returns as many of the best matches as fit in a token budget instead. Auto-decay if >24h. |
 | `icm_memory_update` | Edit content, importance, or keywords of an existing memory by ID. |
 | `icm_memory_forget` | Delete a memory by ID. |
 | `icm_memory_consolidate` | Replace all memories of a topic with a single summary. |

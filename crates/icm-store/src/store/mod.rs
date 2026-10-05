@@ -465,6 +465,7 @@ mod maintenance;
 mod memoir;
 mod memory;
 mod patterns;
+mod ranked;
 #[cfg(test)]
 mod tests;
 mod transcript;

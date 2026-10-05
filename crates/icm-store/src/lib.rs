@@ -29,6 +29,7 @@ compile_error!(
 
 mod backend;
 mod common;
+mod recall;
 
 #[cfg(feature = "backend-sqlite")]
 mod schema;
@@ -46,6 +47,10 @@ pub use common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow}
 
 // The runtime-dispatched store and the backend selector.
 pub use backend::{BackendKind, Store};
+
+// The v2 recall pipeline (rank fusion, token budget), shared by the HTTP,
+// MCP and CLI surfaces.
+pub use recall::{recall_v2, RecallEngine, RecallHit, RecallOutcome, RecallRequest};
 
 // Concrete backend types, exposed for direct use / tests.
 #[cfg(feature = "opensearch")]

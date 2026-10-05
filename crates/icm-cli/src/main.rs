@@ -164,6 +164,20 @@ enum Commands {
         /// human terminal reading. `json` emits a parseable array.
         #[arg(short = 'f', long, default_value = "toon")]
         format: recall_format::RecallFormat,
+
+        /// Token budget for the output (estimated at four characters per
+        /// token, measured on the chosen `--format`): results are cut by
+        /// budget instead of by count, up to `--limit`. Not available
+        /// with `--engine legacy`.
+        #[arg(long)]
+        max_tokens: Option<usize>,
+
+        /// Recall engine: `v2` (default: rank fusion over deep
+        /// candidates, filters applied before the cut) or `legacy` (the
+        /// engine before v2, to roll back or compare). Overrides
+        /// `$ICM_RECALL_ENGINE`.
+        #[arg(long)]
+        engine: Option<String>,
     },
 
     /// List memories
@@ -2465,21 +2479,40 @@ fn main() -> Result<()> {
             keyword,
             project,
             format,
+            max_tokens,
+            engine,
         } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
-            cmd_recall(
-                &store,
-                emb_ref,
-                &query,
-                topic.as_deref(),
-                limit,
-                keyword.as_deref(),
-                project.as_deref(),
-                format,
-            )
+            match icm_store::RecallEngine::resolve(engine.as_deref(), max_tokens.is_some())? {
+                icm_store::RecallEngine::V2 => cmd_recall_v2(
+                    &store,
+                    emb_ref,
+                    &icm_store::RecallRequest {
+                        query: &query,
+                        limit,
+                        max_tokens,
+                        topic: topic.as_deref(),
+                        keyword: keyword.as_deref(),
+                        project: project.as_deref(),
+                        now: None,
+                        expand_neighbors: true,
+                    },
+                    format,
+                ),
+                icm_store::RecallEngine::Legacy => cmd_recall(
+                    &store,
+                    emb_ref,
+                    &query,
+                    topic.as_deref(),
+                    limit,
+                    keyword.as_deref(),
+                    project.as_deref(),
+                    format,
+                ),
+            }
         }
         Commands::List {
             topic,
@@ -3439,6 +3472,101 @@ fn cmd_recall(
     let rendered = recall_format::render(&final_results, format)?;
     print!("{rendered}");
     Ok(())
+}
+
+/// `icm recall` on the v2 engine, the default: ranking, filters, budget
+/// cut and access bookkeeping all live in the `icm_store` recall pipeline;
+/// this only renders, with the same output contract as [`cmd_recall`].
+fn cmd_recall_v2(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    request: &icm_store::RecallRequest<'_>,
+    format: recall_format::RecallFormat,
+) -> Result<()> {
+    print!("{}", render_recall_v2(store, embedder, request, format)?);
+    Ok(())
+}
+
+fn render_recall_v2(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    request: &icm_store::RecallRequest<'_>,
+    format: recall_format::RecallFormat,
+) -> Result<String> {
+    // Same shape as the legacy path: a score only when an embedder took
+    // part in the ranking (a keyword-only ranking has no similarity to
+    // report), and a blank query finds nothing instead of failing.
+    let with_score = embedder.is_some();
+    let results: Vec<(Memory, Option<f32>)> = if request.query.trim().is_empty() {
+        Vec::new()
+    } else {
+        // The budget is spent on what `format` prints: its header once,
+        // then each memory as rendered.
+        let mut request = *request;
+        request.max_tokens = request
+            .max_tokens
+            .map(|budget| budget.saturating_sub(recall_header_tokens(with_score, format)));
+        let outcome = request.run_with_cost(store, embedder, &|memory, score| {
+            rendered_recall_tokens(memory, with_score.then_some(score), format)
+        })?;
+        outcome
+            .hits
+            .into_iter()
+            .map(|hit| (hit.memory, with_score.then_some(hit.score)))
+            .collect()
+    };
+    // The detail renderer has no representation for "nothing": keep the
+    // human banner there, like the legacy path (audit #185 H8).
+    if results.is_empty() && matches!(format, recall_format::RecallFormat::Detail) {
+        return Ok(format!("{MSG_NO_MEMORIES}\n"));
+    }
+    recall_format::render(&results, format)
+}
+
+/// Estimated tokens one recalled memory takes once rendered in `format`,
+/// measured on the renderer's own output for that memory alone. This is
+/// what a recall token budget is spent on (CLI and HTTP).
+fn rendered_recall_tokens(
+    memory: &Memory,
+    score: Option<f32>,
+    format: recall_format::RecallFormat,
+) -> usize {
+    let one = [(memory.clone(), score)];
+    let Ok(body) = recall_format::render(&one, format) else {
+        // A memory that cannot be rendered must not fit in any budget.
+        return usize::MAX;
+    };
+    match format {
+        // The row without the header line, which is charged once (see
+        // `recall_header_tokens`).
+        recall_format::RecallFormat::Toon => {
+            let rows = body
+                .split_once('\n')
+                .map_or(body.as_str(), |(_, rows)| rows);
+            icm_core::estimate_tokens(rows)
+        }
+        // Entries are concatenated; one more character covers the
+        // separator a longer list puts between two of them.
+        _ => (body.chars().count() + 1).div_ceil(4),
+    }
+}
+
+/// Estimated tokens of what `format` prints once per response, however
+/// many memories follow: the TOON header line, read off the renderer.
+fn recall_header_tokens(with_score: bool, format: recall_format::RecallFormat) -> usize {
+    if !matches!(format, recall_format::RecallFormat::Toon) {
+        return 0;
+    }
+    let probe = [(
+        Memory::new(String::new(), String::new(), Importance::Low),
+        with_score.then_some(0.0),
+    )];
+    let header_chars = recall_format::render(&probe, format)
+        .ok()
+        .and_then(|body| body.split_once('\n').map(|(h, _)| h.chars().count()))
+        .unwrap_or(0);
+    // The newline, and two more digits for a three-digit row count.
+    (header_chars + 3).div_ceil(4)
 }
 
 fn cmd_list(
@@ -16166,5 +16294,209 @@ mod embedding_guard_tests {
             lines[0],
             "Embeddings: 1 / 2 memories, model fake/64, 64 dims."
         );
+    }
+}
+
+#[cfg(test)]
+mod cmd_recall_v2_tests {
+    //! `icm recall` on the default (v2) engine: thin wiring over the
+    //! `icm_store` recall pipeline, rendered like the legacy path.
+    use super::*;
+
+    fn store_with(n: usize) -> Store {
+        let store = Store::in_memory().unwrap();
+        for i in 0..n {
+            // ~50 tokens each at four characters per token.
+            let filler = "x".repeat(170);
+            store
+                .store(Memory::new(
+                    "deploys".into(),
+                    format!("deploy checklist item {i:02} {filler}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        store
+    }
+
+    fn request<'a>(
+        query: &'a str,
+        limit: usize,
+        max_tokens: Option<usize>,
+    ) -> icm_store::RecallRequest<'a> {
+        icm_store::RecallRequest {
+            query,
+            limit,
+            max_tokens,
+            topic: None,
+            keyword: None,
+            project: None,
+            now: None,
+            expand_neighbors: true,
+        }
+    }
+
+    fn json_len(rendered: &str) -> usize {
+        serde_json::from_str::<Value>(rendered)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn recall_flags_parse_and_default_to_absent() {
+        let cli = Cli::try_parse_from(["icm", "recall", "q"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Recall {
+                max_tokens: None,
+                engine: None,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "icm",
+            "recall",
+            "q",
+            "--max-tokens",
+            "2000",
+            "--engine",
+            "v2",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Recall {
+                max_tokens, engine, ..
+            } => {
+                assert_eq!(max_tokens, Some(2000));
+                assert_eq!(engine.as_deref(), Some("v2"));
+            }
+            _ => panic!("expected recall"),
+        }
+    }
+
+    #[test]
+    fn v2_cuts_by_token_budget_instead_of_count() {
+        let store = store_with(30);
+        let by_count = render_recall_v2(
+            &store,
+            None,
+            &request("deploy checklist", 20, None),
+            recall_format::RecallFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(json_len(&by_count), 20);
+
+        let by_budget = render_recall_v2(
+            &store,
+            None,
+            &request("deploy checklist", 20, Some(200)),
+            recall_format::RecallFormat::Json,
+        )
+        .unwrap();
+        let kept = json_len(&by_budget);
+        assert!((1..20).contains(&kept), "a 200-token budget kept {kept}");
+    }
+
+    #[test]
+    fn v2_empty_result_keeps_each_format_contract() {
+        let store = store_with(2);
+        let req = request("zzzunmatched", 5, None);
+        let json = render_recall_v2(&store, None, &req, recall_format::RecallFormat::Json).unwrap();
+        assert_eq!(json_len(&json), 0);
+        let detail =
+            render_recall_v2(&store, None, &req, recall_format::RecallFormat::Detail).unwrap();
+        assert_eq!(detail.trim_end(), MSG_NO_MEMORIES);
+    }
+
+    /// The budget is spent on the output in the chosen format, header
+    /// included: whatever `--format` is, the output fits, and the cheap
+    /// formats are filled rather than charged the price of the largest.
+    #[test]
+    fn v2_budget_is_measured_on_the_rendered_format() {
+        let store = store_with(30);
+        for format in [
+            recall_format::RecallFormat::Toon,
+            recall_format::RecallFormat::Detail,
+            recall_format::RecallFormat::Json,
+            recall_format::RecallFormat::Toml,
+        ] {
+            let budget = 1200;
+            let rendered = render_recall_v2(
+                &store,
+                None,
+                &request("deploy checklist", 200, Some(budget)),
+                format,
+            )
+            .unwrap();
+            let tokens = icm_core::estimate_tokens(&rendered);
+            let hits = rendered.matches("deploy checklist item").count();
+            assert!(
+                (2..30).contains(&hits) && tokens <= budget,
+                "{format:?}: {hits} hits, {tokens} tokens for a budget of {budget}"
+            );
+            assert!(
+                tokens * 100 >= budget * 85,
+                "{format:?}: only {tokens} of {budget} tokens used"
+            );
+        }
+    }
+
+    /// Same output shape as the legacy engine: a score only when an
+    /// embedder took part in the ranking.
+    #[test]
+    fn v2_shows_a_score_only_with_an_embedder() {
+        struct Flat;
+        impl icm_core::Embedder for Flat {
+            fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
+                Ok(vec![0.1; icm_core::DEFAULT_EMBEDDING_DIMS])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                icm_core::DEFAULT_EMBEDDING_DIMS
+            }
+        }
+        let store = store_with(3);
+        let req = request("deploy checklist", 5, None);
+
+        let toon = render_recall_v2(&store, None, &req, recall_format::RecallFormat::Toon).unwrap();
+        assert!(toon.starts_with("memories[3]{id,topic,importance,weight,summary}:\n"));
+        let json = render_recall_v2(&store, None, &req, recall_format::RecallFormat::Json).unwrap();
+        assert!(!json.contains("\"score\""));
+
+        let toon =
+            render_recall_v2(&store, Some(&Flat), &req, recall_format::RecallFormat::Toon).unwrap();
+        assert!(toon.starts_with("memories[3]{score,id,topic,importance,weight,summary}:\n"));
+    }
+
+    /// The legacy engine found nothing for a blank query; v2 must not turn
+    /// that into an error.
+    #[test]
+    fn v2_blank_query_renders_an_empty_result() {
+        let store = store_with(2);
+        let req = request("  ", 5, None);
+        let json = render_recall_v2(&store, None, &req, recall_format::RecallFormat::Json).unwrap();
+        assert_eq!(json_len(&json), 0);
+        let toon = render_recall_v2(&store, None, &req, recall_format::RecallFormat::Toon).unwrap();
+        assert!(toon.starts_with("memories[0]{"));
+    }
+
+    #[test]
+    fn v2_applies_topic_filter() {
+        let store = store_with(3);
+        store
+            .store(Memory::new(
+                "other".into(),
+                "deploy checklist for another topic".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        let mut req = request("deploy checklist", 10, None);
+        req.topic = Some("other");
+        let json = render_recall_v2(&store, None, &req, recall_format::RecallFormat::Json).unwrap();
+        assert_eq!(json_len(&json), 1);
     }
 }

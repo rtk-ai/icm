@@ -35,3 +35,24 @@ export async function verifyToken(token: string): Promise<boolean> {
 	const res = await fetch('/api/topics', { headers: { Authorization: `Basic ${token}` } });
 	return res.ok;
 }
+
+/** Where to send the user after login, from the `?redirect=` query value.
+ *
+ * That value comes straight from the URL, so anyone can craft a login link
+ * carrying it. Assigning it to `window.location.href` unchecked ran a
+ * `javascript:` URL in this page right after the credentials were stored
+ * (it could read them back out of sessionStorage), and sent the user to any
+ * external site. Only a location on this same origin is accepted; anything
+ * else falls back to the dashboard root. Resolving through `URL` rather
+ * than testing for a leading "/" also rejects "//host" and "/\host", which
+ * browsers treat as another origin. */
+export function safeRedirectTarget(raw: string | null, origin: string): string {
+	if (!raw) return '/';
+	try {
+		const url = new URL(raw, origin);
+		if (url.origin !== origin) return '/';
+		return `${url.pathname}${url.search}${url.hash}`;
+	} catch {
+		return '/';
+	}
+}

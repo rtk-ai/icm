@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { setCredentials, verifyToken, isLoggedIn } from '$lib/auth';
+	import { setCredentials, verifyToken, isLoggedIn, safeRedirectTarget } from '$lib/auth';
 
 	let username = $state('admin');
 	let password = $state('');
@@ -24,8 +24,10 @@
 				return;
 			}
 			setCredentials(username, password);
-			const redirect = new URLSearchParams(window.location.search).get('redirect') || '/';
-			window.location.href = redirect;
+			window.location.href = safeRedirectTarget(
+				new URLSearchParams(window.location.search).get('redirect'),
+				window.location.origin,
+			);
 		} catch {
 			error = 'Could not reach the ICM server.';
 		} finally {

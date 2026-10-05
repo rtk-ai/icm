@@ -1,0 +1,1 @@
+import{b as o}from"./DCsWAt0U.js";const e=o({current:null});function c(n){return new Promise(r=>{e.current={message:n,resolve:r}})}function s(n){var r;(r=e.current)==null||r.resolve(n),e.current=null}export{c as a,e as c,s as r};

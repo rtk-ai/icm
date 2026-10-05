@@ -101,6 +101,9 @@ struct App<'a> {
     /// Summarizer config (TOML / CLI override). Honored by the consolidate
     /// confirm path so TUI behavior stays consistent with the CLI.
     summarizer_cfg: crate::config::SummarizerConfig,
+    /// Why the config could not be loaded, if it could not. Consolidation is
+    /// refused while this is set.
+    summarizer_cfg_error: Option<String>,
     /// Manual-testing finding: the TUI's own consolidate action (`c` on the
     /// Topics/Health tab) built its merged Memory directly and never had
     /// an embedder available at all to attach one — a fourth independent
@@ -189,6 +192,7 @@ impl<'a> App<'a> {
             confirm: Confirm::None,
             status: None,
             summarizer_cfg: crate::config::SummarizerConfig::default(),
+            summarizer_cfg_error: None,
             embedder,
             graph: GraphViewState::new(),
         };
@@ -494,8 +498,12 @@ pub fn run_dashboard(
     // Read the summarizer block once at startup so the consolidate action in
     // the TUI honors the same config as the CLI. Errors are swallowed: the
     // default (provider = "none") preserves the historical lexical behavior.
-    if let Ok(cfg) = crate::config::load_config() {
-        app.summarizer_cfg = cfg.consolidate.summarizer;
+    match crate::config::load_config() {
+        Ok(cfg) => app.summarizer_cfg = cfg.consolidate.summarizer,
+        // Not swallowed into "provider = none": a broken config.toml would
+        // silently turn the consolidate action into a lexical join that
+        // deletes the originals. The action reports it instead.
+        Err(e) => app.summarizer_cfg_error = Some(e.to_string()),
     }
     run_loop(&mut terminal, &mut app, store, db_path)
     // `_guard` drops here (or at any earlier `?` above), restoring the
@@ -787,6 +795,56 @@ fn run_loop(
 }
 
 /// Execute a confirmed action
+/// One consolidation pass over a topic, per the `[consolidate.summarizer]`
+/// config and through the same engine as the CLI
+/// ([`crate::consolidate_in_passes`]): one pass per keypress, so the screen
+/// can say what is left.
+///
+/// With `provider = "none"` the text is the lexical join of what the pass
+/// covers (it used to be cut at 500 characters here, silently dropping
+/// every fact past the cut before the originals were deleted). With an LLM
+/// provider it is the provider's summary, and an `Err` when the provider
+/// fails or returns nothing: nothing is consolidated in that case.
+fn consolidate_one_pass(
+    app: &App,
+    store: &Store,
+    topic: &str,
+) -> anyhow::Result<crate::ConsolidationRun> {
+    if let Some(e) = &app.summarizer_cfg_error {
+        anyhow::bail!("config could not be loaded ({e})");
+    }
+    let cfg = &app.summarizer_cfg;
+    let resolved =
+        crate::summarizer::resolve(&cfg.provider, &cfg.model, cfg.api_options(), None, None)?;
+    let writer = if matches!(resolved.kind, crate::summarizer::ProviderKind::None) {
+        crate::PassWriter::Lexical
+    } else {
+        crate::PassWriter::Provider {
+            resolved: &resolved,
+            max_tokens: cfg.max_tokens,
+            timeout: Duration::from_secs(cfg.timeout_secs),
+        }
+    };
+    let mut build = |_covered: &[&icm_core::Memory], text: String| {
+        // The engine sets the importance: the highest of what the pass
+        // covers. It used to be `medium` whatever was replaced, which took
+        // a topic of `high` decisions out of the wake-up pack and made its
+        // only memory prunable.
+        let mut consolidated = icm_core::Memory::new(
+            topic.to_string(),
+            format!("[consolidated] {text}"),
+            icm_core::Importance::Medium,
+        );
+        if let Some(emb) = app.embedder {
+            if let Ok(v) = emb.embed(&consolidated.embed_text()) {
+                consolidated.embedding = Some(v);
+            }
+        }
+        consolidated
+    };
+    crate::consolidate_in_passes(store, topic, &writer, false, 1, &mut build)
+}
+
 fn execute_confirm(app: &mut App, store: &Store, db_path: Option<&str>) {
     let confirm = app.confirm.clone();
     app.confirm = Confirm::None;
@@ -816,81 +874,33 @@ fn execute_confirm(app: &mut App, store: &Store, db_path: Option<&str>) {
             Err(e) => app.set_status(format!("Error: {e}"), Color::Red),
         },
         Confirm::ConsolidateTopic { topic } => {
-            if let Ok(mems) = store.get_by_topic(&topic) {
-                if mems.len() < 2 {
-                    app.set_status("Need at least 2 memories to consolidate", Color::Yellow);
-                    return;
-                }
-                let summaries: Vec<&str> = mems.iter().map(|m| m.summary.as_str()).collect();
-
-                // Resolve provider: TUI honors the same config block as the CLI.
-                // `provider = "none"` (default) preserves the lexical concat path.
-                let cfg = &app.summarizer_cfg;
-                let kind = crate::summarizer::ProviderKind::parse(&cfg.provider)
-                    .unwrap_or(crate::summarizer::ProviderKind::None);
-                let resolved = match kind {
-                    crate::summarizer::ProviderKind::Auto => {
-                        crate::summarizer::detect_provider(crate::summarizer::ProviderKind::Claude)
-                    }
-                    other => other,
-                };
-
-                let combined = if matches!(resolved, crate::summarizer::ProviderKind::None) {
-                    let s = summaries.join(" | ");
-                    truncate(&s, 500).to_string()
-                } else {
-                    match crate::summarizer::make_summarizer(resolved) {
-                        Ok(provider) => {
-                            let prompt = crate::summarizer::build_consolidate_prompt(
-                                &topic,
-                                &summaries,
-                                cfg.max_tokens,
-                            );
-                            let req = crate::summarizer::SummarizeRequest {
-                                prompt: &prompt,
-                                model: if cfg.model.is_empty() {
-                                    None
-                                } else {
-                                    Some(cfg.model.as_str())
-                                },
-                                max_tokens: cfg.max_tokens,
-                                timeout: Duration::from_secs(cfg.timeout_secs),
-                            };
-                            match provider.summarize(&req) {
-                                Ok(out) if !out.trim().is_empty() => out,
-                                _ => {
-                                    let s = summaries.join(" | ");
-                                    truncate(&s, 500).to_string()
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            let s = summaries.join(" | ");
-                            truncate(&s, 500).to_string()
-                        }
-                    }
-                };
-
-                let mut consolidated = icm_core::Memory::new(
-                    topic.clone(),
-                    format!("[consolidated] {combined}"),
-                    icm_core::Importance::Medium,
-                );
-                if let Some(emb) = app.embedder {
-                    if let Ok(v) = emb.embed(&consolidated.embed_text()) {
-                        consolidated.embedding = Some(v);
-                    }
-                }
-                match store.consolidate_topic(&topic, consolidated) {
-                    Ok(()) => {
-                        app.set_status(
-                            format!("Consolidated {} ({} entries)", topic, mems.len()),
-                            Color::Green,
-                        );
-                        app.refresh(store, db_path);
-                        app.load_topic_memories(store);
-                    }
-                    Err(e) => app.set_status(format!("Error: {e}"), Color::Red),
+            // A summarizer that is configured but cannot answer (key not
+            // exported in this terminal, 429, timeout, typo in the config)
+            // leaves the topic alone; only the memories a pass covered are
+            // replaced by it.
+            match consolidate_one_pass(app, store, &topic) {
+                Err(e) => app.set_status(
+                    format!("Consolidation failed, nothing changed: {e}"),
+                    Color::Red,
+                ),
+                Ok(run) if run.passes == 0 => app.set_status(
+                    "Need at least 2 non-critical memories to consolidate",
+                    Color::Yellow,
+                ),
+                Ok(run) => {
+                    let status = if run.unfolded > 0 {
+                        format!(
+                            "Consolidated {topic}: {} of {} entries fit in one pass — press c \
+                             again for the rest",
+                            run.replaced,
+                            run.replaced + run.unfolded
+                        )
+                    } else {
+                        format!("Consolidated {} ({} entries)", topic, run.replaced)
+                    };
+                    app.set_status(status, Color::Green);
+                    app.refresh(store, db_path);
+                    app.load_topic_memories(store);
                 }
             }
         }
@@ -1672,7 +1682,11 @@ fn draw_confirm_overlay(f: &mut Frame, app: &App) {
                 .find(|(t, _)| t == topic)
                 .map(|(_, c)| *c)
                 .unwrap_or(0);
-            format!("Consolidate topic: {topic} ({count} entries -> 1)")
+            let how = match app.summarizer_cfg.provider.trim() {
+                "" | "none" | "off" | "disabled" => "lexical join, no LLM".to_string(),
+                provider => format!("via {provider}"),
+            };
+            format!("Consolidate topic: {topic} ({count} entries -> 1, {how})")
         }
         Confirm::PruneStale => "Prune all stale memories (weight < 0.1)?".to_string(),
         Confirm::DecayAll => "Apply decay (0.95) to all memories?".to_string(),
@@ -2257,5 +2271,245 @@ mod tests {
             memories[0].embedding.is_some(),
             "consolidated memory must have an embedding attached"
         );
+    }
+
+    /// A summarizer that is configured but fails must cost nothing: the
+    /// consolidate action used to fall back to a join cut at 500 characters
+    /// and delete the originals, under a green "Consolidated" status. The
+    /// provider here fails before any network (its key variable is unset).
+    #[test]
+    fn consolidate_action_keeps_the_originals_when_the_summarizer_fails() {
+        for (provider, api_key_env) in [
+            ("anthropic", "ICM_TEST_KEY_THAT_IS_NEVER_SET"),
+            ("openai", "sk-pasted-NotARealKey"),
+            ("not-a-provider", ""),
+        ] {
+            let store = Store::in_memory().unwrap();
+            for i in 0..6 {
+                store
+                    .store(Memory::new(
+                        "solo".into(),
+                        format!("MARKER{i} {}", "decision text ".repeat(20)),
+                        Importance::Medium,
+                    ))
+                    .unwrap();
+            }
+            let mut app = App::new(&store, None, None).unwrap();
+            app.summarizer_cfg = crate::config::SummarizerConfig {
+                provider: provider.into(),
+                model: "m".into(),
+                api_key_env: api_key_env.into(),
+                base_url: "http://127.0.0.1:1".into(),
+                ..crate::config::SummarizerConfig::default()
+            };
+            app.confirm = Confirm::ConsolidateTopic {
+                topic: "solo".into(),
+            };
+            execute_confirm(&mut app, &store, None);
+
+            let after = store.get_by_topic("solo").unwrap();
+            assert_eq!(after.len(), 6, "{provider}: originals must survive");
+            let status = app.status.as_ref().expect("a status is shown");
+            assert!(
+                status
+                    .text
+                    .starts_with("Consolidation failed, nothing changed"),
+                "{provider}: {}",
+                status.text
+            );
+            assert_eq!(status.style.fg, Some(Color::Red), "{provider}");
+        }
+    }
+
+    /// An unreadable config is not "provider = none".
+    #[test]
+    fn consolidate_action_refuses_to_run_on_a_config_that_did_not_load() {
+        let store = Store::in_memory().unwrap();
+        for text in ["a", "b"] {
+            store
+                .store(Memory::new("t".into(), text.into(), Importance::Medium))
+                .unwrap();
+        }
+        let mut app = App::new(&store, None, None).unwrap();
+        app.summarizer_cfg_error = Some("invalid TOML".into());
+        app.confirm = Confirm::ConsolidateTopic { topic: "t".into() };
+        execute_confirm(&mut app, &store, None);
+        assert_eq!(store.get_by_topic("t").unwrap().len(), 2);
+        assert!(app.status.as_ref().unwrap().text.contains("invalid TOML"));
+    }
+
+    /// `provider = "none"`: the lexical join keeps every fact, as the CLI's
+    /// does. It used to be cut at 500 characters before the originals were
+    /// deleted.
+    #[test]
+    fn consolidate_action_lexical_join_is_not_truncated() {
+        let store = Store::in_memory().unwrap();
+        for i in 0..6 {
+            store
+                .store(Memory::new(
+                    "solo".into(),
+                    format!("MARKER{i} {}", "decision text ".repeat(20)),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let mut app = App::new(&store, None, None).unwrap();
+        app.confirm = Confirm::ConsolidateTopic {
+            topic: "solo".into(),
+        };
+        execute_confirm(&mut app, &store, None);
+
+        let after = store.get_by_topic("solo").unwrap();
+        assert_eq!(after.len(), 1);
+        for i in 0..6 {
+            assert!(
+                after[0].summary.contains(&format!("MARKER{i}")),
+                "fact {i} lost: {} chars kept",
+                after[0].summary.len()
+            );
+        }
+    }
+
+    /// The store reads a topic 500 memories at a time: the action replaces
+    /// the 500 it read and leaves the rest, instead of deleting the topic.
+    #[test]
+    fn consolidate_action_only_replaces_the_memories_it_read() {
+        let store = Store::in_memory().unwrap();
+        for i in 0..520 {
+            store
+                .store(Memory::new(
+                    "many".into(),
+                    format!("fact {i:03};"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let mut app = App::new(&store, None, None).unwrap();
+        app.confirm = Confirm::ConsolidateTopic {
+            topic: "many".into(),
+        };
+        execute_confirm(&mut app, &store, None);
+
+        assert_eq!(store.count_by_topic("many").unwrap(), 21);
+        let status = &app.status.as_ref().unwrap().text;
+        assert!(status.contains("500 of 520"), "{status}");
+        let everything: String = store
+            .get_by_topic("many")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary)
+            .collect();
+        for i in 0..520 {
+            assert!(
+                everything.contains(&format!("fact {i:03};")),
+                "fact {i} lost"
+            );
+        }
+    }
+
+    /// The same through a real HTTP error rather than a provider that
+    /// cannot even start: a 401 from a loopback listener.
+    #[test]
+    fn consolidate_action_keeps_the_originals_when_the_provider_answers_with_an_error() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (called_tx, called_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Read the whole request (headers + content-length body).
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length: usize = text[..head_end]
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= head_end + 4 + length || n == 0 {
+                        break;
+                    }
+                }
+            }
+            let _ = called_tx.send(());
+            let body = r#"{"error":{"message":"invalid key"}}"#;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+
+        let store = Store::in_memory().unwrap();
+        for i in 0..4 {
+            store
+                .store(Memory::new(
+                    "solo".into(),
+                    format!("fact {i}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let var = "ICM_TEST_TUI_CONSOLIDATE_401_KEY";
+        std::env::set_var(var, "placeholder-not-a-real-key");
+        let mut app = App::new(&store, None, None).unwrap();
+        app.summarizer_cfg = crate::config::SummarizerConfig {
+            provider: "openai".into(),
+            model: "m".into(),
+            api_key_env: var.into(),
+            base_url,
+            ..crate::config::SummarizerConfig::default()
+        };
+        app.confirm = Confirm::ConsolidateTopic {
+            topic: "solo".into(),
+        };
+        execute_confirm(&mut app, &store, None);
+        std::env::remove_var(var);
+
+        called_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the provider was never called");
+        assert_eq!(store.get_by_topic("solo").unwrap().len(), 4);
+        let status = app.status.as_ref().expect("a status is shown");
+        assert!(status.text.contains("HTTP 401"), "{}", status.text);
+        assert_eq!(status.style.fg, Some(Color::Red));
+    }
+
+    /// The summary keeps the highest importance of what it replaces. It was
+    /// always written `medium`: a topic of `high` decisions dropped out of
+    /// the wake-up pack and its only memory became prunable.
+    #[test]
+    fn consolidate_action_keeps_the_importance_of_what_it_replaces() {
+        let store = Store::in_memory().unwrap();
+        for i in 0..4 {
+            store
+                .store(Memory::new(
+                    "decisions".into(),
+                    format!("decision {i}"),
+                    if i == 0 {
+                        Importance::Low
+                    } else {
+                        Importance::High
+                    },
+                ))
+                .unwrap();
+        }
+        let mut app = App::new(&store, None, None).unwrap();
+        app.confirm = Confirm::ConsolidateTopic {
+            topic: "decisions".into(),
+        };
+        execute_confirm(&mut app, &store, None);
+
+        let after = store.get_by_topic("decisions").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].importance, Importance::High);
     }
 }

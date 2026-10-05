@@ -302,7 +302,9 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         limit: usize,
 
-        /// Optional CLI override of `extraction.summarizer.provider`.
+        /// Optional CLI override of `extraction.summarizer.provider`:
+        /// auto | claude | codex | gemini | ollama | anthropic | openai |
+        /// google | none.
         #[arg(long)]
         provider: Option<String>,
 
@@ -325,7 +327,9 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         limit: usize,
 
-        /// Optional CLI override of `consolidate.summarizer.provider`.
+        /// Optional CLI override of `consolidate.summarizer.provider`:
+        /// auto | claude | codex | gemini | ollama | anthropic | openai |
+        /// google | none.
         #[arg(long)]
         provider: Option<String>,
 
@@ -382,11 +386,19 @@ enum Commands {
         #[arg(long)]
         keep_originals: bool,
 
-        /// Summarizer provider: auto | claude | codex | gemini | ollama | none
+        /// Summarizer provider: auto | claude | codex | gemini | ollama |
+        /// anthropic | openai | google | none
         ///
         /// Overrides `[consolidate.summarizer] provider` from config.toml.
         /// `none` keeps the deterministic lexical concat (default behavior).
         /// `auto` detects the invoking AI tool from environment hints.
+        /// `claude` / `codex` / `gemini` use the CLI you are logged into;
+        /// `anthropic` / `openai` / `google` call the API with a key from the
+        /// environment (ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY,
+        /// or `api_key_env` in config) and are never selected by `auto`.
+        /// When this names a different provider than the config does, the
+        /// config's `api_key_env`, `base_url` and `model` are ignored: they
+        /// were written for the other provider.
         #[arg(long, value_name = "PROVIDER")]
         summarizer_provider: Option<String>,
 
@@ -408,8 +420,11 @@ enum Commands {
         #[arg(long, default_value = "10", value_name = "N")]
         threshold: usize,
 
-        /// Summarizer provider: auto | claude | codex | gemini | ollama | none
-        /// (overrides `[consolidate.summarizer] provider`).
+        /// Summarizer provider: auto | claude | codex | gemini | ollama |
+        /// anthropic | openai | google | none
+        /// (overrides `[consolidate.summarizer] provider`). The last three
+        /// before `none` call the vendor API with a key from the environment
+        /// and are never selected by `auto`.
         #[arg(long, value_name = "PROVIDER")]
         summarizer_provider: Option<String>,
 
@@ -722,9 +737,12 @@ enum Commands {
         #[arg(short, long)]
         project: Option<String>,
 
-        /// Summarizer provider: auto | claude | codex | gemini | ollama
+        /// Summarizer provider: auto | claude | codex | gemini | ollama |
+        /// anthropic | openai | google
         /// (overrides `[consolidate.summarizer] provider`). `none` is rejected
-        /// — a briefing needs an LLM.
+        /// — a briefing needs an LLM. `anthropic` / `openai` / `google` call
+        /// the vendor API with a key from the environment and are never
+        /// selected by `auto`.
         #[arg(long, value_name = "PROVIDER")]
         summarizer_provider: Option<String>,
 
@@ -2207,6 +2225,40 @@ fn cmd_embeddings(action: &EmbeddingsAction) -> Result<()> {
     Ok(())
 }
 
+/// The process-wide log subscriber: `fmt` output to `writer`, filtered by
+/// `filter` (built from `RUST_LOG`), minus what [`http_client_log_allowed`]
+/// refuses whatever `RUST_LOG` says.
+fn log_subscriber<W>(
+    filter: tracing_subscriber::EnvFilter,
+    writer: W,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_env_filter(filter)
+        .finish()
+        .with(tracing_subscriber::filter::filter_fn(
+            http_client_log_allowed,
+        ))
+}
+
+/// Keeps the HTTP client's DEBUG/TRACE records out of the log, on every
+/// setting of `RUST_LOG`.
+///
+/// ureq logs each request's header block at DEBUG and masks only
+/// `Authorization` and `Cookie`: `x-api-key` (Anthropic) and
+/// `x-goog-api-key` (Gemini) would be printed in full, on a stderr that
+/// hooks, cron and MCP clients routinely capture to a file. An `EnvFilter`
+/// directive cannot guarantee this — `RUST_LOG=ureq::unit=debug` is more
+/// specific than any `ureq=warn` added here and wins — so it is a hard
+/// filter in front of it. INFO and above (connection errors) still pass.
+fn http_client_log_allowed(meta: &tracing::Metadata<'_>) -> bool {
+    !(meta.target().starts_with("ureq") && *meta.level() > tracing::Level::INFO)
+}
+
 fn main() -> Result<()> {
     // Reset SIGPIPE to default so piped commands (e.g. `icm export | head`)
     // don't panic on broken pipe.
@@ -2219,13 +2271,15 @@ fn main() -> Result<()> {
     // JSON-RPC on stdout, and the default fmt writer (stdout) would let a
     // WARN line corrupt the MCP stream (audit finding — the server logs
     // WARNs in normal operation, e.g. embedding or auto-decay hiccups).
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
+    {
+        use tracing_subscriber::util::SubscriberInitExt;
+        log_subscriber(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing_subscriber::filter::LevelFilter::WARN.into()),
+            std::io::stderr,
         )
         .init();
+    }
 
     let cli = Cli::parse();
     let cfg = config::load_config()?;
@@ -2682,7 +2736,7 @@ fn main() -> Result<()> {
             summarizer_max_tokens,
         } => {
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            cmd_consolidate(
+            let outcome = cmd_consolidate(
                 &store,
                 &topic,
                 keep_originals,
@@ -2691,7 +2745,18 @@ fn main() -> Result<()> {
                 summarizer_model.as_deref(),
                 summarizer_max_tokens,
                 emb_ref,
-            )
+            );
+            // Only here, where the flag exists: the batch commands and the
+            // dashboard show the same error and have no --keep-originals.
+            if let Err(e) = &outcome {
+                if !keep_originals && e.downcast_ref::<SummarizerFailed>().is_some() {
+                    eprintln!(
+                        "hint: `icm consolidate -t {topic} --keep-originals` adds a lexical \
+                         join next to the originals instead of waiting for the provider"
+                    );
+                }
+            }
+            outcome.map(|_| ())
         }
         Commands::ConsolidateAll {
             threshold,
@@ -8445,6 +8510,20 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
     println!("  max_facts = {}", cfg.extraction.max_facts);
     println!("  extract_every = {}", cfg.extraction.extract_every);
     println!("  store_raw = {}", cfg.extraction.store_raw);
+    // The summarizer sections decide whether an LLM is called and, for the
+    // API-key providers, whose credit it spends — worth seeing at a glance.
+    // `describe_config` reports whether the key variable is set, never its
+    // value.
+    for (section, s) in [
+        ("extraction.summarizer", &cfg.extraction.summarizer),
+        ("consolidate.summarizer", &cfg.consolidate.summarizer),
+    ] {
+        println!();
+        println!("[{section}]");
+        for line in summarizer::describe_config(&s.provider, &s.model, &s.api_options()) {
+            println!("  {line}");
+        }
+    }
     println!();
     println!("[recall]");
     println!("  enabled = {}", cfg.recall.enabled);
@@ -8468,15 +8547,66 @@ fn resolve_consolidate_provider(
     cfg: &config::SummarizerConfig,
     cli_flag: Option<&str>,
 ) -> Result<summarizer::ProviderKind> {
-    let raw = cli_flag.unwrap_or(cfg.provider.as_str());
-    let kind = summarizer::ProviderKind::parse(raw)?;
-    Ok(match kind {
-        summarizer::ProviderKind::Auto => {
-            summarizer::detect_provider(summarizer::ProviderKind::Claude)
-        }
-        other => other,
-    })
+    Ok(summarizer::resolve(&cfg.provider, &cfg.model, cfg.api_options(), cli_flag, None)?.kind)
 }
+
+/// Everything a command needs to call the summarizer: provider, its API
+/// options and the model, with CLI flags merged over the config section.
+/// Every call site goes through here rather than reading `cfg` directly, so
+/// the rule in [`summarizer::resolve`] — settings written for one provider
+/// never reach another — cannot be bypassed by one of them.
+fn resolve_summarizer(
+    cfg: &config::SummarizerConfig,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+) -> Result<summarizer::Resolved> {
+    let resolved = summarizer::resolve(
+        &cfg.provider,
+        &cfg.model,
+        cfg.api_options(),
+        cli_provider,
+        cli_model,
+    )?;
+    if let Some(note) = &resolved.note {
+        eprintln!("{note}");
+    }
+    Ok(resolved)
+}
+
+/// The configured LLM provider could not produce a summary and the
+/// originals were about to be deleted, so nothing was consolidated.
+///
+/// A typed error so batch callers can tell "the provider is down" (stop
+/// calling it for the rest of the run) from a failure specific to one topic.
+#[derive(Debug)]
+pub(crate) struct SummarizerFailed {
+    provider: &'static str,
+    reason: String,
+    /// Memories of the topic already folded into a partial summary by
+    /// earlier passes of the same run, before the one that failed.
+    folded_before: usize,
+}
+
+impl std::fmt::Display for SummarizerFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "summarizer '{}' failed: {} — the memories it did not summarize are untouched",
+            self.provider, self.reason
+        )?;
+        if self.folded_before > 0 {
+            write!(
+                f,
+                " ({} memories of the topic were already folded into a partial summary by \
+                 earlier passes)",
+                self.folded_before
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SummarizerFailed {}
 
 /// Best-effort inter-process singleton lock for the extract-pending worker
 /// (#322). Held for the lifetime of the value; the OS releases the advisory
@@ -8810,14 +8940,21 @@ fn cmd_extract_pending(
         return Ok(());
     }
 
-    let mut provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
+    let resolved = resolve_summarizer(cfg, cli_provider, cli_model)?;
+    let mut provider_kind = resolved.kind;
     // `auto` always resolves to a concrete CLI provider (Claude is the
     // ultimate fallback in `detect_provider`). If that CLI is not actually
     // on PATH, the LLM drain would fail on every run and the queue would
     // never empty — so downgrade to the batched fastembed path when the
     // binary is missing.
-    if !matches!(provider_kind, summarizer::ProviderKind::None)
-        && !binary_in_path(provider_kind.as_str())
+    //
+    // An API-key provider needs no binary, so it is never downgraded here.
+    // Its precondition is the key: if that is missing the first call fails
+    // with an error naming the variable, and `drain_pending_groups` takes the
+    // same fastembed fallback as for a CLI that errors at runtime.
+    if provider_kind
+        .cli_binary()
+        .is_some_and(|binary| !binary_in_path(binary))
     {
         eprintln!(
             "[extract-pending] '{}' CLI not found on PATH — draining with \
@@ -8851,13 +8988,7 @@ fn cmd_extract_pending(
     // for the whole batch could only file every fact under one of them.
     let groups = group_pending_by_project(&pending);
 
-    let model_owned: Option<String> = cli_model.map(|s| s.to_string()).or_else(|| {
-        if cfg.model.is_empty() {
-            None
-        } else {
-            Some(cfg.model.clone())
-        }
-    });
+    let model_owned = resolved.model;
     let max_tokens = cfg.max_tokens;
 
     if dry_run {
@@ -8876,7 +9007,7 @@ fn cmd_extract_pending(
         return Ok(());
     }
 
-    let provider = summarizer::make_summarizer(provider_kind)?;
+    let provider = summarizer::make_summarizer(provider_kind, &resolved.api)?;
     let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
     let mut tally = DrainTally::default();
     if let Err(e) = drain_pending_groups(
@@ -8904,13 +9035,6 @@ fn cmd_extract_pending(
     Ok(())
 }
 
-/// Lexical fallback: concat all summaries with " | " — the historical behavior
-/// preserved as a safe baseline when no LLM is configured or available.
-fn lexical_consolidate(memories: &[Memory]) -> String {
-    let summaries: Vec<&str> = memories.iter().map(|m| m.summary.as_str()).collect();
-    summaries.join(" | ")
-}
-
 /// Build the warning printed when `icm consolidate` runs in lexical-join
 /// mode (provider=none). Issue #186: `icm health` flags topics for
 /// consolidation but the default consolidate degrades quality, so we make
@@ -8926,7 +9050,7 @@ fn lexical_consolidate_warning(keep_originals: bool) -> String {
     format!(
         "warning: consolidating with provider=none — summaries will be \
          joined with ' | ' (no LLM summarization). Pass \
-         --summarizer-provider <claude|codex|gemini|ollama> for real \
+         --summarizer-provider <claude|codex|gemini|ollama|anthropic|openai|google> for real \
          consolidation.{originals_clause}"
     )
 }
@@ -8936,10 +9060,323 @@ fn lexical_consolidate_warning(keep_originals: bool) -> String {
 /// `icm consolidate` is a lexical join, so agents/users don't silently
 /// degrade memory by following the recommendation blindly.
 fn health_consolidate_tip() -> String {
-    "Tip: run `icm consolidate -t <topic> --summarizer-provider <claude|codex|gemini|ollama> --keep-originals`\n\
+    "Tip: run `icm consolidate -t <topic> --summarizer-provider <claude|codex|gemini|ollama|anthropic|openai|google> --keep-originals`\n\
      The default (provider=none) joins summaries with ' | ' instead of summarizing.".to_string()
 }
 
+/// A topic that does not fit in one pass is folded in this many at most per
+/// command; each pass shrinks it, so this only bounds a pathological run.
+const MAX_CONSOLIDATION_PASSES: usize = 25;
+
+/// How many times a pass is redone because the topic changed under it
+/// before giving up (each redo re-reads the topic, and re-asks the provider).
+const MAX_STALE_ROUNDS: usize = 3;
+
+/// Largest lexical join written as one memory: the store's 64 KiB summary
+/// limit, less room for a caller's prefix.
+const LEXICAL_JOIN_CAP: usize = 64 * 1024 - 256;
+
+/// How a consolidation pass turns the memories it covers into one text.
+pub(crate) enum PassWriter<'a> {
+    /// `provider = "none"`: the ` | ` join.
+    Lexical,
+    /// An LLM summary.
+    Provider {
+        resolved: &'a summarizer::Resolved,
+        max_tokens: usize,
+        timeout: std::time::Duration,
+    },
+}
+
+impl PassWriter<'_> {
+    /// How much text one pass can take: the provider prompt's cap, or the
+    /// largest summary the store accepts.
+    fn cap(&self) -> usize {
+        match self {
+            Self::Lexical => LEXICAL_JOIN_CAP,
+            Self::Provider { .. } => summarizer::CONSOLIDATE_INPUT_CAP,
+        }
+    }
+
+    /// The text for the memories of one pass. A provider that fails or
+    /// returns nothing is a [`SummarizerFailed`], never a silent fallback.
+    fn write(&self, topic: &str, selected: &[&Memory]) -> Result<String> {
+        let summaries: Vec<&str> = selected.iter().map(|m| m.summary.as_str()).collect();
+        let Self::Provider {
+            resolved,
+            max_tokens,
+            timeout,
+        } = self
+        else {
+            return Ok(summaries.join(" | "));
+        };
+        let (prompt, included) =
+            summarizer::build_consolidate_prompt_counted(topic, &summaries, *max_tokens);
+        // The selection and the prompt builder count sizes the same way; if
+        // they ever disagree, memories the prompt left out must not be
+        // replaced by its answer.
+        if included != selected.len() {
+            bail!(
+                "internal error: the prompt took {included} of the {} memories selected for \
+                 this pass; nothing was consolidated",
+                selected.len()
+            );
+        }
+        let provider = summarizer::make_summarizer(resolved.kind, &resolved.api)?;
+        let req = summarizer::SummarizeRequest {
+            prompt: &prompt,
+            model: resolved.model.as_deref(),
+            max_tokens: *max_tokens,
+            timeout: *timeout,
+        };
+        let reason = match provider.summarize(&req) {
+            Ok(s) if !s.trim().is_empty() => {
+                eprintln!("[consolidate] used provider: {}", provider.name());
+                return Ok(s);
+            }
+            Ok(_) => "returned empty output".to_string(),
+            Err(e) => e.to_string(),
+        };
+        Err(anyhow::Error::new(SummarizerFailed {
+            provider: provider.name(),
+            reason,
+            folded_before: 0,
+        }))
+    }
+}
+
+/// What a consolidation run did to a topic.
+#[derive(Debug)]
+pub(crate) struct ConsolidationRun {
+    /// The memory written by the last pass, if any pass ran.
+    pub summary: Option<Memory>,
+    /// Original memories of the topic folded into it (or, with
+    /// `keep_originals`, covered by it).
+    pub replaced: usize,
+    pub passes: usize,
+    /// Memories the run knowingly did not fold in: too large to share a
+    /// pass, or past the pass limit. Zero after a complete run. A memory
+    /// stored while the run was going is not one of these.
+    pub unfolded: usize,
+    /// Every other memory still in the topic afterwards: the above, the
+    /// `critical` ones, and any stored meanwhile.
+    pub others_left: usize,
+    /// How many of those were set aside as too large to share a pass.
+    pub too_large: usize,
+    pub kept_originals: bool,
+}
+
+/// From `candidates`, in order, the memories that fit together under `cap`.
+/// One that does not fit is skipped, not a stopping point: a huge memory in
+/// the middle of a topic must not hide everything behind it.
+fn select_fitting<'a>(candidates: &[&'a Memory], cap: usize) -> Vec<&'a Memory> {
+    let mut used = 0usize;
+    let mut selected = Vec::new();
+    for memory in candidates {
+        // The separator and bullet a memory costs in the join / the prompt.
+        let cost = memory.summary.len() + 3;
+        if used + cost <= cap {
+            used += cost;
+            selected.push(*memory);
+        }
+    }
+    selected
+}
+
+/// Consolidate a topic, pass by pass. Every surface goes through here —
+/// `icm consolidate`, `consolidate-all`, `consolidate-pending`, the TUI,
+/// `POST /consolidate`, the web dashboard — and differs only in how a pass
+/// writes its text (`writer`) and in the memory it builds from it (`build`).
+///
+/// The rule that governs everything below: a memory is removed only if its
+/// text went into what replaces it, and only if it still says what was
+/// read.
+///
+/// - The store reads a topic 500 memories at a time and a pass has a size
+///   cap, so a large topic does not fit in one go: each pass replaces
+///   exactly the memories it covered, and the next folds the previous
+///   summary together with more of them. Refusing large topics instead
+///   would leave the topics that most need consolidating impossible to
+///   consolidate.
+/// - `critical` memories take no part: they are never removed, so feeding
+///   them in only produced one more summary — of the same critical content
+///   — on every run, forever.
+/// - A pass needs at least two memories. A lone memory is not sent to be
+///   rewritten into itself (a queue with several jobs for one topic used to
+///   do exactly that, one paid call each).
+/// - A memory too large to share a pass is set aside and the rest of the
+///   topic is consolidated without it; it is reported, not silently counted
+///   as done.
+/// - If the topic changed while the text was being written (a memory
+///   edited, forgotten, or consolidated by another run), the store refuses
+///   the write and the pass is redone from a fresh read.
+pub(crate) fn consolidate_in_passes(
+    store: &Store,
+    topic: &str,
+    writer: &PassWriter<'_>,
+    keep_originals: bool,
+    max_passes: usize,
+    build: &mut dyn FnMut(&[&Memory], String) -> Memory,
+) -> Result<ConsolidationRun> {
+    let mut run = ConsolidationRun {
+        summary: None,
+        replaced: 0,
+        passes: 0,
+        unfolded: 0,
+        others_left: 0,
+        too_large: 0,
+        kept_originals: keep_originals,
+    };
+    // Whether the last pass left something it had seen but not covered.
+    let mut stopped_at_pass_limit = false;
+    let mut set_aside: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stale_rounds = 0usize;
+    let mut first_read = true;
+    loop {
+        let read = store.get_by_topic(topic)?;
+        if first_read && read.is_empty() {
+            bail!("no memories found in topic: {topic}");
+        }
+        first_read = false;
+        let candidates: Vec<&Memory> = read
+            .iter()
+            .filter(|m| m.importance != Importance::Critical && !set_aside.contains(&m.id))
+            .collect();
+        if candidates.len() < 2 {
+            break;
+        }
+        let selected = select_fitting(&candidates, writer.cap());
+        if selected.len() < 2 {
+            // Nothing can share a pass: the largest candidate is what does
+            // not fit, or what nothing fits with. Leave it out and try the
+            // others among themselves.
+            if let Some(largest) = candidates.iter().max_by_key(|m| m.summary.len()) {
+                set_aside.insert(largest.id.clone());
+            }
+            continue;
+        }
+        // Something the pass can see but will not cover (it did not fit),
+        // or more of the topic than one read returns: another pass is due.
+        // Otherwise this pass is the last — a memory that shows up while
+        // it runs is a new memory, not a reason to call the provider again.
+        let more_to_fold =
+            selected.len() < candidates.len() || store.count_by_topic(topic)? > read.len();
+
+        let text = match writer.write(topic, &selected) {
+            Ok(text) => text,
+            // The user asked for an LLM summary. Without one, replacing
+            // the originals with a ' | ' join is the very outcome
+            // `consolidate-all` refuses for provider=none (#186) — and a
+            // provider fails for reasons as ordinary as a key not exported
+            // in a cron's environment, a 429, or a CLI missing from PATH.
+            // A failing provider must never cost the originals: the
+            // lexical fallback only runs when they stay.
+            Err(e) if keep_originals && e.downcast_ref::<SummarizerFailed>().is_some() => {
+                eprintln!("[consolidate] {e}; falling back to lexical (originals kept)");
+                PassWriter::Lexical.write(topic, &selected)?
+            }
+            Err(mut e) => {
+                if let Some(failed) = e.downcast_mut::<SummarizerFailed>() {
+                    failed.folded_before = run.replaced;
+                }
+                return Err(e);
+            }
+        };
+
+        let mut consolidated = build(&selected, text);
+        // The summary takes the highest importance of what it covers —
+        // never `critical`, which is not in the input.
+        consolidated.importance = selected
+            .iter()
+            .map(|m| m.importance)
+            .min_by_key(|i| match i {
+                Importance::Critical => 0,
+                Importance::High => 1,
+                Importance::Medium => 2,
+                Importance::Low => 3,
+            })
+            .unwrap_or(Importance::Medium);
+
+        if keep_originals {
+            // The originals survive this call, so pointing the consolidated
+            // memory's related_ids at them is a meaningful, live provenance
+            // link — expand_with_neighbors can actually follow it.
+            consolidated.related_ids = selected.iter().map(|m| m.id.clone()).collect();
+            let id = store.store(consolidated.clone())?;
+            consolidated.id = id;
+            run.replaced = selected.len();
+            run.passes = 1;
+            run.unfolded = candidates.len() - selected.len();
+            run.summary = Some(consolidated);
+            return Ok(run);
+        }
+
+        // Manual-testing finding: the consolidated memory used to inherit
+        // the originals' ids as related_ids unconditionally — but here
+        // those originals are deleted in the same operation, so it was born
+        // already pointing at nothing. Leave related_ids empty; the store
+        // separately cleans up any *other* memory that referenced them.
+        let covered: Vec<icm_core::ReadMemory> = selected
+            .iter()
+            .map(|m| icm_core::ReadMemory::from(*m))
+            .collect();
+        match store.consolidate_ids(topic, &covered, consolidated.clone())? {
+            icm_core::Consolidated::Stale { changed } => {
+                stale_rounds += 1;
+                if stale_rounds > MAX_STALE_ROUNDS {
+                    bail!(
+                        "topic '{topic}' keeps changing while it is being consolidated ({} \
+                         memories edited or removed during the last attempt); nothing more was \
+                         written — run the command again",
+                        changed.len()
+                    );
+                }
+                eprintln!(
+                    "[consolidate] '{topic}' changed while the summary was being written ({} \
+                     memories edited or removed); redoing the pass from a fresh read",
+                    changed.len()
+                );
+                continue;
+            }
+            icm_core::Consolidated::Replaced { removed, id } => {
+                let refolded = run
+                    .summary
+                    .as_ref()
+                    .is_some_and(|prev| covered.iter().any(|c| c.id == prev.id));
+                run.replaced += removed.saturating_sub(usize::from(refolded));
+                consolidated.id = id;
+                run.summary = Some(consolidated);
+                run.passes += 1;
+            }
+        }
+        if !more_to_fold {
+            break;
+        }
+        if run.passes >= max_passes {
+            stopped_at_pass_limit = true;
+            break;
+        }
+    }
+
+    // What is still in the topic besides the summary.
+    let after = store.get_by_topic(topic)?;
+    let total = store.count_by_topic(topic)?;
+    run.others_left = total.saturating_sub(usize::from(run.summary.is_some()));
+    run.too_large = after.iter().filter(|m| set_aside.contains(&m.id)).count();
+    run.unfolded = if stopped_at_pass_limit {
+        let summary_id = run.summary.as_ref().map(|m| m.id.as_str());
+        let visible = after
+            .iter()
+            .filter(|m| m.importance != Importance::Critical && Some(m.id.as_str()) != summary_id)
+            .count();
+        visible + total.saturating_sub(after.len())
+    } else {
+        run.too_large
+    };
+    Ok(run)
+}
+
+/// `icm consolidate` — see [`consolidate_in_passes`].
 #[allow(clippy::too_many_arguments)]
 fn cmd_consolidate(
     store: &Store,
@@ -8950,116 +9387,92 @@ fn cmd_consolidate(
     cli_model: Option<&str>,
     cli_max_tokens: Option<usize>,
     embedder: Option<&dyn icm_core::Embedder>,
-) -> Result<()> {
-    let memories = store.get_by_topic(topic)?;
-    if memories.is_empty() {
-        bail!("no memories found in topic: {topic}");
-    }
-
-    let provider_kind = resolve_consolidate_provider(cfg, cli_provider)?;
-    let max_tokens = cli_max_tokens.unwrap_or(cfg.max_tokens);
-    let model_owned: Option<String> = cli_model.map(|s| s.to_string()).or_else(|| {
-        if cfg.model.is_empty() {
-            None
-        } else {
-            Some(cfg.model.clone())
-        }
-    });
-
-    let merged_summary = if matches!(provider_kind, summarizer::ProviderKind::None) {
+) -> Result<ConsolidationRun> {
+    let resolved = resolve_summarizer(cfg, cli_provider, cli_model)?;
+    let writer = if matches!(resolved.kind, summarizer::ProviderKind::None) {
         // Issue #186: lexical concatenation isn't a real consolidation —
         // it grows past input size, dilutes the embedding, and (without
         // --keep-originals) destroys the originals it replaces.
         eprintln!("{}", lexical_consolidate_warning(keep_originals));
-        lexical_consolidate(&memories)
+        PassWriter::Lexical
     } else {
-        let provider = summarizer::make_summarizer(provider_kind)?;
-        let summaries: Vec<&str> = memories.iter().map(|m| m.summary.as_str()).collect();
-        let prompt = summarizer::build_consolidate_prompt(topic, &summaries, max_tokens);
-        let req = summarizer::SummarizeRequest {
-            prompt: &prompt,
-            model: model_owned.as_deref(),
-            max_tokens,
+        PassWriter::Provider {
+            resolved: &resolved,
+            max_tokens: cli_max_tokens.unwrap_or(cfg.max_tokens),
             timeout: std::time::Duration::from_secs(cfg.timeout_secs),
-        };
-        match provider.summarize(&req) {
-            Ok(s) if !s.trim().is_empty() => {
-                eprintln!("[consolidate] used provider: {}", provider.name());
-                s
-            }
-            Ok(_) => {
-                eprintln!(
-                    "[consolidate] provider {} returned empty output; falling back to lexical",
-                    provider.name(),
-                );
-                lexical_consolidate(&memories)
-            }
-            Err(e) => {
-                eprintln!(
-                    "[consolidate] provider {} failed: {e}; falling back to lexical",
-                    provider.name(),
-                );
-                lexical_consolidate(&memories)
-            }
         }
     };
 
-    let mut all_keywords: Vec<String> = Vec::new();
-    for mem in &memories {
-        for kw in &mem.keywords {
-            if !all_keywords.contains(kw) {
-                all_keywords.push(kw.clone());
+    let mut build = |selected: &[&Memory], text: String| {
+        let mut consolidated = Memory::new(topic.to_string(), text, Importance::Medium);
+        for mem in selected {
+            for kw in &mem.keywords {
+                if !consolidated.keywords.contains(kw) {
+                    consolidated.keywords.push(kw.clone());
+                }
             }
         }
-    }
-
-    let best_importance = memories
-        .iter()
-        .map(|m| &m.importance)
-        .min_by_key(|i| match i {
-            Importance::Critical => 0,
-            Importance::High => 1,
-            Importance::Medium => 2,
-            Importance::Low => 3,
-        })
-        .cloned()
-        .unwrap_or(Importance::Medium);
-
-    let mut consolidated = Memory::new(topic.to_string(), merged_summary, best_importance);
-    consolidated.keywords = all_keywords;
-    // Same bug class as #394/#395: cmd_consolidate had no embedder param at
-    // all, so the merged memory was always born with embedding: None — a
-    // real gap found via manual testing against a real Postgres backend.
-    if let Some(emb) = embedder {
-        if let Ok(vec) = emb.embed(&consolidated.embed_text()) {
-            consolidated.embedding = Some(vec);
+        // Same bug class as #394/#395: cmd_consolidate had no embedder param at
+        // all, so the merged memory was always born with embedding: None — a
+        // real gap found via manual testing against a real Postgres backend.
+        if let Some(emb) = embedder {
+            if let Ok(vec) = emb.embed(&consolidated.embed_text()) {
+                consolidated.embedding = Some(vec);
+            }
         }
-    }
+        consolidated
+    };
+    let run = consolidate_in_passes(
+        store,
+        topic,
+        &writer,
+        keep_originals,
+        MAX_CONSOLIDATION_PASSES,
+        &mut build,
+    )?;
 
-    if keep_originals {
-        // The originals survive this call, so pointing the consolidated
-        // memory's related_ids at them is a meaningful, live provenance
-        // link — expand_with_neighbors can actually follow it.
-        consolidated.related_ids = memories.iter().map(|m| m.id.clone()).collect();
-        let id = store.store(consolidated)?;
-        println!(
-            "Consolidated {} memories from '{topic}' into {id} (originals kept).",
-            memories.len()
-        );
-    } else {
-        // Manual-testing finding: the consolidated memory used to inherit
-        // the originals' ids as related_ids unconditionally — but in this
-        // branch those originals are deleted in the same operation, so it
-        // was born already pointing at nothing. Leave related_ids empty;
-        // consolidate_topic separately cleans up any *other* memory that
-        // referenced the now-deleted originals.
-        store.consolidate_topic(topic, consolidated)?;
-        println!(
-            "Consolidated {} memories from '{topic}' into 1 (originals removed).",
-            memories.len()
+    let n = run.replaced;
+    match (&run.summary, run.kept_originals) {
+        (None, _) => println!(
+            "Nothing to consolidate in '{topic}': fewer than two memories can be merged \
+             (critical memories are never consolidated)."
+        ),
+        (Some(summary), true) => {
+            println!(
+                "Consolidated {n} memories from '{topic}' into {} (originals kept).",
+                summary.id
+            );
+            if run.unfolded > 0 {
+                eprintln!(
+                    "[consolidate] note: the summary covers the {n} memories that fit in one \
+                     pass; {} more are not in it",
+                    run.unfolded
+                );
+            }
+        }
+        (Some(_), false) if run.unfolded == 0 && run.passes == 1 => {
+            // Unchanged wording for the common case.
+            println!("Consolidated {n} memories from '{topic}' into 1 (originals removed).")
+        }
+        (Some(_), false) if run.unfolded == 0 => println!(
+            "Consolidated {n} memories from '{topic}' into 1 (originals removed, {} passes).",
+            run.passes
+        ),
+        (Some(_), false) => println!(
+            "Consolidated {n} memories from '{topic}' in {} pass(es); {} more could not be \
+             folded in and are unchanged.",
+            run.passes, run.unfolded
+        ),
+    }
+    if run.too_large > 0 {
+        eprintln!(
+            "[consolidate] {} memories of '{topic}' are too large to share a pass (limit: {} \
+             characters) and were left as they are",
+            run.too_large,
+            writer.cap()
         );
     }
-    Ok(())
+    Ok(run)
 }
 
 /// `icm consolidate-all` — batch-consolidate every topic over `threshold`
@@ -9098,7 +9511,7 @@ fn cmd_consolidate_all(
         bail!(
             "consolidate-all would replace every over-threshold topic with a lexical \
              ' | ' join and delete the originals (summarizer provider resolves to 'none'). \
-             Pass --summarizer-provider <claude|codex|gemini|ollama> for real consolidation, \
+             Pass --summarizer-provider <claude|codex|gemini|ollama|anthropic|openai|google> for real consolidation, \
              or --summarizer-provider none to explicitly accept lexical joins."
         );
     }
@@ -9129,6 +9542,9 @@ fn cmd_consolidate_all(
 
     let mut done = 0usize;
     let mut failed = 0usize;
+    let mut partial = 0usize;
+    let mut nothing_to_merge = 0usize;
+    let mut provider_failures_in_a_row = 0usize;
     for (topic, count) in &candidates {
         println!("[consolidate-all] {topic} ({count} memories)…");
         match cmd_consolidate(
@@ -9141,21 +9557,63 @@ fn cmd_consolidate_all(
             cli_max_tokens,
             embedder,
         ) {
-            Ok(()) => done += 1,
+            Ok(run) => {
+                provider_failures_in_a_row = 0;
+                if run.passes == 0 {
+                    nothing_to_merge += 1;
+                } else if run.unfolded > 0 {
+                    partial += 1;
+                } else {
+                    done += 1;
+                }
+            }
             Err(e) => {
                 eprintln!("[consolidate-all] {topic} failed: {e}");
                 failed += 1;
+                // One failure can be this topic's own (an answer cut short
+                // on the biggest prompt, a content filter, a timeout) — and
+                // the biggest topic comes first, so stopping there would
+                // starve every other topic on every run. Two in a row is
+                // the provider: the remaining topics would hit the same
+                // wall, one paid or rate-limited call each.
+                if e.downcast_ref::<SummarizerFailed>().is_some() {
+                    provider_failures_in_a_row += 1;
+                    if provider_failures_in_a_row >= 2 {
+                        break;
+                    }
+                } else {
+                    provider_failures_in_a_row = 0;
+                }
             }
         }
     }
 
     println!();
-    if failed == 0 {
-        println!("Consolidated {done} topic(s) over threshold {threshold}.");
-    } else {
-        println!("Consolidated {done} topic(s); {failed} failed (see errors above).");
+    let mut notes = String::new();
+    if partial > 0 {
+        notes.push_str(&format!(
+            " {partial} more only in part (memories too large to share a pass)."
+        ));
     }
-    Ok(())
+    if nothing_to_merge > 0 {
+        notes.push_str(&format!(
+            " {nothing_to_merge} had fewer than two memories that can be merged."
+        ));
+    }
+    if failed == 0 {
+        // Exit status 0: a topic that cannot be folded any further is a
+        // state to report, not an error to page someone for on every run.
+        println!("Consolidated {done} topic(s) over threshold {threshold}.{notes}");
+        return Ok(());
+    }
+    // A cron only sees the exit status: a run in which the summarizer or
+    // the store failed must not look like a success.
+    let not_attempted = candidates.len() - done - failed - partial - nothing_to_merge;
+    bail!(
+        "consolidate-all: {done} topic(s) consolidated, {failed} failed, {not_attempted} not \
+         attempted (see errors above).{notes} Topics not attempted are unchanged; a failed \
+         topic keeps every memory that was not summarized"
+    )
 }
 
 /// `icm consolidate-pending` — drain the async consolidation queue (issue
@@ -9228,7 +9686,25 @@ fn cmd_consolidate_pending(
             None,
             embedder,
         ) {
-            Ok(()) => {
+            // Memories left out because they are too large for a pass will
+            // be left out by every retry too: the job is not `done`, and
+            // not worth queuing again — `failed`, with the reason on record.
+            Ok(run) if run.unfolded > 0 => {
+                let why = format!(
+                    "{} memories folded in; {} could not be (too large to share a pass) and \
+                     are unchanged",
+                    run.replaced, run.unfolded
+                );
+                eprintln!(
+                    "[consolidate-pending] job {} (topic '{}'): {why}",
+                    job.id, job.topic
+                );
+                if let Err(e2) = store.mark_consolidation_job_failed(&job.id, &why) {
+                    tracing::warn!("mark_consolidation_job_failed failed for {}: {e2}", job.id);
+                }
+                failed += 1;
+            }
+            Ok(_) => {
                 if let Err(e) = store.mark_consolidation_job_done(&job.id) {
                     tracing::warn!("mark_consolidation_job_done failed for {}: {e}", job.id);
                 }
@@ -9243,6 +9719,19 @@ fn cmd_consolidate_pending(
                     tracing::warn!("mark_consolidation_job_failed failed for {}: {e2}", job.id);
                 }
                 failed += 1;
+                // Provider down: stop here and leave the other jobs
+                // `pending` for the next drain, rather than spending one
+                // call each to mark the whole queue `failed`.
+                if e.downcast_ref::<SummarizerFailed>().is_some() {
+                    let left = jobs.len() - done - failed;
+                    if left > 0 {
+                        eprintln!(
+                            "[consolidate-pending] provider unavailable — {left} job(s) left \
+                             pending for the next run"
+                        );
+                    }
+                    break;
+                }
             }
         }
     }
@@ -9560,11 +10049,12 @@ fn cmd_briefing(
     };
 
     // A briefing is an LLM narrative; a lexical join isn't one. Refuse `none`.
-    let resolved = resolve_consolidate_provider(cfg, cli_provider)?;
+    let summarizer_cfg = resolve_summarizer(cfg, cli_provider, cli_model)?;
+    let resolved = summarizer_cfg.kind;
     if matches!(resolved, summarizer::ProviderKind::None) {
         bail!(
             "briefing needs an LLM summarizer (provider resolved to 'none'); \
-             pass --summarizer-provider <claude|codex|gemini|ollama>"
+             pass --summarizer-provider <claude|codex|gemini|ollama|anthropic|openai|google>"
         );
     }
 
@@ -9597,15 +10087,9 @@ fn cmd_briefing(
     memories.truncate(MAX_BRIEFING_MEMORIES);
 
     let max_tokens = cli_max_tokens.unwrap_or_else(|| cfg.max_tokens.max(400));
-    let model_owned: Option<String> = cli_model.map(String::from).or_else(|| {
-        if cfg.model.is_empty() {
-            None
-        } else {
-            Some(cfg.model.clone())
-        }
-    });
+    let model_owned = summarizer_cfg.model;
     let prompt = build_briefing_prompt(project_name, &memories, max_tokens);
-    let provider = summarizer::make_summarizer(resolved)?;
+    let provider = summarizer::make_summarizer(resolved, &summarizer_cfg.api)?;
     // A briefing is a heavier LLM task than a single-topic consolidation and an
     // LLM CLI's cold start can be slow, so allow a more generous timeout than
     // the shared consolidate default (still overridable upward via config).
@@ -13905,6 +14389,1272 @@ mod cli_contracts_tests {
         // The topic itself must actually be consolidated (4 memories -> 1).
         let remaining = store.get_by_topic("t").unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    /// One-shot-per-response HTTP stub on a loopback port, for the tests
+    /// that drive a whole command through an API-key provider. Returns the
+    /// base URL and a channel of the raw requests received — read with a
+    /// deadline, never by joining the thread, so a provider that is never
+    /// called fails the test instead of hanging it.
+    fn http_stub(responses: Vec<(u16, String)>) -> (String, std::sync::mpsc::Receiver<String>) {
+        http_stub_with(responses, || {})
+    }
+
+    /// [`http_stub`], running `on_first_request` once the first request has
+    /// been read and before it is answered — i.e. while the caller is
+    /// blocked waiting for the provider.
+    fn http_stub_with(
+        responses: Vec<(u16, String)>,
+        on_first_request: impl FnOnce() + Send + 'static,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut on_first_request = Some(on_first_request);
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Headers, then exactly content-length bytes of body.
+                let (head_end, length) = loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0, "client closed early");
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..pos]).to_ascii_lowercase();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        break (pos + 4, length);
+                    }
+                };
+                while raw.len() < head_end + length {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0, "client closed mid-body");
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                let _ = tx.send(String::from_utf8_lossy(&raw).to_string());
+                if let Some(hook) = on_first_request.take() {
+                    hook();
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base_url, rx)
+    }
+
+    fn openai_reply(text: &str) -> String {
+        serde_json::json!({
+            "choices": [{ "message": { "content": text }, "finish_reason": "stop" }],
+        })
+        .to_string()
+    }
+
+    /// Summarizer configs that fail before any network I/O, one per way a
+    /// provider can be unusable: key variable unset, key pasted where its
+    /// name goes, and a non-API provider (ollama refuses to run without a
+    /// model). The endpoint is a closed loopback port in any case.
+    fn failing_summarizer_configs() -> Vec<config::SummarizerConfig> {
+        [
+            ("anthropic", "ICM_TEST_KEY_THAT_IS_NEVER_SET"),
+            ("openai", "sk-pasted-NotARealKey"),
+            ("ollama", ""),
+        ]
+        .into_iter()
+        .map(|(provider, api_key_env)| config::SummarizerConfig {
+            provider: provider.into(),
+            api_key_env: api_key_env.into(),
+            base_url: "http://127.0.0.1:1".into(),
+            ..config::SummarizerConfig::default()
+        })
+        .collect()
+    }
+
+    /// A summarizer that cannot answer must never cost the originals. It
+    /// used to: the lexical ' | ' join replaced them, for API-key and CLI
+    /// providers alike, and the command reported success.
+    #[test]
+    fn cmd_consolidate_never_destroys_originals_when_the_summarizer_fails() {
+        for cfg in failing_summarizer_configs() {
+            let provider = cfg.provider.clone();
+            let store = Store::in_memory().unwrap();
+            for text in ["fact one", "fact two"] {
+                store
+                    .store(Memory::new("t".into(), text.into(), Importance::Medium))
+                    .unwrap();
+            }
+
+            let err = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None)
+                .expect_err("a failed summarizer is an error, not a lexical join");
+            assert!(
+                err.downcast_ref::<SummarizerFailed>().is_some(),
+                "{provider}: {err}"
+            );
+            assert!(err.to_string().contains("untouched"), "{provider}: {err}");
+            let mut kept: Vec<String> = store
+                .get_by_topic("t")
+                .unwrap()
+                .into_iter()
+                .map(|m| m.summary)
+                .collect();
+            kept.sort();
+            assert_eq!(kept, ["fact one", "fact two"], "{provider}");
+
+            // With --keep-originals nothing can be lost, so the lexical
+            // fallback still runs — next to the originals.
+            cmd_consolidate(&store, "t", true, &cfg, None, None, None, None).unwrap();
+            let all = store.get_by_topic("t").unwrap();
+            assert_eq!(all.len(), 3, "{provider}: originals kept, join added");
+            assert!(all
+                .iter()
+                .any(|m| m.summary.contains("fact one") && m.summary.contains("fact two")));
+        }
+    }
+
+    /// `consolidate-all` with a provider that is down: no topic is touched,
+    /// the provider is not called once per topic, and the run fails so a
+    /// cron notices. It used to join every topic lexically, delete the
+    /// originals and exit 0 — what the #186 guard refuses for provider=none.
+    #[test]
+    fn consolidate_all_stops_and_fails_when_the_summarizer_is_down() {
+        for cfg in failing_summarizer_configs() {
+            let provider = cfg.provider.clone();
+            let store = Store::in_memory().unwrap();
+            for topic in ["alpha", "beta", "gamma"] {
+                for i in 0..3 {
+                    store
+                        .store(Memory::new(
+                            topic.into(),
+                            format!("{topic} fact {i}"),
+                            Importance::Medium,
+                        ))
+                        .unwrap();
+                }
+            }
+
+            let err = cmd_consolidate_all(&store, 2, &cfg, None, None, None, false, None)
+                .expect_err("a run that consolidated nothing must not exit 0");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("0 topic(s) consolidated, 2 failed, 1 not attempted"),
+                "{provider}: {msg}"
+            );
+            for topic in ["alpha", "beta", "gamma"] {
+                assert_eq!(store.get_by_topic(topic).unwrap().len(), 3, "{provider}");
+            }
+        }
+    }
+
+    /// Same for the async queue: the failing job is marked `failed` (so
+    /// `consolidate-jobs` shows why), the rest stay `pending` for the next
+    /// drain, and no topic is rewritten. It used to mark every job `done`
+    /// on a lexical join.
+    #[test]
+    fn consolidate_pending_leaves_topics_and_remaining_jobs_alone_when_the_summarizer_is_down() {
+        for cfg in failing_summarizer_configs() {
+            let provider = cfg.provider.clone();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("memories.db");
+            let store = Store::with_dims(&db_path, 64).unwrap();
+            for topic in ["alpha", "beta"] {
+                for i in 0..3 {
+                    store
+                        .store(Memory::new(
+                            topic.into(),
+                            format!("{topic} fact {i}"),
+                            Importance::Medium,
+                        ))
+                        .unwrap();
+                }
+                store.enqueue_pending_consolidation(topic, "").unwrap();
+            }
+
+            cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path).unwrap();
+
+            let mut statuses: Vec<String> = store
+                .list_consolidation_jobs(None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|j| j.status)
+                .collect();
+            statuses.sort();
+            assert_eq!(statuses, ["failed", "pending"], "{provider}");
+            for topic in ["alpha", "beta"] {
+                assert_eq!(store.get_by_topic(topic).unwrap().len(), 3, "{provider}");
+            }
+        }
+    }
+
+    /// An API-key summarizer config pointed at a loopback stub, with its key
+    /// in a variable unique to the calling test.
+    fn stub_summarizer(base_url: &str, key_var: &str) -> config::SummarizerConfig {
+        std::env::set_var(key_var, "placeholder-not-a-real-key");
+        config::SummarizerConfig {
+            provider: "openai".into(),
+            model: "test-model".into(),
+            api_key_env: key_var.into(),
+            base_url: format!("{base_url}/v1"),
+            ..config::SummarizerConfig::default()
+        }
+    }
+
+    /// The baseline: a consolidation removes exactly the memories it
+    /// summarized — not the `critical` one, not another topic.
+    #[test]
+    fn consolidation_removes_exactly_the_memories_it_summarized() {
+        let (base_url, seen) = http_stub(vec![(200, openai_reply("the summary"))]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_EXACT_KEY");
+        let store = Store::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new(
+                    "t".into(),
+                    format!("fact {i}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        store
+            .store(Memory::new(
+                "t".into(),
+                "never forget".into(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "other".into(),
+                "elsewhere".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+
+        let result = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_EXACT_KEY");
+        result.unwrap();
+
+        assert_eq!(seen.try_iter().count(), 1);
+        let mut left: Vec<String> = store
+            .get_by_topic("t")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["never forget", "the summary"]);
+        assert_eq!(store.count_by_topic("other").unwrap(), 1);
+    }
+
+    /// The provider prompt is capped at ~20 000 characters. A topic larger
+    /// than that used to be deleted whole after a summary of the part that
+    /// fit. Now every memory reaches the provider — in a later pass, with
+    /// the previous summary — before it is removed.
+    #[test]
+    fn consolidation_never_removes_a_memory_that_was_not_sent_to_the_provider() {
+        let (base_url, seen) = http_stub(vec![
+            (200, openai_reply("SUMMARY-ONE")),
+            (200, openai_reply("SUMMARY-TWO")),
+        ]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_CAP_KEY");
+        let store = Store::in_memory().unwrap();
+        for i in 0..70 {
+            store
+                .store(Memory::new(
+                    "big".into(),
+                    format!("FACT{i:03} {}", "x".repeat(310)),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+
+        let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_CAP_KEY");
+        result.unwrap();
+
+        let prompts: Vec<String> = seen.try_iter().collect();
+        assert_eq!(prompts.len(), 2, "70 x 320 chars needs two passes");
+        for i in 0..70 {
+            let fact = format!("FACT{i:03} ");
+            assert_eq!(
+                prompts.iter().filter(|p| p.contains(&fact)).count(),
+                1,
+                "{fact}must be sent to the provider exactly once before being removed"
+            );
+        }
+        assert!(
+            prompts[1].contains("SUMMARY-ONE"),
+            "the second pass folds the first summary in"
+        );
+        let after = store.get_by_topic("big").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].summary, "SUMMARY-TWO");
+    }
+
+    /// Same topic, provider failing on the second pass: the first summary
+    /// and the memories it did not cover are all still there.
+    #[test]
+    fn a_later_pass_that_fails_leaves_the_unsummarized_memories_in_place() {
+        let (base_url, _seen) = http_stub(vec![
+            (200, openai_reply("SUMMARY-ONE")),
+            (401, r#"{"error":{"message":"no"}}"#.to_string()),
+        ]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_PASS2_KEY");
+        let store = Store::in_memory().unwrap();
+        for i in 0..70 {
+            store
+                .store(Memory::new(
+                    "big".into(),
+                    format!("FACT{i:03} {}", "x".repeat(310)),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+
+        let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_PASS2_KEY");
+        let err = result.expect_err("the second pass failed");
+        assert!(err.downcast_ref::<SummarizerFailed>().is_some(), "{err}");
+
+        let after = store.get_by_topic("big").unwrap();
+        let leftovers = after
+            .iter()
+            .filter(|m| m.summary.starts_with("FACT"))
+            .count();
+        assert!(leftovers > 0 && leftovers < 70, "{leftovers}");
+        assert_eq!(after.len(), leftovers + 1);
+        assert!(after.iter().any(|m| m.summary == "SUMMARY-ONE"));
+    }
+
+    /// A memory stored while the provider is answering was never in the
+    /// prompt: it must outlive the consolidation. It used to be deleted
+    /// with the rest of the topic.
+    #[test]
+    fn a_memory_stored_during_the_provider_call_survives_the_consolidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new(
+                    "t".into(),
+                    format!("fact {i}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let late_db = db_path.clone();
+        let (base_url, seen) =
+            http_stub_with(vec![(200, openai_reply("the summary"))], move || {
+                // Another session writing to the same topic, mid-call.
+                let other = Store::with_dims(&late_db, 64).unwrap();
+                other
+                    .store(Memory::new(
+                        "t".into(),
+                        "LATE-ARRIVAL".into(),
+                        Importance::Medium,
+                    ))
+                    .unwrap();
+            });
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_RACE_KEY");
+
+        let result = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_RACE_KEY");
+        result.unwrap();
+
+        let prompt = seen.try_iter().next().expect("provider called");
+        assert!(
+            !prompt.contains("LATE-ARRIVAL"),
+            "it arrived after the read"
+        );
+        let mut left: Vec<String> = store
+            .get_by_topic("t")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["LATE-ARRIVAL", "the summary"]);
+    }
+
+    /// The store hands out a topic 500 memories at a time. Past that, the
+    /// rest used to be deleted without ever being read — with the default
+    /// `provider = "none"` too.
+    #[test]
+    fn consolidating_a_topic_of_more_than_500_memories_keeps_every_fact() {
+        let store = Store::in_memory().unwrap();
+        for i in 0..520 {
+            store
+                .store(Memory::new(
+                    "many".into(),
+                    format!("fact {i:03};"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let cfg = config::SummarizerConfig::default(); // provider = "none"
+        cmd_consolidate(&store, "many", false, &cfg, None, None, None, None).unwrap();
+
+        let after = store.get_by_topic("many").unwrap();
+        assert_eq!(after.len(), 1, "two passes: 500, then the summary + 20");
+        for i in 0..520 {
+            assert!(
+                after[0].summary.contains(&format!("fact {i:03};")),
+                "fact {i} was deleted without being read"
+            );
+        }
+    }
+
+    fn seed_topic(store: &Store, topic: &str, texts: &[String]) -> Vec<String> {
+        texts
+            .iter()
+            .map(|t| {
+                store
+                    .store(Memory::new(topic.into(), t.clone(), Importance::Medium))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn facts(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix} fact {i}")).collect()
+    }
+
+    /// `critical` memories are never removed, so they must not be fed to
+    /// the summary either: every run used to add one more summary of the
+    /// same critical content (itself critical, so never removable), and a
+    /// cron `consolidate-all` paid one provider call per run for it.
+    #[test]
+    fn critical_memories_take_no_part_in_a_consolidation() {
+        let (base_url, seen) = http_stub(vec![(200, openai_reply("SUMMARY"))]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_CRITICAL_KEY");
+        let store = Store::in_memory().unwrap();
+        seed_topic(&store, "t", &facts("plain", 3));
+        store
+            .store(Memory::new(
+                "t".into(),
+                "NEVER-FORGET this".into(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "t".into(),
+                "a decision".into(),
+                Importance::High,
+            ))
+            .unwrap();
+
+        let first = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None).unwrap();
+        assert_eq!((first.passes, first.replaced), (1, 4));
+        let prompt = seen.try_iter().next().expect("one call");
+        assert!(
+            !prompt.contains("NEVER-FORGET"),
+            "critical text sent to be summarized"
+        );
+
+        let after = store.get_by_topic("t").unwrap();
+        assert_eq!(after.len(), 2, "the critical memory and the summary");
+        let summary = after.iter().find(|m| m.summary == "SUMMARY").unwrap();
+        assert_eq!(
+            summary.importance,
+            Importance::High,
+            "highest of what it replaced, never critical"
+        );
+
+        // Again: nothing to merge, no call (the stub has no answer left),
+        // no extra memory. Same through `consolidate-all`.
+        let again = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None).unwrap();
+        assert_eq!(again.passes, 0);
+        cmd_consolidate_all(&store, 1, &cfg, None, None, None, false, None).unwrap();
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_CRITICAL_KEY");
+        assert_eq!(seen.try_iter().count(), 0, "the provider was called again");
+        assert_eq!(store.count_by_topic("t").unwrap(), 2);
+    }
+
+    /// A memory larger than a whole prompt (typically an old lexical join)
+    /// used to stop the consolidation of its topic at the first pass, with
+    /// exit 0 and the topic counted as consolidated. It is now set aside,
+    /// the rest is consolidated, and the run says what it left.
+    #[test]
+    fn a_memory_too_large_for_a_pass_does_not_block_the_rest_of_the_topic() {
+        let huge = format!("HUGE {}", "x".repeat(25_000));
+        let seed = |store: &Store| {
+            store
+                .store(Memory::new("t".into(), huge.clone(), Importance::Medium))
+                .unwrap();
+            seed_topic(store, "t", &facts("small", 4));
+        };
+
+        let (base_url, seen) = http_stub(vec![(200, openai_reply("SUMMARY-OF-THE-SMALL-ONES"))]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_HUGE_KEY");
+        let store = Store::in_memory().unwrap();
+        seed(&store);
+        let run = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None).unwrap();
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY");
+        assert_eq!((run.replaced, run.too_large, run.unfolded), (4, 1, 1));
+        let prompt = seen.try_iter().next().expect("the small ones were sent");
+        assert!(
+            !prompt.contains("HUGE"),
+            "the oversized memory cannot be in a prompt"
+        );
+        let mut left: Vec<String> = store
+            .get_by_topic("t")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary.chars().take(25).collect())
+            .collect();
+        left.sort();
+        assert_eq!(left.len(), 2);
+        assert!(left[0].starts_with("HUGE") && left[1] == "SUMMARY-OF-THE-SMALL-ONES");
+
+        // The queued job for such a topic is not `done`: it records why.
+        let (base_url, _seen) = http_stub(vec![(200, openai_reply("SUMMARY"))]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_HUGE_KEY_P");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+        seed(&store);
+        store.enqueue_pending_consolidation("t", "").unwrap();
+        cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path).unwrap();
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY_P");
+        let jobs = store.list_consolidation_jobs(None, 10).unwrap();
+        assert_eq!(jobs[0].status, "failed");
+        assert!(
+            jobs[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("too large"),
+            "{:?}",
+            jobs[0].error
+        );
+    }
+
+    /// One pending job per topic, and a topic that holds a single memory is
+    /// not sent to the provider to be rewritten into itself. Every store
+    /// past the threshold used to queue a job, and each job after the first
+    /// was a paid call on the lone summary.
+    #[test]
+    fn queued_consolidations_cost_one_provider_call_per_topic() {
+        let (base_url, seen) = http_stub(vec![
+            (200, openai_reply("SUMMARY")),
+            (200, openai_reply("SUMMARY-REWRITTEN")),
+        ]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_QUEUE_KEY");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+        seed_topic(&store, "busy", &facts("busy", 4));
+        let first = store.enqueue_pending_consolidation("busy", "").unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                store.enqueue_pending_consolidation("busy", "").unwrap(),
+                first,
+                "a topic already waiting is not queued again"
+            );
+        }
+        assert_eq!(store.list_pending_consolidation_jobs(50).unwrap().len(), 1);
+
+        cmd_consolidate_pending(&store, None, &cfg, 20, None, None, false, &db_path).unwrap();
+        assert_eq!(seen.try_iter().count(), 1);
+
+        // Queued again after it was consolidated (a job from before the
+        // dedup, or a manual one): done, without a call.
+        store.enqueue_pending_consolidation("busy", "").unwrap();
+        cmd_consolidate_pending(&store, None, &cfg, 20, None, None, false, &db_path).unwrap();
+        let direct = cmd_consolidate(&store, "busy", false, &cfg, None, None, None, None).unwrap();
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_QUEUE_KEY");
+        assert_eq!(direct.passes, 0);
+        assert_eq!(seen.try_iter().count(), 0, "the lone summary was sent back");
+        let left = store.get_by_topic("busy").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].summary, "SUMMARY");
+        assert!(store
+            .list_consolidation_jobs(None, 10)
+            .unwrap()
+            .iter()
+            .all(|j| j.status == "done"));
+    }
+
+    /// `consolidate-all` takes the biggest topic first — the one most
+    /// likely to get an answer cut short. Stopping at that first failure
+    /// meant no other topic was ever consolidated by the cron.
+    #[test]
+    fn consolidate_all_goes_on_after_a_failure_that_is_one_topics_own() {
+        let cut_short = serde_json::json!({
+            "choices": [{ "message": { "content": "half a summ" }, "finish_reason": "length" }],
+        })
+        .to_string();
+        let (base_url, seen) = http_stub(vec![
+            (200, cut_short),
+            (200, openai_reply("SUMMARY-B")),
+            (200, openai_reply("SUMMARY-C")),
+        ]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_ALL_GOES_ON_KEY");
+        let store = Store::in_memory().unwrap();
+        seed_topic(&store, "a-biggest", &facts("a", 5));
+        seed_topic(&store, "b", &facts("b", 4));
+        seed_topic(&store, "c", &facts("c", 3));
+
+        let result = cmd_consolidate_all(&store, 2, &cfg, None, None, None, false, None);
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_ALL_GOES_ON_KEY");
+        let msg = result.expect_err("one topic failed").to_string();
+        assert!(
+            msg.contains("2 topic(s) consolidated, 1 failed, 0 not attempted"),
+            "{msg}"
+        );
+        // What the last line says about the failed topic must be true of a
+        // topic that failed at a later pass too.
+        assert!(
+            msg.contains("keeps every memory that was not summarized"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("failed and skipped topics are unchanged"),
+            "{msg}"
+        );
+        assert_eq!(seen.try_iter().count(), 3);
+        assert_eq!(store.count_by_topic("a-biggest").unwrap(), 5);
+        assert_eq!(store.get_by_topic("b").unwrap()[0].summary, "SUMMARY-B");
+        assert_eq!(store.get_by_topic("c").unwrap()[0].summary, "SUMMARY-C");
+    }
+
+    /// While the provider is answering, one memory of the topic is
+    /// corrected and another is forgotten. The summary being written is
+    /// about what they used to say: writing it would delete the correction
+    /// (it is not in the summary) and bring back what was forgotten. The
+    /// store refuses it and the pass is redone from what the topic holds.
+    #[test]
+    fn a_memory_edited_or_forgotten_during_the_provider_call_is_neither_lost_nor_brought_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+        let ids = seed_topic(
+            &store,
+            "t",
+            &[
+                "the port is 5432".to_string(),
+                "FORGET-ME: a wrong claim".to_string(),
+                "third fact".to_string(),
+            ],
+        );
+        let (edited, forgotten) = (ids[0].clone(), ids[1].clone());
+        let other_db = db_path.clone();
+        let (base_url, seen) = http_stub_with(
+            vec![
+                (200, openai_reply("SUMMARY-OF-THE-OLD-STATE")),
+                (200, openai_reply("SUMMARY-OF-THE-CURRENT-STATE")),
+            ],
+            move || {
+                let other = Store::with_dims(&other_db, 64).unwrap();
+                let mut memory = other.get(&edited).unwrap().unwrap();
+                memory.summary = "the port is 5433 (CORRECTED)".into();
+                other.update(&memory).unwrap();
+                other.delete(&forgotten).unwrap();
+            },
+        );
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_STALE_KEY");
+
+        let run = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_STALE_KEY");
+        let run = run.unwrap();
+        assert_eq!(run.passes, 1);
+
+        let prompts: Vec<String> = seen.try_iter().collect();
+        assert_eq!(prompts.len(), 2, "the pass is redone from a fresh read");
+        assert!(
+            prompts[1].contains("CORRECTED"),
+            "the correction was never summarized"
+        );
+        assert!(
+            !prompts[1].contains("FORGET-ME"),
+            "what was forgotten came back"
+        );
+        let left = store.get_by_topic("t").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].summary, "SUMMARY-OF-THE-CURRENT-STATE");
+    }
+
+    /// The lexical cron: a topic whose join is larger than one memory can
+    /// hold used to be an error on every run (exit 1 since the last round,
+    /// where the commit before exited 0). It is folded into as few memories
+    /// as it takes instead, every fact kept, and the run succeeds.
+    #[test]
+    fn lexical_consolidate_all_handles_a_topic_larger_than_one_summary() {
+        let store = Store::in_memory().unwrap();
+        let texts: Vec<String> = (0..30)
+            .map(|i| format!("FACT{i:02} {}", "y".repeat(5_000)))
+            .collect();
+        seed_topic(&store, "bulky", &texts);
+        let cfg = config::SummarizerConfig::default();
+
+        cmd_consolidate_all(&store, 2, &cfg, Some("none"), None, None, false, None)
+            .expect("a topic that cannot fit in one memory is not an error");
+
+        let after = store.get_by_topic("bulky").unwrap();
+        assert!(after.len() < 30, "nothing was folded: {}", after.len());
+        assert!(
+            after.len() >= 3,
+            "150 KB cannot fit in fewer than 3 memories"
+        );
+        let everything: String = after.iter().map(|m| m.summary.as_str()).collect();
+        for i in 0..30 {
+            assert_eq!(
+                everything.matches(&format!("FACT{i:02} ")).count(),
+                1,
+                "fact {i} lost or duplicated"
+            );
+        }
+        // Idempotent: a second run has nothing left to merge.
+        let count = after.len();
+        cmd_consolidate_all(&store, 2, &cfg, Some("none"), None, None, false, None).unwrap();
+        assert_eq!(store.count_by_topic("bulky").unwrap(), count);
+    }
+
+    /// The failure message is shown by the batch commands, stored on the
+    /// job and displayed by the dashboard: it must not recommend a flag
+    /// those do not have, nor say "untouched" of a topic a first pass has
+    /// already folded in part.
+    #[test]
+    fn summarizer_failure_message_says_only_what_is_true() {
+        let plain = SummarizerFailed {
+            provider: "anthropic",
+            reason: "HTTP 429".into(),
+            folded_before: 0,
+        }
+        .to_string();
+        assert!(
+            plain.contains("the memories it did not summarize are untouched"),
+            "{plain}"
+        );
+        assert!(!plain.contains("--keep-originals"), "{plain}");
+        assert!(!plain.contains("partial summary"), "{plain}");
+
+        // A real later-pass failure: 70 memories, second pass refused.
+        let (base_url, _seen) = http_stub(vec![
+            (200, openai_reply("SUMMARY-ONE")),
+            (401, r#"{"error":{"message":"no"}}"#.to_string()),
+        ]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_PARTIAL_MSG_KEY");
+        let store = Store::in_memory().unwrap();
+        let texts: Vec<String> = (0..70)
+            .map(|i| format!("FACT{i:03} {}", "x".repeat(310)))
+            .collect();
+        seed_topic(&store, "big", &texts);
+        let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
+        std::env::remove_var("ICM_TEST_CONSOLIDATE_PARTIAL_MSG_KEY");
+        let msg = result.expect_err("the second pass failed").to_string();
+        assert!(
+            msg.contains("memories of the topic were already folded into a partial summary"),
+            "{msg}"
+        );
+        assert!(!msg.contains("--keep-originals"), "{msg}");
+    }
+
+    /// The other half of the contract: when the provider does answer, the
+    /// originals are replaced by its summary, through the real HTTP path.
+    #[test]
+    fn cmd_consolidate_replaces_originals_with_the_api_key_providers_summary() {
+        let (base_url, seen) = http_stub(vec![(200, openai_reply("merged by the model"))]);
+        let var = "ICM_TEST_CONSOLIDATE_API_KEY";
+        std::env::set_var(var, "placeholder-not-a-real-key");
+        let cfg = config::SummarizerConfig {
+            provider: "openai".into(),
+            model: "test-model".into(),
+            api_key_env: var.into(),
+            base_url: format!("{base_url}/v1"),
+            ..config::SummarizerConfig::default()
+        };
+        let store = Store::in_memory().unwrap();
+        for text in ["fact one", "fact two"] {
+            store
+                .store(Memory::new("t".into(), text.into(), Importance::Medium))
+                .unwrap();
+        }
+        // The flag spells the configured provider through an alias: its
+        // settings (endpoint, key variable, model) must be kept.
+        let result = cmd_consolidate(
+            &store,
+            "t",
+            false,
+            &cfg,
+            Some("openai-compatible"),
+            None,
+            None,
+            None,
+        );
+        std::env::remove_var(var);
+        result.unwrap();
+
+        let request = seen
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the configured endpoint was never called");
+        assert!(
+            request.starts_with("POST /v1/chat/completions "),
+            "{request}"
+        );
+        assert!(request.contains("\"model\":\"test-model\""), "{request}");
+        let after = store.get_by_topic("t").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].summary, "merged by the model");
+    }
+
+    /// A provider flag that differs from the config must not inherit the
+    /// key variable, endpoint or model written for the configured provider
+    /// (that is how the OpenRouter key was sent to an Anthropic endpoint).
+    /// Checked on the resolved settings, without sending anything: the
+    /// flagged provider would be the real vendor.
+    #[test]
+    fn provider_flag_does_not_inherit_another_providers_key_endpoint_or_model() {
+        let cfg = config::SummarizerConfig {
+            provider: "openai".into(),
+            model: "mistralai/mistral-small".into(),
+            api_key_env: "OPENROUTER_API_KEY".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            ..config::SummarizerConfig::default()
+        };
+        let other = resolve_summarizer(&cfg, Some("anthropic"), None).unwrap();
+        assert_eq!(other.kind, summarizer::ProviderKind::Anthropic);
+        assert_eq!(other.api.api_key_env, "");
+        assert_eq!(other.api.base_url, "");
+        assert_eq!(other.model, None);
+        assert!(other.note.is_some());
+
+        let same = resolve_summarizer(&cfg, Some("openai"), Some("override")).unwrap();
+        assert_eq!(same.api.api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(same.api.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(same.model.as_deref(), Some("override"));
+        assert_eq!(
+            resolve_consolidate_provider(&cfg, Some("google")).unwrap(),
+            summarizer::ProviderKind::Google
+        );
+    }
+
+    /// End-to-end wiring for an API-key provider through `extract-pending`:
+    /// it is not downgraded by the "CLI not on PATH" check (it has no CLI),
+    /// the `[extraction.summarizer]` fields reach the request, and the
+    /// bullets it returns are stored. The "API" is a loopback stub; the key
+    /// is a placeholder in a variable unique to this test.
+    #[test]
+    fn extract_pending_calls_the_configured_api_key_provider() {
+        let (base_url, seen) = http_stub(vec![(
+            200,
+            openai_reply("- The API uses gRPC between services.\n- (none)"),
+        )]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+        store
+            .enqueue_pending_extraction("proj", "Bash", "some tool output")
+            .unwrap();
+        let var = "ICM_TEST_EXTRACT_PENDING_API_KEY";
+        std::env::set_var(var, "placeholder-not-a-real-key");
+        let cfg = config::SummarizerConfig {
+            provider: "openai".into(),
+            model: "test-model".into(),
+            api_key_env: var.into(),
+            base_url: format!("{base_url}/v1"),
+            ..config::SummarizerConfig::default()
+        };
+        let result = cmd_extract_pending(&store, None, &cfg, 10, None, None, false, &db_path);
+        std::env::remove_var(var);
+        result.unwrap();
+
+        let request = seen
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the configured API-key provider was never called");
+        assert!(
+            request.starts_with("POST /v1/chat/completions "),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer placeholder-not-a-real-key"),
+            "key from the configured variable must be sent as a bearer token"
+        );
+        assert!(request.contains("\"model\":\"test-model\""), "{request}");
+        assert!(request.contains("some tool output"), "{request}");
+
+        let facts = store.get_by_topic("context-proj").unwrap();
+        assert_eq!(facts.len(), 1, "one bullet stored, `(none)` skipped");
+        assert_eq!(facts[0].summary, "The API uses gRPC between services.");
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+    }
+
+    /// A compatible server that leaves the model's `<think>` scratchpad in
+    /// the answer: none of its lines may become a stored "fact".
+    #[test]
+    fn extract_pending_does_not_store_the_models_reasoning_as_facts() {
+        let (base_url, _seen) = http_stub(vec![(
+            200,
+            openai_reply(
+                "<think>\nThe user might prefer MySQL, I am not sure.\n- Maybe SQLite?\n\
+                 </think>\n\n- The project uses Postgres on port 5433.",
+            ),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+        store
+            .enqueue_pending_extraction("proj", "Bash", "some tool output")
+            .unwrap();
+        let var = "ICM_TEST_EXTRACT_PENDING_THINK_KEY";
+        std::env::set_var(var, "placeholder-not-a-real-key");
+        let cfg = config::SummarizerConfig {
+            provider: "openai".into(),
+            model: "qwen3".into(),
+            api_key_env: var.into(),
+            base_url: format!("{base_url}/v1"),
+            ..config::SummarizerConfig::default()
+        };
+        let result = cmd_extract_pending(&store, None, &cfg, 10, None, None, false, &db_path);
+        std::env::remove_var(var);
+        result.unwrap();
+
+        let facts: Vec<String> = store
+            .get_by_topic("context-proj")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary)
+            .collect();
+        assert_eq!(facts, ["The project uses Postgres on port 5433."]);
+    }
+
+    /// Embedder keyed on "decided", like the other stubs in this file: a
+    /// constant one would make the local extractor score nothing.
+    struct DecidedEmbedder;
+    impl icm_core::Embedder for DecidedEmbedder {
+        fn embed(&self, text: &str) -> icm_core::IcmResult<Vec<f32>> {
+            let hit = text.to_lowercase().contains("decided");
+            let mut v = vec![0.0_f32; 64];
+            v[0] = if hit { 1.0 } else { 0.0 };
+            v[1] = if hit { 0.0 } else { 1.0 };
+            Ok(v)
+        }
+        fn embed_batch(&self, texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+            texts.iter().map(|t| self.embed(t)).collect()
+        }
+        fn dimensions(&self) -> usize {
+            64
+        }
+    }
+
+    const DECISION: &str = "We decided to switch from REST to gRPC for internal service \
+                            calls because of latency requirements.";
+
+    /// When the API-key provider cannot run, the rows are *extracted* by the
+    /// local fallback — not merely dequeued. An empty queue alone would also
+    /// be what dropping the rows looks like, so the stored facts are checked.
+    #[test]
+    fn extract_pending_falls_back_to_the_local_extractor_when_the_api_key_provider_cannot_run() {
+        for (provider, api_key_env) in [
+            ("anthropic", "ICM_TEST_KEY_THAT_IS_NEVER_SET"),
+            ("openai", "ICM_TEST_KEY_THAT_IS_NEVER_SET"),
+            ("google", "ICM_TEST_KEY_THAT_IS_NEVER_SET"),
+            ("openai", "sk-pasted-NotARealKey"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("memories.db");
+            let store = Store::with_dims(&db_path, 64).unwrap();
+            store
+                .enqueue_pending_extraction("p", "Bash", DECISION)
+                .unwrap();
+            let cfg = config::SummarizerConfig {
+                provider: provider.into(),
+                model: "test-model".into(),
+                api_key_env: api_key_env.into(),
+                base_url: "http://127.0.0.1:1".into(),
+                ..config::SummarizerConfig::default()
+            };
+            cmd_extract_pending(
+                &store,
+                Some(&DecidedEmbedder),
+                &cfg,
+                10,
+                None,
+                None,
+                false,
+                &db_path,
+            )
+            .unwrap();
+            assert!(
+                store.list_pending_extractions(10).unwrap().is_empty(),
+                "{provider}/{api_key_env}: rows must be dequeued by the fallback"
+            );
+            let stored = store.list_all().unwrap();
+            assert!(
+                stored.iter().any(|m| m.summary.contains("gRPC")),
+                "{provider}/{api_key_env}: the fallback must extract the fact, not drop the row"
+            );
+        }
+    }
+
+    /// The same through a real HTTP failure: a 401 from the provider on the
+    /// first project sends that project and the next to the local
+    /// extractor, and the provider is not called again for the second. The
+    /// stub has a second answer ready: if it is ever requested, the count
+    /// says so and its "fact" ends up in the store.
+    #[test]
+    fn extract_pending_survives_an_http_error_from_the_api_key_provider() {
+        let (base_url, seen) = http_stub(vec![
+            (401, r#"{"error":{"message":"invalid key"}}"#.to_string()),
+            (200, openai_reply("- FACT-FROM-A-SECOND-CALL")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+        for project in ["one", "two"] {
+            store
+                .enqueue_pending_extraction(project, "Bash", DECISION)
+                .unwrap();
+        }
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_EXTRACT_PENDING_401_KEY");
+        let result = cmd_extract_pending(
+            &store,
+            Some(&DecidedEmbedder),
+            &cfg,
+            10,
+            None,
+            None,
+            false,
+            &db_path,
+        );
+        std::env::remove_var("ICM_TEST_EXTRACT_PENDING_401_KEY");
+        result.unwrap();
+
+        assert_eq!(seen.try_iter().count(), 1, "one call, then the fallback");
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+        let stored = store.list_all().unwrap();
+        assert!(
+            !stored.iter().any(|m| m.summary.contains("SECOND-CALL")),
+            "the provider was called again after it failed"
+        );
+        for project in ["one", "two"] {
+            assert!(
+                stored
+                    .iter()
+                    .any(|m| m.topic.contains(project) && m.summary.contains("gRPC")),
+                "project {project} was not extracted locally: {:?}",
+                stored.iter().map(|m| &m.topic).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The batch commands through a real HTTP failure (the other tests of
+    /// a summarizer that is down fail before the network): one 401, then
+    /// nothing — the stub's second answer is never requested, no topic is
+    /// touched, `consolidate-all` fails and `consolidate-pending` keeps the
+    /// rest of its queue.
+    #[test]
+    fn batch_consolidation_stops_calling_a_provider_that_answers_with_an_error() {
+        let seed = |store: &Store| {
+            for topic in ["alpha", "beta", "gamma"] {
+                for i in 0..3 {
+                    store
+                        .store(Memory::new(
+                            topic.into(),
+                            format!("{topic} fact {i}"),
+                            Importance::Medium,
+                        ))
+                        .unwrap();
+                }
+            }
+        };
+        // Two failures in a row stop `consolidate-all` (one may be the
+        // topic's own); the first stops `consolidate-pending`. The last
+        // answer must never be requested.
+        let responses = |failures: usize| {
+            let mut answers =
+                vec![(401, r#"{"error":{"message":"invalid key"}}"#.to_string()); failures];
+            answers.push((200, openai_reply("SUMMARY-FROM-ONE-CALL-TOO-MANY")));
+            answers
+        };
+        let untouched = |store: &Store| {
+            for topic in ["alpha", "beta", "gamma"] {
+                assert_eq!(store.get_by_topic(topic).unwrap().len(), 3, "{topic}");
+            }
+        };
+
+        // consolidate-all
+        let (base_url, seen) = http_stub(responses(2));
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_BATCH_401_KEY_A");
+        let store = Store::in_memory().unwrap();
+        seed(&store);
+        let result = cmd_consolidate_all(&store, 2, &cfg, None, None, None, false, None);
+        std::env::remove_var("ICM_TEST_BATCH_401_KEY_A");
+        let msg = result
+            .expect_err("exit status must show the failure")
+            .to_string();
+        assert!(msg.contains("2 failed, 1 not attempted"), "{msg}");
+        assert_eq!(seen.try_iter().count(), 2, "consolidate-all kept calling");
+        untouched(&store);
+
+        // consolidate-pending
+        let (base_url, seen) = http_stub(responses(1));
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_BATCH_401_KEY_P");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+        seed(&store);
+        for topic in ["alpha", "beta", "gamma"] {
+            store.enqueue_pending_consolidation(topic, "").unwrap();
+        }
+        let result = cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path);
+        std::env::remove_var("ICM_TEST_BATCH_401_KEY_P");
+        result.unwrap();
+        assert_eq!(
+            seen.try_iter().count(),
+            1,
+            "consolidate-pending kept calling"
+        );
+        let mut statuses: Vec<String> = store
+            .list_consolidation_jobs(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|j| j.status)
+            .collect();
+        statuses.sort();
+        assert_eq!(statuses, ["failed", "pending", "pending"]);
+        untouched(&store);
+    }
+
+    /// A provider flag that differs from the config, through a whole
+    /// command: the configured endpoint must receive nothing, and the
+    /// flagged provider must not be handed the configured model. `ollama`
+    /// is the flag because it fails before any network when it has no
+    /// model — a vendor flag would aim at the real vendor.
+    #[test]
+    fn a_different_provider_flag_never_reaches_the_configured_endpoint() {
+        let (base_url, seen) = http_stub(vec![(200, openai_reply("FROM-THE-CONFIGURED-ENDPOINT"))]);
+        let cfg = stub_summarizer(&base_url, "ICM_TEST_FLAG_OTHER_PROVIDER_KEY");
+        let store = Store::in_memory().unwrap();
+        for text in ["fact one", "fact two"] {
+            store
+                .store(Memory::new("t".into(), text.into(), Importance::Medium))
+                .unwrap();
+        }
+        let result = cmd_consolidate(&store, "t", false, &cfg, Some("ollama"), None, None, None);
+        std::env::remove_var("ICM_TEST_FLAG_OTHER_PROVIDER_KEY");
+        let err = result
+            .expect_err("ollama has no model of its own")
+            .to_string();
+        assert!(err.contains("ollama provider needs a model"), "{err}");
+        assert!(
+            seen.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the endpoint configured for another provider was called"
+        );
+        assert_eq!(store.get_by_topic("t").unwrap().len(), 2);
+    }
+
+    /// The HTTP client logs every request's headers at DEBUG, masking only
+    /// `Authorization`: `x-api-key` and `x-goog-api-key` would be printed in
+    /// full. They must not reach the log on any `RUST_LOG`, including the
+    /// directive more specific than anything a level cap could override.
+    #[test]
+    fn http_client_debug_log_never_reaches_the_output_whatever_rust_log_says() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf::default();
+        let writer = {
+            let buf = buf.clone();
+            move || buf.clone()
+        };
+        // The same subscriber `main` installs, on the most permissive
+        // RUST_LOG there is. Installed process-wide, as in `main`: the
+        // `log` → `tracing` bridge the HTTP client goes through is global.
+        log_subscriber(
+            tracing_subscriber::EnvFilter::new("trace,ureq=trace,ureq::unit=trace"),
+            writer,
+        )
+        .try_init()
+        .expect("no other test installs a global logger");
+
+        let key = "sk-log-NotARealKey-0123456789";
+        let var = "ICM_TEST_LOG_REDACTION_KEY";
+        std::env::set_var(var, key);
+        let mut headers_seen = Vec::new();
+        for (kind, reply) in [
+            (
+                summarizer::ProviderKind::Anthropic,
+                serde_json::json!({
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "stop_reason": "end_turn",
+                }),
+            ),
+            (
+                summarizer::ProviderKind::Google,
+                serde_json::json!({
+                    "candidates": [{
+                        "content": { "parts": [{ "text": "ok" }] },
+                        "finishReason": "STOP",
+                    }],
+                }),
+            ),
+        ] {
+            let (base_url, seen) = http_stub(vec![(200, reply.to_string())]);
+            let provider = summarizer::make_summarizer(
+                kind,
+                &summarizer::ApiOptions {
+                    api_key_env: var.into(),
+                    base_url,
+                    ..summarizer::ApiOptions::default()
+                },
+            )
+            .unwrap();
+            let req = summarizer::SummarizeRequest {
+                prompt: "p",
+                model: Some("m"),
+                max_tokens: 10,
+                timeout: std::time::Duration::from_secs(5),
+            };
+            assert_eq!(provider.summarize(&req).unwrap(), "ok");
+            headers_seen.push(
+                seen.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+            );
+        }
+        std::env::remove_var(var);
+        tracing::warn!("log-pipeline-marker");
+
+        // The key did travel in the non-masked headers…
+        assert!(headers_seen[0].contains(&format!("x-api-key: {key}")));
+        assert!(headers_seen[1].contains(&format!("x-goog-api-key: {key}")));
+        // …the log pipeline is live…
+        let logged =
+            String::from_utf8_lossy(&buf.0.lock().unwrap_or_else(|e| e.into_inner())).to_string();
+        assert!(logged.contains("log-pipeline-marker"), "{logged}");
+        // …and neither the key nor the line that carries it got through.
+        assert!(!logged.contains(key), "API key in the log: {logged}");
+        assert!(!logged.contains("writing prelude"), "{logged}");
     }
 
     /// `cmd_consolidate_pending` on a job whose topic no longer has any

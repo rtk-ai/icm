@@ -749,8 +749,15 @@ async fn handle_consolidate(
         return err_response(StatusCode::BAD_REQUEST, "topic required", format);
     }
     let store = lock_store(&state);
-    let topic_memories = match store.get_by_topic(&req.topic) {
-        Ok(ms) => ms,
+    match store.count_by_topic(&req.topic) {
+        Ok(0) => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                &format!("no memories under topic {:?}", req.topic),
+                format,
+            )
+        }
+        Ok(_) => {}
         Err(e) => {
             return err_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -758,36 +765,62 @@ async fn handle_consolidate(
                 format,
             )
         }
-    };
-    if topic_memories.is_empty() {
-        return err_response(
-            StatusCode::NOT_FOUND,
-            &format!("no memories under topic {:?}", req.topic),
-            format,
-        );
     }
-    let summary = topic_memories
-        .iter()
-        .map(|m| m.summary.as_str())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let mut consolidated = Memory::new(req.topic.clone(), summary, Importance::High);
     // Same bug class as #400 (cmd_consolidate/tool_consolidate): this is a
     // third, independent /consolidate implementation that had the same gap
     // — never attached an embedding to the merged memory it creates.
-    if let Some(emb) = state.embedder_ref() {
-        if let Ok(v) = emb.embed(&consolidated.embed_text()) {
-            consolidated.embedding = Some(v);
+    let embedder = state.embedder_ref();
+    let mut build = |_covered: &[&Memory], summary: String| {
+        // The engine sets the importance from what the pass covers.
+        let mut consolidated = Memory::new(req.topic.clone(), summary, Importance::Medium);
+        if let Some(emb) = embedder {
+            if let Ok(v) = emb.embed(&consolidated.embed_text()) {
+                consolidated.embedding = Some(v);
+            }
         }
-    }
-
-    let result = if req.keep_originals {
-        store.store(consolidated.clone()).map(|_| ())
-    } else {
-        store.consolidate_topic(&req.topic, consolidated.clone())
+        consolidated
     };
-    match result {
-        Ok(()) => render_recall(&[(consolidated, None)], format),
+
+    // The lexical join, through the same engine as `icm consolidate`: only
+    // the memories that are in the join are removed, pass by pass when the
+    // topic holds more than one read or one summary can carry — never the
+    // whole topic by name, which also took whatever had not been read or
+    // was stored in the meantime.
+    let run = crate::consolidate_in_passes(
+        &store,
+        &req.topic,
+        &crate::PassWriter::Lexical,
+        req.keep_originals,
+        crate::MAX_CONSOLIDATION_PASSES,
+        &mut build,
+    );
+    match run {
+        Ok(run) => {
+            // The body is what it always was: the memory that now stands
+            // for the topic. With nothing to merge (one memory, or only
+            // critical ones) that is what the topic already holds.
+            let shown: Vec<(Memory, Option<f32>)> = match run.summary {
+                Some(summary) => vec![(summary, None)],
+                None => store
+                    .get_by_topic(&req.topic)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(1)
+                    .map(|m| (m, None))
+                    .collect(),
+            };
+            let mut resp = render_recall(&shown, format);
+            // Additive headers.
+            for (name, value) in [
+                ("x-icm-consolidated", run.replaced),
+                ("x-icm-left-in-place", run.others_left),
+            ] {
+                if let Ok(value) = axum::http::HeaderValue::from_str(&value.to_string()) {
+                    resp.headers_mut().insert(name, value);
+                }
+            }
+            resp
+        }
         Err(e) => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("consolidate failed: {e}"),
@@ -1171,6 +1204,132 @@ mod tests {
             memories[0].embedding.is_some(),
             "consolidated memory must have an embedding attached"
         );
+    }
+
+    /// `POST /consolidate` reads the topic, builds the join, then replaces.
+    /// A memory stored in between — by another process on the same database
+    /// — was deleted with the topic without being in the join. The "other
+    /// process" here is a second connection, opened from the embedder: the
+    /// one step that runs between the read and the write.
+    #[tokio::test]
+    async fn handle_consolidate_keeps_a_memory_stored_while_it_runs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct LateWriter {
+            db: std::path::PathBuf,
+            done: AtomicBool,
+        }
+        impl Embedder for LateWriter {
+            fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
+                if !self.done.swap(true, Ordering::SeqCst) {
+                    let other = Store::with_dims(&self.db, 64).unwrap();
+                    other
+                        .store(Memory::new(
+                            "http-test".into(),
+                            "LATE-ARRIVAL".into(),
+                            Importance::Medium,
+                        ))
+                        .unwrap();
+                }
+                Ok(vec![0.4_f32; 64])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("memories.db");
+        let store = Store::with_dims(&db, 64).unwrap();
+        for i in 0..3 {
+            store
+                .store(Memory::new(
+                    "http-test".into(),
+                    format!("expendable {i}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let mut state = test_state(store, false);
+        state.embedder = Some(Arc::new(LateWriter {
+            db,
+            done: AtomicBool::new(false),
+        }));
+
+        let resp = handle_consolidate(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(FormatQuery::default()),
+            Json(ConsolidateReq {
+                topic: "http-test".into(),
+                keep_originals: false,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-icm-consolidated"], "3");
+        assert_eq!(resp.headers()["x-icm-left-in-place"], "1");
+
+        let store = lock_store(&state);
+        let mut left: Vec<String> = store
+            .get_by_topic("http-test")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary)
+            .collect();
+        left.sort();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert_eq!(
+            left[0], "LATE-ARRIVAL",
+            "stored mid-consolidation, then deleted"
+        );
+        for i in 0..3 {
+            assert!(left[1].contains(&format!("expendable {i}")), "{}", left[1]);
+        }
+    }
+
+    /// A topic larger than one read of the store (500 memories): every fact
+    /// must be in the result. The 20 that were never read used to be
+    /// deleted with the rest.
+    #[tokio::test]
+    async fn handle_consolidate_never_removes_memories_it_did_not_join() {
+        let store = Store::in_memory_with_dims(TEST_DIMS).unwrap();
+        for i in 0..520 {
+            store
+                .store(Memory::new(
+                    "many".into(),
+                    format!("fact {i:03};"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let state = test_state(store, false);
+        let resp = handle_consolidate(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(FormatQuery::default()),
+            Json(ConsolidateReq {
+                topic: "many".into(),
+                keep_originals: false,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-icm-consolidated"], "520");
+        assert_eq!(resp.headers()["x-icm-left-in-place"], "0");
+
+        let store = lock_store(&state);
+        let after = store.get_by_topic("many").unwrap();
+        assert_eq!(after.len(), 1, "two passes: 500, then the join + 20");
+        for i in 0..520 {
+            assert!(
+                after[0].summary.contains(&format!("fact {i:03};")),
+                "fact {i} was deleted without being joined"
+            );
+        }
     }
 
     // --- v2 engine, token budget, caller-supplied dates ---------------------

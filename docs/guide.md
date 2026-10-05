@@ -171,6 +171,60 @@ icm consolidate --topic "errors-resolved" --keep-originals
 
 ICM warns when a topic has >7 entries via the MCP `icm_memory_store` response.
 
+#### Summarizer providers: bring your own LLM, or your own token
+
+By default (`provider = "none"`) consolidation is a lexical join. A real summary needs an LLM, selected with `--summarizer-provider` or in `config.toml` (`[consolidate.summarizer]` for `consolidate` / `briefing`, `[extraction.summarizer]` for the hook extraction queue):
+
+- `claude`, `codex`, `gemini` — shell out to the CLI you are already logged into (`claude -p`, `codex exec`, `gemini -p`). No key, your existing quota.
+- `ollama` — local Ollama daemon (`OLLAMA_HOST`), `model` required.
+- `anthropic`, `openai`, `google` — call the vendor API directly with a key, for servers, CI and containers where no CLI is installed. `openai` also covers any OpenAI-compatible server (OpenRouter, Mistral, Groq, vLLM, LM Studio, …) through `base_url`.
+- `auto` — pick a CLI from the environment of the invoking tool. It never selects `anthropic` / `openai` / `google`: an API key in the environment is not spent unless you name the provider.
+- `none` — no LLM.
+
+```toml
+[consolidate.summarizer]
+provider = "anthropic"        # key from $ANTHROPIC_API_KEY
+# model = "claude-haiku-4-5"  # default: the provider's low-cost model
+# workspace_id = "wrkspc_…"   # only for a key not scoped to one workspace
+
+[extraction.summarizer]
+provider = "openai"
+base_url = "https://openrouter.ai/api/v1"   # any OpenAI-compatible endpoint
+api_key_env = "OPENROUTER_API_KEY"          # the variable's NAME, not the key
+model = "mistralai/mistral-small"           # required with a third-party base_url
+```
+
+**The key.** It is read from an environment variable, never from the config file, and sent in a header to the host in `base_url` only (redirects are not followed). On the vendor's own host the variable defaults to `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY`. On any other `base_url` nothing is sent unless `api_key_env` names a variable: a local server (LM Studio, vLLM) needs no key and no placeholder, and your real OpenAI key is never shipped to it by default. A gateway in front of a vendor needs `api_key_env` spelled out. `base_url` is `scheme://host[:port]/path` and nothing else: a query string, a fragment, credentials, or a host that is not a plain name or IP address is refused, so that the host ICM checks is the host the request goes to. `http://` is refused for the vendors' hosts and flagged for any other non-loopback host (the key and the text travel unencrypted). `icm config` shows the variable, whether it is set, and that warning — never the key. `RUST_LOG` cannot make the HTTP client print request headers.
+
+**A provider flag and the config.** `api_key_env`, `base_url`, `workspace_id` and `model` apply to the provider the config names. `--summarizer-provider` / `--provider` with a different provider ignores them (and says so): that provider runs on its own defaults, with `--summarizer-model` / `--model` if given. One exception: when the config names no provider (`none` or `auto`), its `model` is used for whichever provider the flag picks — `model = "qwen3:8b"` plus `--summarizer-provider ollama` keeps working.
+
+**Models.** Defaults when `model` is empty: `claude-haiku-4-5` (anthropic), `gpt-6-luna` (openai, sent with `reasoning_effort: none`), `gemini-3.5-flash-lite` (google) — each vendor's current low-cost model, not necessarily the cheapest ID on its price list: older or deprecated models may cost less, set `model` to use one. OpenAI's regional endpoints (`https://eu.api.openai.com/v1`, …) count as OpenAI. `max_tokens` is the approximate summary budget; the hard cap sent to the API is 4x that, with a minimum of 8192 on a vendor's own API (at most 64000 for anthropic) so reasoning models have room to answer, and of 2048 on any other `base_url`. A compatible server with a small context window (vLLM or TGI serving an 8K model) that rejects even that gets one retry at exactly 4x `max_tokens`: lower `max_tokens` to fit it. An Anthropic key that spans several workspaces needs `workspace_id`.
+
+**When the provider fails.** Rate limits and outages (429, 5xx, dropped connections) are retried twice within `timeout_secs`, honoring `retry-after`. After that — or at once for a missing key, 401/403, a spent quota, a redirect, a timeout, an empty, truncated or unfinished answer — the error says what to fix, and no memory is removed that was not summarized:
+
+- `consolidate`, `consolidate-all`, `consolidate-pending` and the dashboard report the failure and leave in place everything the provider did not summarize. A topic that takes several passes keeps the passes that succeeded: the error says how many memories were already folded into a partial summary. `icm consolidate -t <topic> --keep-originals` adds a lexical join next to the originals instead of waiting for the provider. This holds for the CLI providers too.
+- `consolidate-all` goes on to the next topic after one failure (it may be that topic's own: an answer cut short, a content filter) and stops after two in a row. It exits non-zero when a topic failed, and zero otherwise — including when a topic could only be folded in part.
+- `consolidate-pending` marks the job `failed` and leaves the rest of the queue pending. A topic is queued at most once.
+- `extract-pending` hands the affected rows to the local extractor.
+- `briefing` fails.
+
+An answer only counts when the provider says it finished normally: `end_turn` / `stop_sequence` (anthropic), `STOP` (google), `stop` and its equivalents (openai format), `done: true` with `done_reason: "stop"` (Ollama; older servers that send no `done_reason` are accepted unless the answer used the whole output cap). One cut by the output cap or the context window, stopped for any other reason, or with no finish reason at all, is discarded. On an OpenAI-compatible server a leading `<think>…</think>` scratchpad is removed from the answer, unless the memories being summarized mention such tags or a tag is left after it; an answer with a closing `</think>` and no opening tag is always refused: reasoning cannot be told from a quotation of the tag, and cutting there would store half a summary. Have the server separate the reasoning (vLLM `--reasoning-parser`, Groq `reasoning_format`), or use a model that does not emit it.
+
+Ollama is asked for a context window sized on the prompt (`num_ctx`) and an output cap of 4x `max_tokens`, minimum 2048 (`num_predict`): its default window is smaller than a full consolidation prompt and it would otherwise drop the start of it without saying so. If the window still fills up, the answer is discarded.
+
+**What a consolidation removes.** Only the memories whose text went into the summary, in the same transaction that writes it, and only if they still say what was read:
+
+- A memory stored while the provider was answering is kept. One edited or forgotten meanwhile makes the store refuse the summary; the pass is redone from a fresh read, so a correction is never deleted unsummarized and a forgotten memory never comes back through a summary. Two runs over the same topic do not leave two summaries.
+- `critical` memories take no part: they are never removed, never sent to be summarized, and the summary takes the highest importance of what it replaces (never `critical`).
+- A pass needs at least two memories; a topic with fewer is left alone, without a provider call.
+- A topic too large for one pass (more than 500 memories, more text than the provider prompt takes — about 20 000 characters — or, for the lexical join, than one memory can hold — 64 KB) is folded in several passes, each summary being an entry of the next where it fits. A memory too large to share a pass is set aside and reported, and the rest of the topic is consolidated without it.
+
+`POST /consolidate`, the web dashboard and the TUI go through the same code (the TUI does one pass per keypress and says how much is left). The MCP tool `icm_memory_consolidate` works in two steps, because the summary is the agent's: called with only `topic` it replaces nothing and lists the topic's memories with their ids; called with `summary` and the `ids` it covers, it replaces exactly those. Without `ids` it never replaces anything.
+
+**Auto-consolidation loses content.** `auto_consolidate_enabled` (off by default) is the one exception, by design: when no LLM summarizer is configured, its rollup keeps only the summaries of the 3 heaviest memories of the topic and deletes the other non-critical memories it read. Leave it off unless that is what you want, or configure `[consolidate.summarizer]`: the topic is then queued for a real summary (`icm consolidate-pending`) instead, on the CLI, hook and MCP store paths alike. It never removes memories it did not read.
+
+**Where your text goes.** With an API-key provider, the text being summarized is sent to that provider under its data terms: memory summaries for `consolidate` / `briefing`, and for `[extraction.summarizer]` the queued tool output as captured (up to 8 KB per entry, not redacted). For `google` in particular: with a key from a project without billing (free tier), Google's Gemini API terms say prompts and responses are used to improve its products and may be read by human reviewers, and that sensitive or confidential data must not be submitted; this does not apply in the EEA, Switzerland and the UK, nor to a key from a billing-enabled project. Use a billed project before pointing `[extraction.summarizer]` at `google` — see https://ai.google.dev/gemini-api/terms. The same goes for the `gemini` CLI signed into a free account.
+
 ### Decay and Pruning
 
 ```bash

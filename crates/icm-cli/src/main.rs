@@ -425,6 +425,16 @@ enum Commands {
         /// Batch size for embedding
         #[arg(short, long, default_value = "32")]
         batch_size: usize,
+
+        /// Switch the whole database to the configured embedding model:
+        /// back it up, discard the stored vectors, recreate the vector
+        /// index at the new dimension, then re-embed every memory. If
+        /// interrupted, a plain `icm embed` resumes. Stop every other icm
+        /// process on this database first (`icm serve`, MCP and HTTP
+        /// servers): one started before the migration keeps embedding
+        /// with the previous model until it is restarted.
+        #[arg(long, conflicts_with_all = ["topic", "force"])]
+        migrate: bool,
     },
 
     /// Memoir commands — permanent knowledge layer
@@ -1865,6 +1875,258 @@ fn resolve_embedding_dims(
     }
 }
 
+/// What the embedding policy allows this run to do against one observed
+/// state of the database.
+struct EmbeddingPlan<E> {
+    /// Embedder to use; `None` runs keyword-only.
+    embedder: Option<E>,
+    /// Dimension to open the store with.
+    dims: usize,
+    /// Model name to record in the database, if none is recorded yet.
+    record_model: Option<String>,
+    /// Set when the configuration and the database disagree.
+    warning: Option<String>,
+}
+
+/// Apply the embedding policy to `state`, the embedding state of the
+/// database as observed by the caller.
+///
+/// The database wins over the configuration: its vectors come from one
+/// model at one dimension, and a process running another model can neither
+/// search them nor add to them. The default model went from 768 to 1024
+/// dimensions between two releases; a binary that trusted its
+/// configuration opened existing databases at the wrong dimension, which
+/// at the time wiped every stored vector. So, per
+/// `icm_core::embedding_policy::decide`: follow the model recorded in the
+/// database when this binary can load it, otherwise run keyword-only and
+/// say so. Changing model is the explicit `icm embed --migrate`.
+///
+/// `main` calls this twice. Before the open, on a peek at the file, only
+/// to learn which dimension to open with. After the open, on the state
+/// read from the open store (`settle_embedder`): that second answer is the
+/// one that picks the embedder, because another process may have recorded
+/// a model or migrated the index in between.
+///
+/// `load` builds the embedder for a model name, `None` when this binary
+/// does not know that model.
+fn plan_embeddings<E: icm_core::Embedder>(
+    state: Option<&icm_core::EmbeddingState>,
+    requested: E,
+    requested_model: &str,
+    load: impl Fn(&str) -> Option<E>,
+) -> EmbeddingPlan<E> {
+    use icm_core::EmbeddingDecision;
+
+    let requested_dims = requested.dimensions();
+    // Only a genuinely different model is loaded; names compare the way
+    // `decide` and the embedder compare them.
+    let stored_model = state.and_then(|s| s.model.as_deref());
+    let same_model = stored_model.is_some_and(|m| m.eq_ignore_ascii_case(requested_model));
+    let stored = match stored_model {
+        Some(model) if !same_model => load(model),
+        _ => None,
+    };
+    let stored_model_dims = if same_model {
+        Some(requested_dims)
+    } else {
+        stored.as_ref().map(|e| e.dimensions())
+    };
+
+    match icm_core::decide(state, requested_model, requested_dims, stored_model_dims) {
+        EmbeddingDecision::Proceed { dims, record_model } => EmbeddingPlan {
+            // A name this binary cannot resolve embeds nothing: never
+            // record it as the origin of the stored vectors.
+            record_model: (record_model && load(requested_model).is_some())
+                .then(|| requested_model.to_string()),
+            embedder: Some(requested),
+            dims,
+            warning: None,
+        },
+        EmbeddingDecision::UseStoredModel { model, dims } => EmbeddingPlan {
+            embedder: stored,
+            dims,
+            record_model: None,
+            warning: Some(format!(
+                "embeddings: this database is recorded as embedded with '{model}' ({dims} dims) \
+                 but the configuration asks for '{requested_model}' ({requested_dims} dims); \
+                 using the database's model. To switch models, run `icm embed --migrate`."
+            )),
+        },
+        EmbeddingDecision::KeywordOnly {
+            stored_dims,
+            reason,
+        } => EmbeddingPlan {
+            embedder: None,
+            dims: stored_dims,
+            record_model: None,
+            warning: Some(format!(
+                "embeddings: {reason}; running keyword-only and leaving the stored vectors \
+                 untouched. To fix: set `[embeddings].model` to the model that produced them, \
+                 or re-embed everything with `icm embed --migrate`."
+            )),
+        },
+    }
+}
+
+/// Dimension to open the store with, from a peek at the database file,
+/// and the mismatch warning as far as that peek can tell (`icm doctor`
+/// prints it; it never opens the store).
+///
+/// `migrate` is `icm embed --migrate`: open at the dimension the index has
+/// today, so that opening changes nothing before the backup is taken.
+fn opening_dims<E: icm_core::Embedder>(
+    requested: E,
+    requested_model: &str,
+    db_path: &Path,
+    migrate: bool,
+    load: impl Fn(&str) -> Option<E>,
+) -> (usize, Option<String>) {
+    let requested_dims = requested.dimensions();
+    let state = match Store::read_embedding_state(db_path) {
+        Ok(state) => state,
+        Err(e) => {
+            // Opening at a mismatched dimension discards no vector, and
+            // `settle_embedder` decides from the open store anyway: carry
+            // on with the request rather than fail the run.
+            tracing::warn!(
+                "could not peek embedding state at {} ({e})",
+                db_path.display()
+            );
+            return (requested_dims, None);
+        }
+    };
+    if migrate {
+        let dims = state.and_then(|s| s.dims).unwrap_or(requested_dims);
+        return (dims, None);
+    }
+    let plan = plan_embeddings(state.as_ref(), requested, requested_model, load);
+    (plan.dims, plan.warning)
+}
+
+/// Pick the embedder for this run from the open store: the embedding
+/// policy replayed on the state read through the store's own connection.
+///
+/// The peek that chose the opening dimension is only a hint. Between it
+/// and the open another process can record a model or reset the index for
+/// a migration, and what the configuration says must not win over that:
+/// nothing here uses the earlier answer. The model name is recorded only
+/// when the database has none, with an insert that cannot overwrite.
+///
+/// Returns the embedder to use and what to tell the user, if anything.
+fn settle_embedder<E: icm_core::Embedder>(
+    store: &Store,
+    requested: E,
+    requested_model: &str,
+    load: impl Fn(&str) -> Option<E>,
+) -> (Option<E>, Option<String>) {
+    let state = match store.embedding_state() {
+        Ok(Some(state)) => state,
+        // A backend without a local vector index: nothing to arbitrate.
+        Ok(None) => return (Some(requested), None),
+        // Not knowing what the index holds is not a licence to write to it.
+        Err(e) => {
+            return (
+                None,
+                Some(format!(
+                    "embeddings: could not read the embedding state of the database ({e}); \
+                     running keyword-only."
+                )),
+            )
+        }
+    };
+    let plan = plan_embeddings(Some(&state), requested, requested_model, load);
+
+    // The store is open: `plan.dims` can no longer be applied. If the index
+    // is not at the embedder's dimension (the state changed between the
+    // peek and the open), this run does without.
+    let embedder_dims = plan.embedder.as_ref().map(|e| e.dimensions());
+    if let (Some(embedder_dims), Some(index_dims)) = (embedder_dims, state.dims) {
+        if embedder_dims != index_dims {
+            return (
+                None,
+                Some(format!(
+                    "embeddings: the vector index has {index_dims} dims but the embedding model \
+                     produces {embedder_dims}; running keyword-only and leaving the stored \
+                     vectors untouched. If this persists: set `[embeddings].model` to the model \
+                     that produced them, or re-embed everything with `icm embed --migrate`."
+                )),
+            );
+        }
+    }
+
+    let mut warning = plan.warning;
+    if let (Some(model), true, false) = (
+        plan.record_model.as_deref(),
+        plan.embedder.is_some(),
+        store.is_readonly(),
+    ) {
+        match store.record_embedding_model(model) {
+            // Vectors without a recorded model are adopted on the
+            // assumption that this model produced them. Say so, once.
+            Ok(true) if state.has_vectors => {
+                warning = Some(format!(
+                    "embeddings: no model was recorded for the vectors already in this database; \
+                     recording '{model}' ({} dims). If another model produced them, run \
+                     `icm embed --migrate`.",
+                    state.dims.unwrap_or_default()
+                ));
+            }
+            Ok(_) => {}
+            // Lock contention: the next start tries again.
+            Err(e) => tracing::debug!("could not record the embedding model: {e}"),
+        }
+    }
+    (plan.embedder, warning)
+}
+
+/// Tell the user that the configuration and the database disagree about
+/// embeddings. Hooks run on every tool call and their stderr can end up in
+/// the agent's transcript, so they only log below the default level
+/// (`RUST_LOG=icm=info` shows it; `tracing::warn!` would reach stderr).
+fn report_embedding_warning(warning: &str, quiet: bool) {
+    if quiet {
+        tracing::info!("{warning}");
+    } else {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// fastembed model codes that really produce 384-dimension vectors.
+/// `FastEmbedder::with_model` also reports 384 for any name it cannot
+/// resolve, so 384 alone does not prove the model exists. A 384-dimension
+/// model missing from this list is treated as unknown, which errs towards
+/// keyword-only, never towards mixing vector spaces.
+#[cfg(feature = "embeddings")]
+const FASTEMBED_384_DIM_MODELS: &[&str] = &[
+    "intfloat/multilingual-e5-small",
+    "Qdrant/all-MiniLM-L6-v2-onnx",
+    "Xenova/all-MiniLM-L6-v2",
+    "Xenova/all-MiniLM-L12-v2",
+    "Xenova/bge-small-en-v1.5",
+    "Qdrant/bge-small-en-v1.5-onnx-Q",
+    "Qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q",
+    "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+    "snowflake/snowflake-arctic-embed-xs",
+    "snowflake/snowflake-arctic-embed-s",
+];
+
+/// Embedder for `model`, or `None` when this binary does not know it.
+#[cfg(feature = "embeddings")]
+fn load_known_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
+    use icm_core::Embedder as _;
+    let embedder = icm_core::FastEmbedder::with_model(model);
+    let unresolved = embedder.dimensions() == 384
+        && !FASTEMBED_384_DIM_MODELS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(model));
+    (!unresolved).then_some(embedder)
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn load_known_embedder(_model: &str) -> Option<DisabledEmbedder> {
+    None
+}
+
 #[cfg(feature = "embeddings")]
 fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
     Some(icm_core::FastEmbedder::with_model(model))
@@ -2024,11 +2286,24 @@ fn main() -> Result<()> {
     // unused in the leanest builds.
     #[allow(unused_variables)]
     let db_path = resolve_db_path(cli_db.clone(), &cfg);
-    let embedding_dims = resolve_embedding_dims(
-        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
-        &db_path,
-        &cfg,
-    );
+    // The database, not the configuration, decides which embedding model
+    // may run against it (see `plan_embeddings`). This first pass only
+    // works out which dimension to open with, from a peek at the file; the
+    // embedder itself is chosen once the store is open (`settle_embedder`).
+    // Without an embedder the stored dimension is reused as before (#267).
+    let embed_migrate = matches!(cli.command, Commands::Embed { migrate: true, .. });
+    let (embedding_dims, peeked_embedding_warning) =
+        match init_embedder(&cfg.embeddings.model).filter(|_| embedder.is_some()) {
+            Some(requested) => opening_dims(
+                requested,
+                &cfg.embeddings.model,
+                &db_path,
+                embed_migrate,
+                load_known_embedder,
+            ),
+            None => (resolve_embedding_dims(None, &db_path, &cfg), None),
+        };
+    let quiet_embedding_warnings = matches!(cli.command, Commands::Hook { .. });
 
     // `icm uninstall` must NOT open the SQLite store: a default
     // `open_store` call would recreate the DB directory and WAL/SHM files
@@ -2046,7 +2321,11 @@ fn main() -> Result<()> {
     // malformed") before dispatch is ever reached, which is exactly when the
     // user needs these commands. They open their own maintenance connection.
     if let Commands::Doctor = command {
-        return cmd_doctor(&db_path);
+        cmd_doctor(&db_path)?;
+        if let Some(warning) = &peeked_embedding_warning {
+            println!("Warning — {warning}");
+        }
+        return Ok(());
     }
     if let Commands::Repair { dry_run } = command {
         return cmd_repair(&db_path, dry_run);
@@ -2075,8 +2354,10 @@ fn main() -> Result<()> {
             from_export
         );
         let mut reader = open_export_reader(from_export)?;
-        let dims = peek_export_embedding_dims(&mut reader).unwrap_or(embedding_dims);
+        let export_dims = peek_export_embedding_dims(&mut reader);
+        let dims = export_dims.unwrap_or(embedding_dims);
         let store = open_store_with_backup(db_path.clone(), dims, &cfg.store.backup)?;
+        check_export_fits_index(&store, &mut *reader, export_dims, &db_path)?;
         return cmd_import_from_export(&store, reader, dry_run);
     }
     if let Commands::Import {
@@ -2086,8 +2367,10 @@ fn main() -> Result<()> {
     } = command
     {
         let mut reader = open_export_reader(src)?;
-        let dims = peek_export_embedding_dims(&mut reader).unwrap_or(embedding_dims);
+        let export_dims = peek_export_embedding_dims(&mut reader);
+        let dims = export_dims.unwrap_or(embedding_dims);
         let store = open_store_with_backup(db_path.clone(), dims, &cfg.store.backup)?;
+        check_export_fits_index(&store, &mut *reader, export_dims, &db_path)?;
         return cmd_import_from_export(&store, reader, dry_run);
     }
     // `icm hook disable` only edits AI-tool settings files — it needs neither
@@ -2109,6 +2392,25 @@ fn main() -> Result<()> {
         open_store_readonly(db_path.clone())?
     } else {
         open_store_with_backup(db_path.clone(), embedding_dims, &cfg.store.backup)?
+    };
+    // The embedder is chosen here, from the state of the open store.
+    // `icm embed --migrate` is the exception: it runs the configured model
+    // against an index that belongs to another one, on purpose.
+    #[allow(unused_variables)]
+    let embedder = match embedder {
+        Some(requested) if !embed_migrate => {
+            let (embedder, warning) = settle_embedder(
+                &store,
+                requested,
+                &cfg.embeddings.model,
+                load_known_embedder,
+            );
+            if let Some(warning) = &warning {
+                report_embedding_warning(warning, quiet_embedding_warnings);
+            }
+            embedder
+        }
+        other => other,
     };
 
     match command {
@@ -2404,6 +2706,7 @@ fn main() -> Result<()> {
             topic,
             force,
             batch_size,
+            migrate,
         } => {
             #[cfg(feature = "embeddings")]
             {
@@ -2411,11 +2714,15 @@ fn main() -> Result<()> {
                     Some(e) => e,
                     None => bail!("embeddings not available — check your configuration"),
                 };
-                cmd_embed(&store, emb, topic.as_deref(), force, batch_size)
+                if migrate {
+                    cmd_embed_migrate(&store, emb, &cfg.embeddings.model, &db_path, batch_size)
+                } else {
+                    cmd_embed(&store, emb, topic.as_deref(), force, batch_size)
+                }
             }
             #[cfg(not(feature = "embeddings"))]
             {
-                let _ = (topic, force, batch_size);
+                let _ = (topic, force, batch_size, migrate);
                 bail!("embeddings feature not enabled — rebuild with `--features embeddings`")
             }
         }
@@ -6504,8 +6811,43 @@ fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
     // DB is still diagnosable (the normal store open would fail first).
     println!();
     report_db_integrity(db_path);
+    for line in embedding_status_lines(
+        Store::read_embedding_coverage(db_path).ok().flatten(),
+        Store::read_embedding_state(db_path).ok().flatten().as_ref(),
+    ) {
+        println!("{line}");
+    }
 
     Ok(())
+}
+
+/// The `icm doctor` embeddings line: how many memories carry a vector,
+/// from which model, at which dimension. Semantic recall only sees the
+/// memories that have one, so low coverage gets the command that fixes it.
+/// Empty when there is no database (or no `memories` table) to describe.
+fn embedding_status_lines(
+    coverage: Option<(usize, usize)>,
+    state: Option<&icm_core::EmbeddingState>,
+) -> Vec<String> {
+    let Some((with_vector, total)) = coverage else {
+        return Vec::new();
+    };
+    let model = state.and_then(|s| s.model.as_deref()).map_or_else(
+        || "model not recorded".to_string(),
+        |m| format!("model {m}"),
+    );
+    let dims = state
+        .and_then(|s| s.dims)
+        .map_or_else(|| "dims unknown".to_string(), |d| format!("{d} dims"));
+    let mut lines = vec![format!(
+        "Embeddings: {with_vector} / {total} memories, {model}, {dims}."
+    )];
+    if with_vector * 2 < total {
+        lines.push(
+            "  Fewer than half of the memories have a vector. To embed the rest: icm embed".into(),
+        );
+    }
+    lines
 }
 
 /// Print a one-block SQLite integrity verdict for `icm doctor` (#313).
@@ -6730,6 +7072,60 @@ fn peek_export_embedding_dims(reader: &mut dyn BufReadSeek) -> Option<usize> {
         .map(|d| d as usize);
     let _ = reader.seek(std::io::SeekFrom::Start(0));
     dims
+}
+
+/// Refuse an export whose vectors cannot go into this database's index,
+/// before anything is written.
+///
+/// The store was just opened at the export's dimension. An index without
+/// vectors was resized to it; one that still has another dimension belongs
+/// to vectors of another model, and the export's would not fit. Importing
+/// the memories without their vectors was the alternative; it is not done
+/// silently, because the vectors are part of what a restore is asked to
+/// bring back. An export that carries no vector at all imports anywhere.
+fn check_export_fits_index(
+    store: &Store,
+    reader: &mut dyn BufReadSeek,
+    export_dims: Option<usize>,
+    db_path: &Path,
+) -> Result<()> {
+    let Some(export_dims) = export_dims else {
+        return Ok(());
+    };
+    let index_dims = match store.embedding_state() {
+        Ok(Some(state)) => state.dims,
+        _ => None,
+    };
+    let Some(index_dims) = index_dims.filter(|dims| *dims != export_dims) else {
+        return Ok(());
+    };
+
+    // `embedding` is only serialized for a memory that has one.
+    let mut has_vectors = false;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).context("reading export")? == 0 {
+            break;
+        }
+        if line.contains("\"embedding\"") {
+            has_vectors = true;
+            break;
+        }
+    }
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .context("rewinding export")?;
+    if !has_vectors {
+        return Ok(());
+    }
+    bail!(
+        "this export carries {export_dims}-dimension embeddings, but the vector index of {} \
+         has {index_dims} dimensions; nothing was imported. Import it into a new database \
+         (`icm --db <new.db> import --from-export ...`), or first move this database to the \
+         export's embedding model with `icm embed --migrate`.",
+        db_path.display()
+    )
 }
 
 /// `icm import --from-export` — restore a snapshot produced by `icm export`.
@@ -9242,7 +9638,91 @@ fn cmd_save_project(
     )
 }
 
-#[cfg(feature = "embeddings")]
+/// `icm embed --migrate` — move the whole database to the embedding model
+/// this run is configured with.
+///
+/// Order matters: nothing is discarded until the new model has produced a
+/// vector and a backup exists. After the reset every memory is without a
+/// vector, so an interrupted run is resumed by a plain `icm embed`.
+#[cfg(any(feature = "embeddings", test))]
+fn cmd_embed_migrate(
+    store: &Store,
+    embedder: &dyn icm_core::Embedder,
+    model: &str,
+    db_path: &Path,
+    batch_size: usize,
+) -> Result<()> {
+    if store.is_readonly() {
+        bail!("--migrate rewrites every embedding and cannot run on a read-only store");
+    }
+    let new_dims = embedder.dimensions();
+    let current_dims = store
+        .get_metadata_str("embedding_dims")?
+        .and_then(|v| v.parse::<usize>().ok());
+    let current_model = store.get_metadata_str(icm_core::META_EMBEDDING_MODEL)?;
+    // Same comparison as the embedding policy: a name recorded in another
+    // case is the same model, not a reason to re-embed everything.
+    let already_there = current_dims == Some(new_dims)
+        && current_model
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(model));
+    if already_there {
+        println!(
+            "Database already uses '{model}' ({new_dims} dims); embedding what is still missing."
+        );
+        return cmd_embed(store, embedder, None, false, batch_size);
+    }
+
+    let probe = embedder
+        .embed("icm embed --migrate")
+        .with_context(|| format!("embedding model '{model}' is not usable; nothing was changed"))?;
+    if probe.len() != new_dims {
+        bail!(
+            "embedding model '{model}' returned {} dims instead of {new_dims}; nothing was changed",
+            probe.len()
+        );
+    }
+
+    // Not `.backup-*`: the auto-backup rotation would eventually delete it.
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let mut backup_name = db_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("memories.db"));
+    backup_name.push(format!(".pre-embed-migrate-{ts}"));
+    let backup = db_path.with_file_name(&backup_name);
+    store
+        .backup_to(&backup)
+        .with_context(|| format!("backup to {}; nothing was changed", backup.display()))?;
+    println!("Backup written to {}", backup.display());
+
+    // One transaction empties the index and records the new model: a
+    // process starting from here on sees whose index it is.
+    let discarded = store.reset_vector_index_for_model(new_dims, model)?;
+    let from = match (current_model, current_dims) {
+        (Some(m), Some(d)) => format!("'{m}' ({d} dims)"),
+        (None, Some(d)) => format!("an unrecorded model ({d} dims)"),
+        _ => "an unknown state".to_string(),
+    };
+    println!(
+        "Vector index reset from {from} to '{model}' ({new_dims} dims); \
+         {discarded} stored embeddings discarded."
+    );
+    println!("If this is interrupted, run `icm embed` to resume.");
+    cmd_embed(store, embedder, None, false, batch_size)
+}
+
+/// `icm embed` — compute and store the vectors that are missing (all of
+/// them with `force`).
+///
+/// A run can last hours while other sessions keep using the database, so
+/// nothing read at the start is written back: each batch re-reads its
+/// memories just before embedding them (a memory edited meanwhile is
+/// embedded from its current text, one deleted or already embedded by
+/// someone else is skipped), and only the vector is written
+/// (`Store::set_embedding`). Fails when a vector could not be computed or
+/// stored, after trying every batch.
+#[cfg(any(feature = "embeddings", test))]
 fn cmd_embed(
     store: &Store,
     embedder: &dyn icm_core::Embedder,
@@ -9250,57 +9730,92 @@ fn cmd_embed(
     force: bool,
     batch_size: usize,
 ) -> Result<()> {
-    let memories = if let Some(t) = topic {
-        store.get_by_topic(t)?
-    } else {
-        store.list_all()?
+    let ids: Vec<String> = {
+        let memories = if let Some(t) = topic {
+            store.get_by_topic(t)?
+        } else {
+            store.list_all()?
+        };
+        memories
+            .into_iter()
+            .filter(|m| force || m.embedding.is_none())
+            .map(|m| m.id)
+            .collect()
     };
 
-    let to_embed: Vec<&Memory> = if force {
-        memories.iter().collect()
-    } else {
-        memories.iter().filter(|m| m.embedding.is_none()).collect()
-    };
-
-    if to_embed.is_empty() {
+    if ids.is_empty() {
         println!("All memories already have embeddings.");
         return Ok(());
     }
 
-    let total = to_embed.len();
+    let total = ids.len();
     println!("Embedding {total} memories (batch_size={batch_size})...");
 
-    let mut embedded = 0;
-    let mut errors = 0;
+    let mut embedded = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut first_error: Option<String> = None;
+    let mut fail = |count: usize, error: String, failed: &mut usize| {
+        *failed += count;
+        if first_error.is_none() {
+            eprintln!("embedding error: {error}");
+            first_error = Some(error);
+        }
+    };
 
-    for chunk in to_embed.chunks(batch_size) {
-        let texts: Vec<String> = chunk.iter().map(|m| m.embed_text()).collect();
+    for chunk in ids.chunks(batch_size.max(1)) {
+        let mut current: Vec<Memory> = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            match store.get(id) {
+                Ok(Some(m)) if force || m.embedding.is_none() => current.push(m),
+                Ok(_) => skipped += 1,
+                Err(e) => fail(1, format!("reading {id}: {e}"), &mut failed),
+            }
+        }
+        if current.is_empty() {
+            continue;
+        }
+        let texts: Vec<String> = current.iter().map(|m| m.embed_text()).collect();
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
         match embedder.embed_batch(&text_refs) {
-            Ok(embeddings) => {
-                for (mem, emb) in chunk.iter().zip(embeddings) {
-                    let mut updated = (*mem).clone();
-                    updated.embedding = Some(emb);
-                    if store.update(&updated).is_ok() {
-                        embedded += 1;
-                    } else {
-                        errors += 1;
+            Ok(embeddings) if embeddings.len() == current.len() => {
+                for (mem, emb) in current.iter().zip(embeddings) {
+                    match store.set_embedding(&mem.id, &emb) {
+                        Ok(true) => embedded += 1,
+                        Ok(false) => skipped += 1,
+                        Err(e) => fail(1, format!("storing {}: {e}", mem.id), &mut failed),
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("batch embedding error: {e}");
-                errors += chunk.len();
-            }
+            Ok(embeddings) => fail(
+                current.len(),
+                format!(
+                    "the model returned {} vectors for {} texts",
+                    embeddings.len(),
+                    current.len()
+                ),
+                &mut failed,
+            ),
+            Err(e) => fail(current.len(), e.to_string(), &mut failed),
         }
 
-        if embedded % 100 == 0 && embedded > 0 {
+        if embedded > 0 && embedded.is_multiple_of(100) {
             println!("  {embedded}/{total} done...");
         }
     }
 
-    println!("Embedded {embedded}/{total} memories ({errors} errors).");
+    println!(
+        "Embedded {embedded}/{total} memories ({failed} failed, {skipped} skipped: \
+         deleted or embedded by another process meanwhile)."
+    );
+    if failed > 0 {
+        bail!(
+            "{failed} of {total} memories could not be embedded (first error: {}); \
+             run `icm embed` again to retry them",
+            first_error.unwrap_or_default()
+        );
+    }
     Ok(())
 }
 
@@ -14851,6 +15366,805 @@ mod export_import_roundtrip_tests {
             store.list_all().unwrap().len(),
             1,
             "memory count must not grow on re-import (idempotency)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod embedding_guard_tests {
+    //! The database, not the configuration, decides which embedding model
+    //! runs against it; a mismatch degrades to keyword-only and never
+    //! costs a stored vector; `icm embed --migrate` is the one explicit way
+    //! to change model. The decision is taken on the open store, so what
+    //! other processes committed a moment ago counts.
+    use super::*;
+    use icm_core::{Embedder, IcmError, IcmResult};
+    use tempfile::TempDir;
+
+    /// Deterministic embedder standing in for a model named
+    /// `fake/<dims>` or `alt/<dims>` (two models of the same dimension).
+    struct FakeEmbedder {
+        model: String,
+        dims: usize,
+        /// Every call fails, like a model that cannot be loaded.
+        broken: bool,
+        /// Length of the vectors actually returned, when it should differ
+        /// from `dims`.
+        returns_dims: Option<usize>,
+        /// Runs at the start of each batch: what another session does to
+        /// the database while this one is computing vectors.
+        meanwhile: Option<Box<dyn Fn() + Send + Sync>>,
+    }
+
+    impl FakeEmbedder {
+        fn new(dims: usize) -> Self {
+            Self::named(&format!("fake/{dims}"), dims)
+        }
+        fn named(model: &str, dims: usize) -> Self {
+            Self {
+                model: model.to_string(),
+                dims,
+                broken: false,
+                returns_dims: None,
+                meanwhile: None,
+            }
+        }
+    }
+
+    impl Embedder for FakeEmbedder {
+        fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+            if self.broken {
+                return Err(IcmError::Embedding("model unavailable".into()));
+            }
+            let seed = text.bytes().map(f32::from).sum::<f32>();
+            Ok((0..self.returns_dims.unwrap_or(self.dims))
+                .map(|i| ((seed + i as f32) * 0.37).sin())
+                .collect())
+        }
+        fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+            if let Some(meanwhile) = &self.meanwhile {
+                meanwhile();
+            }
+            texts.iter().map(|t| self.embed(t)).collect()
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+    }
+
+    /// Stands in for `load_known_embedder`: only `fake/<dims>` and
+    /// `alt/<dims>` exist.
+    fn load_fake(model: &str) -> Option<FakeEmbedder> {
+        let lower = model.to_ascii_lowercase();
+        let dims = lower
+            .strip_prefix("fake/")
+            .or_else(|| lower.strip_prefix("alt/"))?
+            .parse()
+            .ok()?;
+        Some(FakeEmbedder::named(model, dims))
+    }
+
+    /// What `main` does for one command configured with `model`: peek,
+    /// open at the dimension the peek calls for, then choose the embedder
+    /// from the open store.
+    fn start(db: &Path, model: &str, dims: usize) -> (Store, Option<FakeEmbedder>, Option<String>) {
+        let (open_dims, _) = opening_dims(
+            FakeEmbedder::named(model, dims),
+            model,
+            db,
+            false,
+            load_fake,
+        );
+        let store = open_store(db.to_path_buf(), open_dims).unwrap();
+        let (embedder, warning) =
+            settle_embedder(&store, FakeEmbedder::named(model, dims), model, load_fake);
+        (store, embedder, warning)
+    }
+
+    fn model_of(embedder: &Option<FakeEmbedder>) -> Option<&str> {
+        embedder.as_ref().map(|e| e.model.as_str())
+    }
+
+    /// Database at `dims` holding `with_vector` embedded memories and one
+    /// memory without a vector, written by `model` when given.
+    fn seed(db: &Path, dims: usize, with_vector: usize, model: Option<&str>) -> Vec<String> {
+        let store = Store::with_dims(db, dims).unwrap();
+        let embedder = FakeEmbedder::new(dims);
+        let mut ids = Vec::new();
+        for i in 0..with_vector {
+            let mut m = Memory::new(
+                "guard".into(),
+                format!("memory number {i} about sqlite vectors"),
+                Importance::Medium,
+            );
+            m.embedding = Some(embedder.embed(&m.embed_text()).unwrap());
+            ids.push(store.store(m).unwrap());
+        }
+        ids.push(
+            store
+                .store(Memory::new(
+                    "guard".into(),
+                    "memory without any vector".into(),
+                    Importance::Medium,
+                ))
+                .unwrap(),
+        );
+        if let Some(model) = model {
+            store
+                .set_metadata_str(icm_core::META_EMBEDDING_MODEL, model)
+                .unwrap();
+        }
+        ids
+    }
+
+    fn coverage(db: &Path) -> (usize, usize) {
+        Store::read_embedding_coverage(db).unwrap().unwrap()
+    }
+
+    fn state(db: &Path) -> icm_core::EmbeddingState {
+        Store::read_embedding_state(db).unwrap().unwrap()
+    }
+
+    #[test]
+    fn fresh_database_proceeds_and_records_the_model_once() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("fresh.db");
+
+        let (store, embedder, warning) = start(&db, "fake/128", 128);
+        assert_eq!(model_of(&embedder), Some("fake/128"));
+        assert!(warning.is_none());
+        drop(store);
+        assert_eq!(state(&db).dims, Some(128));
+        assert_eq!(state(&db).model.as_deref(), Some("fake/128"));
+
+        // Steady state: same model, nothing to say. Names match the way
+        // the embedder resolves them.
+        for model in ["fake/128", "FAKE/128"] {
+            let (_store, embedder, warning) = start(&db, model, 128);
+            assert!(embedder.is_some() && warning.is_none());
+        }
+        assert_eq!(state(&db).model.as_deref(), Some("fake/128"));
+    }
+
+    #[test]
+    fn unresolvable_configured_model_is_never_recorded() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("typo.db");
+        let (store, embedder, _) = start(&db, "vendor/typo", 384);
+        assert!(embedder.is_some());
+        drop(store);
+        assert_eq!(state(&db).model, None);
+    }
+
+    /// The incident: a database embedded at 768 dimensions by a previous
+    /// release (no model recorded), run by a binary whose default model
+    /// has 1024.
+    #[test]
+    fn mac_scenario_768_in_database_1024_in_binary_loses_no_vector() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("mac.db");
+        seed(&db, 768, 6, None);
+        assert_eq!(coverage(&db), (6, 7));
+
+        let (open_dims, peeked) =
+            opening_dims(FakeEmbedder::new(1024), "fake/1024", &db, false, load_fake);
+        assert_eq!(
+            open_dims, 768,
+            "the store opens at the database's dimension"
+        );
+        assert!(peeked.is_some(), "`icm doctor` gets the warning too");
+
+        {
+            let (store, embedder, warning) = start(&db, "fake/1024", 1024);
+            assert!(
+                embedder.is_none(),
+                "must not embed at 1024 into a 768 index"
+            );
+            let warning = warning.expect("the user must be told");
+            assert!(
+                warning.contains("768") && warning.contains("1024"),
+                "{warning}"
+            );
+            assert!(warning.contains("keyword-only"), "{warning}");
+            assert!(warning.contains("[embeddings].model"), "{warning}");
+            assert!(warning.contains("icm embed --migrate"), "{warning}");
+
+            // Recall and write both work, keyword-only.
+            assert_eq!(store.search_fts("sqlite vectors", 20).unwrap().len(), 6);
+            cmd_recall(
+                &store,
+                None,
+                "sqlite vectors",
+                None,
+                5,
+                None,
+                None,
+                recall_format::RecallFormat::Toon,
+            )
+            .unwrap();
+            let cfg = config::Config::default();
+            cmd_store(
+                &store,
+                None,
+                &cfg.memory,
+                &cfg.consolidate,
+                "guard".into(),
+                "written while keyword-only".into(),
+                Importance::Medium,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(store.search_fts("keyword-only", 5).unwrap().len(), 1);
+        }
+
+        assert_eq!(coverage(&db), (6, 8), "every vector is still there");
+        assert_eq!(state(&db).dims, Some(768));
+        assert_eq!(
+            state(&db).model,
+            None,
+            "a model that did not embed is not recorded"
+        );
+    }
+
+    /// The store was opened at a dimension the index does not have (the
+    /// state changed after the peek): nothing is lost and the embedder is
+    /// still taken away.
+    #[test]
+    fn open_store_decides_when_it_was_opened_at_the_wrong_dimension() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("stale.db");
+        seed(&db, 768, 4, None);
+
+        {
+            let store = open_store(db.clone(), 1024).unwrap();
+            let (embedder, warning) =
+                settle_embedder(&store, FakeEmbedder::new(1024), "fake/1024", load_fake);
+            assert!(embedder.is_none());
+            let warning = warning.expect("the user must be told");
+            assert!(
+                warning.contains("768") && warning.contains("1024"),
+                "{warning}"
+            );
+        }
+
+        assert_eq!(coverage(&db), (4, 5));
+        assert_eq!(state(&db).model, None);
+    }
+
+    #[test]
+    fn stored_model_wins_over_the_configuration_when_loadable() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("stored.db");
+        seed(&db, 64, 3, Some("fake/64"));
+
+        let (store, embedder, warning) = start(&db, "fake/128", 128);
+        assert_eq!(model_of(&embedder), Some("fake/64"));
+        let warning = warning.expect("the user must be told");
+        assert!(
+            warning.contains("fake/64") && warning.contains("fake/128"),
+            "{warning}"
+        );
+        assert!(warning.contains("icm embed --migrate"), "{warning}");
+
+        // The stored model keeps embedding into its own index.
+        let embedder = embedder.unwrap();
+        let mut m = Memory::new("guard".into(), "one more".into(), Importance::Medium);
+        m.embedding = Some(embedder.embed(&m.embed_text()).unwrap());
+        store.store(m).unwrap();
+        drop(store);
+        assert_eq!(coverage(&db), (4, 5));
+        assert_eq!(state(&db).model.as_deref(), Some("fake/64"));
+    }
+
+    #[test]
+    fn stored_model_this_binary_cannot_load_means_keyword_only() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("gone.db");
+        seed(&db, 64, 3, Some("vendor/retired-model"));
+
+        // Same dimension, other model: the vector spaces must not mix.
+        let (store, embedder, warning) = start(&db, "fake/64", 64);
+        assert!(embedder.is_none());
+        let warning = warning.expect("the user must be told");
+        assert!(warning.contains("vendor/retired-model"), "{warning}");
+        drop(store);
+        assert_eq!(coverage(&db), (3, 4));
+        assert_eq!(state(&db).model.as_deref(), Some("vendor/retired-model"));
+    }
+
+    /// A recorded model is the database's choice even before it holds a
+    /// vector: the index is not resized to the configured model.
+    #[test]
+    fn recorded_model_wins_even_without_vectors() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("empty-recorded.db");
+        seed(&db, 64, 0, Some("fake/64"));
+
+        let (store, embedder, warning) = start(&db, "fake/128", 128);
+        assert_eq!(model_of(&embedder), Some("fake/64"));
+        assert!(warning.is_some());
+        drop(store);
+        assert_eq!(state(&db).dims, Some(64));
+        assert_eq!(state(&db).model.as_deref(), Some("fake/64"));
+    }
+
+    #[test]
+    fn database_without_model_or_vectors_follows_the_configuration() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("novec.db");
+        seed(&db, 64, 0, None);
+
+        let (store, embedder, warning) = start(&db, "fake/128", 128);
+        assert_eq!(model_of(&embedder), Some("fake/128"));
+        assert!(warning.is_none());
+        drop(store);
+        assert_eq!(state(&db).dims, Some(128));
+        assert_eq!(state(&db).model.as_deref(), Some("fake/128"));
+    }
+
+    /// Vectors without a recorded model, at the configured dimension, are
+    /// adopted: the user is told once which model was assumed.
+    #[test]
+    fn adopting_unlabelled_vectors_says_so_once() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("adopt.db");
+        seed(&db, 64, 2, None);
+
+        let (store, embedder, warning) = start(&db, "fake/64", 64);
+        assert_eq!(model_of(&embedder), Some("fake/64"));
+        let warning = warning.expect("the assumption must be stated");
+        assert!(warning.contains("fake/64"), "{warning}");
+        assert!(warning.contains("icm embed --migrate"), "{warning}");
+        drop(store);
+
+        let (_store, embedder, warning) = start(&db, "fake/64", 64);
+        assert!(embedder.is_some() && warning.is_none());
+    }
+
+    /// A long-lived process (an MCP server) recorded the model; its commit
+    /// is still in the WAL. A process configured with another model of the
+    /// same dimension must follow the recorded one, not overwrite it.
+    #[test]
+    fn model_recorded_by_a_running_process_is_followed_not_overwritten() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("server.db");
+        seed(&db, 64, 3, None);
+
+        let server = Store::with_dims(&db, 64).unwrap();
+        assert!(server.record_embedding_model("alt/64").unwrap());
+
+        let (_store, embedder, warning) = start(&db, "fake/64", 64);
+        assert_eq!(model_of(&embedder), Some("alt/64"));
+        let warning = warning.expect("the user must be told");
+        assert!(warning.contains("alt/64"), "{warning}");
+        assert_eq!(
+            server
+                .get_metadata_str(icm_core::META_EMBEDDING_MODEL)
+                .unwrap()
+                .as_deref(),
+            Some("alt/64")
+        );
+    }
+
+    /// `icm embed --migrate` has reset the index and is computing its
+    /// first batch; nothing is checkpointed. Any process starting now,
+    /// whatever its configuration, must leave the index as the migration
+    /// made it.
+    #[test]
+    fn process_starting_during_a_migration_leaves_the_index_alone() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("during.db");
+        let ids = seed(&db, 64, 3, Some("fake/64"));
+
+        let migrating = Store::with_dims(&db, 64).unwrap();
+        assert_eq!(
+            migrating
+                .reset_vector_index_for_model(128, "fake/128")
+                .unwrap(),
+            3
+        );
+        let index_dims = || migrating.get_metadata_str("embedding_dims").unwrap();
+
+        // A hook with the new configuration.
+        {
+            let (_store, embedder, warning) = start(&db, "fake/128", 128);
+            assert_eq!(model_of(&embedder), Some("fake/128"));
+            assert!(warning.is_none());
+        }
+        assert_eq!(index_dims().as_deref(), Some("128"));
+
+        // A process still configured with the old model.
+        {
+            let (_store, embedder, warning) = start(&db, "fake/64", 64);
+            assert_eq!(model_of(&embedder), Some("fake/128"));
+            assert!(warning.is_some());
+        }
+        assert_eq!(index_dims().as_deref(), Some("128"));
+
+        // The migration writes its first vectors without trouble.
+        let vector = FakeEmbedder::new(128).embed("anything").unwrap();
+        assert!(migrating.set_embedding(&ids[0], &vector).unwrap());
+    }
+
+    /// A same-dimension migration killed after one memory (no clean close,
+    /// nothing checkpointed), then the documented resume: `icm embed`.
+    /// It must continue with the new model, not the one in the main file.
+    #[test]
+    fn resume_after_a_killed_migration_uses_the_new_model() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("killed.db");
+        let ids = seed(&db, 64, 5, Some("alt/64"));
+
+        let migrating = Store::with_dims(&db, 64).unwrap();
+        assert_eq!(
+            migrating
+                .reset_vector_index_for_model(64, "fake/64")
+                .unwrap(),
+            5
+        );
+        let vector = FakeEmbedder::new(64).embed("first").unwrap();
+        assert!(migrating.set_embedding(&ids[0], &vector).unwrap());
+        std::mem::forget(migrating);
+        assert_eq!(coverage(&db), (1, 6));
+
+        let (store, embedder, warning) = start(&db, "fake/64", 64);
+        assert_eq!(model_of(&embedder), Some("fake/64"));
+        assert!(warning.is_none());
+        cmd_embed(&store, &embedder.unwrap(), None, false, 2).unwrap();
+        assert_eq!(coverage(&db), (6, 6));
+        assert_eq!(state(&db).model.as_deref(), Some("fake/64"));
+
+        // The previous configuration is the one that gets overruled now.
+        let (_store, embedder, _) = start(&db, "alt/64", 64);
+        assert_eq!(model_of(&embedder), Some("fake/64"));
+    }
+
+    fn migration_backups(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".pre-embed-migrate-"))
+            .collect()
+    }
+
+    #[test]
+    fn migrate_backs_up_resets_and_reembeds_everything() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("migrate.db");
+        seed(&db, 64, 5, Some("fake/64"));
+        assert_eq!(coverage(&db), (5, 6));
+
+        // `--migrate` keeps the requested model and opens at today's dims.
+        let (open_dims, warning) =
+            opening_dims(FakeEmbedder::new(128), "fake/128", &db, true, load_fake);
+        assert_eq!(open_dims, 64);
+        assert!(warning.is_none());
+        let embedder = FakeEmbedder::new(128);
+
+        {
+            let store = open_store(db.clone(), open_dims).unwrap();
+            cmd_embed_migrate(&store, &embedder, "fake/128", &db, 2).unwrap();
+
+            let all = store.list_all().unwrap();
+            assert_eq!(all.len(), 6);
+            assert!(
+                all.iter()
+                    .all(|m| m.embedding.as_ref().map(Vec::len) == Some(128)),
+                "every memory is re-embedded at the new dimension"
+            );
+            let query = embedder.embed_query("memory number 3").unwrap();
+            assert!(!store.search_by_embedding(&query, 3).unwrap().is_empty());
+        }
+
+        assert_eq!(coverage(&db), (6, 6));
+        assert_eq!(state(&db).dims, Some(128));
+        assert_eq!(state(&db).model.as_deref(), Some("fake/128"));
+
+        // The backup is the database as it was: old model, old vectors.
+        let backups = migration_backups(dir.path());
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(state(&backups[0]).dims, Some(64));
+        assert_eq!(state(&backups[0]).model.as_deref(), Some("fake/64"));
+        assert_eq!(coverage(&backups[0]), (5, 6));
+
+        // Next ordinary run: the new model is the database's model.
+        let (_store, embedder, warning) = start(&db, "fake/128", 128);
+        assert_eq!(model_of(&embedder), Some("fake/128"));
+        assert!(warning.is_none());
+        // And the previous configuration is now the one that gets overruled.
+        let (_store, embedder, _) = start(&db, "fake/64", 64);
+        assert_eq!(model_of(&embedder), Some("fake/128"));
+    }
+
+    #[test]
+    fn migrate_again_to_the_same_model_discards_nothing() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("again.db");
+        // Recorded in another case: still the same model.
+        seed(&db, 64, 5, Some("Fake/64"));
+        let embedder = FakeEmbedder::new(64);
+
+        let store = open_store(db.clone(), 64).unwrap();
+        cmd_embed_migrate(&store, &embedder, "fake/64", &db, 4).unwrap();
+        drop(store);
+
+        assert_eq!(coverage(&db), (6, 6), "only the missing vector was added");
+        assert!(migration_backups(dir.path()).is_empty());
+        assert_eq!(state(&db).model.as_deref(), Some("Fake/64"));
+    }
+
+    #[test]
+    fn migrate_changes_nothing_when_the_new_model_cannot_embed() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("broken.db");
+        seed(&db, 64, 3, Some("fake/64"));
+        let mut broken = FakeEmbedder::new(128);
+        broken.broken = true;
+
+        let store = open_store(db.clone(), 64).unwrap();
+        let err = cmd_embed_migrate(&store, &broken, "fake/128", &db, 2).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nothing was changed"),
+            "{err:#}"
+        );
+        drop(store);
+
+        assert_eq!(coverage(&db), (3, 4));
+        assert_eq!(state(&db).model.as_deref(), Some("fake/64"));
+        assert!(migration_backups(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn migrate_refuses_a_readonly_store() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("ro.db");
+        seed(&db, 64, 2, Some("fake/64"));
+
+        let store = open_store_readonly(db.clone()).unwrap();
+        let err = cmd_embed_migrate(&store, &FakeEmbedder::new(128), "fake/128", &db, 2);
+        assert!(err.unwrap_err().to_string().contains("read-only"));
+        drop(store);
+        assert_eq!(coverage(&db), (2, 3));
+        assert!(migration_backups(dir.path()).is_empty());
+    }
+
+    /// `icm embed` runs for a long time on a list read at the start. What
+    /// another session changes meanwhile must survive, and the vector must
+    /// be the one of the corrected text.
+    #[test]
+    fn embed_keeps_what_another_session_changed_meanwhile() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("concurrent.db");
+        let store = open_store(db.clone(), 64).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let mut m = Memory::new(
+                "guard".into(),
+                format!("original summary {i}"),
+                Importance::Medium,
+            );
+            // `list_all` orders by weight: memory 3 is embedded first,
+            // memory 0 last.
+            m.weight = 0.5 + 0.1 * i as f32;
+            ids.push(store.store(m).unwrap());
+        }
+
+        // While the first batch (memory 3) is being embedded, another
+        // connection edits memory 0 and deletes memory 1.
+        let (edited, deleted) = (ids[0].clone(), ids[1].clone());
+        let other_db = db.clone();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let mut embedder = FakeEmbedder::new(64);
+        embedder.meanwhile = Some(Box::new(move || {
+            if done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let other = Store::with_dims(&other_db, 64).unwrap();
+            let mut m = other.get(&edited).unwrap().unwrap();
+            m.summary = "corrected summary".into();
+            m.importance = Importance::Critical;
+            m.access_count = 7;
+            other.update(&m).unwrap();
+            other.delete(&deleted).unwrap();
+        }));
+
+        cmd_embed(&store, &embedder, None, false, 1).unwrap();
+        drop(store);
+
+        let check = Store::with_dims(&db, 64).unwrap();
+        let after = check.get(&ids[0]).unwrap().unwrap();
+        assert_eq!(after.summary, "corrected summary");
+        assert_eq!(after.importance, Importance::Critical);
+        assert_eq!(after.access_count, 7);
+        assert!(check.get(&ids[1]).unwrap().is_none(), "stays deleted");
+        assert_eq!(coverage(&db), (3, 3));
+        // Its vector is the one of the corrected text, not of the text
+        // listed at the start.
+        let expected = FakeEmbedder::new(64).embed(&after.embed_text()).unwrap();
+        assert_eq!(after.embedding, Some(expected));
+    }
+
+    #[test]
+    fn embed_fails_and_counts_when_vectors_cannot_be_stored() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("mismatch.db");
+        seed(&db, 64, 0, None);
+        let store = open_store(db.clone(), 64).unwrap();
+        store
+            .store(Memory::new(
+                "guard".into(),
+                "second".into(),
+                Importance::Low,
+            ))
+            .unwrap();
+
+        // The model hands back vectors the index cannot take.
+        let mut wrong = FakeEmbedder::new(64);
+        wrong.returns_dims = Some(128);
+        let err = cmd_embed(&store, &wrong, None, false, 8).unwrap_err();
+        assert!(err.to_string().contains("2 of 2"), "{err}");
+        drop(store);
+        assert_eq!(coverage(&db), (0, 2));
+
+        // The model itself fails.
+        let store = open_store(db.clone(), 64).unwrap();
+        let mut broken = FakeEmbedder::new(64);
+        broken.broken = true;
+        let err = cmd_embed(&store, &broken, None, false, 8).unwrap_err();
+        assert!(err.to_string().contains("2 of 2"), "{err}");
+
+        // A working model then fills everything.
+        cmd_embed(&store, &FakeEmbedder::new(64), None, false, 8).unwrap();
+        drop(store);
+        assert_eq!(coverage(&db), (2, 2));
+    }
+
+    /// One export line per memory, as `icm export` writes them.
+    fn write_export(path: &Path, dims: usize, with_vectors: bool) {
+        use std::io::Write as _;
+        let mut out = std::fs::File::create(path).unwrap();
+        let header = serde_json::json!({
+            "type": "header",
+            "icm_export_version": 1,
+            "embedding_dims": dims,
+        });
+        writeln!(out, "{header}").unwrap();
+        let embedder = FakeEmbedder::new(dims);
+        for i in 0..3 {
+            let mut m = Memory::new(
+                "imported".into(),
+                format!("imported memory {i}, mentions \"embedding\" in its text"),
+                Importance::Medium,
+            );
+            if with_vectors {
+                m.embedding = Some(embedder.embed(&m.embed_text()).unwrap());
+            }
+            let mut obj = serde_json::to_value(&m).unwrap();
+            obj.as_object_mut()
+                .unwrap()
+                .insert("type".into(), serde_json::json!("memory"));
+            writeln!(out, "{obj}").unwrap();
+        }
+    }
+
+    /// The import path of `main`, up to the first write.
+    fn import(db: &Path, export: &Path) -> Result<()> {
+        let mut reader = open_export_reader(export.to_str().unwrap())?;
+        let export_dims = peek_export_embedding_dims(&mut reader);
+        let store = open_store(db.to_path_buf(), export_dims.unwrap_or(64))?;
+        check_export_fits_index(&store, &mut *reader, export_dims, db)?;
+        cmd_import_from_export(&store, reader, false)
+    }
+
+    #[test]
+    fn import_of_another_dimension_is_refused_before_any_write() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("target.db");
+        seed(&db, 64, 3, Some("fake/64"));
+        let export = dir.path().join("export.jsonl");
+        write_export(&export, 128, true);
+
+        let err = import(&db, &export).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("128") && msg.contains("64"), "{msg}");
+        assert!(msg.contains("nothing was imported"), "{msg}");
+        assert_eq!(coverage(&db), (3, 4), "the database is as it was");
+        assert_eq!(state(&db).dims, Some(64));
+    }
+
+    #[test]
+    fn import_that_fits_or_carries_no_vector_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let export = dir.path().join("export.jsonl");
+
+        // Same dimension.
+        let db = dir.path().join("same.db");
+        seed(&db, 64, 3, Some("fake/64"));
+        write_export(&export, 64, true);
+        import(&db, &export).unwrap();
+        assert_eq!(coverage(&db), (6, 7));
+
+        // Another dimension in the header, but no vector in the export.
+        let db = dir.path().join("novec.db");
+        seed(&db, 64, 3, Some("fake/64"));
+        write_export(&export, 128, false);
+        import(&db, &export).unwrap();
+        assert_eq!(coverage(&db), (3, 7));
+
+        // Another dimension into a database without vectors: the index
+        // takes the export's dimension.
+        let db = dir.path().join("empty.db");
+        seed(&db, 64, 0, None);
+        write_export(&export, 128, true);
+        import(&db, &export).unwrap();
+        assert_eq!(coverage(&db), (3, 4));
+        assert_eq!(state(&db).dims, Some(128));
+    }
+
+    #[test]
+    fn embed_migrate_flag_parses_and_conflicts_with_partial_runs() {
+        let cli = Cli::try_parse_from(["icm", "embed", "--migrate"]).unwrap();
+        assert!(matches!(cli.command, Commands::Embed { migrate: true, .. }));
+        let cli = Cli::try_parse_from(["icm", "embed"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Embed { migrate: false, .. }
+        ));
+        assert!(Cli::try_parse_from(["icm", "embed", "--migrate", "--topic", "t"]).is_err());
+        assert!(Cli::try_parse_from(["icm", "embed", "--migrate", "--force"]).is_err());
+    }
+
+    #[test]
+    fn doctor_line_reports_coverage_model_and_dims() {
+        let state = icm_core::EmbeddingState {
+            dims: Some(768),
+            model: Some("intfloat/multilingual-e5-base".into()),
+            has_vectors: true,
+        };
+        assert_eq!(
+            embedding_status_lines(Some((9000, 9060)), Some(&state)),
+            vec![
+                "Embeddings: 9000 / 9060 memories, model intfloat/multilingual-e5-base, 768 dims."
+                    .to_string()
+            ]
+        );
+        assert!(embedding_status_lines(None, Some(&state)).is_empty());
+    }
+
+    #[test]
+    fn doctor_line_advises_icm_embed_below_half_coverage() {
+        let state = icm_core::EmbeddingState {
+            dims: Some(768),
+            model: None,
+            has_vectors: true,
+        };
+        let lines = embedding_status_lines(Some((66, 9060)), Some(&state));
+        assert_eq!(
+            lines[0],
+            "Embeddings: 66 / 9060 memories, model not recorded, 768 dims."
+        );
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("icm embed"), "{}", lines[1]);
+        // Exactly half is not "fewer than half"; an empty database is fine.
+        assert_eq!(embedding_status_lines(Some((5, 10)), Some(&state)).len(), 1);
+        assert_eq!(embedding_status_lines(Some((0, 0)), None).len(), 1);
+    }
+
+    #[test]
+    fn doctor_line_reads_a_real_database() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("doctor.db");
+        seed(&db, 64, 1, Some("fake/64"));
+        seed(&db, 64, 0, Some("fake/64"));
+        let lines = embedding_status_lines(
+            Store::read_embedding_coverage(&db).unwrap(),
+            Store::read_embedding_state(&db).unwrap().as_ref(),
+        );
+        assert_eq!(
+            lines[0],
+            "Embeddings: 1 / 2 memories, model fake/64, 64 dims."
         );
     }
 }

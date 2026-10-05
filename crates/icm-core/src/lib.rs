@@ -15,6 +15,7 @@ compile_error!(
 pub mod auto_link;
 pub mod context_snapshot;
 pub mod embedder;
+pub mod embedding_policy;
 pub mod error;
 pub mod facts;
 pub mod facts_store;
@@ -41,6 +42,7 @@ pub use context_snapshot::{
     ContextSnapshotOptions, SnapshotFormat, SnapshotSection, SNAPSHOT_HEADER,
 };
 pub use embedder::Embedder;
+pub use embedding_policy::{decide, EmbeddingDecision, EmbeddingState, META_EMBEDDING_MODEL};
 pub use error::{IcmError, IcmResult};
 pub use facts::{Fact, FactsStats};
 pub use facts_store::FactsStore;

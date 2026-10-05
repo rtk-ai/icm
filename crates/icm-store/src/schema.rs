@@ -14,7 +14,59 @@ fn fts_table_exists(conn: &Connection, name: &str) -> Result<bool, IcmError> {
     .map_err(db_err)
 }
 
-fn create_vec_table(conn: &Connection, embedding_dims: usize) -> Result<(), IcmError> {
+/// Run an `ALTER TABLE ... ADD COLUMN`, treating "duplicate column name"
+/// as success. The callers check for the column first, but two processes
+/// opening the same database can both see it missing and both issue the
+/// `ALTER`; the loser must not fail the whole open (seen as
+/// "duplicate column name: embedding" with 10 concurrent first opens).
+fn add_column_if_missing(conn: &Connection, alter_sql: &str) -> Result<(), IcmError> {
+    match conn.execute_batch(alter_sql) {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(db_err(e)),
+    }
+}
+
+/// Dimension the existing `vec_memories` index was created with, read from
+/// its own DDL (`embedding float[N]`). This is the authoritative value:
+/// `icm_metadata.embedding_dims` can be missing (legacy DBs) or stale.
+/// `None` when the table does not exist or its DDL cannot be parsed.
+fn vec_table_dims(conn: &Connection) -> Option<usize> {
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_memories'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let after = sql.split("float[").nth(1)?;
+    after.split(']').next()?.trim().parse().ok()
+}
+
+/// True when the database records which embedding model its index belongs
+/// to. Such an index is never recreated on open, even while it is empty:
+/// an `icm embed --migrate` in flight has just emptied it and is about to
+/// refill it, and a process started with another configuration would
+/// otherwise swap the index out from under the migration.
+fn embedding_model_is_recorded(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM icm_metadata WHERE key = ?1)",
+        [icm_core::embedding_policy::META_EMBEDDING_MODEL],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
+fn has_any_embedding(conn: &Connection) -> Result<bool, IcmError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE embedding IS NOT NULL)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_err)
+}
+
+pub(crate) fn create_vec_table(conn: &Connection, embedding_dims: usize) -> Result<(), IcmError> {
     if !(64..=4096).contains(&embedding_dims) {
         return Err(IcmError::Config(format!(
             "embedding_dims must be between 64 and 4096, got {embedding_dims}"
@@ -44,7 +96,99 @@ fn init_db(conn: &Connection) -> Result<(), IcmError> {
     init_db_with_dims(conn, icm_core::DEFAULT_EMBEDDING_DIMS)
 }
 
+/// Version of the schema that [`init_db_with_dims`] produces, stamped into
+/// `PRAGMA user_version` once every migration below has run.
+///
+/// Bump it whenever `migrate_schema` gains or changes a step — a new
+/// table, column, index, trigger, or a one-shot data fix-up. A database
+/// already stamped with the current value is opened WITHOUT re-running
+/// the migrations, so a step added without a bump never reaches existing
+/// databases. `schema_fingerprint_is_paired_with_schema_version` fails
+/// when the schema objects change and this constant does not.
+pub(crate) const SCHEMA_VERSION: i64 = 1;
+
+/// True when the database already carries the schema this binary would
+/// produce, so the migrations can be skipped. Reads only.
+///
+/// Why this exists: every migration step needs SQLite's write lock (five
+/// `BEGIN IMMEDIATE` blocks, a dedup `DELETE`, the dim-drift `UPDATE`).
+/// Running them on every open made each process — including pure readers
+/// such as `icm topics` or a recall — queue behind whichever process held
+/// the write lock, then give up with "database is locked". Measured with
+/// one writer holding the lock: a raw SQLite read answered in 0.01s (WAL
+/// lets readers through) while `icm topics` failed after 52s. Several
+/// agent sessions sharing one database hit this constantly.
+///
+/// Any doubt — unreadable version, missing metadata, another embedding
+/// dimension, a BLOB left at a stale dimension (issue #200) — returns
+/// `false` and falls back to the full, self-healing migration path.
+fn schema_is_current(conn: &Connection, embedding_dims: usize) -> bool {
+    let version: Option<i64> = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok();
+    if version != Some(SCHEMA_VERSION) {
+        return false;
+    }
+    let stored_dims: Option<usize> = conn
+        .query_row(
+            "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let Some(stored_dims) = stored_dims else {
+        return false;
+    };
+    if !(64..=4096).contains(&stored_dims) {
+        // Corrupt metadata: let the migration path repair it from the index.
+        return false;
+    }
+    if stored_dims != embedding_dims {
+        // The index is at another dimension. With vectors present, or a
+        // recorded embedding model, the migration deliberately leaves
+        // everything in place (see `migrate_schema`), so there is nothing
+        // to run. Otherwise it must recreate the index at the requested
+        // dimension.
+        match has_any_embedding(conn) {
+            Ok(true) => {}
+            Ok(false) if embedding_model_is_recorded(conn) => {}
+            _ => return false,
+        }
+    }
+    let dim_bytes = (stored_dims * 4) as i64;
+    let drifted: Option<bool> = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories \
+             WHERE embedding IS NOT NULL AND length(embedding) != ?1)",
+            [dim_bytes],
+            |row| row.get(0),
+        )
+        .ok();
+    drifted == Some(false)
+}
+
 pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(), IcmError> {
+    if schema_is_current(conn, embedding_dims) {
+        return Ok(());
+    }
+    // A database stamped by a NEWER binary: leave its schema and its stamp
+    // alone. Re-running this binary's migrations and writing the older
+    // stamp back would make two versions alternating on one database
+    // re-migrate (and take the write lock) on every single open, each
+    // undoing the other's stamp.
+    let version: Option<i64> = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok();
+    if version.is_some_and(|v| v > SCHEMA_VERSION) {
+        return Ok(());
+    }
+    migrate_schema(conn, embedding_dims)?;
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+        .map_err(db_err)
+}
+
+fn migrate_schema(conn: &Connection, embedding_dims: usize) -> Result<(), IcmError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS memories (
@@ -556,11 +700,9 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         .map_err(db_err)?;
 
     if !has_updated_at {
-        conn.execute_batch(
-            "ALTER TABLE memories ADD COLUMN updated_at TEXT;
-             UPDATE memories SET updated_at = created_at WHERE updated_at IS NULL;",
-        )
-        .map_err(db_err)?;
+        add_column_if_missing(conn, "ALTER TABLE memories ADD COLUMN updated_at TEXT")?;
+        conn.execute_batch("UPDATE memories SET updated_at = created_at WHERE updated_at IS NULL;")
+            .map_err(db_err)?;
     }
 
     // Migration: add embedding column if missing (existing DBs)
@@ -570,8 +712,7 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         .map_err(db_err)?;
 
     if !has_embedding {
-        conn.execute_batch("ALTER TABLE memories ADD COLUMN embedding BLOB")
-            .map_err(db_err)?;
+        add_column_if_missing(conn, "ALTER TABLE memories ADD COLUMN embedding BLOB")?;
     }
 
     // Migration: scope FTS UPDATE trigger to indexed columns only (fixes #44).
@@ -610,47 +751,92 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
         }
     };
 
+    // Dimension the vector index actually has. Read from the table's own
+    // DDL first: the metadata row is missing on legacy DBs, and assuming a
+    // default there used to make a matching index look mismatched.
+    let stored_meta = || -> Option<usize> {
+        conn.query_row(
+            "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse().ok())
+    };
     if vec_exists {
-        // Check if stored dims differ from requested dims — if so, recreate
-        let stored_dims: Option<String> = conn
-            .query_row(
-                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-        let stored: usize = stored_dims
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
-        if stored != embedding_dims {
-            // Model changed — drop vec table and clear embeddings.
-            // Wrap the swap in a transaction so a partial failure cannot
-            // leave the DB with metadata at the new dim while the legacy
-            // BLOBs in `memories.embedding` still hold the old dim — that
-            // drift triggers `Dimension mismatch` errors in auto-link
-            // back-refs (issue #200).
-            let tx = conn.unchecked_transaction().map_err(db_err)?;
-            tx.execute_batch("DROP TABLE IF EXISTS vec_memories")
-                .map_err(db_err)?;
-            tx.execute("UPDATE memories SET embedding = NULL", [])
-                .map_err(db_err)?;
-            create_vec_table(&tx, embedding_dims)?;
-            tx.commit().map_err(db_err)?;
+        let table_dims = vec_table_dims(conn).or_else(stored_meta);
+        if table_dims != Some(embedding_dims) {
+            // Decide and act under the write lock: checking "no vector"
+            // and dropping the index in two steps let another process
+            // commit its first vector in between, which the DROP then
+            // destroyed.
+            conn.execute_batch("BEGIN IMMEDIATE;").map_err(db_err)?;
+            let recreated: Result<bool, IcmError> = (|| {
+                if has_any_embedding(conn)? || embedding_model_is_recorded(conn) {
+                    return Ok(false);
+                }
+                // No vector to lose and no model claiming the index:
+                // recreate it at the requested dimension, metadata
+                // included (issue #200).
+                conn.execute_batch("DROP TABLE IF EXISTS vec_memories")
+                    .map_err(db_err)?;
+                create_vec_table(conn, embedding_dims)?;
+                Ok(true)
+            })();
+            match recreated {
+                Ok(true) => conn.execute_batch("COMMIT;").map_err(db_err)?,
+                Ok(false) => {
+                    conn.execute_batch("COMMIT;").map_err(db_err)?;
+                    // The database holds vectors from another embedding
+                    // model. Opening it must never destroy them: this
+                    // branch used to DROP the index and NULL every
+                    // `memories.embedding`, so a changed default model
+                    // (768 -> 1024 dims between two releases), or two
+                    // binaries with different defaults alternating on one
+                    // database, silently wiped the vectors on every open —
+                    // measured on a real database: 94.8% of memories left
+                    // without one. Keep the index and the BLOBs as they
+                    // are; the caller sees the stored dimension through
+                    // `icm_metadata.embedding_dims` and picks a matching
+                    // model or keyword-only search. Re-embedding under a
+                    // new model is an explicit action
+                    // (`reset_vector_index`).
+                    tracing::warn!(
+                        stored = ?table_dims,
+                        requested = embedding_dims,
+                        "embedding dimension differs from the database; existing vectors kept"
+                    );
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return Err(e);
+                }
+            }
         }
+    }
+
+    // The index is the source of truth for the dimension; keep the
+    // metadata row describing it. Missing on legacy databases, and stale
+    // after some historical upgrades: without this repair such a database
+    // never looks "current" and re-runs every migration on every open.
+    let effective_dims = vec_table_dims(conn).unwrap_or(embedding_dims);
+    if stored_meta() != Some(effective_dims) {
+        conn.execute(
+            "INSERT OR REPLACE INTO icm_metadata (key, value) VALUES ('embedding_dims', ?1)",
+            [&effective_dims.to_string()],
+        )
+        .map_err(db_err)?;
     }
 
     // Defensive dim-drift sweep (issue #200).
     //
-    // If a previous migration partially failed, or the user upgraded across
-    // versions in a way that flipped `icm_metadata.embedding_dims` without
-    // clearing the BLOBs, `memories.embedding` may still hold rows at the
-    // old dim. The sqlite-vec INSERT in auto-link back-refs (`store.rs`)
-    // then rejects every neighbour update with "Dimension mismatch".
-    //
-    // This sweep is cheap (O(n) on rows that have a non-null embedding,
-    // single UPDATE), idempotent, and self-healing: after one open the DB
-    // is consistent regardless of how it got into the bad state.
-    let dim_bytes = (embedding_dims * 4) as i64;
+    // A BLOB whose length disagrees with the vector index cannot be
+    // inserted into it: the sqlite-vec INSERT in auto-link back-refs then
+    // rejects every neighbour update with "Dimension mismatch". Clear
+    // those. The comparison is against the dimension of the index itself,
+    // not the requested one — comparing to the requested dimension would
+    // wipe the very vectors the branch above just decided to keep.
+    let dim_bytes = (effective_dims * 4) as i64;
     conn.execute(
         "UPDATE memories SET embedding = NULL \
          WHERE embedding IS NOT NULL AND length(embedding) != ?1",
@@ -882,6 +1068,8 @@ mod tests {
                 ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;",
         )
         .unwrap();
+        // A database that old predates the schema-version stamp.
+        conn.execute_batch("PRAGMA user_version = 0;").unwrap();
 
         // Re-running init_db must detect and replace the old definition.
         init_db(&conn).expect("migration must succeed");
@@ -922,6 +1110,8 @@ mod tests {
                 ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;",
         )
         .unwrap();
+        // A database that old predates the schema-version stamp.
+        conn.execute_batch("PRAGMA user_version = 0;").unwrap();
 
         // Two rows whose topics differ only by the accented-letter casing
         // SQLite's ASCII-only LOWER() doesn't fold (LOWER("Décisions") =
@@ -1066,25 +1256,88 @@ mod tests {
         .unwrap()
     }
 
-    /// Issue #200: switching the embedding model (e.g. 768d → 384d) must
-    /// clear the legacy embedding BLOBs, otherwise auto-link back-refs
-    /// fail with "Dimension mismatch" on every subsequent store.
+    /// Opening a database with another embedding dimension must not
+    /// destroy the vectors it holds. This used to NULL every blob and drop
+    /// the index (the `768 -> 1024` default-model change between releases
+    /// wiped real databases on first open).
     #[test]
-    fn test_dim_change_clears_legacy_blobs() {
+    fn test_dim_change_keeps_existing_vectors() {
         ensure_vec_init();
         let conn = Connection::open_in_memory().unwrap();
         init_db_with_dims(&conn, 768).unwrap();
         insert_raw_memory_with_blob_dim(&conn, "old-768", 768);
-        assert_eq!(embedding_byte_len(&conn, "old-768"), Some(768 * 4));
 
-        // Switch to a smaller-dim model — the migration branch must run.
-        init_db_with_dims(&conn, 384).unwrap();
+        init_db_with_dims(&conn, 1024).unwrap();
 
-        // Legacy blob must be cleared (not just the metadata flipped).
         assert_eq!(
             embedding_byte_len(&conn, "old-768"),
+            Some(768 * 4),
+            "a dimension change must keep existing vectors"
+        );
+        assert_eq!(vec_table_dims(&conn), Some(768), "index must be kept");
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "768", "metadata must keep describing the index");
+
+        // Settled state: later opens at either dimension change nothing
+        // and need no migration.
+        assert!(schema_is_current(&conn, 1024));
+        init_db_with_dims(&conn, 1024).unwrap();
+        init_db_with_dims(&conn, 768).unwrap();
+        assert_eq!(embedding_byte_len(&conn, "old-768"), Some(768 * 4));
+    }
+
+    /// Legacy databases have a vector index but no `embedding_dims`
+    /// metadata row. The dimension must come from the index itself, not
+    /// from a default: assuming one made a matching index look mismatched.
+    #[test]
+    fn test_missing_dims_metadata_is_read_from_the_index() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_with_dims(&conn, 768).unwrap();
+        insert_raw_memory_with_blob_dim(&conn, "old-768", 768);
+        conn.execute_batch(
+            "DELETE FROM icm_metadata WHERE key = 'embedding_dims';
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+
+        init_db_with_dims(&conn, 1024).unwrap();
+
+        assert_eq!(embedding_byte_len(&conn, "old-768"), Some(768 * 4));
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "768", "metadata must be restored from the index");
+    }
+
+    /// With vectors kept at the index dimension, the drift sweep must
+    /// compare against that dimension: comparing to the requested one
+    /// would wipe the kept vectors through the back door.
+    #[test]
+    fn test_sweep_uses_the_index_dimension_when_vectors_are_kept() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_with_dims(&conn, 768).unwrap();
+        insert_raw_memory_with_blob_dim(&conn, "ok-768", 768);
+        insert_raw_memory_with_blob_dim(&conn, "drift-384", 384);
+
+        init_db_with_dims(&conn, 384).unwrap();
+
+        assert_eq!(embedding_byte_len(&conn, "ok-768"), Some(768 * 4));
+        assert_eq!(
+            embedding_byte_len(&conn, "drift-384"),
             None,
-            "switching dims must NULL out blobs of the old dim (issue #200)"
+            "a blob that cannot enter the index is still cleared"
         );
     }
 
@@ -1119,19 +1372,24 @@ mod tests {
         );
     }
 
-    /// Issue #200: dim-change migration must be atomic. After it returns Ok,
-    /// the metadata, the vec_memories table dim, and the embedding column
-    /// state must all agree.
+    /// With no vector to lose, a dimension change recreates the index at
+    /// the requested dimension, and metadata and index agree afterwards
+    /// (issue #200: the swap is one transaction).
     #[test]
-    fn test_dim_change_is_consistent() {
+    fn test_dim_change_without_vectors_recreates_the_index() {
         ensure_vec_init();
         let conn = Connection::open_in_memory().unwrap();
         init_db_with_dims(&conn, 768).unwrap();
-        insert_raw_memory_with_blob_dim(&conn, "before", 768);
+        // A memory without embedding does not pin the dimension.
+        conn.execute(
+            "INSERT INTO memories (id, created_at, last_accessed, topic, summary, importance, source_type)
+             VALUES ('no-vec', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 't', 's', 'medium', 'manual')",
+            [],
+        )
+        .unwrap();
 
         init_db_with_dims(&conn, 384).unwrap();
 
-        // Metadata reflects the new dim.
         let stored: String = conn
             .query_row(
                 "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
@@ -1140,27 +1398,254 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, "384");
+        assert_eq!(vec_table_dims(&conn), Some(384));
+        assert!(schema_is_current(&conn, 384));
+    }
 
-        // vec_memories was recreated.
-        let vec_exists: bool = conn
+    /// An empty index that a recorded model claims is the state right after
+    /// `icm embed --migrate` reset it. A process opening at another
+    /// dimension must not recreate it under the migration.
+    #[test]
+    fn empty_index_with_a_recorded_model_is_not_recreated() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_with_dims(&conn, 128).unwrap();
+        conn.execute(
+            "INSERT INTO icm_metadata (key, value) VALUES (?1, 'new/model')",
+            [icm_core::embedding_policy::META_EMBEDDING_MODEL],
+        )
+        .unwrap();
+
+        init_db_with_dims(&conn, 64).unwrap();
+
+        assert_eq!(
+            vec_table_dims(&conn),
+            Some(128),
+            "index left to the migration"
+        );
+        assert!(schema_is_current(&conn, 64), "nothing left to migrate");
+    }
+
+    /// A stamp from a newer binary is left alone: writing the older one
+    /// back would make two versions re-migrate on every alternate open.
+    #[test]
+    fn newer_schema_version_is_not_downgraded() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let newer = SCHEMA_VERSION + 1;
+        conn.execute_batch(&format!("PRAGMA user_version = {newer};"))
+            .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, newer);
+    }
+
+    /// A legacy database whose index matches the requested dimension but
+    /// whose `embedding_dims` row is missing must get the row back, or it
+    /// never qualifies for the lock-free open.
+    #[test]
+    fn missing_dims_metadata_is_repaired_at_the_same_dimension() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_with_dims(&conn, 768).unwrap();
+        conn.execute_batch(
+            "DELETE FROM icm_metadata WHERE key = 'embedding_dims';
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+        assert!(!schema_is_current(&conn, 768));
+
+        init_db_with_dims(&conn, 768).unwrap();
+
+        let stored: String = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master \
-                 WHERE type='table' AND name='vec_memories'",
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(vec_exists);
+        assert_eq!(stored, "768");
+        assert!(
+            schema_is_current(&conn, 768),
+            "open must be lock-free again"
+        );
+    }
 
-        // No row carries a stale blob.
-        let stale_count: i64 = conn
+    /// Same repair for a stale row: the index, not the metadata, says
+    /// which dimension the database is at.
+    #[test]
+    fn stale_dims_metadata_is_repaired_from_the_index() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_with_dims(&conn, 768).unwrap();
+        conn.execute_batch("UPDATE icm_metadata SET value = '1024' WHERE key = 'embedding_dims';")
+            .unwrap();
+
+        init_db_with_dims(&conn, 768).unwrap();
+
+        let stored: String = conn
             .query_row(
-                "SELECT COUNT(*) FROM memories \
-                 WHERE embedding IS NOT NULL AND length(embedding) != 1536",
+                "SELECT value FROM icm_metadata WHERE key = 'embedding_dims'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stale_count, 0);
+        assert_eq!(stored, "768");
+        assert_eq!(vec_table_dims(&conn), Some(768));
+    }
+
+    /// Names and SQL of the schema objects ICM itself declares, hashed.
+    /// Shadow tables of the FTS5 / vec0 virtual tables are left out: their
+    /// shape belongs to the extension, not to this file.
+    fn schema_fingerprint(conn: &Connection) -> String {
+        use sha2::{Digest, Sha256};
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master \
+                 WHERE sql IS NOT NULL \
+                   AND name NOT LIKE 'sqlite_%' \
+                   AND name NOT LIKE '%\\_fts\\_%' ESCAPE '\\' \
+                   AND name NOT LIKE 'vec\\_memories\\_%' ESCAPE '\\' \
+                 ORDER BY type, name",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap();
+        let mut hasher = Sha256::new();
+        for row in rows {
+            let (kind, name, sql) = row.unwrap();
+            // Whitespace-insensitive: reformatting a statement is not a
+            // schema change.
+            let sql: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            hasher.update(format!("{kind}|{name}|{sql}\n"));
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Guards the fast path of `init_db_with_dims`: a database stamped
+    /// with `SCHEMA_VERSION` skips the migrations, so changing the schema
+    /// without bumping the version would leave every existing database on
+    /// the old shape. When this fails: bump `SCHEMA_VERSION`, then update
+    /// the pair below.
+    #[test]
+    fn schema_fingerprint_is_paired_with_schema_version() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let expected = (
+            1,
+            "284f33e4efbe6dff1db12896084e1ce81813059ed3378449cc9f2c9d3a5b1b8c",
+        );
+        assert_eq!(
+            (SCHEMA_VERSION, schema_fingerprint(&conn).as_str()),
+            expected,
+            "schema objects changed: bump SCHEMA_VERSION and update this pair"
+        );
+    }
+
+    #[test]
+    fn init_stamps_the_schema_version() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(schema_is_current(&conn, icm_core::DEFAULT_EMBEDDING_DIMS));
+        // Another dimension, or an unstamped database, is never "current".
+        assert!(!schema_is_current(&conn, 64));
+        conn.execute_batch("PRAGMA user_version = 0;").unwrap();
+        assert!(!schema_is_current(&conn, icm_core::DEFAULT_EMBEDDING_DIMS));
+    }
+
+    /// A database stamped by an older schema version still gets the
+    /// migrations: here the scoped FTS trigger is replaced by the old
+    /// broad one and the stamp rolled back, as a pre-migration database
+    /// would look.
+    #[test]
+    fn stale_schema_version_reruns_the_migrations() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER memories_au;
+             CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                 INSERT INTO memories_fts(memories_fts, rowid, id, topic, summary, keywords)
+                 VALUES('delete', old.rowid, old.id, old.topic, old.summary, old.keywords);
+                 INSERT INTO memories_fts(rowid, id, topic, summary, keywords)
+                 VALUES (new.rowid, new.id, new.topic, new.summary, new.keywords);
+             END;
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let trigger_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='memories_au'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_sql.contains("UPDATE OF"), "migration must re-run");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The reported failure: with several agent sessions on one database,
+    /// opening it — even only to read — failed with "database is locked"
+    /// whenever another process held the write lock, because every open
+    /// re-ran the migrations. An up-to-date database must open while a
+    /// writer is mid-transaction.
+    #[test]
+    fn up_to_date_db_opens_while_another_connection_holds_the_write_lock() {
+        ensure_vec_init();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+        let dims = icm_core::DEFAULT_EMBEDDING_DIMS;
+        drop(crate::store::SqliteStore::with_dims(&path, dims).unwrap());
+
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO icm_metadata (key, value) VALUES ('held', 'by-writer');",
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let opened = crate::store::SqliteStore::with_dims(&path, dims);
+        let elapsed = started.elapsed();
+
+        writer.execute_batch("ROLLBACK;").unwrap();
+        assert!(
+            opened.is_ok(),
+            "open must not need the write lock: {:?}",
+            opened.err().map(|e| e.to_string())
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "open waited {elapsed:?} behind a writer"
+        );
     }
 }

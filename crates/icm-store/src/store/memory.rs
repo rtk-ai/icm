@@ -7,15 +7,18 @@
 use super::*;
 use rusqlite::OptionalExtension;
 
-impl MemoryStore for SqliteStore {
-    fn store(&self, memory: Memory) -> IcmResult<String> {
-        let memory = validate_and_normalize(memory)?;
+/// sqlite-vec's error for a vector whose length differs from the index.
+fn is_dimension_mismatch(e: &IcmError) -> bool {
+    e.to_string().contains("Dimension mismatch")
+}
 
+impl SqliteStore {
+    fn store_in_transaction(&self, memory: &Memory) -> IcmResult<String> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
-        match self.store_inner(&memory) {
+        match self.store_inner(memory) {
             Ok(id) => {
                 self.conn.execute_batch("COMMIT;").map_err(db_err)?;
                 Ok(id)
@@ -24,6 +27,30 @@ impl MemoryStore for SqliteStore {
                 let _ = self.conn.execute_batch("ROLLBACK;");
                 Err(e)
             }
+        }
+    }
+}
+
+impl MemoryStore for SqliteStore {
+    fn store(&self, memory: Memory) -> IcmResult<String> {
+        let memory = validate_and_normalize(memory)?;
+
+        match self.store_in_transaction(&memory) {
+            // The vector does not fit the index: another process re-embedded
+            // the database under a model of another dimension while this
+            // one (an MCP or HTTP server started earlier) kept its embedder.
+            // The memory matters more than its vector — store it without
+            // one rather than lose it; `icm embed` fills the vector later.
+            Err(e) if memory.embedding.is_some() && is_dimension_mismatch(&e) => {
+                tracing::warn!(
+                    "embedding dimension does not match the vector index; \
+                     storing the memory without a vector: {e}"
+                );
+                let mut without_vector = memory;
+                without_vector.embedding = None;
+                self.store_in_transaction(&without_vector)
+            }
+            other => other,
         }
     }
 
@@ -492,7 +519,9 @@ impl MemoryStore for SqliteStore {
         }
         let refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let changed = self.conn.execute(&sql, refs.as_slice()).map_err(db_err)?;
+        let changed = self.with_bookkeeping_timeout(|| {
+            self.conn.execute(&sql, refs.as_slice()).map_err(db_err)
+        })?;
         self.cache_invalidate_many(ids);
         Ok(changed)
     }

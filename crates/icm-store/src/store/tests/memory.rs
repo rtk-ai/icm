@@ -661,3 +661,25 @@ fn test_consolidate_no_stale_fts_results() {
 }
 
 // === MemoirStore tests ===
+
+/// A long-running server keeps its embedder while another process
+/// re-embeds the database at another dimension. Its next store used to
+/// fail outright ("Dimension mismatch") and the memory was lost.
+#[test]
+fn store_keeps_the_memory_when_its_vector_does_not_fit_the_index() {
+    let store = SqliteStore::in_memory_with_dims(64).unwrap();
+    let mut memory = make_memory("t", "vector from a model of another dimension");
+    memory.embedding = Some(vec![0.1; 128]);
+
+    let id = store.store(memory).expect("the memory must be stored");
+
+    let stored = store.get(&id).unwrap().expect("memory present");
+    assert_eq!(stored.summary, "vector from a model of another dimension");
+    assert!(stored.embedding.is_none(), "the unusable vector is dropped");
+
+    // A vector of the right dimension is still stored with its vector.
+    let mut fits = make_memory("t", "vector that fits the index");
+    fits.embedding = Some(vec![0.1; 64]);
+    let id = store.store(fits).unwrap();
+    assert!(store.get(&id).unwrap().unwrap().embedding.is_some());
+}

@@ -80,6 +80,12 @@ pub struct MemoryConfig {
     pub decay_rate: f32,
     pub prune_threshold: f32,
     /// Enable automatic consolidation when a topic exceeds the threshold.
+    ///
+    /// Off by default, and lossy by design when no LLM summarizer is
+    /// configured: the rollup keeps the summaries of the 3 heaviest
+    /// memories and replaces every non-`critical` memory it read with it —
+    /// the content of the others is gone. With `[consolidate.summarizer]`
+    /// set to a provider, the topic is queued for an LLM summary instead.
     pub auto_consolidate_enabled: bool,
     /// Number of entries in a topic before auto-consolidation triggers.
     pub auto_consolidate_threshold: usize,

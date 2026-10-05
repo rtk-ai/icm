@@ -2984,6 +2984,7 @@ fn main() -> Result<()> {
                 let auto_consolidate = icm_mcp::AutoConsolidate {
                     enabled: cfg.memory.auto_consolidate_enabled,
                     threshold: cfg.memory.auto_consolidate_threshold,
+                    queue: cfg.consolidate.summarizer.provider.trim() != "none",
                 };
                 return http_api::run_http_server(
                     store,
@@ -3007,6 +3008,7 @@ fn main() -> Result<()> {
             let auto_consolidate = icm_mcp::AutoConsolidate {
                 enabled: cfg.memory.auto_consolidate_enabled,
                 threshold: cfg.memory.auto_consolidate_threshold,
+                queue: cfg.consolidate.summarizer.provider.trim() != "none",
             };
             icm_mcp::run_server(
                 &store,

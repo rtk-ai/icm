@@ -64,6 +64,7 @@ pub use memory::{
 pub use store::{
     find_similar_memory, merge_summaries, union_keywords, MemoryStore, DEDUP_SIMILARITY_THRESHOLD,
 };
+pub use store::{Consolidated, ReadMemory};
 pub use temporal::{parse_instant, parse_query_window, TimeWindow};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;

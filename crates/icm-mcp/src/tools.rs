@@ -29,6 +29,13 @@ const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
 pub struct AutoConsolidate {
     pub enabled: bool,
     pub threshold: usize,
+    /// An LLM summarizer is configured (`[consolidate.summarizer]` provider
+    /// other than `none`): a topic past the threshold is queued for
+    /// `icm consolidate-pending` instead of being rolled up on the spot.
+    /// The rollup keeps the 3 heaviest memories and deletes the rest; with
+    /// a summarizer configured the user asked for a real summary, and the
+    /// CLI store path already queues.
+    pub queue: bool,
 }
 
 impl Default for AutoConsolidate {
@@ -40,6 +47,7 @@ impl Default for AutoConsolidate {
         Self {
             enabled: true,
             threshold: AUTO_CONSOLIDATE_THRESHOLD,
+            queue: false,
         }
     }
 }
@@ -88,6 +96,26 @@ fn try_auto_consolidate(
 ) -> String {
     if !auto.enabled {
         return String::new();
+    }
+    if auto.queue {
+        // Same decision as `maybe_auto_consolidate` on the CLI store path.
+        return match store.count_by_topic(topic) {
+            Ok(n) if n > auto.threshold => match store.enqueue_pending_consolidation(topic, "") {
+                Ok(_) => format!(
+                    "Topic '{topic}' queued for consolidation (exceeded {} entries).",
+                    auto.threshold
+                ),
+                Err(e) => {
+                    tracing::warn!("enqueue consolidation failed for topic '{topic}': {e}");
+                    String::new()
+                }
+            },
+            Ok(_) => String::new(),
+            Err(e) => {
+                tracing::warn!("count_by_topic failed for '{topic}': {e}");
+                String::new()
+            }
+        };
     }
     match store.auto_consolidate_with_embedder(topic, auto.threshold, embedder) {
         Ok(true) => format!(
@@ -228,7 +256,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
         }),
         json!({
             "name": "icm_memory_consolidate",
-            "description": "Consolidate all memories of a topic into a single summary. Useful when a topic accumulates too many entries.",
+            "description": "Replace memories of a topic with one summary you wrote from them. Two steps: call with only `topic` to list the memories and their ids, then call with `summary` and the `ids` it covers. Only the listed memories are replaced; critical ones never are.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -238,10 +266,15 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     },
                     "summary": {
                         "type": "string",
-                        "description": "Consolidated summary to replace all memories in the topic"
+                        "description": "Your summary of the memories listed in `ids`"
+                    },
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ids of the memories the summary covers: only these are replaced. Call once WITHOUT ids (and without summary) to get the topic's memories with their ids; nothing is replaced by that call."
                     }
                 },
-                "required": ["topic", "summary"]
+                "required": ["topic"]
             }
         }),
         json!({
@@ -1586,17 +1619,99 @@ fn tool_learn(store: &Store, args: &Value) -> ToolResult {
     }
 }
 
+/// How many memories the listing answer of `icm_memory_consolidate` shows.
+const CONSOLIDATE_LISTING: usize = 40;
+
+/// `icm_memory_consolidate`: replace the memories the caller summarized.
+///
+/// The caller wrote `summary` from memories it read; `ids` says which. The
+/// tool never guesses: it used to replace everything the topic held, and in
+/// the default (compact) mode no tool output shows ids, so an agent that
+/// had seen the 5 to 20 memories a recall returns wiped out a topic of
+/// hundreds. Two choices were possible — show ids in recall output, or stop
+/// replacing blind. This does the second without touching recall: called
+/// without `ids`, the tool writes nothing and answers with the topic's
+/// memories and their ids, which is also what makes `ids` usable at all.
 fn tool_consolidate(store: &Store, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
     let topic = match get_str(args, "topic") {
-        Some(t) => t,
+        Some(t) => t.trim(),
         None => return ToolResult::error("missing required field: topic".into()),
+    };
+
+    let ids: Vec<String> = match args.get("ids") {
+        // Absent: answer with what there is to consolidate.
+        None | Some(Value::Null) => return consolidate_listing(store, topic),
+        Some(Value::Array(listed)) => {
+            // Empty is not "everything": at the store, an empty list
+            // replaces nothing, and here it must not mean the opposite.
+            if listed.is_empty() {
+                return ToolResult::error(
+                    "ids is empty: nothing was replaced. Pass the ids of the memories the \
+                     summary covers; call without `ids` to list them."
+                        .into(),
+                );
+            }
+            let mut ids = Vec::with_capacity(listed.len());
+            for id in listed {
+                match id.as_str() {
+                    Some(id) => ids.push(id.to_string()),
+                    None => return ToolResult::error("ids must be an array of strings".into()),
+                }
+            }
+            ids
+        }
+        Some(_) => return ToolResult::error("ids must be an array of strings".into()),
     };
     let summary = match get_str(args, "summary") {
         Some(s) => s,
         None => return ToolResult::error("missing required field: summary".into()),
     };
 
-    let mut consolidated = Memory::new(topic.into(), summary.into(), icm_core::Importance::High);
+    // The listed memories must be in this topic — a topic that differs by
+    // case or a blank used to match nothing and leave a stray summary
+    // behind, reported as a success. They also set the summary's
+    // importance: the highest of what it replaces, as on every other path.
+    let mut not_here: Vec<&str> = Vec::new();
+    let mut importance: Option<icm_core::Importance> = None;
+    let mut critical = 0usize;
+    for id in &ids {
+        match store.get(id) {
+            Ok(Some(m)) if m.topic == topic => {
+                if m.importance == icm_core::Importance::Critical {
+                    critical += 1;
+                } else {
+                    importance = Some(match importance {
+                        Some(best) => icm_core::max_importance(best, m.importance),
+                        None => m.importance,
+                    });
+                }
+            }
+            Ok(_) => not_here.push(id),
+            Err(e) => return ToolResult::error(format!("failed to get memory {id}: {e}")),
+        }
+    }
+    if !not_here.is_empty() {
+        return ToolResult::error(format!(
+            "nothing was replaced: {} of the listed ids are not in topic {topic:?} ({}). Check \
+             the topic's exact spelling, or call without `ids` to list its memories.",
+            not_here.len(),
+            not_here
+                .iter()
+                .take(5)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    let Some(importance) = importance else {
+        return ToolResult::error(
+            "nothing was replaced: every listed memory is critical, and critical memories are \
+             never consolidated."
+                .into(),
+        );
+    };
+
+    let mut consolidated = Memory::new(topic.into(), summary.into(), importance);
     // Same bug class as #394/#395/cmd_consolidate: this tool never attached
     // an embedding to the merged memory it creates.
     if let Some(emb) = embedder {
@@ -1605,10 +1720,91 @@ fn tool_consolidate(store: &Store, embedder: Option<&dyn Embedder>, args: &Value
         }
     }
 
-    match store.consolidate_topic(topic, consolidated) {
-        Ok(()) => ToolResult::text(format!("Consolidated topic: {topic}")),
+    // Only ids are known here, not what the caller read under them: the
+    // store checks that each is still in the topic, nothing more.
+    let read: Vec<icm_core::ReadMemory> = ids
+        .iter()
+        .map(|id| icm_core::ReadMemory {
+            id: id.clone(),
+            summary: None,
+        })
+        .collect();
+    match store.consolidate_ids(topic, &read, consolidated) {
+        Ok(icm_core::Consolidated::Replaced { removed, id }) => {
+            let left = store
+                .count_by_topic(topic)
+                .map(|n| n.saturating_sub(1))
+                .unwrap_or(0);
+            let mut text = format!(
+                "Consolidated topic: {topic} ({removed} memories replaced, summary id {id}"
+            );
+            if left > 0 {
+                text.push_str(&format!("; {left} other memories left in place"));
+            }
+            if critical > 0 {
+                text.push_str(&format!(
+                    "; {critical} of the listed ones are critical and are never replaced"
+                ));
+            }
+            text.push(')');
+            ToolResult::text(text)
+        }
+        Ok(icm_core::Consolidated::Stale { changed }) => ToolResult::error(format!(
+            "nothing was replaced: {} of the listed memories were removed or moved while this \
+             call was running ({}). Call without `ids` to list the topic again.",
+            changed.len(),
+            changed
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+        )),
         Err(e) => ToolResult::error(format!("failed to consolidate: {e}")),
     }
+}
+
+/// The answer to `icm_memory_consolidate` without `ids`: what the topic
+/// holds, with ids, and how to call again. Nothing is written.
+fn consolidate_listing(store: &Store, topic: &str) -> ToolResult {
+    let memories = match store.get_by_topic(topic) {
+        Ok(m) => m,
+        Err(e) => return ToolResult::error(format!("failed to get memories: {e}")),
+    };
+    let total = store.count_by_topic(topic).unwrap_or(memories.len());
+    let replaceable: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| m.importance != icm_core::Importance::Critical)
+        .collect();
+    if replaceable.len() < 2 {
+        return ToolResult::error(format!(
+            "nothing to consolidate in topic {topic:?}: it holds {total} memories, {} of which \
+             can be merged (critical memories never are).",
+            replaceable.len()
+        ));
+    }
+    let mut text = format!(
+        "Nothing was replaced: `ids` is required. Topic {topic:?} holds {total} memories; \
+         {} can be consolidated. Read the ones below, write a summary that covers them, and \
+         call again with `summary` and their `ids` — only those are replaced.\n",
+        replaceable.len()
+    );
+    for m in replaceable.iter().take(CONSOLIDATE_LISTING) {
+        let summary: String = m.summary.chars().take(300).collect();
+        let more = if m.summary.chars().count() > 300 {
+            "…"
+        } else {
+            ""
+        };
+        text.push_str(&format!("- {}: {summary}{more}\n", m.id));
+    }
+    if replaceable.len() > CONSOLIDATE_LISTING {
+        text.push_str(&format!(
+            "({} more not shown: consolidate these first, then call again.)\n",
+            replaceable.len() - CONSOLIDATE_LISTING
+        ));
+    }
+    ToolResult::error(text)
 }
 
 fn tool_list_topics(store: &Store) -> ToolResult {
@@ -2771,12 +2967,24 @@ mod tests {
         }
 
         let store = Store::in_memory_with_dims(64).unwrap();
+        let ids: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|s| {
+                store
+                    .store(Memory::new(
+                        "t".into(),
+                        (*s).into(),
+                        icm_core::Importance::Medium,
+                    ))
+                    .unwrap()
+            })
+            .collect();
         let embedder = StubEmbedder;
         let result = call_tool(
             &store,
             Some(&embedder),
             "icm_memory_consolidate",
-            &json!({"topic": "t", "summary": "merged summary"}),
+            &json!({"topic": "t", "summary": "merged summary", "ids": ids}),
             false,
         );
         assert!(!result.is_error, "{:?}", result.content);
@@ -2787,6 +2995,252 @@ mod tests {
             memories[0].embedding.is_some(),
             "consolidated memory must have an embedding attached"
         );
+    }
+
+    fn seed(store: &Store, topic: &str, texts: &[&str]) -> Vec<String> {
+        texts
+            .iter()
+            .map(|s| {
+                store
+                    .store(Memory::new(
+                        topic.into(),
+                        (*s).into(),
+                        icm_core::Importance::Medium,
+                    ))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn consolidate(store: &Store, args: Value) -> ToolResult {
+        call_tool(store, None, "icm_memory_consolidate", &args, true)
+    }
+
+    /// The summary an agent passes stands for the memories it read. With
+    /// their `ids`, a memory stored since — here, between the read and the
+    /// call — is not removed with them. The tool used to delete the topic.
+    #[test]
+    fn tool_consolidate_keeps_a_memory_stored_after_the_caller_read_the_topic() {
+        let store = test_store();
+        let read = seed(&store, "t", &["fact one", "fact two"]);
+        let late = seed(&store, "t", &["LATE-ARRIVAL"]).remove(0);
+
+        let result = consolidate(
+            &store,
+            json!({"topic": "t", "summary": "facts one and two", "ids": read}),
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+        let text = &result.content[0].text;
+        assert!(text.starts_with("Consolidated topic: t"), "{text}");
+        assert!(text.contains("2 memories replaced"), "{text}");
+        assert!(text.contains("1 other memories left in place"), "{text}");
+
+        assert!(
+            store.get(&late).unwrap().is_some(),
+            "the late memory is gone"
+        );
+        let mut left: Vec<String> = store
+            .get_by_topic("t")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["LATE-ARRIVAL", "facts one and two"]);
+    }
+
+    /// In the default (compact) mode no tool shows memory ids, so an agent
+    /// could not pass `ids` — and without them the tool replaced everything
+    /// the topic held, including what the agent never read. Without `ids`
+    /// it now replaces nothing and answers with the memories and their ids.
+    #[test]
+    fn tool_consolidate_without_ids_lists_the_topic_and_replaces_nothing() {
+        let store = test_store();
+        let ids = seed(
+            &store,
+            "many",
+            &(0..60)
+                .map(|i| format!("fact {i:02}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        for args in [
+            json!({"topic": "many", "summary": "what the agent saw of it"}),
+            json!({"topic": "many"}),
+            json!({"topic": "many", "summary": "s", "ids": null}),
+        ] {
+            let result = consolidate(&store, args);
+            assert!(
+                result.is_error,
+                "a call that replaced nothing is not a success"
+            );
+            let text = &result.content[0].text;
+            assert!(
+                text.starts_with("Nothing was replaced: `ids` is required"),
+                "{text}"
+            );
+            assert!(text.contains("holds 60 memories"), "{text}");
+            // The ids the agent needs, with what each memory says.
+            let listed = ids.iter().filter(|id| text.contains(id.as_str())).count();
+            assert_eq!(listed, 40, "40 of the 60 are listed per call");
+            assert!(text.contains("20 more not shown"), "{text}");
+            assert_eq!(store.count_by_topic("many").unwrap(), 60, "nothing removed");
+        }
+
+        // The ids from the listing make the second step possible.
+        let listing = consolidate(&store, json!({"topic": "many"})).content[0]
+            .text
+            .clone();
+        let shown: Vec<String> = ids
+            .iter()
+            .filter(|id| listing.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let result = consolidate(
+            &store,
+            json!({"topic": "many", "summary": "the 40 listed", "ids": shown}),
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("40 memories replaced"));
+        assert_eq!(store.count_by_topic("many").unwrap(), 21);
+
+        // A topic with nothing to merge says so.
+        seed(&store, "one", &["alone"]);
+        let result = consolidate(&store, json!({"topic": "one"}));
+        assert!(result.content[0].text.contains("nothing to consolidate"));
+    }
+
+    /// `ids: []` is not "every memory": at the store an empty list replaces
+    /// nothing, and the tool used to turn it into the whole topic.
+    #[test]
+    fn tool_consolidate_with_an_empty_id_list_replaces_nothing() {
+        let store = test_store();
+        seed(&store, "t", &["a", "b", "c"]);
+        let result = consolidate(
+            &store,
+            json!({"topic": "t", "summary": "a and b", "ids": []}),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.content[0].text.contains("ids is empty"),
+            "{:?}",
+            result.content
+        );
+        assert_eq!(store.count_by_topic("t").unwrap(), 3);
+
+        let result = consolidate(&store, json!({"topic": "t", "summary": "x", "ids": [1, 2]}));
+        assert!(result.is_error);
+        assert_eq!(store.count_by_topic("t").unwrap(), 3);
+    }
+
+    /// Right ids, topic spelled differently (case, as a recall shows it and
+    /// dedup ignores it): nothing matched, yet a summary was written under
+    /// the misspelled topic and the answer was "Consolidated topic".
+    #[test]
+    fn tool_consolidate_refuses_ids_that_are_not_in_the_topic() {
+        let store = test_store();
+        let ids = seed(&store, "decisions-proj", &["a", "b"]);
+        let result = consolidate(
+            &store,
+            json!({"topic": "Decisions-proj", "summary": "a and b", "ids": ids}),
+        );
+        assert!(result.is_error);
+        let text = &result.content[0].text;
+        assert!(text.contains("not in topic \"Decisions-proj\""), "{text}");
+        assert_eq!(
+            store.count_by_topic("Decisions-proj").unwrap(),
+            0,
+            "orphan summary"
+        );
+        assert_eq!(store.count_by_topic("decisions-proj").unwrap(), 2);
+
+        // Blanks around the topic are the same topic.
+        let result = consolidate(
+            &store,
+            json!({"topic": " decisions-proj ", "summary": "a and b", "ids": ids}),
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(store.count_by_topic("decisions-proj").unwrap(), 1);
+
+        // Ids that no longer exist (already consolidated by someone else).
+        let result = consolidate(
+            &store,
+            json!({"topic": "decisions-proj", "summary": "again", "ids": ids}),
+        );
+        assert!(result.is_error);
+        assert_eq!(
+            store.count_by_topic("decisions-proj").unwrap(),
+            1,
+            "second summary"
+        );
+    }
+
+    /// The summary keeps the highest importance of what it replaces (it was
+    /// always `high`), and critical memories are neither replaced nor a
+    /// reason to promote it.
+    #[test]
+    fn tool_consolidate_gives_the_summary_the_importance_of_what_it_replaces() {
+        let store = test_store();
+        let mut ids = seed(&store, "t", &["a", "b"]);
+        let critical = store
+            .store(Memory::new(
+                "t".into(),
+                "never forget".into(),
+                icm_core::Importance::Critical,
+            ))
+            .unwrap();
+        ids.push(critical.clone());
+        let result = consolidate(
+            &store,
+            json!({"topic": "t", "summary": "a and b", "ids": ids}),
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0]
+            .text
+            .contains("1 of the listed ones are critical"));
+        let after = store.get_by_topic("t").unwrap();
+        assert_eq!(after.len(), 2);
+        let summary = after.iter().find(|m| m.id != critical).unwrap();
+        assert_eq!(summary.importance, icm_core::Importance::Medium);
+
+        let only_critical = consolidate(
+            &store,
+            json!({"topic": "t", "summary": "x", "ids": [critical]}),
+        );
+        assert!(only_critical.is_error);
+        assert_eq!(store.count_by_topic("t").unwrap(), 2);
+    }
+
+    /// With an LLM summarizer configured, a topic past the threshold is
+    /// queued — once — for a real summary, as the CLI store path does. The
+    /// MCP path used to run the 3-memory rollup regardless, deleting the
+    /// rest, exactly what the docs say configuring a summarizer avoids.
+    #[test]
+    fn auto_consolidation_queues_instead_of_rolling_up_when_a_summarizer_is_configured() {
+        let store = test_store();
+        let queued = AutoConsolidate {
+            enabled: true,
+            threshold: 3,
+            queue: true,
+        };
+        for i in 0..8 {
+            let r = store_via_mcp(&store, "busy", i, queued);
+            assert!(!r.is_error);
+        }
+        assert_eq!(
+            store.count_by_topic("busy").unwrap(),
+            8,
+            "nothing rolled up"
+        );
+        let jobs = store.list_pending_consolidation_jobs(50).unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "one pending job per topic, not one per store"
+        );
+        assert_eq!(jobs[0].topic, "busy");
     }
 
     #[test]
@@ -2929,19 +3383,32 @@ mod tests {
 
     /// Audit regression: the schema advertises limit <= 20 but the code
     /// accepted 100 — the clamp must match the published contract.
+    ///
+    /// The 30 probes are stored with auto-consolidation off. With the
+    /// default test policy (on, threshold 10) they were rolled up as they
+    /// came, the rollup keeping only 3 of them: fewer than 20 occurrences
+    /// were left in the whole store, and the assertion passed whatever the
+    /// clamp did. Thirty separate memories and an exact count test the
+    /// clamp itself.
     #[test]
     fn test_recall_limit_clamped_to_schema_max() {
         let store = test_store();
         for i in 0..30 {
-            let r = call_tool(
+            let r = call_tool_with_config(
                 &store,
                 None,
                 "icm_memory_store",
                 &json!({"topic": "t", "content": format!("clamp probe entry number {i}")}),
                 false,
+                AutoConsolidate {
+                    enabled: false,
+                    threshold: AUTO_CONSOLIDATE_THRESHOLD,
+                    queue: false,
+                },
             );
             assert!(!r.is_error);
         }
+        assert_eq!(store.count_by_topic("t").unwrap(), 30);
         let recall_result = call_tool(
             &store,
             None,
@@ -2954,9 +3421,9 @@ mod tests {
             .text
             .matches("clamp probe entry")
             .count();
-        assert!(
-            hits <= 20,
-            "limit must clamp to the schema max of 20, got {hits} hits"
+        assert_eq!(
+            hits, 20,
+            "30 memories match and 100 were asked for: the schema max of 20 must apply"
         );
     }
 
@@ -3348,22 +3815,35 @@ mod tests {
     fn test_consolidate_via_mcp() {
         let store = test_store();
         for i in 0..10 {
-            call_tool(
+            // Auto-consolidation off: this test is about the tool.
+            call_tool_with_config(
                 &store,
                 None,
                 "icm_memory_store",
                 &json!({"topic": "consolidate-me", "content": format!("detail {i}")}),
                 false,
+                AutoConsolidate {
+                    enabled: false,
+                    threshold: AUTO_CONSOLIDATE_THRESHOLD,
+                    queue: false,
+                },
             );
         }
+        let ids: Vec<String> = store
+            .get_by_topic("consolidate-me")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids.len(), 10);
         let result = call_tool(
             &store,
             None,
             "icm_memory_consolidate",
-            &json!({"topic": "consolidate-me", "summary": "All 10 details merged"}),
+            &json!({"topic": "consolidate-me", "summary": "All 10 details merged", "ids": ids}),
             false,
         );
-        assert!(!result.is_error);
+        assert!(!result.is_error, "{:?}", result.content);
         let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
         assert!(stats.content[0].text.contains("Memories: 1"));
     }
@@ -3389,6 +3869,7 @@ mod tests {
         let off = AutoConsolidate {
             enabled: false,
             threshold: 10,
+            queue: false,
         };
         for i in 0..14 {
             let r = store_via_mcp(&store, "t", i, off);
@@ -3412,6 +3893,7 @@ mod tests {
         let on = AutoConsolidate {
             enabled: true,
             threshold: 3,
+            queue: false,
         };
         let mut consolidated = false;
         for i in 0..6 {

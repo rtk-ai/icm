@@ -457,6 +457,265 @@ fn test_consolidate_topic() {
     assert_eq!(store.get_by_topic("topic-b").unwrap().len(), 1);
 }
 
+fn read_of(store: &SqliteStore, ids: &[String]) -> Vec<icm_core::ReadMemory> {
+    ids.iter()
+        .map(|id| icm_core::ReadMemory::from(&store.get(id).unwrap().unwrap()))
+        .collect()
+}
+
+fn replaced(removed: usize, outcome: icm_core::Consolidated) -> String {
+    match outcome {
+        icm_core::Consolidated::Replaced { removed: n, id } => {
+            assert_eq!(n, removed);
+            id
+        }
+        stale => panic!("expected a replacement, got {stale:?}"),
+    }
+}
+
+/// `consolidate_ids` is what a consolidation that read some memories
+/// calls: exactly those go, whatever else is in the topic by then.
+#[test]
+fn consolidate_ids_removes_exactly_the_listed_memories() {
+    let store = test_store();
+    let ids: Vec<String> = ["entry 1", "entry 2", "entry 3"]
+        .iter()
+        .map(|s| store.store(make_memory("t", s)).unwrap())
+        .collect();
+    let read = read_of(&store, &ids);
+    // Stored after the caller read the topic (while the LLM was busy), or
+    // simply never read: both must survive.
+    let late = store.store(make_memory("t", "late arrival")).unwrap();
+    let other_topic = store.store(make_memory("u", "elsewhere")).unwrap();
+
+    let outcome = store
+        .consolidate_ids("t", &read, make_memory("t", "summary of 1-3"))
+        .unwrap();
+    replaced(3, outcome);
+
+    let mut left: Vec<String> = store
+        .get_by_topic("t")
+        .unwrap()
+        .into_iter()
+        .map(|m| m.summary)
+        .collect();
+    left.sort();
+    assert_eq!(left, ["late arrival", "summary of 1-3"]);
+    assert!(store.get(&late).unwrap().is_some());
+    assert!(store.get(&other_topic).unwrap().is_some());
+    for id in &ids {
+        assert!(store.get(id).unwrap().is_none(), "{id} must be gone");
+    }
+}
+
+/// `critical` memories are never removed, listed or not; unlisted ones are
+/// not touched; an empty list writes the summary and removes nothing.
+#[test]
+fn consolidate_ids_never_removes_critical_or_unlisted_memories() {
+    let store = test_store();
+    let plain = store.store(make_memory("t", "expendable")).unwrap();
+    let critical = store
+        .store(Memory::new(
+            "t".into(),
+            "never forget this".into(),
+            Importance::Critical,
+        ))
+        .unwrap();
+    let unlisted = store.store(make_memory("t", "not in the list")).unwrap();
+
+    let read = read_of(&store, &[plain.clone(), critical.clone()]);
+    let outcome = store
+        .consolidate_ids("t", &read, make_memory("t", "rollup"))
+        .unwrap();
+    replaced(1, outcome);
+    assert!(store.get(&plain).unwrap().is_none());
+    assert!(store.get(&critical).unwrap().is_some());
+    assert!(store.get(&unlisted).unwrap().is_some());
+
+    let outcome = store
+        .consolidate_ids("t", &[], make_memory("t", "standalone"))
+        .unwrap();
+    replaced(0, outcome);
+    assert_eq!(store.count_by_topic("t").unwrap(), 4);
+}
+
+/// The summary stands for what was read. If a listed memory was edited,
+/// forgotten or moved since — or all of them were already consolidated by
+/// another run — writing it would delete a correction that is not in it,
+/// bring back what was forgotten, or leave two summaries. Nothing is
+/// written, and the caller is told which memories changed.
+#[test]
+fn consolidate_ids_writes_nothing_when_what_was_read_has_changed() {
+    let stale = |outcome: icm_core::Consolidated| match outcome {
+        icm_core::Consolidated::Stale { changed } => changed,
+        other => panic!("expected Stale, got {other:?}"),
+    };
+
+    // Edited between the read and the write.
+    let store = test_store();
+    let a = store.store(make_memory("t", "port is 5432")).unwrap();
+    let b = store.store(make_memory("t", "other fact")).unwrap();
+    let read = read_of(&store, &[a.clone(), b.clone()]);
+    let mut corrected = store.get(&a).unwrap().unwrap();
+    corrected.summary = "port is 5433 (corrected)".into();
+    store.update(&corrected).unwrap();
+    let outcome = store
+        .consolidate_ids("t", &read, make_memory("t", "summary with the old port"))
+        .unwrap();
+    assert_eq!(stale(outcome), std::slice::from_ref(&a));
+    assert_eq!(store.count_by_topic("t").unwrap(), 2, "nothing written");
+    assert_eq!(
+        store.get(&a).unwrap().unwrap().summary,
+        "port is 5433 (corrected)"
+    );
+
+    // Forgotten between the read and the write: it must not come back.
+    let read = read_of(&store, &[a.clone(), b.clone()]);
+    store.delete(&b).unwrap();
+    let outcome = store
+        .consolidate_ids("t", &read, make_memory("t", "summary quoting other fact"))
+        .unwrap();
+    assert_eq!(stale(outcome), std::slice::from_ref(&b));
+    assert_eq!(store.count_by_topic("t").unwrap(), 1);
+
+    // Already consolidated by an overlapping run: no second summary.
+    let store = test_store();
+    let ids: Vec<String> = ["x", "y"]
+        .iter()
+        .map(|s| store.store(make_memory("t", s)).unwrap())
+        .collect();
+    let read = read_of(&store, &ids);
+    replaced(
+        2,
+        store
+            .consolidate_ids("t", &read, make_memory("t", "first run"))
+            .unwrap(),
+    );
+    let outcome = store
+        .consolidate_ids("t", &read, make_memory("t", "second run"))
+        .unwrap();
+    assert_eq!(stale(outcome).len(), 2);
+    let left = store.get_by_topic("t").unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].summary, "first run");
+
+    // A caller that only knows ids (no summary): existence is still checked.
+    let only_ids = vec![icm_core::ReadMemory {
+        id: "01NOSUCHID0000000000000000".into(),
+        summary: None,
+    }];
+    let outcome = store
+        .consolidate_ids("t", &only_ids, make_memory("t", "orphan"))
+        .unwrap();
+    assert_eq!(stale(outcome).len(), 1);
+    assert_eq!(store.count_by_topic("t").unwrap(), 1);
+}
+
+/// The memories are looked up under the topic the summary is written to.
+/// A raw " t" used to match nothing, remove nothing, and add the summary
+/// to "t" — reported as a success. And ids from another topic (same name,
+/// different case) are not "in the topic".
+#[test]
+fn consolidate_ids_uses_one_topic_for_the_lookup_and_the_write() {
+    let store = test_store();
+    let ids: Vec<String> = ["a", "b"]
+        .iter()
+        .map(|s| store.store(make_memory("t", s)).unwrap())
+        .collect();
+    let read = read_of(&store, &ids);
+
+    // Surrounding blanks are the same topic.
+    let outcome = store
+        .consolidate_ids(" t ", &read, make_memory(" t ", "a+b"))
+        .unwrap();
+    replaced(2, outcome);
+    assert_eq!(store.count_by_topic("t").unwrap(), 1);
+
+    // A different topic for the lookup and for the summary is a caller bug.
+    assert!(store
+        .consolidate_ids("t", &[], make_memory("u", "x"))
+        .is_err());
+
+    // Right ids, wrong topic: stale, and no orphan summary under "T".
+    let ids: Vec<String> = ["c", "d"]
+        .iter()
+        .map(|s| store.store(make_memory("t", s)).unwrap())
+        .collect();
+    let read = read_of(&store, &ids);
+    let outcome = store
+        .consolidate_ids("T", &read, make_memory("T", "c+d"))
+        .unwrap();
+    assert!(matches!(outcome, icm_core::Consolidated::Stale { .. }));
+    assert_eq!(store.count_by_topic("T").unwrap(), 0);
+    assert_eq!(store.count_by_topic("t").unwrap(), 3);
+}
+
+/// The store deduplicates on a hash of the summary that ignores the
+/// topic's case. A summary identical to a memory of another topic used to
+/// be merged into that memory: originals deleted, summary absent from the
+/// topic, success reported.
+#[test]
+fn consolidate_ids_refuses_a_summary_that_would_land_in_another_topic() {
+    let store = test_store();
+    store
+        .store(make_memory("Decisions", "use postgres"))
+        .unwrap();
+    let ids: Vec<String> = ["we chose postgres", "after comparing"]
+        .iter()
+        .map(|s| store.store(make_memory("decisions", s)).unwrap())
+        .collect();
+    let read = read_of(&store, &ids);
+    let err = store
+        .consolidate_ids("decisions", &read, make_memory("decisions", "Use Postgres"))
+        .expect_err("the summary would be merged into topic 'Decisions'");
+    assert!(err.to_string().contains("identical summary"), "{err}");
+    assert_eq!(store.count_by_topic("decisions").unwrap(), 2, "rolled back");
+    assert_eq!(store.count_by_topic("Decisions").unwrap(), 1);
+
+    // Deduplicated onto a memory of the same topic: fine, and the id of
+    // the memory that holds the summary is the one returned.
+    let keeper = store
+        .store(Memory::new(
+            "decisions".into(),
+            "final answer".into(),
+            Importance::Critical,
+        ))
+        .unwrap();
+    let read = read_of(&store, &ids);
+    let outcome = store
+        .consolidate_ids("decisions", &read, make_memory("decisions", "Final Answer"))
+        .unwrap();
+    assert_eq!(replaced(2, outcome), keeper);
+}
+
+/// One transaction: a consolidated memory the store refuses leaves every
+/// listed memory in place, and references to the removed ones are cleaned
+/// up exactly as `consolidate_topic` does.
+#[test]
+fn consolidate_ids_is_atomic_and_cleans_up_references() {
+    let store = test_store();
+    let a = store.store(make_memory("t", "a")).unwrap();
+    let b = store.store(make_memory("t", "b")).unwrap();
+    let mut pointer = make_memory("elsewhere", "points at a and at itself");
+    pointer.related_ids = vec![a.clone(), "keep-me".to_string()];
+    let pointer_id = store.store(pointer).unwrap();
+    let read = read_of(&store, &[a.clone(), b.clone()]);
+
+    let oversized = make_memory("t", &"x".repeat(70 * 1024));
+    assert!(store.consolidate_ids("t", &read, oversized).is_err());
+    assert_eq!(store.count_by_topic("t").unwrap(), 2, "nothing removed");
+
+    replaced(
+        2,
+        store
+            .consolidate_ids("t", &read, make_memory("t", "a+b"))
+            .unwrap(),
+    );
+    let pointer = store.get(&pointer_id).unwrap().unwrap();
+    assert_eq!(pointer.related_ids, ["keep-me"]);
+    assert_eq!(store.get_by_topic("t").unwrap().len(), 1);
+}
+
 /// Audit regression: consolidation must honor the "critical = never
 /// forget" contract that `apply_decay` and `prune` already respect.
 #[test]

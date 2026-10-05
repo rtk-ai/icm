@@ -358,6 +358,13 @@ impl SqliteStore {
     /// [`auto_consolidate_with_embedder`] for new code so the
     /// consolidated memory keeps a fresh embedding instead of being
     /// silently un-recallable via vector search.
+    ///
+    /// **Lossy by design.** The rollup is the join of the summaries of the
+    /// 3 heaviest memories only; every other non-`critical` memory that was
+    /// read is replaced by it and its content is not kept anywhere. It is a
+    /// product choice ("keep the three that matter most"), off by default,
+    /// not a summary. Memories that were not read — past the 500-row read,
+    /// or stored meanwhile — are left alone.
     pub fn auto_consolidate(&self, topic: &str, threshold: usize) -> IcmResult<bool> {
         self.auto_consolidate_with_embedder(topic, threshold, None)
     }
@@ -430,6 +437,13 @@ impl SqliteStore {
         }
 
         let original_count = memories.len();
+        // The rollup stands for the memories read above, and only for those:
+        // a memory stored since, or one past the 500-row read, was never
+        // looked at and must not go with them. (The rollup itself keeps the
+        // 3 heaviest summaries, not all of them: that is this feature's
+        // long-standing design, unchanged here.)
+        let replaced: Vec<icm_core::ReadMemory> =
+            memories.iter().map(icm_core::ReadMemory::from).collect();
 
         // Build the consolidated memory
         let mut consolidated = Memory::new(topic.into(), consolidated_summary, Importance::High);
@@ -454,9 +468,11 @@ impl SqliteStore {
             }
         }
 
-        // Replace all memories in the topic with the consolidated one
-        self.consolidate_topic(topic, consolidated)?;
+        // Replace the memories that were read — not the whole topic
+        // `Stale`: one of them changed or went away since the read a few
+        // lines up. Nothing was written; the next store tries again.
+        let outcome = self.consolidate_ids(topic, &replaced, consolidated)?;
 
-        Ok(true)
+        Ok(matches!(outcome, icm_core::Consolidated::Replaced { .. }))
     }
 }

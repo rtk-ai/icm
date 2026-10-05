@@ -142,17 +142,37 @@ impl SqliteStore {
 
     /// Enqueue a topic for later LLM consolidation. Returns the generated
     /// row id.
+    ///
+    /// One `pending` job per topic: a topic that is already waiting is not
+    /// queued again (the id of the waiting job is returned). Every store
+    /// past the threshold used to add a job, and each job after the first
+    /// sent the lone summary back to the provider to be rewritten.
     pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
         let id = ulid::Ulid::new().to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
+        let inserted = self
+            .conn
             .execute(
                 "INSERT INTO pending_consolidations (id, topic, project, status, created_at)
-                 VALUES (?1, ?2, ?3, 'pending', ?4)",
+                 SELECT ?1, ?2, ?3, 'pending', ?4
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM pending_consolidations
+                         WHERE topic = ?2 AND status = 'pending')",
                 rusqlite::params![id, topic, project, now],
             )
             .map_err(db_err)?;
-        Ok(id)
+        if inserted > 0 {
+            return Ok(id);
+        }
+        self.conn
+            .query_row(
+                "SELECT id FROM pending_consolidations
+                  WHERE topic = ?1 AND status = 'pending'
+                  ORDER BY created_at LIMIT 1",
+                rusqlite::params![topic],
+                |row| row.get(0),
+            )
+            .map_err(db_err)
     }
 
     /// Pop up to `limit` oldest `pending` jobs (FIFO by enqueue time).

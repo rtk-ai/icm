@@ -219,3 +219,29 @@ fn test_code_area_count_matches_unique_paths() {
         .unwrap();
     assert_eq!(store.code_area_count().unwrap(), 2);
 }
+
+// Consolidation queue
+
+/// One `pending` job per topic: every store past the threshold used to add
+/// a job, and each one after the first was a provider call spent on
+/// re-summarizing the summary the first had written.
+#[test]
+fn enqueue_pending_consolidation_keeps_one_pending_job_per_topic() {
+    let store = test_store();
+    let first = store.enqueue_pending_consolidation("busy", "").unwrap();
+    for _ in 0..4 {
+        assert_eq!(
+            store.enqueue_pending_consolidation("busy", "").unwrap(),
+            first
+        );
+    }
+    let other = store.enqueue_pending_consolidation("quiet", "").unwrap();
+    assert_ne!(other, first);
+    assert_eq!(store.list_pending_consolidation_jobs(50).unwrap().len(), 2);
+
+    // Once the job is no longer waiting, the topic can be queued again.
+    store.mark_consolidation_job_done(&first).unwrap();
+    let again = store.enqueue_pending_consolidation("busy", "").unwrap();
+    assert_ne!(again, first);
+    assert_eq!(store.list_pending_consolidation_jobs(50).unwrap().len(), 2);
+}

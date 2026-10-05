@@ -817,6 +817,14 @@ impl MemoryStore for Store {
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()> {
         dispatch!(self, consolidate_topic(topic, consolidated))
     }
+    fn consolidate_ids(
+        &self,
+        topic: &str,
+        read: &[icm_core::ReadMemory],
+        consolidated: Memory,
+    ) -> IcmResult<icm_core::Consolidated> {
+        dispatch!(self, consolidate_ids(topic, read, consolidated))
+    }
     fn count(&self) -> IcmResult<usize> {
         dispatch!(self, count())
     }

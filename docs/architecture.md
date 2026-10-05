@@ -348,7 +348,7 @@ Client                              ICM Server
 | `icm_memory_recall` | `query` | `topic`, `keyword`, `project`, `limit`, `max_tokens` |
 | `icm_memory_update` | `id`, `content` | `importance`, `keywords[]` |
 | `icm_memory_forget` | `id` | — |
-| `icm_memory_consolidate` | `topic`, `summary` | — |
+| `icm_memory_consolidate` | `topic` | `summary`, `ids` (both needed to replace; without `ids` the tool lists the topic and replaces nothing) |
 | `icm_memory_list_topics` | — | — |
 | `icm_memory_stats` | — | — |
 | `icm_memory_health` | — | `topic` |

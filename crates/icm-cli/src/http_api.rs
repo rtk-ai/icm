@@ -1077,6 +1077,7 @@ mod tests {
             auto_consolidate: icm_mcp::AutoConsolidate {
                 enabled: false,
                 threshold: 10,
+                queue: false,
             },
             mcp_instructions: None,
             token: None,
@@ -1145,6 +1146,7 @@ mod tests {
             auto_consolidate: icm_mcp::AutoConsolidate {
                 enabled: false,
                 threshold: 10,
+                queue: false,
             },
             mcp_instructions: None,
             token: None,
@@ -1213,6 +1215,7 @@ mod tests {
             auto_consolidate: icm_mcp::AutoConsolidate {
                 enabled: false,
                 threshold: 10,
+                queue: false,
             },
             mcp_instructions: None,
             token: None,

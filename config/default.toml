@@ -48,6 +48,17 @@ decay_rate = 0.95
 # Weight threshold for automatic pruning
 prune_threshold = 0.1
 
+# Automatic consolidation of a topic once it holds more than
+# `auto_consolidate_threshold` memories. Off by default.
+#
+# WARNING — this loses content. Without an LLM summarizer
+# ([consolidate.summarizer] provider = "none", the default), the rollup keeps
+# only the summaries of the 3 heaviest memories of the topic and deletes the
+# other non-critical ones it read. With a summarizer provider configured,
+# the topic is queued for an LLM summary instead (`icm consolidate-pending`).
+# auto_consolidate_enabled = false
+# auto_consolidate_threshold = 10
+
 [embeddings]
 # Set to false to disable embeddings entirely (no model download, keyword search only)
 # enabled = false

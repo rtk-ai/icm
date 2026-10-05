@@ -108,15 +108,32 @@ impl PostgresStore {
     // Async consolidation queue (issue #179)
 
     pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
+        // One `pending` job per topic, as on SQLite: a topic already
+        // waiting is not queued again.
         let id = ulid::Ulid::new().to_string();
         let mut c = self.conn()?;
-        c.execute(
-            "INSERT INTO pending_consolidations (id, topic, project, status, created_at)
-             VALUES ($1, $2, $3, 'pending', $4)",
-            &[&id, &topic, &project, &Utc::now()],
-        )
-        .map_err(pg_err)?;
-        Ok(id)
+        let inserted = c
+            .execute(
+                "INSERT INTO pending_consolidations (id, topic, project, status, created_at)
+                 SELECT $1, $2, $3, 'pending', $4
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM pending_consolidations
+                         WHERE topic = $2 AND status = 'pending')",
+                &[&id, &topic, &project, &Utc::now()],
+            )
+            .map_err(pg_err)?;
+        if inserted > 0 {
+            return Ok(id);
+        }
+        let row = c
+            .query_one(
+                "SELECT id FROM pending_consolidations
+                  WHERE topic = $1 AND status = 'pending'
+                  ORDER BY created_at LIMIT 1",
+                &[&topic],
+            )
+            .map_err(pg_err)?;
+        Ok(row.get(0))
     }
 
     fn row_to_consolidation_job(row: &postgres::Row) -> ConsolidationJob {

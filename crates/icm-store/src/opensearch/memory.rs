@@ -500,6 +500,107 @@ impl MemoryStore for OpenSearchStore {
         Ok(())
     }
 
+    fn consolidate_ids(
+        &self,
+        topic: &str,
+        read: &[icm_core::ReadMemory],
+        consolidated: Memory,
+    ) -> IcmResult<icm_core::Consolidated> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("consolidate".into()));
+        }
+        // Same contract as the SQL backends, without their atomicity (no
+        // multi-document transaction here): the listed memories are checked
+        // first — each must still be in the topic and, where the caller
+        // passed what it read, unchanged — and only then is the summary
+        // written and the delete issued, restricted to those ids. A failure
+        // between the two leaves a duplicate a retry fixes, never a gap.
+        let consolidated = validate_and_normalize(consolidated)?;
+        self.check_dims(&consolidated)?;
+        if topic.trim() != consolidated.topic {
+            return Err(IcmError::InvalidInput(format!(
+                "consolidation topic {topic:?} does not match the summary's topic {:?}",
+                consolidated.topic
+            )));
+        }
+        let topic = consolidated.topic.as_str();
+        let mut changed = Vec::new();
+        let mut deleted_ids: Vec<String> = Vec::new();
+        for item in read.iter().filter(|r| r.id != consolidated.id) {
+            match self.get(&item.id)? {
+                Some(now) if now.topic == topic => {
+                    if item.summary.as_ref().is_some_and(|was| *was != now.summary) {
+                        changed.push(item.id.clone());
+                    } else if now.importance != Importance::Critical {
+                        deleted_ids.push(item.id.clone());
+                    }
+                }
+                _ => changed.push(item.id.clone()),
+            }
+        }
+        if !changed.is_empty() {
+            return Ok(icm_core::Consolidated::Stale { changed });
+        }
+
+        let written_id = self.store_inner(&consolidated)?;
+        if written_id != consolidated.id {
+            // Deduplicated onto an existing memory; it must be in this
+            // topic for the delete below to be a replacement.
+            let landed = self.get(&written_id)?.map(|m| m.topic);
+            if landed.as_deref() != Some(topic) {
+                return Err(IcmError::InvalidInput(format!(
+                    "an identical summary already exists in topic {landed:?} (memory \
+                     {written_id}); nothing was consolidated"
+                )));
+            }
+        }
+        deleted_ids.retain(|id| *id != written_id);
+        if deleted_ids.is_empty() {
+            return Ok(icm_core::Consolidated::Replaced {
+                removed: 0,
+                id: written_id,
+            });
+        }
+        let resp = self.post(
+            &format!(
+                "{IDX_MEMORIES}/_delete_by_query?{}&conflicts=proceed",
+                self.refresh_param()
+            ),
+            json!({"query": {"bool": {
+                "must": [
+                    {"term": {"topic.keyword": topic}},
+                    {"ids": {"values": deleted_ids}}
+                ],
+                "must_not": [{"term": {"importance": "critical"}}]
+            }}}),
+        )?;
+        let removed = resp
+            .get("deleted")
+            .and_then(|v| v.as_u64())
+            .map_or(deleted_ids.len(), |n| n as usize);
+
+        if let Err(e) = self.post(
+            &format!(
+                "{IDX_MEMORIES}/_update_by_query?conflicts=proceed&{}",
+                self.refresh_param()
+            ),
+            json!({
+                "script": {
+                    "source": "ctx._source.related_ids.removeIf(x -> params.deleted_ids.contains(x))",
+                    "params": {"deleted_ids": deleted_ids}
+                },
+                "query": {"terms": {"related_ids": deleted_ids}}
+            }),
+        ) {
+            tracing::warn!(topic, error = %e, "consolidate_ids: failed to clean up dangling related_ids");
+        }
+
+        Ok(icm_core::Consolidated::Replaced {
+            removed,
+            id: written_id,
+        })
+    }
+
     fn count(&self) -> IcmResult<usize> {
         let resp = self.post(&format!("{IDX_MEMORIES}/_count"), json!({}))?;
         Ok(resp.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize)

@@ -275,7 +275,7 @@ icm embed --topic "decisions" # Only one topic
 | `icm_memory_recall` | Search by query. Filters: `topic`, `keyword`, `project`, `limit` (1 to 20). `max_tokens` returns as many of the best matches as fit in a token budget instead. Auto-decay if >24h. |
 | `icm_memory_update` | Edit content, importance, or keywords of an existing memory by ID. |
 | `icm_memory_forget` | Delete a memory by ID. |
-| `icm_memory_consolidate` | Replace all memories of a topic with a single summary. |
+| `icm_memory_consolidate` | Replace the memories you list (`ids`) with a summary you wrote from them. Called with only `topic`, it replaces nothing and lists the topic's memories with their ids. |
 | `icm_memory_list_topics` | List all topics with entry counts. |
 | `icm_memory_stats` | Total memories, topics, average weight, date range. |
 | `icm_memory_health` | Per-topic audit: staleness, consolidation needs, access patterns. |

@@ -1,0 +1,124 @@
+name: Release build check
+
+# Dry run of the release build: every target is built, every archive is
+# unpacked and its binary started (`icm --version`), and the asset set is
+# checked against the manifest in scripts/release-check.sh. Here, unlike in
+# the release itself, each build that carries or can fetch ONNX Runtime also
+# stores a memory and finds it again by meaning alone. Nothing is published,
+# no tag is created, no secret is used.
+#
+# Why this exists: CI only ran `cargo test` on ubuntu-latest, macos-latest
+# and windows-latest, so a dependency bump that broke four release targets
+# (fastembed 4 -> 6, merged 2026-08-29) stayed green on its pull request and
+# only failed in CD, after the release had been tagged.
+#
+# Runs:
+#   - on every pull request to main (the release pull request);
+#   - on pull requests to develop that touch what the release build depends
+#     on (dependencies, build configuration, these workflows, the installers);
+#   - by hand, on any branch: Actions -> "Release build check" -> Run workflow,
+#     or `gh workflow run release-check.yml --ref <branch>`. GitHub only
+#     offers this once the file is on the default branch; before that, the
+#     pull request is the only way to run it.
+#
+# Make "Release build check / result" a required status check on main to
+# turn it into a gate.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: release-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scope:
+    name: Scope
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - name: Decide whether the release build has to run
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.base_ref }}
+          PR: ${{ github.event.pull_request.number }}
+          CHANGED: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          # Any doubt runs the build: "not needed" is only ever answered on
+          # a complete file list in which nothing matched.
+          run=true
+          if [ "$EVENT" != "pull_request" ]; then
+            why="started by hand"
+          elif [ "$BASE" = "main" ]; then
+            why="pull request to main"
+          else
+            files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename')
+            # No `grep -q` on these pipes: it leaves at the first match, the
+            # writer is killed by SIGPIPE once the list outgrows the pipe
+            # buffer, and `pipefail` then reads a match as "no match".
+            listed=$(printf '%s\n' "$files" | grep -c . || true)
+            status=0
+            relevant=$(printf '%s\n' "$files" | grep -E \
+              '^(Cargo\.lock|Cargo\.toml|rust-toolchain(\.toml)?|\.cargo/.*|crates/[^/]+/Cargo\.toml|crates/[^/]+/build\.rs|install\.sh|install\.ps1|scripts/release-check\.sh|\.github/workflows/(release|release-build|release-check|cd)\.yml)$') \
+              || status=$?
+            if [ "$status" -gt 1 ]; then
+              echo "::error::could not filter the changed files (grep exit $status)"
+              exit 1
+            fi
+            if [ "$listed" != "$CHANGED" ]; then
+              # GitHub lists at most 3000 files of a pull request.
+              why="file list incomplete ($listed listed, $CHANGED changed)"
+            elif [ -n "$relevant" ]; then
+              why="touches $(printf '%s\n' "$relevant" | head -n 5 | tr '\n' ' ')"
+            else
+              run=false
+              why="none of the $listed changed files affects the release build"
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "release build needed: $run ($why)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    needs: scope
+    if: ${{ needs.scope.outputs.run == 'true' }}
+    uses: ./.github/workflows/release-build.yml
+    with:
+      semantic_check: true
+    permissions:
+      contents: read
+
+  result:
+    name: result
+    # One stable check name for branch protection: green when the release
+    # build passed or was not needed, red when it failed or was cancelled.
+    needs: [scope, build]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report
+        env:
+          SCOPE: ${{ needs.scope.result }}
+          BUILD: ${{ needs.build.result }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          echo "scope=$SCOPE build=$BUILD version=$VERSION"
+          if [ "$SCOPE" != "success" ]; then
+            echo "::error::could not decide whether the release build is needed"
+            exit 1
+          fi
+          case "$BUILD" in
+            success) echo "Release build verified for version $VERSION: every target built, started, and the asset set is complete." ;;
+            skipped) echo "Release build not needed for this change." ;;
+            *) echo "::error::the release build would fail (build=$BUILD): a release cut from this commit would be incomplete"; exit 1 ;;
+          esac

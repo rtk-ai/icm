@@ -13,6 +13,12 @@ pub mod cloud;
 mod config;
 mod extract;
 mod extract_semantic;
+// Force-directed layout for the memory-relationship graph view: the TUI's
+// own 2D layout, and (issue: large real stores scatter/stall when laid out
+// client-side in the browser) a 3D variant the web dashboard now computes
+// server-side in web.rs instead of running physics in the browser.
+#[cfg(any(feature = "tui", feature = "web"))]
+mod graph_layout;
 #[cfg(feature = "http-api")]
 mod http_api;
 mod import;

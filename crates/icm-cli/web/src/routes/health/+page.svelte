@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
+	import { askConfirm } from '$lib/confirm.svelte';
 	import type { TopicHealth, ActionResult } from '$lib/types';
 
 	let healthData: TopicHealth[] = $state([]);
@@ -17,14 +18,14 @@
 	}
 
 	async function runPrune() {
-		if (!confirm('Prune all stale memories (weight < 0.1)?')) return;
+		if (!(await askConfirm('Prune all stale memories (weight < 0.1)?'))) return;
 		const r = await api.prune();
 		message = r.message;
 		healthData = await api.healthAll();
 	}
 
 	async function consolidate(topic: string) {
-		if (!confirm(`Consolidate topic "${topic}"?`)) return;
+		if (!(await askConfirm(`Consolidate topic "${topic}"?`))) return;
 		const r = await api.topicConsolidate(topic);
 		message = r.message;
 		healthData = await api.healthAll();

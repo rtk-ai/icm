@@ -256,6 +256,31 @@ impl SqliteStore {
     }
 }
 
+/// How long a write waits for SQLite's write lock in normal use.
+const WRITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long best-effort bookkeeping on the READ path may wait for it:
+/// access counters and the daily decay check. Losing one of those to
+/// contention is harmless; making a recall hang 30s behind another
+/// session's write is not.
+const BOOKKEEPING_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+impl SqliteStore {
+    /// Run `f` with the short bookkeeping busy timeout, then restore the
+    /// normal one. For writes a reader issues on the side and that callers
+    /// already treat as best-effort.
+    pub(crate) fn with_bookkeeping_timeout<T>(
+        &self,
+        f: impl FnOnce() -> IcmResult<T>,
+    ) -> IcmResult<T> {
+        // Setting the timeout cannot meaningfully fail; if it does, the
+        // write simply keeps the previous timeout.
+        let _ = self.conn.busy_timeout(BOOKKEEPING_BUSY_TIMEOUT);
+        let out = f();
+        let _ = self.conn.busy_timeout(WRITE_BUSY_TIMEOUT);
+        out
+    }
+}
+
 impl SqliteStore {
     /// Insert a memory into the database without transaction management.
     /// Callers are responsible for wrapping this in a transaction.
@@ -424,6 +449,7 @@ pub(crate) mod test_helpers {
 // Submodules (formerly monolithic `store.rs`, split for reviewability).
 mod cache;
 mod connection;
+mod embedding_state;
 mod hooks;
 mod rows;
 

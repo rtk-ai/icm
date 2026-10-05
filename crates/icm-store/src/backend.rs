@@ -12,9 +12,9 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use icm_core::{
-    Concept, ConceptLink, Embedder, Fact, FactsStats, FactsStore, Feedback, FeedbackStats,
-    FeedbackStore, IcmError, IcmResult, Label, Memoir, MemoirStats, MemoirStore, Memory,
-    MemoryStore, Message, PatternCluster, Relation, Role, Session, StoreStats, TopicHealth,
+    Concept, ConceptLink, Embedder, EmbeddingState, Fact, FactsStats, FactsStore, Feedback,
+    FeedbackStats, FeedbackStore, IcmError, IcmResult, Label, Memoir, MemoirStats, MemoirStore,
+    Memory, MemoryStore, Message, PatternCluster, Relation, Role, Session, StoreStats, TopicHealth,
     TranscriptHit, TranscriptStats, TranscriptStore,
 };
 
@@ -407,6 +407,134 @@ impl Store {
                     Ok(None)
                 }
             }
+        }
+    }
+
+    /// Peek what the database says about its embeddings (dimension, model,
+    /// whether any vector is stored) without opening it for writing. Only
+    /// the SQLite backend has a file to peek into; the others report
+    /// `Ok(None)`, which callers treat as "nothing to protect".
+    pub fn read_embedding_state(path: &Path) -> IcmResult<Option<EmbeddingState>> {
+        match BackendKind::from_env()? {
+            BackendKind::Sqlite => {
+                #[cfg(feature = "backend-sqlite")]
+                {
+                    SqliteStore::read_embedding_state(path)
+                }
+                #[cfg(not(feature = "backend-sqlite"))]
+                {
+                    let _ = path;
+                    Ok(None)
+                }
+            }
+            BackendKind::Postgres | BackendKind::OpenSearch => {
+                let _ = path;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Count `(memories with a vector, memories)` without a full open, for
+    /// `icm doctor`. `Ok(None)` outside the SQLite backend.
+    pub fn read_embedding_coverage(path: &Path) -> IcmResult<Option<(usize, usize)>> {
+        match BackendKind::from_env()? {
+            BackendKind::Sqlite => {
+                #[cfg(feature = "backend-sqlite")]
+                {
+                    SqliteStore::read_embedding_coverage(path)
+                }
+                #[cfg(not(feature = "backend-sqlite"))]
+                {
+                    let _ = path;
+                    Ok(None)
+                }
+            }
+            BackendKind::Postgres | BackendKind::OpenSearch => {
+                let _ = path;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drop every stored vector and recreate the vector index at `new_dims`
+    /// (the explicit `icm embed --migrate` path). Returns the number of
+    /// memories whose embedding was cleared. SQLite only: the remote
+    /// backends size their vector column themselves.
+    pub fn reset_vector_index(&self, new_dims: usize) -> IcmResult<usize> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.reset_vector_index(new_dims),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(_) => {
+                let _ = new_dims;
+                Err(IcmError::Unsupported("reset_vector_index".into()))
+            }
+            #[cfg(feature = "opensearch")]
+            Store::OpenSearch(_) => {
+                let _ = new_dims;
+                Err(IcmError::Unsupported("reset_vector_index".into()))
+            }
+        }
+    }
+
+    /// [`Self::reset_vector_index`] that also records `model` as the new
+    /// owner of the index, in the same transaction. SQLite only.
+    pub fn reset_vector_index_for_model(&self, new_dims: usize, model: &str) -> IcmResult<usize> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.reset_vector_index_for_model(new_dims, model),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = (new_dims, model);
+                Err(IcmError::Unsupported("reset_vector_index_for_model".into()))
+            }
+        }
+    }
+
+    /// The embedding state of the open store, read on its live connection
+    /// (unlike [`Self::read_embedding_state`], which peeks at a file).
+    /// `Ok(None)` outside the SQLite backend: nothing to arbitrate there.
+    pub fn embedding_state(&self) -> IcmResult<Option<EmbeddingState>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.embedding_state().map(Some),
+            #[allow(unreachable_patterns)]
+            _ => Ok(None),
+        }
+    }
+
+    /// Record the embedding model unless one is already recorded; never
+    /// overwrites. Returns whether it was written. Best effort, short lock
+    /// wait. `Ok(false)` outside the SQLite backend.
+    pub fn record_embedding_model(&self, model: &str) -> IcmResult<bool> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.record_embedding_model(model),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = model;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Set the vector of one memory without rewriting the rest of the row.
+    /// `Ok(false)` when the memory no longer exists. The remote backends
+    /// have no such write: they re-read the memory and `update` it, which
+    /// narrows the window for a lost concurrent edit but does not close it.
+    pub fn set_embedding(&self, id: &str, embedding: &[f32]) -> IcmResult<bool> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.set_embedding(id, embedding),
+            #[allow(unreachable_patterns)]
+            _ => match self.get(id)? {
+                Some(mut memory) => {
+                    memory.embedding = Some(embedding.to_vec());
+                    self.update(&memory)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
         }
     }
 

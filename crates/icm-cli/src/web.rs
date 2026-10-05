@@ -627,43 +627,14 @@ async fn api_topic_health(
     }
 }
 
-async fn api_topic_consolidate(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    let store = lock_store(&state);
-    let memories = match store.get_by_topic(&name) {
-        Ok(m) => m,
-        Err(e) => {
-            return Json(ActionResult {
-                ok: false,
-                message: e.to_string(),
-            })
-            .into_response()
-        }
-    };
-
-    if memories.is_empty() {
-        return Json(ActionResult {
-            ok: false,
-            message: "No memories in topic".into(),
-        })
-        .into_response();
-    }
-
-    // Build consolidated summary
-    let summary: String = memories
-        .iter()
-        .map(|m| m.summary.as_str())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let truncated = if summary.len() > 500 {
-        format!("{}...", truncate_at_char_boundary(&summary, 500))
-    } else {
-        summary
-    };
-
-    let mut consolidated = memories[0].clone();
+/// The memory the dashboard writes for one consolidation pass: the heaviest
+/// memory of the pass, re-identified, carrying the join of all of them.
+fn dashboard_rollup(covered: &[&icm_core::Memory], summary: String) -> icm_core::Memory {
+    // `covered` is never empty: the engine only builds for a pass of at
+    // least two memories. The fallback keeps this total rather than indexing.
+    let mut consolidated = covered.first().map(|m| (*m).clone()).unwrap_or_else(|| {
+        icm_core::Memory::new(String::new(), String::new(), icm_core::Importance::Medium)
+    });
     consolidated.id = format!(
         "{:032X}",
         std::time::SystemTime::now()
@@ -671,22 +642,59 @@ async fn api_topic_consolidate(
             .unwrap_or_default()
             .as_nanos()
     );
-    consolidated.summary = truncated;
+    // The whole join. It used to be cut at 500 characters, and the topic
+    // then deleted: every fact past the cut was lost.
+    consolidated.summary = summary;
     consolidated.access_count = 0;
     consolidated.weight = 1.0;
+    // It no longer says what the cloned memory said.
+    consolidated.embedding = None;
+    consolidated.related_ids = Vec::new();
+    consolidated
+}
 
-    match store.consolidate_topic(&name, consolidated) {
-        Ok(_) => Json(ActionResult {
-            ok: true,
-            message: format!("Consolidated {} memories", memories.len()),
+async fn api_topic_consolidate(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let store = lock_store(&state);
+    if matches!(store.count_by_topic(&name), Ok(0)) {
+        return Json(ActionResult {
+            ok: false,
+            message: "No memories in topic".into(),
         })
-        .into_response(),
-        Err(e) => Json(ActionResult {
+        .into_response();
+    }
+    // Only the memories that are in the join are removed, pass by pass for
+    // a topic larger than one read or one summary — not the whole topic by
+    // name. Same engine as `icm consolidate`.
+    let mut build = dashboard_rollup;
+    let run = crate::consolidate_in_passes(
+        &store,
+        &name,
+        &crate::PassWriter::Lexical,
+        false,
+        crate::MAX_CONSOLIDATION_PASSES,
+        &mut build,
+    );
+    let result = match run {
+        Ok(run) if run.passes == 0 => ActionResult {
+            ok: true,
+            message: "Nothing to consolidate: fewer than two memories can be merged".into(),
+        },
+        Ok(run) => {
+            let mut message = format!("Consolidated {} memories", run.replaced);
+            if run.others_left > 0 {
+                message.push_str(&format!(" ({} left in place)", run.others_left));
+            }
+            ActionResult { ok: true, message }
+        }
+        Err(e) => ActionResult {
             ok: false,
             message: e.to_string(),
-        })
-        .into_response(),
-    }
+        },
+    };
+    Json(result).into_response()
 }
 
 async fn api_memories(
@@ -1253,5 +1261,95 @@ mod tests {
         let graph = build_graph_response(&[]);
         assert!(graph.nodes.is_empty());
         assert!(graph.edges.is_empty());
+    }
+
+    fn state_with(store: Store) -> AppState {
+        AppState {
+            store: Arc::new(Mutex::new(store)),
+            username: "u".into(),
+            password: "p".into(),
+        }
+    }
+
+    /// The dashboard's consolidate used to cut the join at 500 characters
+    /// and then delete the topic — and the store only reads 500 memories of
+    /// it. Every fact must come out the other side.
+    #[tokio::test]
+    async fn dashboard_consolidate_keeps_every_fact_of_a_large_topic() {
+        use icm_core::{Importance, Memory};
+
+        let store = Store::in_memory().unwrap();
+        for i in 0..520 {
+            store
+                .store(Memory::new(
+                    "many".into(),
+                    format!("fact {i:03};"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let state = state_with(store);
+        let resp = api_topic_consolidate(State(state.clone()), Path("many".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let store = lock_store(&state);
+        let after = store.get_by_topic("many").unwrap();
+        assert_eq!(after.len(), 1, "two passes: 500, then the join + 20");
+        assert!(after[0].summary.len() > 500, "cut at 500 characters");
+        assert!(!after[0].summary.ends_with("..."));
+        for i in 0..520 {
+            assert!(
+                after[0].summary.contains(&format!("fact {i:03};")),
+                "fact {i} was lost"
+            );
+        }
+    }
+
+    /// A memory stored between the dashboard's read of the topic and its
+    /// write is not part of the join: it stays. Driven through the same
+    /// two pieces the handler uses, with a store slipped in between.
+    #[test]
+    fn dashboard_consolidate_keeps_a_memory_stored_while_it_runs() {
+        use icm_core::{Importance, Memory};
+
+        let store = Store::in_memory().unwrap();
+        for text in ["fact one", "fact two"] {
+            store
+                .store(Memory::new("t".into(), text.into(), Importance::Medium))
+                .unwrap();
+        }
+        let mut build = |covered: &[&Memory], join: String| {
+            store
+                .store(Memory::new(
+                    "t".into(),
+                    "LATE-ARRIVAL".into(),
+                    Importance::Medium,
+                ))
+                .unwrap();
+            dashboard_rollup(covered, join)
+        };
+        let done = crate::consolidate_in_passes(
+            &store,
+            "t",
+            &crate::PassWriter::Lexical,
+            false,
+            1,
+            &mut build,
+        )
+        .unwrap();
+        assert_eq!((done.replaced, done.others_left), (2, 1));
+
+        let mut left: Vec<String> = store
+            .get_by_topic("t")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary)
+            .collect();
+        left.sort();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert_eq!(left[0], "LATE-ARRIVAL");
+        assert!(left[1].contains("fact one") && left[1].contains("fact two"));
     }
 }

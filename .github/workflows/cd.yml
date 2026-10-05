@@ -102,6 +102,8 @@ jobs:
     with:
       tag: ${{ needs.pre-release.outputs.tag }}
       prerelease: true
+      # release.yml publishes only on an explicit "false".
+      dry_run: false
     permissions:
       contents: write
     secrets: inherit
@@ -130,6 +132,23 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
+      # release-please publishes the GitHub release before a single asset
+      # exists, and install.sh / `icm upgrade` follow /releases/latest: for
+      # the ~10 minutes of the build, and for good when a build fails (as
+      # for 0.10.64 and 0.10.65, issue #474), they got a 404. A pre-release
+      # is never "latest", so flag the new release as one until release.yml
+      # has uploaded and verified every asset; its "Promote the release"
+      # step turns it back into a full release and marks it latest.
+      # Best effort: if this call fails the release proceeds as before.
+      - name: Keep the new release out of "latest" until its assets are verified
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs['crates/icm-cli--tag_name'] }}
+        run: |
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+            || echo "::warning::could not flag $TAG as a pre-release; it stays 'latest' while its assets are being built"
+
   build-release:
     name: Build and upload release assets
     needs: release-please
@@ -138,6 +157,7 @@ jobs:
     with:
       tag: ${{ needs.release-please.outputs.tag_name }}
       prerelease: false
+      dry_run: false
     permissions:
       contents: write
     secrets: inherit

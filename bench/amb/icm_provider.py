@@ -212,7 +212,7 @@ def _free_port() -> int:
 def _unit_slug(unit: str) -> str:
     """Filesystem-safe, collision-free name for an isolation unit."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", unit)[:80]
-    return f"{safe}-{hashlib.sha1(unit.encode()).hexdigest()[:8]}"
+    return f"{safe}-{hashlib.sha1(unit.encode(), usedforsecurity=False).hexdigest()[:8]}"
 
 
 class _IcmServer:

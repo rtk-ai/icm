@@ -1,4 +1,4 @@
-# icm installer for Windows — https://github.com/rtk-ai/icm
+# icm installer for Windows - https://github.com/rtk-ai/icm
 #
 # Usage:
 #   irm https://raw.githubusercontent.com/rtk-ai/icm/main/install.ps1 | iex
@@ -21,7 +21,7 @@ $BinaryName = "icm"
 
 function Get-Arch {
     # Resolution order:
-    #   1. $env:PROCESSOR_ARCHITECTURE  — set on every Windows since
+    #   1. $env:PROCESSOR_ARCHITECTURE  - set on every Windows since
     #      forever; cheapest and survives the PowerShell-5 +
     #      old-.NET-Framework path where `RuntimeInformation`
     #      sometimes stringifies to "" inside switch comparisons
@@ -126,14 +126,14 @@ try {
     Write-Host "[INFO] Downloading $ArchiveName" -ForegroundColor Green
     Invoke-WebRequest -Uri $Url -OutFile $TempZip -UseBasicParsing
 
-    # SHA256 verification — mandatory, never skipped.
+    # SHA256 verification - mandatory, never skipped.
     Write-Host "[INFO] Downloading checksums.txt" -ForegroundColor Green
     Invoke-WebRequest -Uri "$BaseUrl/checksums.txt" -OutFile $TempChecksums -UseBasicParsing
 
     $Expected = Get-ExpectedSha -ChecksumsPath $TempChecksums -Filename $ArchiveName
     $Actual = (Get-FileHash -Path $TempZip -Algorithm SHA256).Hash.ToLower()
     if ($Expected -ne $Actual) {
-        throw "SHA256 mismatch — refusing to install.`n  expected: $Expected`n  got:      $Actual`nThe download was tampered with or corrupted."
+        throw "SHA256 mismatch - refusing to install.`n  expected: $Expected`n  got:      $Actual`nThe download was tampered with or corrupted."
     }
     Write-Host "[INFO] SHA256 verified: $Actual" -ForegroundColor Green
 
@@ -163,7 +163,7 @@ if ($PreviousVersion) {
 }
 Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor Green
-Write-Host "    1. icm init              # configure your AI tools (MCP)"
-Write-Host "    2. icm init --mode hook  # install Claude Code hooks"
+Write-Host "    1. icm init              # instructions, skills and hooks for the AI tools it detects"
+Write-Host "    2. icm init --mode all   # optional: also register the MCP server"
 Write-Host "    3. Restart your AI tool to activate"
 Write-Host ""

@@ -35,7 +35,7 @@ brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubus
 icm init                                   # instructions, skills and hooks for every agent it detects
 ```
 
-设置到此就完成了。在 Claude Code、Codex、Gemini CLI 或 Copilot CLI 中打开一个新会话：你的智能体现在会带着一小组最重要的记忆开始工作，并在你发送每条提示时收到与之相关的记忆。它从工具输出中学到的内容会进入队列，队列会在每个 Claude Code 会话结束时转换为记忆；对于其他工具，请运行 `icm extract-pending`（例如通过 cron 任务）。
+设置到此就完成了。在 Claude Code、Codex、Gemini CLI 或 Copilot CLI 中打开一个新会话：你的智能体现在会带着一小组它所在项目中最重要的记忆（即主题中带有仓库名称的记忆，例如名为 `myapp` 的仓库中的 `decisions-myapp`，再加上你的偏好）开始工作，并在你发送每条提示时收到与之相关的记忆。它从工具输出中学到的内容会进入队列，队列会在每个 Claude Code 会话结束时转换为记忆；对于其他工具，请运行 `icm extract-pending`（例如通过 cron 任务）。
 
 存储和召回都在你的机器上进行。自动提取会在已安装的情况下，把文本交给你已经在用的 LLM 命令行工具（Claude Code、Codex 或 Gemini CLI）；在 `[extraction.summarizer]` 下设置 `provider = "none"` 可使其完全在本地运行。
 

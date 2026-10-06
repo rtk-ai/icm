@@ -35,7 +35,7 @@ brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubus
 icm init                                   # instructions, skills and hooks for every agent it detects
 ```
 
-To cała konfiguracja. Otwórz nową sesję w Claude Code, Codex, Gemini CLI lub Copilot CLI: agent zaczyna teraz od krótkiego pakietu swoich najważniejszych wspomnień i otrzymuje wspomnienia związane z każdym wysłanym przez Ciebie promptem. To, czego uczy się z wyników swoich narzędzi, trafia do kolejki, a kolejka jest zamieniana na wspomnienia na końcu każdej sesji Claude Code; w przypadku pozostałych narzędzi uruchom `icm extract-pending` (na przykład z zadania cron).
+To cała konfiguracja. Otwórz nową sesję w Claude Code, Codex, Gemini CLI lub Copilot CLI: agent zaczyna teraz od krótkiego pakietu najważniejszych wspomnień projektu, w którym się znajduje (tych, których temat zawiera nazwę repozytorium, na przykład `decisions-myapp` w repozytorium o nazwie `myapp`, oraz Twoich preferencji), i otrzymuje wspomnienia związane z każdym wysłanym przez Ciebie promptem. To, czego uczy się z wyników swoich narzędzi, trafia do kolejki, a kolejka jest zamieniana na wspomnienia na końcu każdej sesji Claude Code; w przypadku pozostałych narzędzi uruchom `icm extract-pending` (na przykład z zadania cron).
 
 Zapisywanie i przywoływanie odbywa się na Twoim komputerze. Automatyczne wydobywanie przekazuje tekst do narzędzia wiersza poleceń LLM, którego już używasz (Claude Code, Codex lub Gemini CLI), jeśli jest zainstalowane; ustaw `provider = "none"` w sekcji `[extraction.summarizer]`, aby wszystko działało w pełni lokalnie.
 

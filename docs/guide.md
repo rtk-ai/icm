@@ -498,7 +498,7 @@ L'agent devrait utiliser automatiquement `icm_memory_recall`. S'il ne le fait pa
 
 **Symptome :** ICM prend 30+ secondes au premier `store` ou `recall`.
 
-**Explication :** Le modele d'embedding (~100MB pour multilingual-e5-base) est telecharge a la premiere utilisation. Les executions suivantes chargent depuis le cache (~1-2s).
+**Explication :** Le modele d'embedding (environ 2 Go pour Qdrant/multilingual-e5-large-onnx, le modele par defaut) est telecharge a la premiere utilisation. Les executions suivantes chargent depuis le cache (~1-2s).
 
 **Solutions :**
 - C'est normal la premiere fois — attendez le telechargement
@@ -843,7 +843,7 @@ La seule difference est le fichier de config et la cle JSON. `icm init` gere tou
 
 ### Q1 : ICM envoie-t-il des donnees sur internet ?
 
-**Non.** ICM stocke tout localement dans un fichier SQLite. Le modele d'embedding tourne localement (via fastembed/ONNX Runtime). Aucune donnee ne quitte votre machine. Le seul acces reseau est le telechargement initial du modele d'embedding (~100MB, une seule fois).
+**Pas pour stocker ni rappeler.** ICM stocke tout localement dans un fichier SQLite, et le modele d'embedding tourne localement (via fastembed/ONNX Runtime). Deux exceptions : le telechargement initial du modele d'embedding (environ 2 Go pour le modele par defaut, une seule fois), et l'extraction automatique, qui confie le texte capture a l'outil LLM en ligne de commande deja installe (Claude Code, Codex ou Gemini CLI) tant que `[extraction.summarizer] provider` vaut `"auto"` (le defaut). Avec `provider = "none"`, rien ne quitte la machine apres le telechargement du modele. Un fournisseur par cle API (`anthropic`, `openai`, `google`) envoie le texte resume a ce fournisseur, selon ses conditions.
 
 ### Q2 : Puis-je utiliser ICM avec plusieurs projets ?
 
@@ -925,7 +925,7 @@ Le compteur se reinitialise a chaque `icm_memory_store`. C'est un rappel discret
 - `icm health` — check if memories decayed too much
 
 **Embeddings slow on first run**
-- Normal: model downloads on first use (~100MB for multilingual-e5-base)
+- Normal: model downloads on first use (about 2 GB for the default Qdrant/multilingual-e5-large-onnx)
 - Subsequent runs load from cache (~1-2s)
 - Build without embeddings: `cargo build --no-default-features`
 

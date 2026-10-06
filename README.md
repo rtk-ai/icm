@@ -1,5 +1,3 @@
-[English](README.md) | [Français](README_fr.md) | [Español](README_es.md) | [Deutsch](README_de.md) | [Italiano](README_it.md) | [Português](README_pt.md) | [Nederlands](README_nl.md) | [Polski](README_pl.md) | [Русский](README_ru.md) | [日本語](README_ja.md) | [中文](README_zh.md) | [العربية](README_ar.md) | [한국어](README_ko.md)
-
 <p align="center">
   <img src="assets/banner.png" alt="ICM — Infinite Context Memory" width="600">
 </p>
@@ -17,10 +15,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
 </p>
 
-Tell Claude Code how your project handles auth on Monday, and Tuesday's Gemini CLI session already knows it. Hit a Postgres indexing gotcha in a Codex run, and next week's Cursor session finds the fix. ICM keeps what your coding agents learn (decisions, fixes, conventions, preferences) in one SQLite file on your machine, and hands the relevant part back when a session starts and as you type. Up to 18 agents and editors read and write the same memory, so you stop re-explaining your project every time you open a session or switch tools.
+Tell Claude Code how your project handles auth on Monday, and Tuesday's Gemini CLI session already knows it. ICM keeps what your coding agents learn (decisions, fixes, conventions, preferences) in one SQLite file on your machine, and gives the relevant part back at the start of each session and with each prompt you send. Up to 18 agents and editors share that memory, so you stop re-explaining your project every time you open a session or switch tools.
 
 - **92.8% on LoCoMo (1,540 questions), level with Hindsight (92.0%)**, with a third less context per question. [Details and caveats below](#benchmark-comparison).
-- **No LLM call to store or recall.** Hindsight, Mem0, Graphiti (Zep) and claude-mem call an LLM for every memory they store by default. ICM's optional extraction of facts from tool output does use the LLM command-line tool you already have, when one is installed; one setting keeps it entirely local (see [Quickstart](#quickstart)).
+- **No LLM call to store or recall.** Hindsight, Mem0, Graphiti (Zep) and claude-mem call an LLM for every memory they store by default. ICM does not. Only its automatic extraction of facts from tool output goes through the LLM command-line tool you already use, when one is installed; `provider = "none"` keeps that local too (see [Quickstart](#quickstart)).
 - **Useful without an embedding model.** Keyword recall alone puts at least one of the right sessions in the top 5 for 88.6% of LoCoMo questions, with a median of 6.8 ms per recall on Linux x86-64.
 - **Not ahead everywhere.** On PersonaMem (a user's evolving preferences), Hindsight leads: 86.6% against ICM's 82.9%.
 
@@ -31,18 +29,22 @@ brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubus
 icm init                                   # instructions, skills and hooks for every agent it detects
 ```
 
-That is the whole setup. Open a new session in Claude Code, Codex, Gemini CLI or Copilot CLI: your agent now starts with a short pack of its most important memories and receives the memories relevant to each prompt as you type it. What it learns from its tool output is queued, and the queue is turned into memories at the end of each Claude Code session; with the other tools, run `icm extract-pending` (from a cron job, for instance).
+That is the whole setup. Open a new session in Claude Code, Codex, Gemini CLI or Copilot CLI: your agent now starts with a short pack of its most important memories and receives the memories relevant to each prompt you send. What it learns from its tool output is queued, and the queue is turned into memories at the end of each Claude Code session; with the other tools, run `icm extract-pending` (from a cron job, for instance).
 
 Storing and recalling stay on your machine. The automatic extraction hands text to the LLM command-line tool you already use (Claude Code, Codex or Gemini CLI) when one is installed; set `provider = "none"` under `[extraction.summarizer]` to keep it entirely local.
 
 To see it work right away, store and recall by hand:
 
-```bash
-icm store -t decisions-myapp -c "Auth uses short-lived JWTs, refreshed through /auth/refresh" -i high
-icm recall "how does auth work"
+```console
+$ icm store -t decisions-myapp -c "Auth uses short-lived JWTs, refreshed through /auth/refresh" -i high
+Stored: 01M47YY6CHVZ48BYKQRCRNZTCF
+
+$ icm recall "how does auth work"
+memories[1]{id,topic,importance,weight,summary}:
+  01M47YY6CHVZ48BYKQRCRNZTCF,decisions-myapp,high,0.975,"Auth uses short-lived JWTs, refreshed through /auth/refresh"
 ```
 
-The first recall with semantic search downloads the multilingual embedding model once; keyword recall works without it (`icm --no-embeddings`). Windows, Linux, Nix and building from source: [Install](#install).
+The first store or recall with semantic search downloads the multilingual embedding model once (`Qdrant/multilingual-e5-large-onnx`, about 2 GB). To try ICM without it, add `--no-embeddings` (keyword recall, as in the output above) or pick a lighter model in the config. `icm init` writes hooks and instructions into each detected agent's configuration; `icm uninstall --dry-run` shows how to remove them. Windows, Linux, Nix and building from source: [Install](#install).
 
 ## Benchmark comparison
 
@@ -62,7 +64,7 @@ On [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 multiple-choice quest
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | published by the harness |
 | Hybrid search baseline | 84.4% (497 / 589) | 24.2k tokens | published by the harness |
 
-Retrieval alone, on LoCoMo, with no answering model: the share of questions for which at least one gold session is in the top results. This is the evidence for the recall engine itself.
+Retrieval alone, on LoCoMo, with no answering model: the share of questions for which at least one gold session is in the top results. This is the evidence for the recall engine itself. The v2 runs received each session's date and the question's date; the previous engine has no date input, so its runs received none.
 
 | Top results | Previous engine (`legacy`) | Recall engine v2 | Previous engine, no embedding model | Recall engine v2, no embedding model |
 |:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|

@@ -7,7 +7,8 @@
 <h1 align="center">ICM</h1>
 
 <p align="center">
-  Permanent memory for AI agents. Single binary, zero dependencies, MCP native.
+  <b>Long-term memory for AI coding agents.</b><br>
+  One binary, one SQLite file. No LLM call to store or recall a memory.
 </p>
 
 <p align="center">
@@ -16,27 +17,34 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
 </p>
 
----
+ICM remembers what your coding agents learn — decisions, fixes, conventions, preferences — and hands it back on the next session. Claude Code, Codex, Gemini CLI, Cursor and the other supported tools read and write the same local memory, so you stop re-explaining your project every time you open a session or switch tools.
 
-> ⚠️ **Project status: experimental**
->
-> ICM is pre-1.0 and under active development. Breaking changes can land
-> in any minor release, and hooks/MCP configuration formats may shift.
->
-> That said, I (the maintainer) use ICM every day as my primary AI
-> coding memory layer — it's experimental in API stability, not in
-> day-to-day usefulness.
->
-> My focus is currently on [rtk](https://github.com/rtk-ai/rtk); ICM
-> updates are merged on a best-effort cadence. Issues and pull requests
-> are welcome but may take longer to review than usual.
->
-> ICM is Apache-2.0 licensed and ships **as-is, without warranty of any
-> kind** (see [LICENSE](LICENSE)). Before any destructive operation, run
-> the read-only equivalent first (`icm uninstall --dry-run`,
-> `icm uninstall --check`).
+| | |
+|---|---|
+| **As accurate as the best memory systems we could measure** | 92.8% on LoCoMo (1,540 questions), level with Hindsight (92.0%), with a third less context per question. [Details below](#benchmark-comparison). |
+| **No LLM in the loop** | Storing and recalling a memory never calls a model. Hindsight, Mem0, Graphiti (Zep) and claude-mem call an LLM for every memory they store by default. |
+| **Local and light** | One Rust binary for macOS, Linux and Windows, one SQLite file, nothing to host. Even without an embedding model, recall puts the right session in the top 5 for 88.6% of LoCoMo questions, in a few milliseconds. |
+| **One memory for every tool** | 18 agents and editors supported, all sharing the same database. |
 
----
+## Quickstart
+
+```bash
+brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
+icm init                                   # instructions, skills and hooks for every agent it detects
+```
+
+That is the whole setup. From the next session on, your agent receives a short pack of its most important memories when the session starts and the memories relevant to each prompt as you type it, and facts are extracted from its tool output as it works.
+
+Storing and recalling stay on your machine. The automatic extraction hands text to the LLM command-line tool you already use (Claude Code, Codex or Gemini CLI) when one is installed; set `provider = "none"` under `[extraction.summarizer]` to keep it entirely local.
+
+You can also drive it by hand:
+
+```bash
+icm store -t decisions-myapp -c "Auth uses short-lived JWTs, refreshed through /auth/refresh" -i high
+icm recall "how does auth work"
+```
+
+The first recall with semantic search downloads the multilingual embedding model once; keyword recall works without it (`icm --no-embeddings`). Other install methods, Windows and Linux details: [Install](#install).
 
 ## Benchmark comparison
 
@@ -81,6 +89,28 @@ What these numbers do and do not show:
 Per-question results for both datasets are in [`bench/amb/results/`](bench/amb/results/); the adapter, the exact settings and the commands to reproduce are in [`bench/amb/README.md`](bench/amb/README.md).
 
 
+---
+
+> ⚠️ **Project status: experimental**
+>
+> ICM is pre-1.0 and under active development. Breaking changes can land
+> in any minor release, and hooks/MCP configuration formats may shift.
+>
+> That said, I (the maintainer) use ICM every day as my primary AI
+> coding memory layer — it's experimental in API stability, not in
+> day-to-day usefulness.
+>
+> My focus is currently on [rtk](https://github.com/rtk-ai/rtk); ICM
+> updates are merged on a best-effort cadence. Issues and pull requests
+> are welcome but may take longer to review than usual.
+>
+> ICM is Apache-2.0 licensed and ships **as-is, without warranty of any
+> kind** (see [LICENSE](LICENSE)). Before any destructive operation, run
+> the read-only equivalent first (`icm uninstall --dry-run`,
+> `icm uninstall --check`).
+
+---
+
 ICM gives your AI agent a real memory — not a note-taking tool, not a context manager, a **memory**.
 
 ```
@@ -121,7 +151,7 @@ fix in `errors-resolved`.
 This works because every AI tool you configure with `icm init` reads
 and writes the **same SQLite database** at the OS-standard data
 location (e.g. `~/.local/share/icm/memories.db` on Linux,
-`~/Library/Application Support/icm/memories.db` on macOS,
+`~/Library/Application Support/dev.icm.icm/memories.db` on macOS,
 `%APPDATA%\icm\icm\data\memories.db` on Windows):
 
 - A `icm store -t decisions-myapp -c "..."` from Claude Code is
@@ -202,7 +232,7 @@ root, so all `icm` commands run from within the project automatically
 use an isolated database. Combine with global `icm init` — global
 settings (tools, hooks) are unaffected; only the database is scoped.
 
-Configures **18 tools** in one command ([full integration guide](docs/integrations.md)):
+The default (`standard`) sets up instructions, skills and hooks, without an MCP server. `icm init --mode all` also registers the MCP server, which is how the 18 tools below are covered ([full integration guide](docs/integrations.md)):
 
 | Tool | MCP | Hooks | CLI | Skills |
 |------|:---:|:-----:|:---:|:------:|

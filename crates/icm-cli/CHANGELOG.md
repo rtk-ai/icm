@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.0](https://github.com/rtk-ai/icm/compare/icm-v0.10.65...icm-v0.11.0) (2026-10-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **consolidate:** `icm_memory_consolidate` needs `ids` to replace anything. Called with only `topic` (or `topic` and `summary`), which used to replace the whole topic, it now writes nothing and answers with the topic's memories and their ids, to be passed back in `ids`.
+
+### Features
+
+* **recall:** rank-fusion recall engine v2, now the default ([ce3e7d0](https://github.com/rtk-ai/icm/commit/ce3e7d0ac12716b5cbff1f6288b90ba4daf0856a))
+* **summarizer:** API-key providers; consolidate only what was summarized ([f8b61f6](https://github.com/rtk-ai/icm/commit/f8b61f61658997f0583decca96e421049c75e232))
+* **web:** 3D memory-relationship graph with topic clustering ([#470](https://github.com/rtk-ai/icm/issues/470)) ([046c3a7](https://github.com/rtk-ai/icm/commit/046c3a7305d3ba4105d39f5b6f9a8c2362a17f6e))
+
+
+### Bug Fixes
+
+* **consolidate:** consolidate_ids replaces only the memories that were read ([61c3f38](https://github.com/rtk-ai/icm/commit/61c3f387d5e03e3ec8cb66fd6912a7dca1abd578))
+* **store:** open without the write lock and keep vectors across a model change ([3b20919](https://github.com/rtk-ai/icm/commit/3b209199092139b6b5a9166cdc804a4d4f63361d))
+
 ## [0.10.65](https://github.com/rtk-ai/icm/compare/icm-v0.10.64...icm-v0.10.65) (2026-09-08)
 
 

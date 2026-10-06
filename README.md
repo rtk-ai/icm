@@ -17,11 +17,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
 </p>
 
-Tell Claude Code how your project handles auth on Monday, and Tuesday's Gemini CLI session already knows it. Hit a Postgres indexing gotcha in a Codex run, and next week's Cursor session finds the fix. ICM keeps what your coding agents learn (decisions, fixes, conventions, preferences) in one SQLite file on your machine, and hands the relevant part back when a session starts and as you type. 18 agents and editors read and write the same memory, so you stop re-explaining your project every time you open a session or switch tools.
+Tell Claude Code how your project handles auth on Monday, and Tuesday's Gemini CLI session already knows it. Hit a Postgres indexing gotcha in a Codex run, and next week's Cursor session finds the fix. ICM keeps what your coding agents learn (decisions, fixes, conventions, preferences) in one SQLite file on your machine, and hands the relevant part back when a session starts and as you type. Up to 18 agents and editors read and write the same memory, so you stop re-explaining your project every time you open a session or switch tools.
 
 - **92.8% on LoCoMo (1,540 questions), level with Hindsight (92.0%)**, with a third less context per question. [Details and caveats below](#benchmark-comparison).
 - **No LLM call to store or recall.** Hindsight, Mem0, Graphiti (Zep) and claude-mem call an LLM for every memory they store by default. ICM's optional extraction of facts from tool output does use the LLM command-line tool you already have, when one is installed; one setting keeps it entirely local (see [Quickstart](#quickstart)).
-- **Useful without an embedding model.** Keyword recall alone puts the right session in the top 5 for 88.6% of LoCoMo questions, in a few milliseconds.
+- **Useful without an embedding model.** Keyword recall alone puts at least one of the right sessions in the top 5 for 88.6% of LoCoMo questions, with a median of 6.8 ms per recall on Linux x86-64.
 - **Not ahead everywhere.** On PersonaMem (a user's evolving preferences), Hindsight leads: 86.6% against ICM's 82.9%.
 
 ## Quickstart
@@ -31,7 +31,7 @@ brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubus
 icm init                                   # instructions, skills and hooks for every agent it detects
 ```
 
-That is the whole setup. Open a new session: your agent now starts with a short pack of its most important memories, receives the memories relevant to each prompt as you type it, and saves facts from its tool output as it works.
+That is the whole setup. Open a new session in Claude Code, Codex, Gemini CLI or Copilot CLI: your agent now starts with a short pack of its most important memories and receives the memories relevant to each prompt as you type it. What it learns from its tool output is queued, and the queue is turned into memories at the end of each Claude Code session; with the other tools, run `icm extract-pending` (from a cron job, for instance).
 
 Storing and recalling stay on your machine. The automatic extraction hands text to the LLM command-line tool you already use (Claude Code, Codex or Gemini CLI) when one is installed; set `provider = "none"` under `[extraction.summarizer]` to keep it entirely local.
 
@@ -50,7 +50,7 @@ Answer accuracy on [LoCoMo](https://github.com/snap-research/locomo) (10 long co
 
 | System | LoCoMo accuracy | Context per question | LLM calls to store a memory | Runs as | Result |
 |--------|:---------------:|:--------------------:|:---------------------------:|---------|--------|
-| **ICM** (recall engine v2) | **92.8%** (1,429 / 1,540) | 24.1k tokens | none | one Rust binary, SQLite file | our run, 2026-10-05 |
+| **ICM** 0.10.65 (recall engine v2) | **92.8%** (1,429 / 1,540) | 24.1k tokens | none | one Rust binary, SQLite file | our run, 2026-10-05 |
 | Hindsight | 92.0% (1,417 / 1,540) | 36.2k tokens | LLM fact extraction | Python service, PostgreSQL + pgvector | published by the harness |
 | Hybrid search baseline (dense + sparse, RRF) | 79.1% (1,218 / 1,540) | 22.2k tokens | none | Qdrant | published by the harness |
 
@@ -58,7 +58,7 @@ On [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 multiple-choice quest
 
 | System | PersonaMem accuracy | Context per question | Result |
 |--------|:-------------------:|:--------------------:|--------|
-| **ICM** (recall engine v2) | **82.9%** (488 / 589) | 16.2k tokens | our run, 2026-10-05 |
+| **ICM** 0.10.65 (recall engine v2) | **82.9%** (488 / 589) | 16.2k tokens | our run, 2026-10-05 |
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | published by the harness |
 | Hybrid search baseline | 84.4% (497 / 589) | 24.2k tokens | published by the harness |
 
@@ -76,14 +76,14 @@ What these numbers do and do not show:
 - **On PersonaMem, Hindsight is ahead** by 3.7 points; ICM is level with the hybrid search baseline (95% interval for ICM: 79.8 to 85.9) while reading a third less context than it. ICM's weakest category there is suggesting new ideas from known preferences (59.1%).
 - **Not identical conditions.** The harness is maintained by Vectorize, the vendor of Hindsight. The published LoCoMo results predate a change that set the answer and judge temperature to 0; our run uses the current harness (commit `f618ed7`) and Vertex AI.
 - **At 50 chunks, much of each conversation is returned,** so this accuracy also measures the answering model. The retrieval table is the evidence for the recall engine itself.
-- **One run per dataset so far.** Three repetitions are running and will replace these figures.
+- **One run per dataset so far.** The 95% intervals above cover the sampling of questions, not the variation from one run to the next.
 
 <details>
 <summary>Per-category results, latency and further caveats</summary>
 
 - **By question type** (LoCoMo, harness labels): open-domain 96.7% (813 / 841), temporal 91.0% (292 / 321), single-hop 89.0% (251 / 282), multi-hop 76.0% (73 / 96).
-- **Latency.** Median recall latency 141 ms on a 4-vCPU cloud VM; 272 sessions ingested with no LLM call. Same figures on Apple Silicon and on Linux x86-64. Median recall latency with embeddings: 65 ms and 136 ms; keyword-only: 1.6 ms and 6.8 ms.
-- **Session dates are written into the memory text** by the benchmark adapter, as Hindsight does. The hybrid search baseline does not get them, which accounts for part of its gap on temporal questions.
+- **Latency.** Median recall latency 141 ms on a 4-vCPU cloud VM during the run above; 272 sessions ingested with no LLM call. In the retrieval-only runs on Linux x86-64: median 136 ms with embeddings, 6.8 ms keyword-only.
+- **Session dates.** The benchmark adapter writes each session's date into ICM's memory text; Hindsight receives the same dates as metadata, and every system gets the date of the question.
 - **The weakest category is the 96 questions the harness labels multi-hop** (76.0%). Category names do not line up across benchmarks: other LoCoMo evaluations call this category open-domain, and call multi-hop the 282 questions the harness labels single-hop (89.0% here). Compare by question count, not by label.
 - **Recall engine v2 is the default** for `icm recall`, the MCP `icm_memory_recall` tool, HTTP `/recall` and the prompt hook. The previous engine stays available to roll back or to compare: `icm recall --engine legacy`, `"engine": "legacy"` on HTTP `/recall`, or `ICM_RECALL_ENGINE=legacy`.
 
@@ -93,9 +93,9 @@ Per-question results for both datasets are in [`bench/amb/results/`](bench/amb/r
 
 ## One memory for every tool
 
-Every tool configured by `icm init` reads and writes the same SQLite database, and topics (`decisions-myapp`, `preferences`, `errors-resolved`, ...) are not partitioned by tool. A memory stored from Claude Code is immediately visible to Codex, Gemini, Cursor, Roo, Amp, Aider, ... In a small [demonstration](docs/demonstrations.md#multi-agent-unified-memory) with 10 seeded facts, Claude Code, Gemini CLI, Copilot CLI, Cursor Agent and Aider each recalled all 10 facts stored through ICM by another tool.
+Every tool configured by `icm init` reads and writes the same SQLite database, and topics (`decisions-myapp`, `preferences`, `errors-resolved`, ...) are not partitioned by tool. A memory stored from Claude Code is immediately visible to Codex, Gemini, Cursor, Roo, Amp, Aider, ...
 
-Want isolation instead? `icm init --per-project` creates a project-local database under `.icm/`; `--db <path>` or `ICM_DB` point to any other file. Each path is an independent corpus.
+Want isolation instead? `icm init --per-project` creates a project-local database under `.icm/` (and writes the agents' instruction files, such as `CLAUDE.md` and `AGENTS.md`, in the current directory); `--db <path>` or `ICM_DB` point to any other file. Each path is an independent corpus.
 
 > **Project status: beta.** ICM is pre-1.0: breaking changes can land in any minor release, and hook and MCP configuration formats may shift. Beta refers to API stability, not to day-to-day usefulness: I (the maintainer) use ICM every day as my primary AI coding memory. My main focus is [rtk](https://github.com/rtk-ai/rtk), so issues and pull requests are reviewed on a best-effort cadence.
 >
@@ -114,7 +114,7 @@ curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
 irm https://raw.githubusercontent.com/rtk-ai/icm/main/install.ps1 | iex
 ```
 
-Keyword search works everywhere. Run `icm embeddings status` to see whether semantic search is on: it is built into the macOS Apple Silicon, Windows and `.rpm` builds, and one `icm embeddings download` away on Linux. Nix, building from source, version pinning and the per-platform details: [reference](docs/reference.md#install).
+Keyword search works everywhere. Run `icm embeddings status` to see whether semantic search is on: it is built into the macOS Apple Silicon, Windows and `.rpm` builds; the Linux glibc archives and the `.deb` need one `icm embeddings download`; the Intel Mac build needs your own ONNX Runtime (`ORT_DYLIB_PATH`); the static Linux musl build is keyword-only. Nix, building from source, version pinning and the details: [reference](docs/reference.md#install).
 
 ## Setup
 
@@ -124,7 +124,7 @@ icm init --per-project    # database under .icm/ at the git root
 icm init --mode all       # also register the MCP server in every tool that supports it
 ```
 
-The default mode (`standard`) writes instructions, skills and hooks, without an MCP server. `--mode all` adds the MCP server; with the instruction files used for Aider and Pi, that covers the 18 tools below ([integration guide](docs/integrations.md)):
+The default mode (`standard`) writes instructions, skills and hooks, without an MCP server. `--mode all` adds the MCP server; with it (plus `--per-project` for Aider, whose conventions file is per project), that covers the 18 tools below ([integration guide](docs/integrations.md)):
 
 | Tool | MCP server | Hooks |
 |------|:---:|:-----:|
@@ -182,11 +182,11 @@ icm stats
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```
 
-ICM also keeps **memoirs** (permanent knowledge graphs of concepts and typed relations), **feedback** (corrections to learn from) and **verbatim transcripts**, exposes **31 MCP tools**, an **HTTP API** that keeps the embedding model warm and a **terminal dashboard** (`icm dashboard`). All of it is in the [reference](docs/reference.md).
+ICM also keeps **memoirs** (permanent knowledge graphs of concepts and typed relations), **feedback** (corrections to learn from) and **verbatim transcripts**, exposes **31 MCP tools** (30 without an embedding model), an **HTTP API** that keeps the embedding model warm and a **terminal dashboard** (`icm dashboard`). All of it is in the [reference](docs/reference.md).
 
 ## How it works
 
-Recall fuses up to three ranked lists by reciprocal rank (RRF): **FTS5 BM25** keyword matching, always on; **semantic vector search** via sqlite-vec when an embedding model is loaded (default `Qdrant/multilingual-e5-large-onnx`, 1024 dimensions, 100+ languages); and a **date window** when the query names a period ("last week", "in March 2024"). Project, topic and keyword filters apply before the cut. Memories decay over time according to their importance (`critical` never fades), near-duplicates are merged on store, and the model that produced the stored vectors is recorded in the database, so changing `model` in the config never clears them (`icm embed --migrate` is the explicit way to switch).
+Recall fuses up to three ranked lists by reciprocal rank (RRF): **FTS5 BM25** keyword matching, always on; **semantic vector search** via sqlite-vec when an embedding model is loaded (default `Qdrant/multilingual-e5-large-onnx`, 1024 dimensions, 100+ languages); and a **date window** when the query names a period ("last week", "in March 2024"). Project, topic and keyword filters apply before the cut. Memories decay over time according to their importance (`critical` never fades); with an embedding model loaded, a new memory almost identical to one in the same topic (cosine similarity above 0.95) is merged into it; and the model that produced the stored vectors is recorded in the database, so changing `model` in the config never clears them (`icm embed --migrate` is the explicit way to switch).
 
 Everything lives in one SQLite file, with no external service:
 
@@ -203,7 +203,7 @@ Everything lives in one SQLite file, with no external service:
 
 | Document | Description |
 |----------|-------------|
-| [Integration Guide](docs/integrations.md) | Setup for all 18 tools: Claude Code, Copilot, Cursor, Windsurf, Zed, Amp, etc. |
+| [Integration Guide](docs/integrations.md) | Per-tool MCP setup: Claude Code, Cursor, Windsurf, Zed, Amp, Codex, Cline, Roo Code, etc. |
 | [Technical Architecture](docs/architecture.md) | Crate structure, search pipeline, decay model, sqlite-vec integration, testing |
 | [User Guide](docs/guide.md) | Installation, topic organization, consolidation, extraction, troubleshooting |
 | [Product Overview](docs/product.md) | Use cases, benchmarks, comparison with alternatives |

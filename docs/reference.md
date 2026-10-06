@@ -70,7 +70,7 @@ The default (`standard`) sets up instructions, skills and hooks, without an MCP 
 
 | Tool | MCP | Hooks | CLI | Skills |
 |------|:---:|:-----:|:---:|:------:|
-| Claude Code | `~/.claude.json` | 5 hooks | `CLAUDE.md` | `/recall` `/remember` |
+| Claude Code | `~/.claude.json` | 6 hooks | `CLAUDE.md` | `/recall` `/remember` |
 | Claude Desktop | JSON | — | — | — |
 | Gemini CLI | `~/.gemini/settings.json` | 5 hooks | `GEMINI.md` | — |
 | Codex CLI | `~/.codex/config.toml` | 3 hooks (PostToolUse opt-in, see #288) | `AGENTS.md` | — |
@@ -84,7 +84,7 @@ The default (`standard`) sets up instructions, skills and hooks, without an MCP 
 | Roo Code | VS Code globalStorage | — | — | `.md` rule |
 | Kilo Code | VS Code globalStorage | — | — | — |
 | Zed | `~/.zed/settings.json` | — | — | — |
-| OpenCode | JSON | TS plugin | — | — |
+| OpenCode | JSON | TS plugin | — | `icm-recall` `icm-remember` `icm-remember-session` |
 | Continue.dev | `~/.continue/config.yaml` | — | — | — |
 | Aider | — | — | `.aider.conventions.md` | — |
 | Pi | — | TS ext (TBD) | `~/.pi/agent/AGENTS.md` | `/icm-recall` `/icm-remember` |
@@ -138,7 +138,7 @@ Installs auto-extraction and auto-recall hooks for all supported tools:
 | Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
 | Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
 | Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post`¹ | — | `icm hook prompt` | `~/.codex/hooks.json` |
-| Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
+| Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.copilot/settings.json` |
 | OpenCode | session start | — | tool extract | compaction | — | `~/.config/opencode/plugins/icm.ts` |
 
 **What each hook does:**
@@ -196,9 +196,9 @@ The embedding model is loaded once instead of on every CLI call, so any scriptin
 icm dashboard    # or: icm tui
 ```
 
-Interactive TUI with 5 tabs: Overview, Topics, Memories, Health, Memoirs. Keyboard navigation (vim-style: j/k, g/G, Tab, 1-5), live search (/), auto-refresh.
+Interactive TUI with 6 tabs: Overview, Topics, Memories, Health, Memoirs, Graph. Keyboard navigation (vim-style: j/k, g/G, Tab, 1-6), live search (/), auto-refresh.
 
-Requires the `tui` feature (enabled by default). Build without: `cargo install --path crates/icm-cli --no-default-features --features embeddings`.
+Requires the `tui` feature (enabled by default). Build without: `cargo install --path crates/icm-cli --no-default-features --features embeddings-static,backend-sqlite,http-api`.
 
 ## CLI
 
@@ -289,7 +289,7 @@ memories and memoirs.
 
 | Tool | Description |
 |------|-------------|
-| `icm_memory_store` | Store with auto-dedup (>85% similarity → update instead of duplicate) |
+| `icm_memory_store` | Store, merging into a near-identical memory of the same topic (cosine above 0.95, with embeddings) |
 | `icm_memory_recall` | Search by query, filter by topic / keyword / project |
 | `icm_memory_update` | Edit a memory in-place (content, importance, keywords) |
 | `icm_memory_forget` | Delete a memory by ID |
@@ -387,10 +387,10 @@ ICM gives your AI agent a real memory — not a note-taking tool, not a context 
 | `medium` | normal | yes | Standard decay, pruned when weight < threshold |
 | `low` | fast (2x rate) | yes | Quickly forgotten |
 
-Decay is **access-aware**: frequently recalled memories decay slower (`decay / (1 + access_count × 0.1)`). Applied automatically on recall (if >24h since last decay).
+Decay is **access-aware**: frequently recalled memories decay slower (`decay / (1 + min(access_count, 5) × 0.1)`). Applied automatically on recall (if >24h since last decay).
 
 **Memory hygiene** is built-in:
-- **Auto-dedup**: storing content >85% similar to an existing memory in the same topic updates it instead of creating a duplicate
+- **Auto-dedup**: with an embedding model loaded, storing content whose cosine similarity to a memory in the same topic exceeds 0.95 merges it into that memory instead of creating a duplicate
 - **Consolidation hints**: when a topic exceeds 7 entries, `icm_memory_store` warns the caller to consolidate
 - **Health audit**: `icm_memory_health` reports per-topic entry count, average weight, stale entries, and consolidation needs
 - **No silent data loss**: critical and high-importance memories are never auto-pruned
@@ -495,7 +495,7 @@ The `UserPromptSubmit` hook (`icm hook prompt`) and the `SessionStart` hook (`ic
 | `keywords` | 3–5 terms to boost BM25 retrieval. |
 | `importance` | `critical` for never-forget, `high` for project decisions, `medium` default, `low` for ephemeral. |
 
-ICM handles the rest: **dedup at 85% similarity**, **auto-link** between semantically close memories, **auto-consolidation** above 10 entries per topic, and **decay** weighted by access count. One fact per call beats batched dumps — the retriever ranks individually-stored facts higher.
+ICM handles the rest: **dedup above 0.95 cosine similarity (with embeddings)**, **auto-link** between semantically close memories, **auto-consolidation** above 10 entries per topic (off by default), and **decay** weighted by access count. One fact per call beats batched dumps — the retriever ranks individually-stored facts higher.
 
 ### Multi-agent roles
 
@@ -524,7 +524,7 @@ ICM captures and reinjects memories through three hooks. Capture is rule-based; 
 
 ```
   Layer 0: Pattern hooks              Layer 1: PreCompact           Layer 2: UserPromptSubmit
-  (rules; your LLM CLI if auto)       (rules; your LLM CLI if auto) (no LLM call)  
+  (rules; your LLM CLI if auto)       (rules, no LLM call)          (no LLM call)  
   ┌──────────────────┐                ┌──────────────────┐          ┌──────────────────┐
   │ PostToolUse hook  │                │ PreCompact hook   │          │ UserPromptSubmit  │
   │                   │                │                   │          │                   │
@@ -543,7 +543,7 @@ ICM captures and reinjects memories through three hooks. Capture is rule-based; 
 | Layer | Status | LLM call | Hook command | Description |
 |-------|--------|----------|-------------|-------------|
 | Layer 0 | Implemented | only with `provider = "auto"` and an LLM CLI installed | `icm hook post` | Rule-based extraction from tool output |
-| Layer 1 | Implemented | only with `provider = "auto"` and an LLM CLI installed | `icm hook compact` | Extract from transcript before context compression |
+| Layer 1 | Implemented | none | `icm hook compact` | Extract from transcript before context compression |
 | Layer 2 | Implemented | none | `icm hook prompt` | Inject recalled memories on each user prompt (recall, not extraction) |
 
 All 3 layers are installed automatically by `icm init --mode hook`.

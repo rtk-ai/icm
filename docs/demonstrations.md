@@ -20,7 +20,7 @@ Apple M1 Pro, in-memory SQLite, 1,000 synthetic memories, single-threaded (`icm 
 
 ### Agent efficiency (demonstration)
 
-Three runs, one model, one small project: an illustration, not a benchmark. Multi-session workflow with a real Rust project (12 files, ~550 lines). Sessions 2+ show the biggest gains as ICM recalls instead of re-reading files.
+Three runs, one model, one small project: an illustration, not a benchmark. Multi-session workflow with a real Rust project (12 files, ~1,000 lines). Sessions 2+ show the biggest gains as ICM recalls instead of re-reading files.
 
 ```
 ICM Agent Benchmark (10 sessions, model: haiku, 3 runs averaged)
@@ -81,7 +81,7 @@ qwen2.5:3b             3B       2%       58%       +56%
 All benchmarks use **real API calls** — no mocks, no simulated responses, no cached answers.
 
 - **Agent benchmark**: Creates a real Rust project in a tempdir. Runs N sessions with `claude -p --output-format json`. Without ICM: empty MCP config. With ICM: real MCP server + auto-extraction + context injection.
-- **Knowledge retention**: Uses a fictional technical document (the "Meridian Protocol"). Scores answers by keyword matching against expected facts. 120s timeout per invocation.
+- **Knowledge retention**: Uses a fictional technical document (the "Meridian Protocol"). Scores answers by keyword matching against expected facts. 180 s timeout per invocation.
 - **Isolation**: Each run uses its own tempdir and fresh SQLite DB. No session persistence.
 
 ### Multi-agent unified memory

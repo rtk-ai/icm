@@ -91,14 +91,13 @@ Per-question results for both datasets are in [`bench/amb/results/`](bench/amb/r
 
 ---
 
-> ⚠️ **Project status: experimental**
+> **Project status: beta**
 >
 > ICM is pre-1.0 and under active development. Breaking changes can land
 > in any minor release, and hooks/MCP configuration formats may shift.
 >
-> That said, I (the maintainer) use ICM every day as my primary AI
-> coding memory layer — it's experimental in API stability, not in
-> day-to-day usefulness.
+> I (the maintainer) use ICM every day as my primary AI coding memory
+> layer. Beta refers to API stability, not to day-to-day usefulness.
 >
 > My focus is currently on [rtk](https://github.com/rtk-ai/rtk); ICM
 > updates are merged on a best-effort cadence. Issues and pull requests

@@ -10,7 +10,7 @@
 //!
 //! Gated to Linux: these assertions hard-code XDG-style paths
 //! (`.local/share/icm`, `.claude/CLAUDE.md`, etc.). On macOS the
-//! `directories` crate routes data to `Library/Application Support/icm/`
+//! `directories` crate routes data to `Library/Application Support/dev.icm.icm/`
 //! and on Windows to `%APPDATA%\icm\icm\data\`, so the same fake-HOME
 //! scaffolding doesn't line up. The cross-OS logic itself is exercised
 //! by the in-binary unit tests in `crates/icm-cli/src/install_manifest.rs`

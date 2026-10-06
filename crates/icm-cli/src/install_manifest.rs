@@ -8,7 +8,7 @@
 //!
 //! Path: `<icm-data-dir>/install-manifest.json`
 //! - Linux/WSL: `~/.local/share/icm/install-manifest.json`
-//! - macOS:     `~/Library/Application Support/icm/install-manifest.json`
+//! - macOS:     `~/Library/Application Support/dev.icm.icm/install-manifest.json`
 //! - Windows:   `%APPDATA%\icm\icm\data\install-manifest.json`
 //!
 //! Schema is versioned (`schema_version` field) so future migrations

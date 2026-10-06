@@ -248,7 +248,7 @@ fn extract_lib_zip(archive: &[u8]) -> Result<Vec<u8>> {
 /// pre-planted symlink at `tmp` (another same-user process, shared
 /// CI/container) would get followed and its target clobbered with the
 /// verified library bytes — the same TOCTOU class already hardened in
-/// `cloud.rs::write_secret_file` and `upgrade.rs::write_new_binary`.
+/// `config.rs::write_secret_file` and `upgrade.rs::write_new_binary`.
 /// Remove any existing entry first via `symlink_metadata` (reports the
 /// symlink itself, not its target), then open with `create_new`
 /// (`O_EXCL`) so even a fresh symlink racing into the gap fails the open
@@ -312,7 +312,7 @@ pub fn download(progress: bool) -> Result<PathBuf> {
     // pre-planted symlink at `tmp` (another same-user process, shared
     // CI/container) would get followed and its target clobbered with the
     // verified library bytes — the same TOCTOU class already hardened in
-    // `cloud.rs::write_secret_file` and `upgrade.rs::write_new_binary`.
+    // `config.rs::write_secret_file` and `upgrade.rs::write_new_binary`.
     // Remove any existing entry first via `symlink_metadata` (reports the
     // symlink itself, not its target), then open with `create_new`
     // (`O_EXCL`) so even a fresh symlink racing into the gap fails the

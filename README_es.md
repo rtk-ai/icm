@@ -17,10 +17,11 @@ Esta es una traducción de README.md (inglés), que es la referencia; si difiere
 
 Explícale a Claude Code el lunes cómo gestiona tu proyecto la autenticación, y la sesión de Gemini CLI del martes ya lo sabe. ICM guarda lo que aprenden tus agentes de programación (decisiones, correcciones, convenciones, preferencias) en un único archivo SQLite en tu máquina, y les devuelve la parte relevante al inicio de cada sesión y con cada prompt que envías. Hasta 18 agentes y editores comparten esa memoria, así que dejas de volver a explicar tu proyecto cada vez que abres una sesión o cambias de herramienta.
 
-- **92.8% en LoCoMo (1,540 preguntas), al nivel de Hindsight (92.0%)**, con un tercio menos de contexto por pregunta. [Detalles y salvedades más abajo](#benchmark-comparison).
+- **92.9% en LoCoMo (1,540 preguntas, media de tres ejecuciones), al nivel de Hindsight (92.0%)**, con un tercio menos de contexto por pregunta. [Detalles y salvedades más abajo](#benchmark-comparison).
 - **Ninguna llamada a un LLM para guardar o recuperar.** Hindsight, Mem0, Graphiti (Zep) y claude-mem llaman por defecto a un LLM por cada memoria que guardan. ICM no. Solo su extracción automática de hechos a partir de la salida de las herramientas pasa por la herramienta de línea de comandos de LLM que ya usas, cuando hay una instalada; `provider = "none"` también la mantiene local (ver [Inicio rápido](#quickstart)).
 - **Útil sin modelo de embeddings.** La recuperación solo por palabras clave sitúa al menos una de las sesiones correctas en el top 5 para el 88.6% de las preguntas de LoCoMo, con una mediana de 6.8 ms por consulta en Linux x86-64.
-- **No va por delante en todo.** En PersonaMem (las preferencias cambiantes de un usuario), Hindsight lidera: 86.6% frente al 82.9% de ICM.
+- **97.4% en LongMemEval-S, recuperación sin LLM**: una de las sesiones correctas en el top 5 para 487 de 500 preguntas, frente al 96.6% de MemPalace y el 95.2% de agentmemory con la misma medida.
+- **No va por delante en todo.** En PersonaMem (las preferencias cambiantes de un usuario), Hindsight lidera: 86.6% frente al 81.7% de ICM.
 
 <p align="center">
   <img src="assets/demo.svg" alt="Terminal: tres memorias guardadas con icm store y luego dos preguntas respondidas por icm recall, cada una devolviendo la memoria correcta">
@@ -60,7 +61,7 @@ Precisión de las respuestas en [LoCoMo](https://github.com/snap-research/locomo
 
 | Sistema | Precisión en LoCoMo | Contexto por pregunta | Llamadas a un LLM para guardar una memoria | Se ejecuta como | Resultado |
 |--------|:---------------:|:--------------------:|:---------------------------:|---------|--------|
-| **ICM** 0.10.65 (motor de recall v2) | **92.8%** (1,429 / 1,540) | 24.1k tokens | ninguna | un binario Rust, un archivo SQLite | nuestra ejecución, 2026-10-05 |
+| **ICM** 0.11.0 (motor de recall v2) | **92.9%** (1,430, 1,433 y 1,430 / 1,540 en tres ejecuciones) | 24.1k tokens | ninguna | un binario Rust, un archivo SQLite | nuestras ejecuciones, 2026-10-06 |
 | Hindsight | 92.0% (1,417 / 1,540) | 36.2k tokens | extracción de hechos con LLM | servicio Python, PostgreSQL + pgvector | publicado por el arnés |
 | Línea base de búsqueda híbrida (dense + sparse, RRF) | 79.1% (1,218 / 1,540) | 22.2k tokens | ninguna | Qdrant | publicado por el arnés |
 
@@ -68,7 +69,7 @@ En [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 preguntas de opción 
 
 | Sistema | Precisión en PersonaMem | Contexto por pregunta | Resultado |
 |--------|:-------------------:|:--------------------:|--------|
-| **ICM** 0.10.65 (motor de recall v2) | **82.9%** (488 / 589) | 16.2k tokens | nuestra ejecución, 2026-10-05 |
+| **ICM** 0.11.0 (motor de recall v2) | **81.7%** (486, 486 y 472 / 589 en tres ejecuciones) | 16.2k tokens | nuestras ejecuciones, 2026-10-06 |
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | publicado por el arnés |
 | Línea base de búsqueda híbrida | 84.4% (497 / 589) | 24.2k tokens | publicado por el arnés |
 
@@ -80,26 +81,35 @@ Solo la recuperación, en LoCoMo, sin modelo de respuesta: la proporción de pre
 | 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
 | 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
 
+LongMemEval-S, solo recuperación, sin LLM (ICM con su modelo de embeddings por defecto; 500 preguntas; cada pregunta viene con unas 48 sesiones pasadas en las que buscar; una memoria por sesión, solo los turnos del usuario, como las indexa MemPalace; sin dar ninguna fecha a ICM):
+
+| Sesiones correctas en el top 5 | **ICM** 0.11.0 | MemPalace | agentmemory | Solo BM25 |
+|---|:---:|:---:|:---:|:---:|
+| Al menos una (la medida publicada) | **97.4%** (487 / 500) | 96.6% (483 / 500) | 95.2% (476 / 500) | 94.6% |
+| Todas | **88.6%** (443 / 500) | 85.0% | 81.8% | 81.2% |
+
+Las cifras de MemPalace y agentmemory se han recalculado con nuestro evaluador a partir de los archivos de resultados que publica cada proyecto; coinciden con sus cifras publicadas. agentmemory indexa todos los turnos de una sesión; con esa unidad, BM25 solo alcanza el 96.2% y el 83.0%. Un BM25 simple ya ronda el 95% en la primera medida, por eso la segunda, todas las sesiones correctas, separa mejor a los sistemas.
+
 Lo que muestran y lo que no muestran estas cifras:
 
-- **ICM y Hindsight están empatados en LoCoMo.** La diferencia de 0.8 puntos son 12 preguntas, dentro del error de muestreo (intervalo del 95% para ICM: 91.5 a 94.1). ICM llega ahí con un tercio menos de contexto y sin llamar a un LLM cuando se guarda una memoria.
-- **En PersonaMem, Hindsight va por delante** por 3.7 puntos; ICM está al nivel de la línea base de búsqueda híbrida (intervalo del 95% para ICM: 79.8 a 85.9) leyendo un tercio menos de contexto que ella. La categoría más débil de ICM allí es sugerir ideas nuevas a partir de preferencias conocidas (59.1%).
+- **ICM y Hindsight están empatados en LoCoMo.** Las tres ejecuciones de ICM (92.9%, 93.1%, 92.9%) quedan cada una alrededor de 1 punto por encima del 92.0% publicado de Hindsight, una diferencia de unas 14 preguntas, dentro del error de muestreo (intervalo del 95% para ICM: 91.6 a 94.2). ICM llega ahí con un tercio menos de contexto y sin llamar a un LLM cuando se guarda una memoria.
+- **En PersonaMem, Hindsight va por delante** por 4.9 puntos, fuera del error de muestreo (intervalo del 95% para ICM: 78.6 a 84.8). ICM también queda 2.7 puntos por debajo de la línea base de búsqueda híbrida, dentro de ese intervalo, leyendo un tercio menos de contexto que ella. Las tres ejecuciones van del 80.1% al 82.5%.
 - **Las condiciones no son idénticas.** El arnés lo mantiene Vectorize, el proveedor de Hindsight. Los resultados publicados de LoCoMo son anteriores a un cambio que fijó en 0 la temperatura de la respuesta y del juez; nuestra ejecución usa el arnés actual (commit `f618ed7`) y Vertex AI.
 - **Con 50 chunks se devuelve gran parte de cada conversación,** así que esta precisión también mide el modelo de respuesta. La tabla de recuperación es la evidencia sobre el motor de recall en sí.
-- **Por ahora, una sola ejecución por conjunto de datos.** Los intervalos del 95% de arriba cubren el muestreo de las preguntas, no la variación de una ejecución a otra.
+- **Tres ejecuciones por conjunto de datos.** El modelo de respuesta varía de una ejecución a otra: 0.2 puntos en LoCoMo, 2.4 puntos en PersonaMem. Los intervalos de arriba cubren el muestreo de las preguntas.
 
 <details>
 <summary>Resultados por categoría, latencia y otras salvedades</summary>
 
-- **Por tipo de pregunta** (LoCoMo, etiquetas del arnés): open-domain 96.7% (813 / 841), temporal 91.0% (292 / 321), single-hop 89.0% (251 / 282), multi-hop 76.0% (73 / 96).
-- **Latencia.** Latencia mediana de recuperación de 141 ms en una VM en la nube de 4 vCPU durante la ejecución anterior; 272 sesiones ingeridas sin ninguna llamada a un LLM. En las ejecuciones de solo recuperación en Linux x86-64: mediana de 136 ms con embeddings y 6.8 ms solo con palabras clave.
+- **Por tipo de pregunta** (LoCoMo, etiquetas del arnés, tres ejecuciones): open-domain 96.7% (841 preguntas), temporal 90.9% (321), single-hop 88.8% (282), multi-hop 78.8% (96).
+- **Latencia.** Latencia mediana de recuperación de 137 a 149 ms en los nodos de 4 vCPU del clúster durante las ejecuciones de LoCoMo; 272 sesiones ingeridas sin ninguna llamada a un LLM. En las ejecuciones de solo recuperación en Linux x86-64: mediana de 136 ms con embeddings y 6.8 ms solo con palabras clave.
 - **Fechas de las sesiones.** El adaptador del benchmark escribe la fecha de cada sesión en el texto de la memoria de ICM; Hindsight recibe las mismas fechas como metadatos, y todos los sistemas reciben la fecha de la pregunta.
-- **La categoría más débil son las 96 preguntas que el arnés etiqueta como multi-hop** (76.0%). Los nombres de las categorías no coinciden entre benchmarks: otras evaluaciones de LoCoMo llaman open-domain a esta categoría, y llaman multi-hop a las 282 preguntas que el arnés etiqueta como single-hop (aquí, 89.0%). Compara por número de preguntas, no por etiqueta.
+- **La categoría más débil son las 96 preguntas que el arnés etiqueta como multi-hop** (78.8%). Los nombres de las categorías no coinciden entre benchmarks: otras evaluaciones de LoCoMo llaman open-domain a esta categoría, y llaman multi-hop a las 282 preguntas que el arnés etiqueta como single-hop (aquí, 88.8%). Compara por número de preguntas, no por etiqueta.
 - **El motor de recall v2 es el predeterminado** para `icm recall`, la herramienta MCP `icm_memory_recall`, `/recall` por HTTP y el hook de prompt. El motor anterior sigue disponible para volver atrás o para comparar: `icm recall --engine legacy`, `"engine": "legacy"` en `/recall` por HTTP, o `ICM_RECALL_ENGINE=legacy`.
 
 </details>
 
-Los resultados por pregunta de ambos conjuntos de datos están en [`bench/amb/results/`](bench/amb/results/); el adaptador, los ajustes exactos y los comandos para reproducirlo están en [`bench/amb/README.md`](bench/amb/README.md).
+Los resultados por pregunta de cada ejecución (tres por conjunto de datos, más la ejecución de recuperación de LongMemEval-S) están en [`bench/amb/results/`](bench/amb/results/); el adaptador, los ajustes exactos y los comandos para reproducirlo están en [`bench/amb/README.md`](bench/amb/README.md).
 
 <a id="one-memory-for-every-tool"></a>
 

@@ -17,10 +17,11 @@ Dit is een vertaling van README.md (Engels), dat de referentie is; als ze versch
 
 Vertel Claude Code op maandag hoe je project met authenticatie omgaat, en de Gemini CLI-sessie van dinsdag weet het al. ICM bewaart wat je codeeragents leren (beslissingen, fixes, conventies, voorkeuren) in één SQLite-bestand op je machine, en geeft het relevante deel terug aan het begin van elke sessie en bij elke prompt die je stuurt. Tot 18 agents en editors delen dat geheugen, zodat je je project niet steeds opnieuw hoeft uit te leggen wanneer je een sessie opent of van tool wisselt.
 
-- **92.8% op LoCoMo (1,540 vragen), gelijk met Hindsight (92.0%)**, met een derde minder context per vraag. [Details en kanttekeningen hieronder](#benchmark-comparison).
+- **92.9% op LoCoMo (1,540 vragen, gemiddelde van drie runs), gelijk met Hindsight (92.0%)**, met een derde minder context per vraag. [Details en kanttekeningen hieronder](#benchmark-comparison).
 - **Geen LLM-aanroep om op te slaan of op te halen.** Hindsight, Mem0, Graphiti (Zep) en claude-mem roepen standaard een LLM aan voor elke herinnering die ze opslaan. ICM niet. Alleen de automatische extractie van feiten uit tool-uitvoer loopt via de LLM-commandlinetool die je al gebruikt, als er een geïnstalleerd is; `provider = "none"` houdt ook dat lokaal (zie [Snel aan de slag](#quickstart)).
 - **Bruikbaar zonder embeddingmodel.** Alleen al de recall op trefwoorden zet voor 88.6% van de LoCoMo-vragen minstens één van de juiste sessies in de top 5, met een mediaan van 6.8 ms per recall op Linux x86-64.
-- **Niet overal voorop.** Op PersonaMem (de veranderende voorkeuren van een gebruiker) loopt Hindsight voor: 86.6% tegenover 82.9% voor ICM.
+- **97.4% op LongMemEval-S, retrieval zonder LLM**: één van de juiste sessies in de top 5 voor 487 van de 500 vragen, tegenover 96.6% voor MemPalace en 95.2% voor agentmemory op dezelfde maatstaf.
+- **Niet overal voorop.** Op PersonaMem (de veranderende voorkeuren van een gebruiker) loopt Hindsight voor: 86.6% tegenover 81.7% voor ICM.
 
 <p align="center">
   <img src="assets/demo.svg" alt="Terminal: drie herinneringen opgeslagen met icm store, daarna twee vragen beantwoord door icm recall, die elk de juiste herinnering teruggeven">
@@ -60,7 +61,7 @@ Nauwkeurigheid van antwoorden op [LoCoMo](https://github.com/snap-research/locom
 
 | Systeem | Nauwkeurigheid LoCoMo | Context per vraag | LLM-aanroepen om een herinnering op te slaan | Draait als | Resultaat |
 |--------|:---------------:|:--------------------:|:---------------------------:|---------|--------|
-| **ICM** 0.10.65 (recall-engine v2) | **92.8%** (1,429 / 1,540) | 24.1k tokens | geen | één Rust-binary, SQLite-bestand | onze run, 2026-10-05 |
+| **ICM** 0.11.0 (recall-engine v2) | **92.9%** (1,430, 1,433 en 1,430 / 1,540 in drie runs) | 24.1k tokens | geen | één Rust-binary, SQLite-bestand | onze runs, 2026-10-06 |
 | Hindsight | 92.0% (1,417 / 1,540) | 36.2k tokens | feitenextractie via LLM | Python-service, PostgreSQL + pgvector | gepubliceerd door de harness |
 | Baseline hybride zoeken (dense + sparse, RRF) | 79.1% (1,218 / 1,540) | 22.2k tokens | geen | Qdrant | gepubliceerd door de harness |
 
@@ -68,7 +69,7 @@ Op [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 meerkeuzevragen over 
 
 | Systeem | Nauwkeurigheid PersonaMem | Context per vraag | Resultaat |
 |--------|:-------------------:|:--------------------:|--------|
-| **ICM** 0.10.65 (recall-engine v2) | **82.9%** (488 / 589) | 16.2k tokens | onze run, 2026-10-05 |
+| **ICM** 0.11.0 (recall-engine v2) | **81.7%** (486, 486 en 472 / 589 in drie runs) | 16.2k tokens | onze runs, 2026-10-06 |
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | gepubliceerd door de harness |
 | Baseline hybride zoeken | 84.4% (497 / 589) | 24.2k tokens | gepubliceerd door de harness |
 
@@ -80,26 +81,35 @@ Alleen retrieval, op LoCoMo, zonder antwoordmodel: het aandeel vragen waarvoor m
 | 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
 | 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
 
+LongMemEval-S, alleen retrieval, zonder LLM (ICM met zijn standaard-embeddingmodel; 500 vragen; bij elke vraag horen ongeveer 48 eerdere sessies om te doorzoeken; één herinnering per sessie, alleen de beurten van de gebruiker, zoals MemPalace ze indexeert; ICM krijgt geen datum):
+
+| Juiste sessies in de top 5 | **ICM** 0.11.0 | MemPalace | agentmemory | Alleen BM25 |
+|---|:---:|:---:|:---:|:---:|
+| Minstens één (de gepubliceerde maatstaf) | **97.4%** (487 / 500) | 96.6% (483 / 500) | 95.2% (476 / 500) | 94.6% |
+| Allemaal | **88.6%** (443 / 500) | 85.0% | 81.8% | 81.2% |
+
+De cijfers van MemPalace en agentmemory zijn met onze scorer opnieuw berekend uit de resultaatbestanden die elk project publiceert; ze komen overeen met hun gepubliceerde cijfers. agentmemory indexeert alle beurten van een sessie; op die eenheid haalt BM25 alleen 96.2% en 83.0%. Een gewone BM25 scoort op de eerste maatstaf al rond de 95%, en daarom onderscheidt de tweede, alle juiste sessies, de systemen beter.
+
 Wat deze cijfers wel en niet laten zien:
 
-- **ICM en Hindsight staan gelijk op LoCoMo.** Het verschil van 0.8 punt is 12 vragen, binnen de steekproeffout (95%-interval voor ICM: 91.5 tot 94.1). ICM haalt dat met een derde minder context en zonder een LLM aan te roepen wanneer een herinnering wordt opgeslagen.
-- **Op PersonaMem loopt Hindsight voor**, met 3.7 punten; ICM staat gelijk met de baseline voor hybride zoeken (95%-interval voor ICM: 79.8 tot 85.9) en leest daarbij een derde minder context. De zwakste categorie van ICM is daar het voorstellen van nieuwe ideeën op basis van bekende voorkeuren (59.1%).
+- **ICM en Hindsight staan gelijk op LoCoMo.** De drie runs van ICM (92.9%, 93.1%, 92.9%) liggen elk ongeveer 1 punt boven de gepubliceerde 92.0% van Hindsight, een verschil van ongeveer 14 vragen, binnen de steekproeffout (95%-interval voor ICM: 91.6 tot 94.2). ICM haalt dat met een derde minder context en zonder een LLM aan te roepen wanneer een herinnering wordt opgeslagen.
+- **Op PersonaMem loopt Hindsight voor**, met 4.9 punten, buiten de steekproeffout (95%-interval voor ICM: 78.6 tot 84.8). ICM ligt ook 2.7 punten onder de baseline voor hybride zoeken, binnen dat interval, en leest daarbij een derde minder context. De drie runs lopen uiteen van 80.1% tot 82.5%.
 - **Geen identieke omstandigheden.** De harness wordt onderhouden door Vectorize, de leverancier van Hindsight. De gepubliceerde LoCoMo-resultaten dateren van vóór een wijziging die de temperatuur van antwoord en beoordelaar op 0 zette; onze run gebruikt de huidige harness (commit `f618ed7`) en Vertex AI.
 - **Bij 50 chunks wordt een groot deel van elk gesprek teruggegeven,** dus deze nauwkeurigheid meet ook het antwoordmodel. De retrievaltabel is het bewijs voor de recall-engine zelf.
-- **Tot nu toe één run per dataset.** De 95%-intervallen hierboven dekken de steekproef van vragen, niet de variatie van de ene run naar de andere.
+- **Drie runs per dataset.** Het antwoordmodel varieert van run tot run: 0.2 punt op LoCoMo, 2.4 punten op PersonaMem. De intervallen hierboven dekken de steekproef van vragen.
 
 <details>
 <summary>Resultaten per categorie, latentie en verdere kanttekeningen</summary>
 
-- **Per vraagtype** (LoCoMo, labels van de harness): open-domain 96.7% (813 / 841), temporal 91.0% (292 / 321), single-hop 89.0% (251 / 282), multi-hop 76.0% (73 / 96).
-- **Latentie.** Mediane recall-latentie van 141 ms op een cloud-VM met 4 vCPU's tijdens de run hierboven; 272 sessies ingelezen zonder LLM-aanroep. In de runs met alleen retrieval op Linux x86-64: mediaan 136 ms met embeddings, 6.8 ms met alleen trefwoorden.
+- **Per vraagtype** (LoCoMo, labels van de harness, drie runs): open-domain 96.7% (841 vragen), temporal 90.9% (321), single-hop 88.8% (282), multi-hop 78.8% (96).
+- **Latentie.** Mediane recall-latentie van 137 tot 149 ms op de nodes met 4 vCPU's van het cluster tijdens de LoCoMo-runs; 272 sessies ingelezen zonder LLM-aanroep. In de runs met alleen retrieval op Linux x86-64: mediaan 136 ms met embeddings, 6.8 ms met alleen trefwoorden.
 - **Sessiedatums.** De benchmarkadapter schrijft de datum van elke sessie in de herinneringstekst van ICM; Hindsight krijgt dezelfde datums als metadata, en elk systeem krijgt de datum van de vraag.
-- **De zwakste categorie is die van de 96 vragen die de harness als multi-hop labelt** (76.0%). Categorienamen komen tussen benchmarks niet overeen: andere LoCoMo-evaluaties noemen deze categorie open-domain, en noemen de 282 vragen die de harness als single-hop labelt multi-hop (hier 89.0%). Vergelijk op aantal vragen, niet op label.
+- **De zwakste categorie is die van de 96 vragen die de harness als multi-hop labelt** (78.8%). Categorienamen komen tussen benchmarks niet overeen: andere LoCoMo-evaluaties noemen deze categorie open-domain, en noemen de 282 vragen die de harness als single-hop labelt multi-hop (hier 88.8%). Vergelijk op aantal vragen, niet op label.
 - **Recall-engine v2 is de standaard** voor `icm recall`, de MCP-tool `icm_memory_recall`, HTTP `/recall` en de prompt-hook. De vorige engine blijft beschikbaar om terug te gaan of om te vergelijken: `icm recall --engine legacy`, `"engine": "legacy"` op HTTP `/recall`, of `ICM_RECALL_ENGINE=legacy`.
 
 </details>
 
-De resultaten per vraag voor beide datasets staan in [`bench/amb/results/`](bench/amb/results/); de adapter, de exacte instellingen en de commando's om alles te reproduceren staan in [`bench/amb/README.md`](bench/amb/README.md).
+De resultaten per vraag voor elke run (drie per dataset, plus de recall-run op LongMemEval-S) staan in [`bench/amb/results/`](bench/amb/results/); de adapter, de exacte instellingen en de commando's om alles te reproduceren staan in [`bench/amb/README.md`](bench/amb/README.md).
 
 <a id="one-memory-for-every-tool"></a>
 

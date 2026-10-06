@@ -17,10 +17,11 @@ To jest tłumaczenie pliku README.md (po angielsku), który jest wersją wzorcow
 
 Powiedz w poniedziałek Claude Code, jak Twój projekt obsługuje uwierzytelnianie, a wtorkowa sesja Gemini CLI już to wie. ICM przechowuje to, czego uczą się Twoi agenci programistyczni (decyzje, poprawki, konwencje, preferencje), w jednym pliku SQLite na Twoim komputerze i oddaje odpowiednią część na początku każdej sesji oraz z każdym wysłanym promptem. Tę pamięć współdzieli do 18 agentów i edytorów, więc nie musisz już ponownie objaśniać projektu za każdym razem, gdy otwierasz sesję lub zmieniasz narzędzie.
 
-- **92.8% na LoCoMo (1,540 pytań), na poziomie Hindsight (92.0%)**, przy kontekście mniejszym o jedną trzecią na pytanie. [Szczegóły i zastrzeżenia poniżej](#benchmark-comparison).
+- **92.9% na LoCoMo (1,540 pytań, średnia z trzech przebiegów), na poziomie Hindsight (92.0%)**, przy kontekście mniejszym o jedną trzecią na pytanie. [Szczegóły i zastrzeżenia poniżej](#benchmark-comparison).
 - **Bez wywołania LLM przy zapisie i przywołaniu.** Hindsight, Mem0, Graphiti (Zep) i claude-mem domyślnie wywołują LLM dla każdego zapisywanego wspomnienia. ICM tego nie robi. Jedynie automatyczne wydobywanie faktów z wyników narzędzi przechodzi przez narzędzie wiersza poleceń LLM, którego już używasz, jeśli jest zainstalowane; `provider = "none"` pozostawia również to lokalnie (zob. [Szybki start](#quickstart)).
 - **Przydatny bez modelu embeddingów.** Samo przywoływanie po słowach kluczowych umieszcza co najmniej jedną z właściwych sesji wśród 5 najwyższych wyników dla 88.6% pytań LoCoMo, z medianą 6.8 ms na przywołanie na Linux x86-64.
-- **Nie wszędzie na prowadzeniu.** Na PersonaMem (zmieniające się preferencje użytkownika) prowadzi Hindsight: 86.6% wobec 82.9% dla ICM.
+- **97.4% na LongMemEval-S, wyszukiwanie bez LLM**: jedna z właściwych sesji wśród 5 najwyższych wyników dla 487 z 500 pytań, wobec 96.6% dla MemPalace i 95.2% dla agentmemory w tej samej mierze.
+- **Nie wszędzie na prowadzeniu.** Na PersonaMem (zmieniające się preferencje użytkownika) prowadzi Hindsight: 86.6% wobec 81.7% dla ICM.
 
 <p align="center">
   <img src="assets/demo.svg" alt="Terminal: trzy wspomnienia zapisane przez icm store, a potem dwa pytania, na które odpowiada icm recall, za każdym razem zwracając właściwe wspomnienie">
@@ -58,7 +59,7 @@ Dokładność odpowiedzi na [LoCoMo](https://github.com/snap-research/locomo) (1
 
 | System | Dokładność LoCoMo | Kontekst na pytanie | Wywołania LLM przy zapisie wspomnienia | Działa jako | Wynik |
 |--------|:---------------:|:--------------------:|:---------------------------:|---------|--------|
-| **ICM** 0.10.65 (silnik przywoływania v2) | **92.8%** (1,429 / 1,540) | 24.1k tokens | brak | jeden plik binarny Rust, plik SQLite | nasz przebieg, 2026-10-05 |
+| **ICM** 0.11.0 (silnik przywoływania v2) | **92.9%** (1,430, 1,433 i 1,430 / 1,540 w trzech przebiegach) | 24.1k tokens | brak | jeden plik binarny Rust, plik SQLite | nasze przebiegi, 2026-10-06 |
 | Hindsight | 92.0% (1,417 / 1,540) | 36.2k tokens | wydobywanie faktów przez LLM | usługa w Pythonie, PostgreSQL + pgvector | opublikowany przez zestaw testowy |
 | Bazowe wyszukiwanie hybrydowe (gęste + rzadkie, RRF) | 79.1% (1,218 / 1,540) | 22.2k tokens | brak | Qdrant | opublikowany przez zestaw testowy |
 
@@ -66,7 +67,7 @@ Na [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 pytań wielokrotnego 
 
 | System | Dokładność PersonaMem | Kontekst na pytanie | Wynik |
 |--------|:-------------------:|:--------------------:|--------|
-| **ICM** 0.10.65 (silnik przywoływania v2) | **82.9%** (488 / 589) | 16.2k tokens | nasz przebieg, 2026-10-05 |
+| **ICM** 0.11.0 (silnik przywoływania v2) | **81.7%** (486, 486 i 472 / 589 w trzech przebiegach) | 16.2k tokens | nasze przebiegi, 2026-10-06 |
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | opublikowany przez zestaw testowy |
 | Bazowe wyszukiwanie hybrydowe | 84.4% (497 / 589) | 24.2k tokens | opublikowany przez zestaw testowy |
 
@@ -78,26 +79,35 @@ Samo wyszukiwanie, na LoCoMo, bez modelu odpowiadającego: odsetek pytań, dla k
 | 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
 | 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
 
+LongMemEval-S, samo wyszukiwanie, bez LLM (ICM z domyślnym modelem embeddingów; 500 pytań; do każdego pytania dołączonych jest około 48 wcześniejszych sesji do przeszukania; jedno wspomnienie na sesję, tylko wypowiedzi użytkownika, tak jak indeksuje je MemPalace; ICM nie dostaje żadnej daty):
+
+| Właściwe sesje wśród 5 najwyższych wyników | **ICM** 0.11.0 | MemPalace | agentmemory | Samo BM25 |
+|---|:---:|:---:|:---:|:---:|
+| Co najmniej jedna (publikowana miara) | **97.4%** (487 / 500) | 96.6% (483 / 500) | 95.2% (476 / 500) | 94.6% |
+| Wszystkie | **88.6%** (443 / 500) | 85.0% | 81.8% | 81.2% |
+
+Wyniki MemPalace i agentmemory przeliczyliśmy naszym skryptem oceniającym na podstawie plików wyników publikowanych przez każdy z projektów; zgadzają się z ich opublikowanymi liczbami. agentmemory indeksuje wszystkie wypowiedzi w sesji; przy takiej jednostce samo BM25 osiąga 96.2% i 83.0%. Zwykłe BM25 osiąga już około 95% w pierwszej mierze, dlatego druga, wszystkie właściwe sesje, lepiej rozróżnia systemy.
+
 Co te liczby pokazują, a czego nie:
 
-- **ICM i Hindsight remisują na LoCoMo.** Różnica 0.8 punktu to 12 pytań, w granicach błędu próbkowania (przedział 95% dla ICM: od 91.5 do 94.1). ICM osiąga to przy kontekście mniejszym o jedną trzecią i bez wywoływania LLM przy zapisie wspomnienia.
-- **Na PersonaMem prowadzi Hindsight**, o 3.7 punktu; ICM jest na poziomie bazowego wyszukiwania hybrydowego (przedział 95% dla ICM: od 79.8 do 85.9), czytając o jedną trzecią mniej kontekstu niż ono. Najsłabsza kategoria ICM w tym zbiorze to proponowanie nowych pomysłów na podstawie znanych preferencji (59.1%).
+- **ICM i Hindsight remisują na LoCoMo.** Każdy z trzech przebiegów ICM (92.9%, 93.1%, 92.9%) jest o około 1 punkt powyżej opublikowanego wyniku Hindsight 92.0%, co daje różnicę około 14 pytań, w granicach błędu próbkowania (przedział 95% dla ICM: od 91.6 do 94.2). ICM osiąga to przy kontekście mniejszym o jedną trzecią i bez wywoływania LLM przy zapisie wspomnienia.
+- **Na PersonaMem prowadzi Hindsight**, o 4.9 punktu, poza granicami błędu próbkowania (przedział 95% dla ICM: od 78.6 do 84.8). ICM jest też o 2.7 punktu poniżej bazowego wyszukiwania hybrydowego, w granicach tego przedziału, czytając o jedną trzecią mniej kontekstu niż ono. Wyniki trzech przebiegów mieszczą się w zakresie od 80.1% do 82.5%.
 - **Warunki nie są identyczne.** Zestaw testowy utrzymuje Vectorize, dostawca Hindsight. Opublikowane wyniki LoCoMo pochodzą sprzed zmiany, która ustawiła temperaturę modelu odpowiadającego i oceniającego na 0; nasz przebieg używa obecnej wersji zestawu (commit `f618ed7`) i Vertex AI.
 - **Przy 50 fragmentach zwracana jest duża część każdej rozmowy,** więc ta dokładność mierzy także model odpowiadający. Dowodem dotyczącym samego silnika przywoływania jest tabela wyszukiwania.
-- **Na razie jeden przebieg na zbiór danych.** Powyższe przedziały 95% obejmują losowanie pytań, a nie zmienność między kolejnymi przebiegami.
+- **Trzy przebiegi na zbiór danych.** Wyniki modelu odpowiadającego różnią się między przebiegami: 0.2 punktu na LoCoMo, 2.4 punktu na PersonaMem. Powyższe przedziały obejmują losowanie pytań.
 
 <details>
 <summary>Wyniki według kategorii, opóźnienia i dalsze zastrzeżenia</summary>
 
-- **Według typu pytania** (LoCoMo, etykiety zestawu testowego): open-domain 96.7% (813 / 841), temporal 91.0% (292 / 321), single-hop 89.0% (251 / 282), multi-hop 76.0% (73 / 96).
-- **Opóźnienie.** Mediana opóźnienia przywołania wyniosła 141 ms na chmurowej maszynie wirtualnej z 4 vCPU podczas powyższego przebiegu; 272 sesje wczytano bez żadnego wywołania LLM. W przebiegach samego wyszukiwania na Linux x86-64: mediana 136 ms z embeddingami, 6.8 ms tylko ze słowami kluczowymi.
+- **Według typu pytania** (LoCoMo, etykiety zestawu testowego, trzy przebiegi): open-domain 96.7% (841 pytań), temporal 90.9% (321), single-hop 88.8% (282), multi-hop 78.8% (96).
+- **Opóźnienie.** Mediana opóźnienia przywołania wyniosła od 137 do 149 ms na węzłach klastra z 4 vCPU podczas przebiegów LoCoMo; 272 sesje wczytano bez żadnego wywołania LLM. W przebiegach samego wyszukiwania na Linux x86-64: mediana 136 ms z embeddingami, 6.8 ms tylko ze słowami kluczowymi.
 - **Daty sesji.** Adapter benchmarku zapisuje datę każdej sesji w tekście wspomnienia ICM; Hindsight otrzymuje te same daty jako metadane, a każdy system dostaje datę pytania.
-- **Najsłabsza kategoria to 96 pytań, które zestaw testowy oznacza jako multi-hop** (76.0%). Nazwy kategorii nie pokrywają się między benchmarkami: inne ewaluacje LoCoMo nazywają tę kategorię open-domain, a jako multi-hop określają 282 pytania, które zestaw testowy oznacza jako single-hop (tutaj 89.0%). Porównuj według liczby pytań, nie według etykiety.
+- **Najsłabsza kategoria to 96 pytań, które zestaw testowy oznacza jako multi-hop** (78.8%). Nazwy kategorii nie pokrywają się między benchmarkami: inne ewaluacje LoCoMo nazywają tę kategorię open-domain, a jako multi-hop określają 282 pytania, które zestaw testowy oznacza jako single-hop (tutaj 88.8%). Porównuj według liczby pytań, nie według etykiety.
 - **Silnik przywoływania v2 jest domyślny** dla `icm recall`, narzędzia MCP `icm_memory_recall`, HTTP `/recall` i hooka promptu. Poprzedni silnik pozostaje dostępny, aby do niego wrócić lub porównać wyniki: `icm recall --engine legacy`, `"engine": "legacy"` w HTTP `/recall` albo `ICM_RECALL_ENGINE=legacy`.
 
 </details>
 
-Wyniki dla poszczególnych pytań z obu zbiorów danych są w [`bench/amb/results/`](bench/amb/results/); adapter, dokładne ustawienia i polecenia do odtworzenia wyników są w [`bench/amb/README.md`](bench/amb/README.md).
+Wyniki dla poszczególnych pytań z każdego przebiegu (trzech na zbiór danych oraz przebiegu przywoływania na LongMemEval-S) są w [`bench/amb/results/`](bench/amb/results/); adapter, dokładne ustawienia i polecenia do odtworzenia wyników są w [`bench/amb/README.md`](bench/amb/README.md).
 
 <a id="one-memory-for-every-tool"></a>
 ## Jedna pamięć dla wszystkich narzędzi

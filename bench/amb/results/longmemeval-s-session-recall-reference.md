@@ -1,7 +1,16 @@
 # LongMemEval-S, session recall without any model: reference points (2026-10-05)
 
-No ICM figure here yet: this page holds the floor (BM25) and the two published
-figures re-scored with our scorer, so an ICM run can be read against them.
+This page holds the floor (BM25), the two published figures re-scored with our
+scorer, and ICM's run on the same unit and with the same scorer.
+
+ICM, measured on 2026-10-06 at commit b49db9b (recall code identical to 0.11.0),
+engine v2 with its default embedding model, unit session-user, no date sent
+(`ICM_AMB_STORE_DATE=0`, `ICM_AMB_QUERY_NOW=0`), per-question results in
+`longmemeval-s-icm-v2-session-user-nodate-20261006.json`:
+
+| unit | any@1 | any@3 | any@5 | any@10 | all@5 | all@10 |
+|---|---|---|---|---|---|---|
+| session-user | 89.4 | 96.2 | 97.4 (487/500) | 98.6 | 88.6 (443/500) | 94.8 |
 
 All rows: 500 questions of `longmemeval_s_cleaned.json` (abstention questions
 included), one index per question, expected sessions = `answer_session_ids`,

@@ -15,10 +15,11 @@
 
 Tell Claude Code how your project handles auth on Monday, and Tuesday's Gemini CLI session already knows it. ICM keeps what your coding agents learn (decisions, fixes, conventions, preferences) in one SQLite file on your machine, and gives the relevant part back at the start of each session and with each prompt you send. Up to 18 agents and editors share that memory, so you stop re-explaining your project every time you open a session or switch tools.
 
-- **92.8% on LoCoMo (1,540 questions), level with Hindsight (92.0%)**, with a third less context per question. [Details and caveats below](#benchmark-comparison).
+- **92.9% on LoCoMo (1,540 questions, mean of three runs), level with Hindsight (92.0%)**, with a third less context per question. [Details and caveats below](#benchmark-comparison).
 - **No LLM call to store or recall.** Hindsight, Mem0, Graphiti (Zep) and claude-mem call an LLM for every memory they store by default. ICM does not. Only its automatic extraction of facts from tool output goes through the LLM command-line tool you already use, when one is installed; `provider = "none"` keeps that local too (see [Quickstart](#quickstart)).
 - **Useful without an embedding model.** Keyword recall alone puts at least one of the right sessions in the top 5 for 88.6% of LoCoMo questions, with a median of 6.8 ms per recall on Linux x86-64.
-- **Not ahead everywhere.** On PersonaMem (a user's evolving preferences), Hindsight leads: 86.6% against ICM's 82.9%.
+- **97.4% on LongMemEval-S, retrieval with no LLM**: one of the right sessions in the top 5 for 487 of 500 questions, against 96.6% for MemPalace and 95.2% for agentmemory on the same measure.
+- **Not ahead everywhere.** On PersonaMem (a user's evolving preferences), Hindsight leads: 86.6% against ICM's 81.7%.
 
 <p align="center">
   <img src="assets/demo.svg" alt="Terminal: three memories stored with icm store, then two questions answered by icm recall, each returning the right memory">
@@ -54,7 +55,7 @@ Answer accuracy on [LoCoMo](https://github.com/snap-research/locomo) (10 long co
 
 | System | LoCoMo accuracy | Context per question | LLM calls to store a memory | Runs as | Result |
 |--------|:---------------:|:--------------------:|:---------------------------:|---------|--------|
-| **ICM** 0.10.65 (recall engine v2) | **92.8%** (1,429 / 1,540) | 24.1k tokens | none | one Rust binary, SQLite file | our run, 2026-10-05 |
+| **ICM** 0.11.0 (recall engine v2) | **92.9%** (1,430, 1,433 and 1,430 / 1,540 in three runs) | 24.1k tokens | none | one Rust binary, SQLite file | our runs, 2026-10-06 |
 | Hindsight | 92.0% (1,417 / 1,540) | 36.2k tokens | LLM fact extraction | Python service, PostgreSQL + pgvector | published by the harness |
 | Hybrid search baseline (dense + sparse, RRF) | 79.1% (1,218 / 1,540) | 22.2k tokens | none | Qdrant | published by the harness |
 
@@ -62,7 +63,7 @@ On [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 multiple-choice quest
 
 | System | PersonaMem accuracy | Context per question | Result |
 |--------|:-------------------:|:--------------------:|--------|
-| **ICM** 0.10.65 (recall engine v2) | **82.9%** (488 / 589) | 16.2k tokens | our run, 2026-10-05 |
+| **ICM** 0.11.0 (recall engine v2) | **81.7%** (486, 486 and 472 / 589 in three runs) | 16.2k tokens | our runs, 2026-10-06 |
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | published by the harness |
 | Hybrid search baseline | 84.4% (497 / 589) | 24.2k tokens | published by the harness |
 
@@ -74,26 +75,35 @@ Retrieval alone, on LoCoMo, with no answering model: the share of questions for 
 | 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
 | 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
 
+LongMemEval-S, retrieval only, with no LLM (ICM with its default embedding model; 500 questions; each question comes with about 48 past sessions to search; one memory per session, user turns only, as MemPalace indexes them; no date given to ICM):
+
+| Right sessions in the top 5 | **ICM** 0.11.0 | MemPalace | agentmemory | BM25 alone |
+|---|:---:|:---:|:---:|:---:|
+| At least one (the published measure) | **97.4%** (487 / 500) | 96.6% (483 / 500) | 95.2% (476 / 500) | 94.6% |
+| All of them | **88.6%** (443 / 500) | 85.0% | 81.8% | 81.2% |
+
+MemPalace and agentmemory figures are recomputed with our scorer from the result files each project publishes; they match their published numbers. agentmemory indexes all turns of a session; on that unit BM25 alone reaches 96.2% and 83.0%. A plain BM25 already scores in the mid-nineties on the first measure, which is why the second one, all the right sessions, separates the systems better.
+
 What these numbers do and do not show:
 
-- **ICM and Hindsight are tied on LoCoMo.** The 0.8-point gap is 12 questions, inside the sampling error (95% interval for ICM: 91.5 to 94.1). ICM gets there with a third less context and without calling an LLM when a memory is stored.
-- **On PersonaMem, Hindsight is ahead** by 3.7 points; ICM is level with the hybrid search baseline (95% interval for ICM: 79.8 to 85.9) while reading a third less context than it. ICM's weakest category there is suggesting new ideas from known preferences (59.1%).
+- **ICM and Hindsight are tied on LoCoMo.** ICM's three runs (92.9%, 93.1%, 92.9%) are each about 1 point above Hindsight's published 92.0%, a gap of about 14 questions, inside the sampling error (95% interval for ICM: 91.6 to 94.2). ICM gets there with a third less context and without calling an LLM when a memory is stored.
+- **On PersonaMem, Hindsight is ahead** by 4.9 points, outside the sampling error (95% interval for ICM: 78.6 to 84.8). ICM is also 2.7 points below the hybrid search baseline, inside that interval, while reading a third less context than it. The three runs spread from 80.1% to 82.5%.
 - **Not identical conditions.** The harness is maintained by Vectorize, the vendor of Hindsight. The published LoCoMo results predate a change that set the answer and judge temperature to 0; our run uses the current harness (commit `f618ed7`) and Vertex AI.
 - **At 50 chunks, much of each conversation is returned,** so this accuracy also measures the answering model. The retrieval table is the evidence for the recall engine itself.
-- **One run per dataset so far.** The 95% intervals above cover the sampling of questions, not the variation from one run to the next.
+- **Three runs per dataset.** The answering model varies from run to run: 0.2 points on LoCoMo, 2.4 points on PersonaMem. The intervals above cover the sampling of questions.
 
 <details>
 <summary>Per-category results, latency and further caveats</summary>
 
-- **By question type** (LoCoMo, harness labels): open-domain 96.7% (813 / 841), temporal 91.0% (292 / 321), single-hop 89.0% (251 / 282), multi-hop 76.0% (73 / 96).
-- **Latency.** Median recall latency 141 ms on a 4-vCPU cloud VM during the run above; 272 sessions ingested with no LLM call. In the retrieval-only runs on Linux x86-64: median 136 ms with embeddings, 6.8 ms keyword-only.
+- **By question type** (LoCoMo, harness labels, three runs): open-domain 96.7% (841 questions), temporal 90.9% (321), single-hop 88.8% (282), multi-hop 78.8% (96).
+- **Latency.** Median recall latency 137 to 149 ms on the cluster's 4-vCPU nodes during the LoCoMo runs; 272 sessions ingested with no LLM call. In the retrieval-only runs on Linux x86-64: median 136 ms with embeddings, 6.8 ms keyword-only.
 - **Session dates.** The benchmark adapter writes each session's date into ICM's memory text; Hindsight receives the same dates as metadata, and every system gets the date of the question.
-- **The weakest category is the 96 questions the harness labels multi-hop** (76.0%). Category names do not line up across benchmarks: other LoCoMo evaluations call this category open-domain, and call multi-hop the 282 questions the harness labels single-hop (89.0% here). Compare by question count, not by label.
+- **The weakest category is the 96 questions the harness labels multi-hop** (78.8%). Category names do not line up across benchmarks: other LoCoMo evaluations call this category open-domain, and call multi-hop the 282 questions the harness labels single-hop (88.8% here). Compare by question count, not by label.
 - **Recall engine v2 is the default** for `icm recall`, the MCP `icm_memory_recall` tool, HTTP `/recall` and the prompt hook. The previous engine stays available to roll back or to compare: `icm recall --engine legacy`, `"engine": "legacy"` on HTTP `/recall`, or `ICM_RECALL_ENGINE=legacy`.
 
 </details>
 
-Per-question results for both datasets are in [`bench/amb/results/`](bench/amb/results/); the adapter, the exact settings and the commands to reproduce are in [`bench/amb/README.md`](bench/amb/README.md).
+Per-question results for every run (three per dataset, plus the LongMemEval-S recall run) are in [`bench/amb/results/`](bench/amb/results/); the adapter, the exact settings and the commands to reproduce are in [`bench/amb/README.md`](bench/amb/README.md).
 
 ## One memory for every tool
 

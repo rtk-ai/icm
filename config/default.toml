@@ -63,7 +63,9 @@ prune_threshold = 0.1
 # Set to false to disable embeddings entirely (no model download, keyword search only)
 # enabled = false
 
-# Embedding model (fastembed model_code). Default: multilingual-e5-small (384d, 100+ languages)
+# Embedding model (fastembed model_code). Default when unset: Qdrant/multilingual-e5-large-onnx (1024d, 100+ languages).
+# The model that produced the stored vectors is recorded in the database and wins over this
+# setting; switch with `icm embed --migrate`.
 # Other options:
 #   "BAAI/bge-small-en-v1.5"              — 384d, English-only (fastest)
 #   "Xenova/bge-small-en-v1.5"            — 384d, quantized English-only
@@ -71,7 +73,7 @@ prune_threshold = 0.1
 #   "intfloat/multilingual-e5-large"      — 1024d, multilingual (best accuracy, largest)
 #   "Xenova/all-MiniLM-L12-v2"            — 384d, English
 #   "jinaai/jina-embeddings-v2-base-code" — 768d, code-optimized
-model = "intfloat/multilingual-e5-base"
+# model = "intfloat/multilingual-e5-base"
 
 [extraction]
 # Layer 0: rule-based fact extraction (zero LLM cost)

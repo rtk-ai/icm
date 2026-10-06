@@ -69,7 +69,7 @@ pub struct UninstallOpts {
     /// Override the backup root. Defaults to
     /// `<icm-data-dir>/uninstall-backups/<ts>/` (resolved by
     /// `directories::ProjectDirs` so the location follows each OS:
-    /// `~/.local/share/icm/` on Linux/WSL, `~/Library/Application Support/icm/`
+    /// `~/.local/share/icm/` on Linux/WSL, `~/Library/Application Support/dev.icm.icm/`
     /// on macOS, `%APPDATA%\icm\icm\data\` on Windows).
     #[arg(long, value_name = "PATH")]
     pub backup_dir: Option<PathBuf>,

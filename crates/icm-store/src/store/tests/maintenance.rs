@@ -444,3 +444,75 @@ fn claim_backup_slot_epoch_reset_allows_immediate_retry() {
 }
 
 // === MemoryStore tests ===
+
+/// Reported failure: with several agent sessions on one database, reads
+/// hung or failed behind another process's write. The side-writes of the
+/// read path (backup slot, daily decay, access counters) must not wait for
+/// the write lock when there is nothing to do, and must give up quickly
+/// when there is.
+#[test]
+fn read_path_bookkeeping_does_not_wait_for_a_writer() {
+    use rusqlite::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("busy.db");
+    let store = SqliteStore::with_dims(&path, 64).unwrap();
+    let id = store
+        .store(make_memory("t", "bookkeeping under contention"))
+        .unwrap();
+    // Both slots are claimed once, so neither is due any more.
+    assert!(store.claim_backup_slot(7).unwrap());
+    store.maybe_auto_decay().unwrap();
+
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO icm_metadata (key, value) VALUES ('held', 'by-writer');",
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    // Not due: answered from a read, no write lock needed.
+    assert!(!store.claim_backup_slot(7).unwrap());
+    store.maybe_auto_decay().unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "not-due slot checks waited {:?} behind a writer",
+        started.elapsed()
+    );
+
+    // A real write on the read path gives up after the short timeout
+    // instead of the 30s one; callers treat it as best-effort.
+    let started = std::time::Instant::now();
+    let bumped = store.batch_update_access(&[id.as_str()]);
+    assert!(bumped.is_err(), "the writer still holds the lock");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "access bookkeeping waited {:?} behind a writer",
+        started.elapsed()
+    );
+
+    // Hook telemetry and the hook counter run in every hook: same rule.
+    let started = std::time::Instant::now();
+    let event = HookEventInsert {
+        event: "prompt".to_string(),
+        project: None,
+        session_id: None,
+        tool_name: None,
+        duration_ms: Some(1),
+        exit_code: 0,
+        payload_size: None,
+        note: None,
+    };
+    assert!(store.record_hook_event(&event).is_err());
+    assert!(store.increment_hook_counter().is_err());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "hook bookkeeping waited {:?} behind a writer",
+        started.elapsed()
+    );
+
+    writer.execute_batch("ROLLBACK;").unwrap();
+    // Lock released: bookkeeping works again, at the normal timeout.
+    assert_eq!(store.batch_update_access(&[id.as_str()]).unwrap(), 1);
+}

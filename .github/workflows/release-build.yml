@@ -1,0 +1,337 @@
+name: Release build
+
+# Builds every release artifact, proves each one starts, and assembles the
+# exact asset set a release must carry. It publishes nothing and asks for no
+# write permission, so it runs unchanged for a real release (release.yml) and
+# for a dry run on a pull request or by hand (release-check.yml).
+#
+# What each artifact must be able to do is declared in one place:
+# scripts/release-check.sh (the `manifest` function). A target added to the
+# matrix below without a line there fails the "Verify asset set" job, and so
+# does a line there that no job produces.
+#
+# Why three of the builds below do not link ONNX Runtime statically any more
+# (release 0.10.64 and 0.10.65 lost four artifacts to this): fastembed 6
+# pulls ort 2.0.0-rc.13, whose prebuilt ONNX Runtime
+#   - does not exist for x86_64-apple-darwin
+#     ("no prebuilt binaries available for target x86_64-apple-darwin");
+#   - needs glibc >= 2.38 and a GCC 13 libstdc++ on Linux
+#     ("undefined symbol: __isoc23_strtol", "_M_replace_cold",
+#     "__cxa_call_terminate"), which the glibc 2.35 runner cannot link.
+# Raising the Linux baseline is not an option for the gnu archives: every
+# installed `icm upgrade` downloads icm-<arch>-unknown-linux-gnu.tar.gz and
+# swaps it in without trying it first, so a build that needs a newer glibc
+# would brick installs on Debian 12 / Ubuntu 22.04 (issue #330). Those
+# targets therefore use the `embeddings-dynamic` feature: same embedding
+# code, ONNX Runtime loaded at run time (`icm embeddings download` fetches
+# Microsoft's build, which only needs glibc 2.28).
+# The price: on those builds semantic search is off until the user acts, and
+# an update from 0.10.63 or older takes it away. Users are told in three
+# places, each checked by scripts/release-check.sh: install.sh warns, the
+# .deb prints a note when installed, release.yml heads the release notes
+# with the per-file table.
+
+on:
+  workflow_call:
+    inputs:
+      expected_version:
+        description: When set (e.g. 0.10.66), every binary must report exactly this version
+        required: false
+        default: ''
+        type: string
+      semantic_check:
+        description: >-
+          Also store a memory and find it again by meaning alone with every
+          build that carries or can fetch ONNX Runtime. Downloads an embedding
+          model from Hugging Face, so the pull-request check turns it on and
+          the release itself leaves it off.
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      version:
+        description: Version reported by the built binaries
+        value: ${{ jobs.assemble.outputs.version }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_CHECK_SEMANTIC: ${{ inputs.semantic_check && '1' || '0' }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static ONNX Runtime: semantic search works as shipped.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          # Intel Mac: built natively so the binary can be started here.
+          # No ONNX Runtime >= 1.24 is published for this platform, neither
+          # by ort nor by Microsoft, so this archive is keyword-only unless
+          # the user points ORT_DYLIB_PATH at a libonnxruntime.dylib.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar.gz
+            flags: --no-default-features --features embeddings-dynamic,tui,http-api,backend-sqlite,postgres,opensearch
+          # glibc 2.35 baseline (Debian 12, Ubuntu 22.04; issue #330).
+          # Semantic search after a one-time `icm embeddings download`.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+            flags: --no-default-features --features embeddings-dynamic,tui,http-api,backend-sqlite,postgres,opensearch
+          # Same, built natively on arm64 (no cross toolchain) so the binary
+          # can be started here. vendored-openssl as before: this archive has
+          # never depended on the system libssl.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            archive: tar.gz
+            flags: --no-default-features --features embeddings-dynamic,tui,http-api,backend-sqlite,postgres,opensearch,vendored-openssl
+          # Fully-static musl binary for old-glibc and musl distros
+          # (issue #330). Keyword search only: there is no ONNX Runtime for
+          # musl, static or loadable.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            flags: --no-default-features --features backend-sqlite,tui,http-api
+          # Static ONNX Runtime.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        # Target-specific, so a no-op for non-musl targets: sqlite-vec.c uses
+        # BSD type names (u_int8_t/…) that glibc provides but musl does not.
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
+        run: cargo build --release --target ${{ matrix.target }} -p icm-cli ${{ matrix.flags }}
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../icm-${{ matrix.target }}.${{ matrix.archive }} icm
+          cd ../../..
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/icm.exe" -DestinationPath "icm-${{ matrix.target }}.zip"
+
+      - name: Smoke-test the packaged binary
+        # Unpacks the archive that will be published, runs `icm --version`
+        # and checks the embeddings capability and glibc baseline declared
+        # for it in scripts/release-check.sh. With `semantic_check`, also
+        # proves this binary embeds and searches by meaning.
+        shell: bash
+        env:
+          ARTIFACT: icm-${{ matrix.target }}.${{ matrix.archive }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: sh scripts/release-check.sh smoke "$ARTIFACT" "$EXPECTED_VERSION"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: icm-${{ matrix.target }}
+          path: icm-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  build-deb:
+    name: Build .deb
+    # glibc 2.35 so the package installs on Debian 12 / Ubuntu 22.04 (#330).
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build binary
+        # Same feature set as the x86_64-unknown-linux-gnu archive.
+        run: cargo build --release -p icm-cli --no-default-features --features embeddings-dynamic,tui,http-api,backend-sqlite,postgres,opensearch
+
+      - name: Build .deb
+        run: cargo deb -p icm-cli --no-build
+
+      - name: Add the install note about semantic search
+        # This package does not carry ONNX Runtime, and apt runs no icm
+        # command for the user: the package itself says what to do, each
+        # time it is installed or upgraded. It cannot fetch the runtime
+        # instead, which lives in each user's data directory. The smoke test
+        # below refuses a .deb of this kind without the note.
+        run: |
+          set -euo pipefail
+          set -- target/debian/*.deb
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected exactly one .deb in target/debian, got: $*"
+            exit 1
+          fi
+          deb=$1
+          dpkg-deb -R "$deb" deb-root
+          if [ -e deb-root/DEBIAN/postinst ]; then
+            echo "::error::the package already has a postinst; add the note to it instead of replacing it"
+            exit 1
+          fi
+          cat > deb-root/DEBIAN/postinst <<'POSTINST'
+          #!/bin/sh
+          set -e
+          if [ "$1" = "configure" ]; then
+              echo "icm: this package does not bundle the ONNX Runtime that semantic"
+              echo "icm: (vector) search needs. Each user enables it once with:"
+              echo "icm:     icm embeddings download"
+              echo "icm: Until then icm uses keyword search only, also as an MCP server"
+              echo "icm: and from hooks. Check with: icm embeddings status"
+          fi
+          exit 0
+          POSTINST
+          chmod 0755 deb-root/DEBIAN/postinst
+          dpkg-deb --root-owner-group -Zxz -b deb-root "$deb"
+          rm -rf deb-root
+          dpkg-deb -I "$deb"
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p deb-out
+          cp target/debian/*.deb deb-out/
+          # Create version-agnostic name
+          cp target/debian/*.deb deb-out/icm_amd64.deb
+          dpkg-deb -f deb-out/icm_amd64.deb Package Version Architecture Depends
+
+      - name: Smoke-test the packaged binary
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: sh scripts/release-check.sh smoke deb-out/icm_amd64.deb "$EXPECTED_VERSION"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: icm-deb
+          path: deb-out/*.deb
+          if-no-files-found: error
+
+  build-rpm:
+    name: Build .rpm
+    # Static ONNX Runtime, linked against Fedora's current glibc: this
+    # package targets current Fedora, not RHEL 9 and derivatives.
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install dependencies
+        run: dnf install -y git rust cargo rpm-build openssl-devel pkg-config perl-FindBin perl-File-Compare gcc-c++ cpio
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Build release
+        run: cargo build --release -p icm-cli
+
+      - name: Generate .rpm
+        run: cargo generate-rpm -p crates/icm-cli
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p rpm-out
+          cp target/generate-rpm/*.rpm rpm-out/
+          # Create version-agnostic name
+          VERSION=$(grep '^version' crates/icm-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          cp target/generate-rpm/*.rpm "rpm-out/icm-${VERSION}-1.x86_64.rpm"
+          cp target/generate-rpm/*.rpm rpm-out/icm.x86_64.rpm
+
+      - name: Smoke-test the packaged binary
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: sh scripts/release-check.sh smoke rpm-out/icm.x86_64.rpm "$EXPECTED_VERSION"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: icm-rpm
+          path: rpm-out/*.rpm
+          if-no-files-found: error
+
+  assemble:
+    name: Verify asset set
+    # Skipped, and with it everything downstream, as soon as one build fails.
+    needs: [build, build-deb, build-rpm]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: icm-*
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -l release
+
+      - name: Read the version the binaries report
+        id: version
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          version=$(sh scripts/release-check.sh version release/icm-x86_64-unknown-linux-musl.tar.gz)
+          echo "Binaries report version $version"
+          if [ -n "$EXPECTED_VERSION" ] && [ "$version" != "$EXPECTED_VERSION" ]; then
+            echo "::error::binaries report $version but the release is $EXPECTED_VERSION"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check the asset set and write checksums.txt
+        # Fails if an expected asset is missing or empty, or if a file shows
+        # up that the manifest does not know.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sh scripts/release-check.sh assemble release "$VERSION"
+          sh scripts/release-check.sh verify release "$VERSION"
+          {
+            echo "### Release bundle (version $VERSION)"
+            echo '```'
+            cat release/checksums.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release/*
+          if-no-files-found: error

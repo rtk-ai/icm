@@ -308,7 +308,15 @@ Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
 Do NOT store: trivial details, information already in CLAUDE.md, ephemeral state.\n\
 \n\
-Importance levels: critical (never forgotten), high (slow decay), medium (normal), low (fast decay).";
+Importance levels: critical (never forgotten), high (slow decay), medium (normal), low (fast decay).\n\
+\n\
+MEMOIR (icm_memoir_create / icm_memoir_add_concept / icm_memoir_refine): a separate, permanent \
+knowledge layer — unlike memory_store, concepts here never decay or get pruned. Reach for it, not \
+memory_store, for durable foundational knowledge a project will keep relying on indefinitely: \
+canonical architecture decisions, stable domain/API definitions, core conventions — not day-to-day \
+context, which belongs in memory_store and is expected to fade. Create one memoir per project, then \
+icm_memoir_add_concept as durable facts emerge; use icm_memoir_refine to update an existing concept \
+rather than adding a duplicate.";
 
 /// `ListToolsResult` needs the same `CacheableResult` envelope as
 /// `server/discover` (issue #432: "cacheable list results carry the

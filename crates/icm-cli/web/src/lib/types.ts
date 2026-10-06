@@ -54,3 +54,27 @@ export interface ActionResult {
 	ok: boolean;
 	message: string;
 }
+
+export interface GraphNode {
+	id: string;
+	topic: string;
+	importance: string;
+	weight: number;
+	summary: string;
+	/** Server-computed layout position — see graph_layout::compute_force_layout_3d. */
+	x: number;
+	y: number;
+	z: number;
+}
+
+export interface GraphEdge {
+	source: string;
+	target: string;
+	/** Cosine similarity between the two memories' embeddings, 0-1. */
+	similarity: number;
+}
+
+export interface GraphResponse {
+	nodes: GraphNode[];
+	edges: GraphEdge[];
+}

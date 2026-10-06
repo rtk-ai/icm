@@ -48,6 +48,17 @@ decay_rate = 0.95
 # Weight threshold for automatic pruning
 prune_threshold = 0.1
 
+# Automatic consolidation of a topic once it holds more than
+# `auto_consolidate_threshold` memories. Off by default.
+#
+# WARNING — this loses content. Without an LLM summarizer
+# ([consolidate.summarizer] provider = "none", the default), the rollup keeps
+# only the summaries of the 3 heaviest memories of the topic and deletes the
+# other non-critical ones it read. With a summarizer provider configured,
+# the topic is queued for an LLM summary instead (`icm consolidate-pending`).
+# auto_consolidate_enabled = false
+# auto_consolidate_threshold = 10
+
 [embeddings]
 # Set to false to disable embeddings entirely (no model download, keyword search only)
 # enabled = false
@@ -82,6 +93,58 @@ extract_every = 3
 # rule-based extractor produces no facts. Useful as a coarse safety
 # net; set to `false` if you only want signal-rich extractions.
 store_raw = true
+
+# LLM summarizer used by the async extraction queue (`icm extract-pending`).
+# Same keys as [consolidate.summarizer] below. Default provider: "auto".
+# [extraction.summarizer]
+# provider = "auto"
+
+# LLM summarizer used by `icm consolidate` / `consolidate-all` / `briefing`.
+# [consolidate.summarizer]
+#
+# provider:
+#   "none"                          — no LLM, lexical join (default)
+#   "auto"                          — detect the invoking tool's CLI; never
+#                                     picks an API-key provider
+#   "claude" | "codex" | "gemini"   — the CLI you are logged into (no key)
+#   "ollama"                        — local Ollama daemon (model required)
+#   "anthropic" | "openai" | "google" — the vendor API, with a key read from
+#                                     the environment. The text being
+#                                     summarized (for [extraction.summarizer]:
+#                                     raw tool output) goes to that vendor
+#                                     under its data terms — a free-tier
+#                                     Gemini key lets Google use and review
+#                                     it (https://ai.google.dev/gemini-api/terms).
+# provider = "none"
+#
+# Empty = the provider's current low-cost model (claude-haiku-4-5,
+# gpt-6-luna, gemini-3.5-flash-lite, …).
+# model = ""
+#
+# Approximate token budget for the summary, and per-call timeout (retries
+# on 429 / 5xx included).
+# max_tokens = 400
+# timeout_secs = 60
+#
+# API-key providers only. `api_key_env` is the NAME of the environment
+# variable holding the key — never the key itself, which does not belong in
+# this file. Empty = ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY on
+# the vendor's own host, and no key at all for any other base_url.
+# api_key_env = ""
+#
+# API-key providers only: endpoint override. With provider = "openai" this
+# reaches any OpenAI-compatible server (OpenRouter, Mistral, Groq, vLLM,
+# LM Studio, …); `model` is then required, and a key is sent only if
+# `api_key_env` is set. OpenAI's regional endpoints
+# (https://eu.api.openai.com/v1, …) count as OpenAI. Write it as
+# scheme://host[:port]/path, without query string. Use https:// — plain
+# http:// is refused for vendor hosts and flagged by `icm config` for any
+# host that is not loopback.
+# base_url = ""
+#
+# provider = "anthropic" only: required by an API key that is not scoped to
+# a single workspace.
+# workspace_id = ""
 
 [recall]
 # Layer 2: context injection before sessions

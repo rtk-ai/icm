@@ -246,6 +246,30 @@ On startup, the schema is checked and migrated if needed:
 
 ### Search Pipeline
 
+Recall runs on the v2 engine by default (`icm_store::recall`), shared by `icm recall`, the MCP `icm_memory_recall` tool, HTTP `/recall` and the prompt hook (`recall-context`):
+
+```
+Query arrives
+    │
+    ├─ Lexical arm ──► FTS5 BM25, query words OR-joined
+    ├─ Vector arm ───► cosine KNN via sqlite-vec      (only with an embedder)
+    ├─ Temporal arm ─► candidates created in the time window the query
+    │                  names ("yesterday", "in March 2024")  (only if it names one)
+    │
+    │   each arm: 100 to 2000 candidates deep, project / topic / keyword
+    │   filters applied before the cut
+    │
+    ├─ Reciprocal Rank Fusion (k = 60) of the arms, on ranks, not scores
+    ├─ No arm matched? ──► substring (LIKE) search on the query words
+    ├─ Cut: by `limit`, or by token budget (`max_tokens`) measured on the
+    │       rendered output
+    └─ `related_ids` neighbors appended in the room left (CLI, MCP)
+```
+
+Without an embedder the lexical and temporal arms rank alone; the prompt hook always runs this way, read-only.
+
+The engine before v2 is still there, selected with `icm recall --engine legacy`, `"engine": "legacy"` on HTTP `/recall`, or `ICM_RECALL_ENGINE=legacy` (MCP, hook, and the default of the other two):
+
 ```
 Query arrives
     │
@@ -258,6 +282,8 @@ Query arrives
                           │
                           └─ No FTS results? ──► Keyword LIKE fallback
 ```
+
+It scores at most 40 candidates per query, applies filters after that cut, and has no token budget (`max_tokens` with `legacy` is an error).
 
 FTS queries are sanitized: special characters (`-`, `*`, `:`, etc.) are stripped and each token is quoted to prevent FTS5 syntax injection.
 
@@ -319,10 +345,10 @@ Client                              ICM Server
 | Tool | Required args | Optional args |
 |------|--------------|---------------|
 | `icm_memory_store` | `topic`, `content` | `importance`, `keywords[]`, `raw_excerpt` |
-| `icm_memory_recall` | `query` | `topic`, `keyword`, `limit` |
+| `icm_memory_recall` | `query` | `topic`, `keyword`, `project`, `limit`, `max_tokens` |
 | `icm_memory_update` | `id`, `content` | `importance`, `keywords[]` |
 | `icm_memory_forget` | `id` | — |
-| `icm_memory_consolidate` | `topic`, `summary` | — |
+| `icm_memory_consolidate` | `topic` | `summary`, `ids` (both needed to replace; without `ids` the tool lists the topic and replaces nothing) |
 | `icm_memory_list_topics` | — | — |
 | `icm_memory_stats` | — | — |
 | `icm_memory_health` | — | `topic` |

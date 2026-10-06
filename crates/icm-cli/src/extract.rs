@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use icm_core::{is_preference_topic, project_matches, Embedder, Importance, Memory, MemoryStore};
-use icm_store::Store;
+use icm_store::{RecallEngine, RecallRequest, Store};
 
 use crate::extract_semantic::{AnchorKind, SemanticScorer};
 
@@ -242,12 +242,116 @@ fn matched_token_count(tokens: &[String], mem: &Memory) -> usize {
 /// query as a soft scoring hint, which let high-FTS-score memories from
 /// other projects bleed into the recalled context. The hard filter here
 /// prevents cross-project leakage.
+///
+/// The candidates come from the default recall engine (v2), keyword-only:
+/// this runs on every prompt, so it never loads an embedding model and
+/// never writes. `ICM_RECALL_ENGINE=legacy` brings back the previous
+/// candidate search. The rendering is the same either way.
 pub fn recall_context(
     store: &Store,
     query: &str,
     project: Option<&str>,
     limit: usize,
 ) -> Result<String> {
+    // No explicit engine, no budget: `resolve` cannot fail here.
+    let engine = RecallEngine::resolve(None, false).unwrap_or(RecallEngine::V2);
+    recall_context_on(store, query, project, limit, engine)
+}
+
+/// [`recall_context`] on a given engine.
+fn recall_context_on(
+    store: &Store,
+    query: &str,
+    project: Option<&str>,
+    limit: usize,
+    engine: RecallEngine,
+) -> Result<String> {
+    let candidate = match engine {
+        RecallEngine::V2 => ranked_candidates(store, query, project, limit)?,
+        RecallEngine::Legacy => legacy_candidates(store, query, project, limit)?,
+    };
+    Ok(render_recall_context(candidate))
+}
+
+/// Candidates from the v2 pipeline, with the same three tiers as the
+/// legacy search (see [`legacy_candidates`]): hits inside the project,
+/// else hits anywhere, else preferences by weight.
+///
+/// No embedder (the lexical and temporal arms rank alone), no neighbor
+/// expansion, and the read-only run: a recall nobody asked for must not
+/// record an access on what it surfaces, nor wait on a write lock.
+fn ranked_candidates(
+    store: &Store,
+    query: &str,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let search = |project: Option<&str>| -> Result<Vec<Memory>> {
+        let request = RecallRequest {
+            query,
+            limit,
+            max_tokens: None,
+            topic: None,
+            keyword: None,
+            project,
+            now: None,
+            expand_neighbors: false,
+        };
+        // The injection is bounded in characters when rendered, not by a
+        // token budget: nothing to charge.
+        let outcome = request.run_read_only(store, None, &|_, _| 0)?;
+        Ok(outcome.hits.into_iter().map(|hit| hit.memory).collect())
+    };
+
+    if !query.trim().is_empty() {
+        let scoped = search(project)?;
+        if !scoped.is_empty() {
+            return Ok(scoped);
+        }
+        if matches!(project, Some(p) if !p.is_empty()) {
+            let anywhere = search(None)?;
+            if !anywhere.is_empty() {
+                return Ok(anywhere);
+            }
+        }
+    }
+    preferences_by_weight(store, limit)
+}
+
+/// Last tier of the recall context: preference / identity memories, the
+/// heaviest first.
+fn preferences_by_weight(store: &Store, limit: usize) -> Result<Vec<Memory>> {
+    let topics = store.list_topics()?;
+    let mut prefs: Vec<Memory> = Vec::new();
+    for (topic, _) in &topics {
+        if !is_preference_topic(topic) {
+            continue;
+        }
+        for mem in store.get_by_topic(topic)? {
+            prefs.push(mem);
+        }
+    }
+    prefs.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    prefs.truncate(limit);
+    Ok(prefs)
+}
+
+/// Candidates of the pre-v2 recall context (`ICM_RECALL_ENGINE=legacy`):
+/// AND-joined full-text search, then a keyword search when it finds
+/// nothing.
+fn legacy_candidates(
+    store: &Store,
+    query: &str,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Memory>> {
     let project_filter = |m: &Memory| -> bool {
         match project {
             None => true,
@@ -313,30 +417,19 @@ pub fn recall_context(
     //    too). Restricting the last-ditch fallback to preferences
     //    preserves that contract while killing the off-topic
     //    pollution.
-    let candidate: Vec<Memory> = if !project_filtered.is_empty() {
-        project_filtered
+    if !project_filtered.is_empty() {
+        Ok(project_filtered)
     } else if !fts_results.is_empty() {
-        fts_results.into_iter().take(limit).collect()
+        Ok(fts_results.into_iter().take(limit).collect())
     } else {
-        let topics = store.list_topics()?;
-        let mut prefs: Vec<Memory> = Vec::new();
-        for (topic, _) in &topics {
-            if !is_preference_topic(topic) {
-                continue;
-            }
-            for mem in store.get_by_topic(topic)? {
-                prefs.push(mem);
-            }
-        }
-        prefs.sort_by(|a, b| {
-            b.weight
-                .partial_cmp(&a.weight)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        prefs.truncate(limit);
-        prefs
-    };
+        preferences_by_weight(store, limit)
+    }
+}
 
+/// Render recall candidates, most relevant first, as the context preamble:
+/// near-paraphrases dropped, each memory and the whole block capped in
+/// characters. Empty when there is no candidate.
+fn render_recall_context(candidate: Vec<Memory>) -> String {
     // Audit #185 medium: deduplicate near-paraphrases before
     // rendering. Without this, storing 10 paraphrases of "Patrick
     // prefers Rust over Go" returns 5 near-identical bullets in
@@ -357,7 +450,7 @@ pub fn recall_context(
     }
 
     if relevant.is_empty() {
-        return Ok(String::new());
+        return String::new();
     }
 
     // Per-memory and aggregate caps to bound the injection size.
@@ -412,7 +505,7 @@ pub fn recall_context(
     }
     ctx.push_str("\n---\n\n");
 
-    Ok(ctx)
+    ctx
 }
 
 /// Public wrapper for CLI dry-run that uses the semantic scorer
@@ -1669,6 +1762,141 @@ mod tests {
         let stored =
             extract_and_store_with_opts(&store, text, "test", true, Importance::Critical).unwrap();
         assert_eq!(stored, 1, "should store raw text as fallback");
+    }
+
+    // --- recall_context on the default (v2) engine and on legacy ---------
+
+    fn remember(store: &Store, topic: &str, summary: &str) -> String {
+        store
+            .store(Memory::new(
+                topic.into(),
+                summary.into(),
+                Importance::Medium,
+            ))
+            .unwrap()
+    }
+
+    /// v2 ranks by how well a memory matches; the legacy full-text search
+    /// needed every query word and dropped the partial match.
+    #[test]
+    fn test_recall_context_v2_ranks_partial_matches() {
+        let store = Store::in_memory().unwrap();
+        remember(&store, "notes", "kiwi harvest dates");
+        remember(&store, "notes", "unrelated note about build caches");
+        remember(&store, "notes", "kiwi mango papaya salad recipe");
+
+        let v2 = recall_context_on(&store, "kiwi mango papaya", None, 5, RecallEngine::V2).unwrap();
+        let best = v2.find("- kiwi mango papaya salad recipe\n").unwrap();
+        let partial = v2.find("- kiwi harvest dates\n").unwrap();
+        assert!(best < partial, "{v2}");
+        assert!(!v2.contains("build caches"));
+
+        let legacy =
+            recall_context_on(&store, "kiwi mango papaya", None, 5, RecallEngine::Legacy).unwrap();
+        assert!(legacy.contains("- kiwi mango papaya salad recipe\n"));
+        assert!(!legacy.contains("kiwi harvest dates"), "{legacy}");
+    }
+
+    /// Same preamble, same bullets, same trailer on both engines.
+    #[test]
+    fn test_recall_context_format_is_the_same_on_both_engines() {
+        let store = Store::in_memory().unwrap();
+        remember(
+            &store,
+            "decisions-app",
+            "Use SQLite for the cache\nsecond line",
+        );
+        let long = format!("cache eviction {}", "x".repeat(600));
+        remember(&store, "decisions-app", &long);
+
+        let v2 = recall_context_on(&store, "cache", None, 5, RecallEngine::V2).unwrap();
+        let legacy = recall_context_on(&store, "cache", None, 5, RecallEngine::Legacy).unwrap();
+        let sorted = |ctx: &str| {
+            let mut lines: Vec<String> = ctx.lines().map(String::from).collect();
+            lines.sort();
+            lines
+        };
+        // The two engines may order the bullets differently; nothing else
+        // differs.
+        assert_eq!(sorted(&v2), sorted(&legacy));
+        assert!(v2.starts_with("Here is context recalled from ICM's memory store"));
+        assert!(v2.ends_with("\n---\n\n"));
+        assert!(v2.contains("- Use SQLite for the cache second line\n"));
+        assert!(v2.contains(" […]\n"), "per-memory cap must still apply");
+    }
+
+    /// The hook runs on every prompt: it must not record an access on what
+    /// it surfaces, nor run the decay.
+    #[test]
+    fn test_recall_context_v2_writes_nothing() {
+        let store = Store::in_memory().unwrap();
+        let id = remember(&store, "notes", "deploy checklist for the api");
+
+        let ctx = recall_context_on(&store, "deploy checklist", None, 5, RecallEngine::V2).unwrap();
+        assert!(ctx.contains("deploy checklist for the api"));
+        let after = store.get(&id).unwrap().unwrap();
+        assert_eq!(after.access_count, 0);
+        assert_eq!(after.weight, 1.0);
+        assert_eq!(store.get_metadata_str("last_decay_at").unwrap(), None);
+    }
+
+    /// The three tiers hold on v2: project hits, else hits anywhere, else
+    /// preferences; and an off-topic query does not dump project memories.
+    #[test]
+    fn test_recall_context_v2_keeps_the_project_tiers() {
+        let store = Store::in_memory().unwrap();
+        remember(
+            &store,
+            "decisions-alpha",
+            "alpha uses a token bucket limiter",
+        );
+        remember(&store, "decisions-beta", "beta uses a token ring");
+        remember(
+            &store,
+            "errors-resolved",
+            "fixed the flaky websocket reconnect",
+        );
+        remember(&store, "preferences", "answer in French");
+
+        let on = |query: &str, project: Option<&str>| {
+            recall_context_on(&store, query, project, 5, RecallEngine::V2).unwrap()
+        };
+
+        // Tier 1: only the project's hit, even though beta matches too.
+        let ctx = on("token limiter", Some("alpha"));
+        assert!(ctx.contains("alpha uses a token bucket limiter"));
+        assert!(!ctx.contains("beta uses a token ring"), "{ctx}");
+
+        // Tier 2: nothing in the project, a hit elsewhere is surfaced.
+        let ctx = on("websocket reconnect", Some("alpha"));
+        assert!(ctx.contains("fixed the flaky websocket reconnect"));
+
+        // Tier 3: nothing matches anywhere, preferences only.
+        let ctx = on("qwerty xyzzy", Some("alpha"));
+        assert!(ctx.contains("answer in French"));
+        assert!(!ctx.contains("token"), "{ctx}");
+
+        // No project: every match, no filter.
+        let ctx = on("token", None);
+        assert!(ctx.contains("alpha uses") && ctx.contains("beta uses"));
+
+        // A blank query and a zero limit are not errors.
+        assert!(on("   ", None).contains("answer in French"));
+        assert!(
+            recall_context_on(&store, "token", None, 0, RecallEngine::V2)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Whole-word index: a query word that is only part of a stored word
+    /// is still found, through the substring fallback.
+    #[test]
+    fn test_recall_context_v2_falls_back_to_substrings() {
+        let store = Store::in_memory().unwrap();
+        remember(&store, "notes", "the deployment broke the workers");
+        let ctx = recall_context_on(&store, "deploy", None, 5, RecallEngine::V2).unwrap();
+        assert!(ctx.contains("the deployment broke the workers"), "{ctx}");
     }
 
     #[test]

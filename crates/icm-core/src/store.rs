@@ -1,6 +1,40 @@
 use crate::error::IcmResult;
 use crate::memory::{Memory, StoreStats, TopicHealth};
 
+/// A memory as a consolidation read it, for [`MemoryStore::consolidate_ids`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadMemory {
+    pub id: String,
+    /// Its summary when it was read. `None` when the caller only knows the
+    /// id: the memory is then replaced whatever it holds now.
+    pub summary: Option<String>,
+}
+
+impl From<&Memory> for ReadMemory {
+    fn from(memory: &Memory) -> Self {
+        Self {
+            id: memory.id.clone(),
+            summary: Some(memory.summary.clone()),
+        }
+    }
+}
+
+/// What [`MemoryStore::consolidate_ids`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Consolidated {
+    /// The summary is in, the listed memories are out.
+    Replaced {
+        /// How many memories were removed (`critical` ones stay).
+        removed: usize,
+        /// The memory that holds the summary. Not the id passed in when an
+        /// identical summary already existed in the topic.
+        id: String,
+    },
+    /// Nothing was written: these listed memories are gone, moved to
+    /// another topic, or no longer say what was read.
+    Stale { changed: Vec<String> },
+}
+
 /// Similarity score above which a new memory is considered a duplicate of an existing one.
 ///
 /// Calibrated empirically against the real multilingual-e5-base embedder
@@ -126,6 +160,26 @@ pub trait MemoryStore {
     fn get_by_topic(&self, topic: &str) -> IcmResult<Vec<Memory>>;
     fn list_topics(&self) -> IcmResult<Vec<(String, usize)>>;
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()>;
+    /// Replace the memories a consolidation read with the summary it wrote
+    /// from them — all of them or nothing, atomically where the backend can.
+    ///
+    /// Unlike [`MemoryStore::consolidate_topic`], nothing outside `read` is
+    /// removed: not a memory stored while the summary was being written,
+    /// not the part of a topic that did not fit in the prompt or in one
+    /// read. And the summary is only written if what it stands for is still
+    /// what was read: every listed memory must still be in `topic` and, when
+    /// its `summary` is given, unchanged. Otherwise the result is
+    /// [`Consolidated::Stale`] and the store is untouched — a memory edited
+    /// meanwhile would be deleted with a correction that is not in the
+    /// summary, one forgotten meanwhile would come back through it, and a
+    /// concurrent consolidation of the same memories would leave two
+    /// summaries. `critical` memories are never removed, listed or not.
+    fn consolidate_ids(
+        &self,
+        topic: &str,
+        read: &[ReadMemory],
+        consolidated: Memory,
+    ) -> IcmResult<Consolidated>;
 
     // Stats
     fn count(&self) -> IcmResult<usize>;
@@ -203,6 +257,14 @@ mod tests {
             unimplemented!()
         }
         fn consolidate_topic(&self, _topic: &str, _consolidated: Memory) -> IcmResult<()> {
+            unimplemented!()
+        }
+        fn consolidate_ids(
+            &self,
+            _topic: &str,
+            _read: &[ReadMemory],
+            _consolidated: Memory,
+        ) -> IcmResult<Consolidated> {
             unimplemented!()
         }
         fn count(&self) -> IcmResult<usize> {

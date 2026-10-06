@@ -258,6 +258,17 @@ mod tests {
         fn consolidate_topic(&self, _topic: &str, _consolidated: Memory) -> IcmResult<()> {
             Ok(())
         }
+        fn consolidate_ids(
+            &self,
+            _topic: &str,
+            _read: &[crate::ReadMemory],
+            consolidated: Memory,
+        ) -> IcmResult<crate::Consolidated> {
+            Ok(crate::Consolidated::Replaced {
+                removed: 0,
+                id: consolidated.id,
+            })
+        }
         fn count(&self) -> IcmResult<usize> {
             Ok(self.memories.borrow().len())
         }

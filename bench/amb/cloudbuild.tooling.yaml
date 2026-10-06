@@ -1,0 +1,18 @@
+# Tooling-only image: the `icm` binary and model cache of _BASE (an earlier runner
+# image, by digest), with the benchmark scripts of this checkout on top.
+# Run from the repository root:
+#
+#   gcloud builds submit --project rtk-ai-labs-01 --config bench/amb/cloudbuild.tooling.yaml \
+#     --substitutions _TAG=wave1-tooling-2,_BASE=europe-west9-docker.pkg.dev/rtk-ai-labs-01/rtk-bench/icm-amb@sha256:<digest> .
+#
+# Then run the Jobs with the digest Cloud Build prints for the new image.
+substitutions:
+  _TAG: tooling
+  _BASE: ""
+  _IMAGE: europe-west9-docker.pkg.dev/rtk-ai-labs-01/rtk-bench/icm-amb
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "bench/amb/Dockerfile.tooling", "--build-arg", "BASE=${_BASE}", "-t", "${_IMAGE}:${_TAG}", "."]
+images:
+  - "${_IMAGE}:${_TAG}"
+timeout: 1200s

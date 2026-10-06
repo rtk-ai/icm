@@ -516,6 +516,7 @@ mod tests {
     /// bugfix / preference sentences in EN, FR, DE, ES, IT all match
     /// their respective anchors above the threshold, while narration
     /// sentences in any of those languages reject.
+    #[cfg(feature = "embeddings")]
     #[test]
     #[ignore = "downloads multilingual-e5-base on first run; opt-in via --ignored"]
     fn crosslingual_anchor_separation_with_real_embedder() {
@@ -664,6 +665,7 @@ mod tests {
     /// sentence is stored. The pre-existing English-only keyword
     /// scorer extracts zero facts from this input — the regression
     /// this PR fixes.
+    #[cfg(feature = "embeddings")]
     #[test]
     #[ignore = "downloads multilingual-e5-base on first run; opt-in via --ignored"]
     fn french_transcript_extracts_facts_end_to_end() {

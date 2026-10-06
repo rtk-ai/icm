@@ -1,0 +1,27 @@
+# Namespace and identity for the ICM x AMB benchmark jobs.
+#
+# ALWAYS apply with the bench cluster context spelled out. The local kubeconfig
+# also holds a production cluster; never rely on the current context:
+#
+#   kubectl --context gke_rtk-ai-labs-01_europe-west9-a_rtk-bench apply -f bench/amb/k8s/base.yaml
+#
+# Prerequisites that are NOT created by this file (see README.md, "GKE"):
+#   - a Google service account `icm-amb@rtk-ai-labs-01.iam.gserviceaccount.com` with
+#     roles/aiplatform.user on the project and roles/storage.objectAdmin on the results bucket
+#   - a Workload Identity binding between that account and the Kubernetes
+#     service account below (serviceAccount:rtk-ai-labs-01.svc.id.goog[icm-bench/icm-amb])
+#   - the results bucket
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: icm-bench
+  labels:
+    app.kubernetes.io/part-of: icm-amb
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: icm-amb
+  namespace: icm-bench
+  annotations:
+    iam.gke.io/gcp-service-account: icm-amb@rtk-ai-labs-01.iam.gserviceaccount.com

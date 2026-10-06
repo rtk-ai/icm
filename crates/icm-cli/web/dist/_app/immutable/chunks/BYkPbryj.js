@@ -1,0 +1,1 @@
+import{ai as f,l as e,v as t}from"./DCsWAt0U.js";function c(n){throw new Error("https://svelte.dev/e/lifecycle_outside_component")}function i(n){e===null&&c(),f(()=>{const o=t(n);if(typeof o=="function")return o})}function r(n){e===null&&c(),i(()=>()=>t(n))}export{r as a,i as o};

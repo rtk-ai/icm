@@ -309,8 +309,8 @@ main() {
     fi
     echo ""
     echo "  Next steps:"
-    echo "    1. icm init              # configure your AI tools (MCP)"
-    echo "    2. icm init --mode hook  # install Claude Code hooks"
+    echo "    1. icm init              # instructions, skills and hooks for the AI tools it detects"
+    echo "    2. icm init --mode all   # optional: also register the MCP server"
     echo "    3. Restart your AI tool to activate"
     echo ""
     print_embeddings_status

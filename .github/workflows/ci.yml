@@ -23,6 +23,15 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      # Windows PowerShell 5.1 reads a script file without a byte-order mark as
+      # ANSI: a UTF-8 dash inside a string ends the string and the installer
+      # no longer parses when saved and run from a file.
+      - name: install.ps1 is ASCII only
+        run: |
+          if LC_ALL=C grep -n '[^ -~]' install.ps1; then
+            echo "::error file=install.ps1::non-ASCII character in install.ps1"
+            exit 1
+          fi
 
   clippy:
     name: clippy

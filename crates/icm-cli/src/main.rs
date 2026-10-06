@@ -6981,6 +6981,16 @@ fn embedding_status_lines(
     coverage: Option<(usize, usize)>,
     state: Option<&icm_core::EmbeddingState>,
 ) -> Vec<String> {
+    embedding_status_lines_for(coverage, state, cfg!(feature = "embeddings"))
+}
+
+/// [`embedding_status_lines`] for a build with (`true`) or without (`false`)
+/// embedding support, so both wordings are tested whatever the features.
+fn embedding_status_lines_for(
+    coverage: Option<(usize, usize)>,
+    state: Option<&icm_core::EmbeddingState>,
+    embeddings_built: bool,
+) -> Vec<String> {
     let Some((with_vector, total)) = coverage else {
         return Vec::new();
     };
@@ -6994,7 +7004,10 @@ fn embedding_status_lines(
     let mut lines = vec![format!(
         "Embeddings: {with_vector} / {total} memories, {model}, {dims}."
     )];
-    if with_vector * 2 < total {
+    if !embeddings_built {
+        // Nothing to run on a keyword-only build: `icm embed` does not exist there.
+        lines.push("  This build has no embedding support: recall is keyword-only.".into());
+    } else if with_vector * 2 < total {
         lines.push(
             "  Fewer than half of the memories have a vector. To embed the rest: icm embed".into(),
         );
@@ -17789,13 +17802,13 @@ mod embedding_guard_tests {
             has_vectors: true,
         };
         assert_eq!(
-            embedding_status_lines(Some((9000, 9060)), Some(&state)),
+            embedding_status_lines_for(Some((9000, 9060)), Some(&state), true),
             vec![
                 "Embeddings: 9000 / 9060 memories, model intfloat/multilingual-e5-base, 768 dims."
                     .to_string()
             ]
         );
-        assert!(embedding_status_lines(None, Some(&state)).is_empty());
+        assert!(embedding_status_lines_for(None, Some(&state), true).is_empty());
     }
 
     #[test]
@@ -17805,7 +17818,7 @@ mod embedding_guard_tests {
             model: None,
             has_vectors: true,
         };
-        let lines = embedding_status_lines(Some((66, 9060)), Some(&state));
+        let lines = embedding_status_lines_for(Some((66, 9060)), Some(&state), true);
         assert_eq!(
             lines[0],
             "Embeddings: 66 / 9060 memories, model not recorded, 768 dims."
@@ -17813,8 +17826,22 @@ mod embedding_guard_tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("icm embed"), "{}", lines[1]);
         // Exactly half is not "fewer than half"; an empty database is fine.
-        assert_eq!(embedding_status_lines(Some((5, 10)), Some(&state)).len(), 1);
-        assert_eq!(embedding_status_lines(Some((0, 0)), None).len(), 1);
+        assert_eq!(
+            embedding_status_lines_for(Some((5, 10)), Some(&state), true).len(),
+            1
+        );
+        assert_eq!(
+            embedding_status_lines_for(Some((0, 0)), None, true).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn doctor_line_on_a_keyword_only_build_does_not_advise_icm_embed() {
+        let lines = embedding_status_lines_for(Some((0, 2)), None, false);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("keyword-only"), "{}", lines[1]);
+        assert!(!lines[1].contains("icm embed"), "{}", lines[1]);
     }
 
     #[test]

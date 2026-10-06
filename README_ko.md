@@ -35,7 +35,7 @@ brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubus
 icm init                                   # instructions, skills and hooks for every agent it detects
 ```
 
-설정은 이것으로 끝입니다. Claude Code, Codex, Gemini CLI 또는 Copilot CLI에서 새 세션을 열면, 에이전트는 가장 중요한 메모리를 모은 짧은 팩을 가지고 시작하며, 보내는 프롬프트마다 관련된 메모리를 받습니다. 에이전트가 도구 출력에서 배운 내용은 큐에 쌓이고, 이 큐는 각 Claude Code 세션이 끝날 때 메모리로 변환됩니다. 다른 도구에서는 `icm extract-pending`을 실행하세요(예를 들어 cron 작업으로).
+설정은 이것으로 끝입니다. Claude Code, Codex, Gemini CLI 또는 Copilot CLI에서 새 세션을 열면, 에이전트는 현재 있는 프로젝트의 가장 중요한 메모리(`myapp`이라는 저장소의 `decisions-myapp`처럼 토픽에 저장소 이름이 들어 있는 메모리와 사용자의 선호)를 모은 짧은 팩을 가지고 시작하며, 보내는 프롬프트마다 관련된 메모리를 받습니다. 에이전트가 도구 출력에서 배운 내용은 큐에 쌓이고, 이 큐는 각 Claude Code 세션이 끝날 때 메모리로 변환됩니다. 다른 도구에서는 `icm extract-pending`을 실행하세요(예를 들어 cron 작업으로).
 
 저장과 검색은 사용자의 머신에서 이루어집니다. 자동 추출은 이미 사용 중인 LLM 명령줄 도구(Claude Code, Codex 또는 Gemini CLI)가 설치되어 있으면 그 도구에 텍스트를 넘깁니다. 완전히 로컬로 유지하려면 `[extraction.summarizer]` 아래에 `provider = "none"`을 설정하세요.
 

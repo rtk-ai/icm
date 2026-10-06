@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/banner.png" alt="ICM — Infinite Context Memory" width="600">
-</p>
-
 <h1 align="center">ICM</h1>
 
 <p align="center">
@@ -21,6 +17,10 @@ Tell Claude Code how your project handles auth on Monday, and Tuesday's Gemini C
 - **No LLM call to store or recall.** Hindsight, Mem0, Graphiti (Zep) and claude-mem call an LLM for every memory they store by default. ICM does not. Only its automatic extraction of facts from tool output goes through the LLM command-line tool you already use, when one is installed; `provider = "none"` keeps that local too (see [Quickstart](#quickstart)).
 - **Useful without an embedding model.** Keyword recall alone puts at least one of the right sessions in the top 5 for 88.6% of LoCoMo questions, with a median of 6.8 ms per recall on Linux x86-64.
 - **Not ahead everywhere.** On PersonaMem (a user's evolving preferences), Hindsight leads: 86.6% against ICM's 82.9%.
+
+<p align="center">
+  <img src="assets/demo.svg" alt="Terminal: three memories stored with icm store, then two questions answered by icm recall, each returning the right memory">
+</p>
 
 ## Quickstart
 

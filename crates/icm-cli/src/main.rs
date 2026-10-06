@@ -15359,7 +15359,7 @@ mod cli_contracts_tests {
     /// be what dropping the rows looks like, so the stored facts are checked.
     #[test]
     fn extract_pending_falls_back_to_the_local_extractor_when_the_api_key_provider_cannot_run() {
-        for (provider, api_key_env) in [
+        for (provider, key_var) in [
             ("anthropic", "ICM_TEST_KEY_THAT_IS_NEVER_SET"),
             ("openai", "ICM_TEST_KEY_THAT_IS_NEVER_SET"),
             ("google", "ICM_TEST_KEY_THAT_IS_NEVER_SET"),
@@ -15374,7 +15374,7 @@ mod cli_contracts_tests {
             let cfg = config::SummarizerConfig {
                 provider: provider.into(),
                 model: "test-model".into(),
-                api_key_env: api_key_env.into(),
+                api_key_env: key_var.into(),
                 base_url: "http://127.0.0.1:1".into(),
                 ..config::SummarizerConfig::default()
             };
@@ -15391,12 +15391,12 @@ mod cli_contracts_tests {
             .unwrap();
             assert!(
                 store.list_pending_extractions(10).unwrap().is_empty(),
-                "{provider}/{api_key_env}: rows must be dequeued by the fallback"
+                "{provider}/{key_var}: rows must be dequeued by the fallback"
             );
             let stored = store.list_all().unwrap();
             assert!(
                 stored.iter().any(|m| m.summary.contains("gRPC")),
-                "{provider}/{api_key_env}: the fallback must extract the fact, not drop the row"
+                "{provider}/{key_var}: the fallback must extract the fact, not drop the row"
             );
         }
     }

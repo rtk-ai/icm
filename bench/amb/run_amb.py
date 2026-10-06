@@ -396,7 +396,7 @@ def _install_save_guard() -> None:
 
 
 def _shard_of(key: str, n: int) -> int:
-    return int(hashlib.sha1(key.encode()).hexdigest(), 16) % n
+    return int(hashlib.sha1(key.encode(), usedforsecurity=False).hexdigest(), 16) % n
 
 
 def _install_sharding(spec: str, by: str = "hash") -> None:

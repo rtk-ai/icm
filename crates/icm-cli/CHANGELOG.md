@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.2](https://github.com/rtk-ai/icm/compare/icm-v0.11.1...icm-v0.11.2) (2026-10-07)
+
+
+### Bug Fixes
+
+* **release:** count commits from every crate and version them together ([#493](https://github.com/rtk-ai/icm/issues/493)) ([d4be9fb](https://github.com/rtk-ai/icm/commit/d4be9fb52389783847dde01cc98660aff37a9147))
+* **release:** keep Cargo.lock in step with the released version ([9da9bb9](https://github.com/rtk-ai/icm/commit/9da9bb92b9bea48d7957b935da08c95520461978))
+
 ## [0.11.1](https://github.com/rtk-ai/icm/compare/icm-v0.11.0...icm-v0.11.1) (2026-10-07)
 
 

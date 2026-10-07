@@ -73,13 +73,16 @@ Su [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 domande a scelta mult
 | Hindsight | 86.6% (510 / 589) | 15.8k token | pubblicato dall'harness |
 | Baseline di ricerca ibrida | 84.4% (497 / 589) | 24.2k token | pubblicato dall'harness |
 
-Il solo retrieval, su LoCoMo, senza modello di risposta: la quota di domande per cui almeno una sessione gold è tra i primi risultati. Questa è la prova che riguarda il motore di recall in sé. Le esecuzioni v2 hanno ricevuto la data di ogni sessione e la data della domanda; il motore precedente non ha un input di data, quindi le sue esecuzioni non ne hanno ricevuta nessuna.
+Il solo retrieval, su LoCoMo, senza modello di risposta: la quota di domande per cui almeno una sessione gold è tra i primi risultati. Questa è la prova che riguarda il motore di recall in sé.
 
-| Primi risultati | Motore precedente (`legacy`) | Motore di recall v2 | Motore precedente, senza modello di embedding | Motore di recall v2, senza modello di embedding |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| Motore di recall | Ricerca | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (predefinito) | parole chiave + modello di embedding | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (predefinito) | solo parole chiave | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | parole chiave + modello di embedding | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | solo parole chiave | 12.0% | 17.4% | 29.8% |
+
+I due motori sono stati misurati con la stessa versione 0.11. Le esecuzioni del motore 0.11 hanno ricevuto la data di ogni sessione e la data della domanda; il motore 0.10 non ha un input di data, quindi le sue esecuzioni non ne hanno ricevuta nessuna.
 
 LongMemEval-S, solo retrieval, senza LLM (ICM con il suo modello di embedding predefinito; 500 domande; ogni domanda è accompagnata da circa 48 sessioni passate in cui cercare; una memoria per sessione, solo i turni dell'utente, come li indicizza MemPalace; nessuna data fornita a ICM):
 
@@ -221,13 +224,13 @@ Il recall fonde fino a tre liste ordinate tramite reciprocal rank fusion (RRF): 
 Tutto sta in un unico file SQLite, senza servizi esterni:
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config` mostra la configurazione attiva; [config/default.toml](config/default.toml) elenca tutte le opzioni. Dettagli: [riferimento](docs/reference.md#how-it-works).
+`icm config` mostra la configurazione attiva; [config/default.toml](config/default.toml) elenca tutte le opzioni. Dettagli: [riferimento](docs/reference.md#how-it-works), [diagrammi di architettura](docs/architecture.md#architecture-at-a-glance).
 
 <a id="documentation"></a>
 

@@ -71,13 +71,16 @@ memories[1]{id,topic,importance,weight,summary}:
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | ハーネスによる公開値 |
 | ハイブリッド検索ベースライン | 84.4% (497 / 589) | 24.2k tokens | ハーネスによる公開値 |
 
-LoCoMo での検索のみの結果（回答モデルなし）: 正解セッションのうち少なくとも 1 つが上位の結果に含まれる質問の割合です。これが想起エンジンそのものの根拠となる数値です。v2 の実行には各セッションの日付と質問の日付を与えました。以前のエンジンには日付の入力がないため、その実行には日付を与えていません。
+LoCoMo での検索のみの結果（回答モデルなし）: 正解セッションのうち少なくとも 1 つが上位の結果に含まれる質問の割合です。これが想起エンジンそのものの根拠となる数値です。
 
-| 上位件数 | 以前のエンジン（`legacy`） | 想起エンジン v2 | 以前のエンジン、埋め込みモデルなし | 想起エンジン v2、埋め込みモデルなし |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| 想起エンジン | 検索 | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (デフォルト) | キーワード + 埋め込みモデル | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (デフォルト) | キーワードのみ | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | キーワード + 埋め込みモデル | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | キーワードのみ | 12.0% | 17.4% | 29.8% |
+
+どちらのエンジンも同じ 0.11 のビルドで測定しました。0.11 エンジンの実行には各セッションの日付と質問の日付を与えました。0.10 エンジンには日付の入力がないため、その実行には日付を与えていません。
 
 LongMemEval-S での検索のみの結果（LLM なし。ICM はデフォルトの埋め込みモデルを使用。500 問。各質問には検索対象となる過去のセッションが約 48 件付いています。MemPalace のインデックス方法に合わせ、セッションごとに 1 件の記憶、ユーザーの発話のみ。ICM には日付を与えていません）:
 
@@ -214,13 +217,13 @@ ICM はさらに、**memoirs**（概念と型付きの関係からなる永続�
 すべては外部サービスなしで単一の SQLite ファイルに保存されます:
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config` は有効な設定を表示します。[config/default.toml](config/default.toml) にすべてのオプションが記載されています。詳細: [リファレンス](docs/reference.md#how-it-works)。
+`icm config` は有効な設定を表示します。[config/default.toml](config/default.toml) にすべてのオプションが記載されています。詳細: [リファレンス](docs/reference.md#how-it-works)、[アーキテクチャ図](docs/architecture.md#architecture-at-a-glance)。
 
 <a id="documentation"></a>
 ## ドキュメント

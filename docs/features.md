@@ -1630,7 +1630,7 @@ compact = true
 | Plateforme | Chemin |
 |------------|--------|
 | macOS | `~/Library/Application Support/dev.icm.icm/memories.db` |
-| Linux | `~/.local/share/dev.icm.icm/memories.db` |
+| Linux | `~/.local/share/icm/memories.db` |
 
 Surcharge possible via `--db <chemin>` ou `ICM_DB`.
 

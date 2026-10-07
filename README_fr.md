@@ -73,13 +73,16 @@ Sur [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 questions à choix m
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | publié par le banc d'évaluation |
 | Référence de recherche hybride | 84.4% (497 / 589) | 24.2k tokens | publié par le banc d'évaluation |
 
-La récupération seule, sur LoCoMo, sans modèle de réponse : la part des questions pour lesquelles au moins une session de référence figure dans les premiers résultats. C'est la preuve qui porte sur le moteur de rappel lui-même. Les runs v2 ont reçu la date de chaque session et la date de la question ; le moteur précédent n'a pas d'entrée de date, ses runs n'en ont donc reçu aucune.
+La récupération seule, sur LoCoMo, sans modèle de réponse : la part des questions pour lesquelles au moins une session de référence figure dans les premiers résultats. C'est la preuve qui porte sur le moteur de rappel lui-même.
 
-| Premiers résultats | Moteur précédent (`legacy`) | Moteur de rappel v2 | Moteur précédent, sans modèle d'embedding | Moteur de rappel v2, sans modèle d'embedding |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| Moteur de rappel | Recherche | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (par défaut) | mots-clés + modèle d'embedding | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (par défaut) | mots-clés seuls | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | mots-clés + modèle d'embedding | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | mots-clés seuls | 12.0% | 17.4% | 29.8% |
+
+Les deux moteurs ont été mesurés avec la même version 0.11. Les runs du moteur 0.11 ont reçu la date de chaque session et la date de la question ; le moteur 0.10 n'a pas d'entrée de date, ses runs n'en ont donc reçu aucune.
 
 LongMemEval-S, récupération seule, sans LLM (ICM avec son modèle d'embedding par défaut ; 500 questions ; chaque question est accompagnée d'environ 48 sessions passées dans lesquelles chercher ; une mémoire par session, tours de l'utilisateur seulement, comme MemPalace les indexe ; aucune date fournie à ICM) :
 
@@ -221,13 +224,13 @@ Le rappel fusionne jusqu'à trois listes classées par rang réciproque (RRF) : 
 Tout tient dans un seul fichier SQLite, sans service externe :
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config` affiche la configuration active ; [config/default.toml](config/default.toml) liste toutes les options. Détails : [référence](docs/reference.md#how-it-works).
+`icm config` affiche la configuration active ; [config/default.toml](config/default.toml) liste toutes les options. Détails : [référence](docs/reference.md#how-it-works), [schémas d'architecture](docs/architecture.md#architecture-at-a-glance).
 
 <a id="documentation"></a>
 

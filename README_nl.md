@@ -73,13 +73,16 @@ Op [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 meerkeuzevragen over 
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | gepubliceerd door de harness |
 | Baseline hybride zoeken | 84.4% (497 / 589) | 24.2k tokens | gepubliceerd door de harness |
 
-Alleen retrieval, op LoCoMo, zonder antwoordmodel: het aandeel vragen waarvoor minstens één gold-sessie bij de topresultaten zit. Dit is het bewijs voor de recall-engine zelf. De v2-runs kregen de datum van elke sessie en de datum van de vraag; de vorige engine heeft geen datuminvoer, dus zijn runs kregen er geen.
+Alleen retrieval, op LoCoMo, zonder antwoordmodel: het aandeel vragen waarvoor minstens één gold-sessie bij de topresultaten zit. Dit is het bewijs voor de recall-engine zelf.
 
-| Topresultaten | Vorige engine (`legacy`) | Recall-engine v2 | Vorige engine, zonder embeddingmodel | Recall-engine v2, zonder embeddingmodel |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| Recall-engine | Zoeken | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (standaard) | trefwoorden + embeddingmodel | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (standaard) | alleen trefwoorden | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | trefwoorden + embeddingmodel | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | alleen trefwoorden | 12.0% | 17.4% | 29.8% |
+
+Beide engines zijn gemeten met dezelfde 0.11-build. De runs van de 0.11-engine kregen de datum van elke sessie en de datum van de vraag; de 0.10-engine heeft geen datuminvoer, dus zijn runs kregen er geen.
 
 LongMemEval-S, alleen retrieval, zonder LLM (ICM met zijn standaard-embeddingmodel; 500 vragen; bij elke vraag horen ongeveer 48 eerdere sessies om te doorzoeken; één herinnering per sessie, alleen de beurten van de gebruiker, zoals MemPalace ze indexeert; ICM krijgt geen datum):
 
@@ -221,13 +224,13 @@ Recall voegt tot drie gerangschikte lijsten samen via reciprocal rank fusion (RR
 Alles staat in één SQLite-bestand, zonder externe service:
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config` toont de actieve configuratie; [config/default.toml](config/default.toml) somt alle opties op. Details: [referentie](docs/reference.md#how-it-works).
+`icm config` toont de actieve configuratie; [config/default.toml](config/default.toml) somt alle opties op. Details: [referentie](docs/reference.md#how-it-works), [architectuurdiagrammen](docs/architecture.md#architecture-at-a-glance).
 
 <a id="documentation"></a>
 

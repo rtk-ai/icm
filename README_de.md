@@ -73,13 +73,16 @@ Auf [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 Multiple-Choice-Frag
 | Hindsight | 86.6% (510 / 589) | 15.8k Tokens | vom Harness veröffentlicht |
 | Baseline hybride Suche | 84.4% (497 / 589) | 24.2k Tokens | vom Harness veröffentlicht |
 
-Nur das Retrieval, auf LoCoMo, ohne Antwortmodell: der Anteil der Fragen, bei denen mindestens eine Gold-Session unter den Top-Ergebnissen ist. Das ist der Beleg für die Recall-Engine selbst. Die v2-Läufe erhielten das Datum jeder Session und das Datum der Frage; die vorherige Engine hat keinen Datums-Input, daher erhielten ihre Läufe keines.
+Nur das Retrieval, auf LoCoMo, ohne Antwortmodell: der Anteil der Fragen, bei denen mindestens eine Gold-Session unter den Top-Ergebnissen ist. Das ist der Beleg für die Recall-Engine selbst.
 
-| Top-Ergebnisse | Vorherige Engine (`legacy`) | Recall-Engine v2 | Vorherige Engine, ohne Embedding-Modell | Recall-Engine v2, ohne Embedding-Modell |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| Recall-Engine | Suche | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (Standard) | Schlüsselwörter + Embedding-Modell | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (Standard) | nur Schlüsselwörter | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | Schlüsselwörter + Embedding-Modell | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | nur Schlüsselwörter | 12.0% | 17.4% | 29.8% |
+
+Beide Engines wurden mit demselben 0.11-Build gemessen. Die Läufe der 0.11-Engine erhielten das Datum jeder Session und das Datum der Frage; die 0.10-Engine hat keine Datumseingabe, ihre Läufe erhielten daher keines.
 
 LongMemEval-S, nur Retrieval, ohne LLM (ICM mit seinem Standard-Embedding-Modell; 500 Fragen; zu jeder Frage gehören etwa 48 frühere Sessions, die durchsucht werden; eine Erinnerung pro Session, nur die Beiträge des Nutzers, so wie MemPalace sie indexiert; ICM erhält kein Datum):
 
@@ -221,13 +224,13 @@ Der Recall führt bis zu drei Ranglisten per Reciprocal Rank Fusion (RRF) zusamm
 Alles liegt in einer einzigen SQLite-Datei, ohne externen Dienst:
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config` zeigt die aktive Konfiguration; [config/default.toml](config/default.toml) listet alle Optionen auf. Details: [Referenz](docs/reference.md#how-it-works).
+`icm config` zeigt die aktive Konfiguration; [config/default.toml](config/default.toml) listet alle Optionen auf. Details: [Referenz](docs/reference.md#how-it-works), [Architekturdiagramme](docs/architecture.md#architecture-at-a-glance).
 
 <a id="documentation"></a>
 

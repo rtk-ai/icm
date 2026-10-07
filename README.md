@@ -67,13 +67,16 @@ On [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 multiple-choice quest
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | published by the harness |
 | Hybrid search baseline | 84.4% (497 / 589) | 24.2k tokens | published by the harness |
 
-Retrieval alone, on LoCoMo, with no answering model: the share of questions for which at least one gold session is in the top results. This is the evidence for the recall engine itself. The v2 runs received each session's date and the question's date; the previous engine has no date input, so its runs received none.
+Retrieval alone, on LoCoMo, with no answering model: the share of questions for which at least one of the right sessions is in the top results. This is the evidence for the recall engine itself.
 
-| Top results | Previous engine (`legacy`) | Recall engine v2 | Previous engine, no embedding model | Recall engine v2, no embedding model |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| Recall engine | Search | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (default) | keywords + embedding model | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (default) | keywords only | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | keywords + embedding model | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | keywords only | 12.0% | 17.4% | 29.8% |
+
+Both engines were measured with the same 0.11 build. The 0.11 runs received each session's date and the question's date; the 0.10 engine has no date input, so its runs received none.
 
 LongMemEval-S, retrieval only, with no LLM (ICM with its default embedding model; 500 questions; each question comes with about 48 past sessions to search; one memory per session, user turns only, as MemPalace indexes them; no date given to ICM):
 
@@ -207,20 +210,20 @@ Recall fuses up to three ranked lists by reciprocal rank (RRF): **FTS5 BM25** ke
 Everything lives in one SQLite file, with no external service:
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config` shows the active configuration; [config/default.toml](config/default.toml) lists every option. Details: [reference](docs/reference.md#how-it-works).
+`icm config` shows the active configuration; [config/default.toml](config/default.toml) lists every option. Details: [reference](docs/reference.md#how-it-works), [architecture diagrams](docs/architecture.md#architecture-at-a-glance).
 
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
 | [Integration Guide](docs/integrations.md) | Per-tool MCP setup: Claude Code, Cursor, Windsurf, Zed, Amp, Codex, Cline, Roo Code, etc. |
-| [Technical Architecture](docs/architecture.md) | Crate structure, search pipeline, decay model, sqlite-vec integration, testing |
+| [Technical Architecture](docs/architecture.md) | Architecture diagram, function flows, crate structure, search pipeline, decay model, sqlite-vec integration, testing |
 | [User Guide](docs/guide.md) | Installation, topic organization, consolidation, extraction, troubleshooting |
 | [Product Overview](docs/product.md) | Use cases, benchmarks, comparison with alternatives |
 | [Reference](docs/reference.md) | Install options, per-tool setup, CLI, 31 MCP tools, HTTP API, dashboard, internals |

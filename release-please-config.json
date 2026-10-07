@@ -1,17 +1,52 @@
 {
   "packages": {
-    "crates/icm-cli": {
-      "release-type": "rust",
+    ".": {
+      "release-type": "simple",
       "package-name": "icm",
       "component": "icm",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
-      "changelog-path": "CHANGELOG.md",
+      "changelog-path": "crates/icm-cli/CHANGELOG.md",
       "extra-files": [
         {
           "type": "toml",
-          "path": "/Cargo.lock",
+          "path": "crates/icm-cli/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/icm-core/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/icm-store/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/icm-mcp/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value==\"icm-cli\")].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==\"icm-core\")].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==\"icm-store\")].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==\"icm-mcp\")].version"
         }
       ]
     }

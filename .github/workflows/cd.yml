@@ -117,7 +117,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.releases_created }}
-      tag_name: ${{ steps.release.outputs['crates/icm-cli--tag_name'] }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       # The default workflow token cannot open PRs in this org; mint a
       # short-lived token from the configured GitHub App instead.
@@ -144,7 +144,7 @@ jobs:
         if: ${{ steps.release.outputs.releases_created == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.release.outputs['crates/icm-cli--tag_name'] }}
+          TAG: ${{ steps.release.outputs.tag_name }}
         run: |
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
             || echo "::warning::could not flag $TAG as a pre-release; it stays 'latest' while its assets are being built"

@@ -24,6 +24,157 @@ icm-cli ──────► icm-core
             └──► icm-core
 ```
 
+## Architecture at a glance
+
+Who talks to what. Every entry point ends in the same store, so a memory written through one is visible through the others.
+
+```mermaid
+flowchart LR
+    subgraph agents["AI coding agents"]
+        A1["Claude Code, Codex,<br/>Gemini CLI, Copilot CLI"]
+        A2["Cursor, Zed, VS Code,<br/>other MCP clients"]
+        A3["Scripts, cron, you"]
+    end
+
+    subgraph entry["icm-cli: one binary, four entry points"]
+        H["Hooks<br/>icm hook start / prompt / post / compact / end"]
+        C["CLI<br/>icm store, recall, memoir, ..."]
+        M["MCP server (icm-mcp)<br/>icm serve"]
+        W["HTTP API<br/>icm serve --http"]
+    end
+
+    subgraph engine["icm-store"]
+        R["Recall engine v2<br/>recall.rs"]
+        S["Store backend<br/>SQLite by default,<br/>Postgres or OpenSearch"]
+    end
+
+    subgraph core["icm-core: types and pure logic"]
+        F["Rank fusion, token budget,<br/>date windows, auto-link, wake-up"]
+        E["Embedder (fastembed + ONNX Runtime)<br/>optional"]
+    end
+
+    DB[("memories.db<br/>memories, FTS5 index, vector index,<br/>memoirs, feedback, transcripts")]
+    L["Your LLM command-line tool<br/>or an API-key provider<br/>(extraction and summaries only)"]
+
+    A1 --> H
+    A1 --> C
+    A2 --> M
+    A3 --> C
+    A3 --> W
+    entry -- "recall" --> R
+    entry -- "store, update, forget" --> S
+    entry -- "embed the text<br/>(not the hooks)" --> E
+    R --> S
+    R --> F
+    S --> DB
+    H -. "queued text" .-> L
+    C -. "consolidate, briefing" .-> L
+```
+
+Storing and recalling never reach the LLM box. Only the extraction worker, `icm consolidate` and `icm briefing` do, and only when a summarizer provider is configured.
+
+## Function flows
+
+The three paths a memory takes, with the function that does each step. Names are the ones in the source.
+
+### Storing a memory
+
+`icm store`, the MCP `icm_memory_store` tool and HTTP `/store` follow the same steps; the CLI functions are shown.
+
+```mermaid
+flowchart TD
+    A["icm store -t topic -c text<br/>cmd_store"] --> B{"Embedding model<br/>loaded?"}
+    B -- yes --> C["embed_text"]
+    B -- no --> D
+    C --> D{"find_similar_memory<br/>same topic, cosine above 0.95?"}
+    D -- yes --> E["merge_summaries, union_keywords,<br/>max_importance"]
+    E --> F["store.update"]
+    D -- no --> G["store.store"]
+    G --> H["store_in_transaction<br/>row in memories, FTS5 index by trigger,<br/>vector in vec_memories"]
+    H --> I{"Vector does not fit<br/>the index dimension?"}
+    I -- yes --> J["stored again without the vector"]
+    I -- no --> K
+    J --> K["auto_link_memory, add_backrefs<br/>related_ids to the nearest memories"]
+    F --> K
+    K --> L["maybe_auto_consolidate<br/>off by default"]
+```
+
+### Recalling
+
+One engine behind four callers. The prompt hook is the read-only, keyword-only caller.
+
+```mermaid
+flowchart TD
+    subgraph callers["Callers"]
+        C1["icm recall<br/>cmd_recall, cmd_recall_v2"]
+        C2["MCP icm_memory_recall<br/>tool_recall, tool_recall_v2"]
+        C3["HTTP /recall<br/>handle_recall"]
+        C4["Prompt hook<br/>cmd_hook_prompt, recall_context"]
+    end
+    C1 --> R
+    C2 --> R
+    C3 --> R
+    C4 --> R
+    R["RecallEngine::resolve<br/>v2 unless --engine legacy<br/>or ICM_RECALL_ENGINE=legacy"] --> V["recall_v2"]
+    V --> T["parse_query_window<br/>does the query name a period?"]
+    T --> Q["search_ranked<br/>project, topic and keyword filters<br/>applied inside each arm"]
+    Q --> L1["Lexical arm<br/>FTS5 BM25"]
+    Q --> L2["Vector arm<br/>sqlite-vec KNN<br/>only with an embedder"]
+    Q --> L3["Temporal arm<br/>created in the named window"]
+    L1 --> U["rrf_fuse<br/>reciprocal rank fusion, k = 60"]
+    L2 --> U
+    L3 --> U
+    U --> N{"No arm matched?"}
+    N -- yes --> S2["substring search<br/>on the query words"]
+    N -- no --> X
+    S2 --> X{"max_tokens given?"}
+    X -- yes --> B1["select_within_budget<br/>as many best hits as fit"]
+    X -- no --> B2["cut at limit"]
+    B1 --> Z["related_ids neighbors appended<br/>in the room left"]
+    B2 --> Z
+    Z --> W2["batch_update_access<br/>skipped by the read-only hook"]
+    W2 --> O["rendered result"]
+```
+
+### A session, through the hooks
+
+What `icm init` wires into an agent, and what each hook calls.
+
+```mermaid
+sequenceDiagram
+    participant A as Agent (Claude Code, ...)
+    participant I as icm hook
+    participant D as memories.db
+    participant X as LLM CLI (optional)
+
+    A->>I: SessionStart
+    I->>D: cmd_hook_start, build_hook_start_pack<br/>critical and high memories of this project
+    I-->>A: wake-up pack
+
+    loop each prompt
+        A->>I: UserPromptSubmit
+        I->>D: cmd_hook_prompt, recall_context<br/>recall_v2, keyword-only, read-only
+        I-->>A: memories relevant to the prompt
+    end
+
+    loop each tool call
+        A->>I: PreToolUse
+        I-->>A: cmd_hook_pre: allow icm commands
+        A->>I: PostToolUse
+        I->>D: cmd_hook_post: increment_hook_counter<br/>every N calls: enqueue_pending_extraction,<br/>or extract by rules when the provider is "none"
+    end
+
+    A->>I: PreCompact
+    I->>D: cmd_hook_compact: extract_from_hook_transcript
+
+    A->>I: SessionEnd
+    I->>D: cmd_hook_end: extract_from_hook_transcript
+    I-)X: detached workers: extract-pending,<br/>consolidate-pending, briefing
+    X-)D: facts written as memories
+```
+
+The SessionEnd workers run only when the extraction summarizer is not `none`; they are what turns the queued tool output into memories. With an agent that has no SessionEnd hook, run `icm extract-pending` yourself.
+
 ## icm-core
 
 Foundation crate. No I/O, no database — only types and traits.

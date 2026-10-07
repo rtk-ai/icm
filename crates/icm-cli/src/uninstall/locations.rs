@@ -186,6 +186,19 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
         kind: K::OwnedFile,
         purge_data_only: false,
     });
+    specs.push(LocationSpec {
+        label: "Claude Code /remember-session",
+        path: d.claude_dir.join("commands/remember-session.md"),
+        kind: K::OwnedFile,
+        purge_data_only: false,
+    });
+    // The global instruction file `icm init` writes its block into.
+    specs.push(LocationSpec {
+        label: "Claude Code CLAUDE.md",
+        path: d.claude_dir.join("CLAUDE.md"),
+        kind: K::MarkdownBlock,
+        purge_data_only: false,
+    });
 
     // --- Claude Desktop (macOS) ---
     specs.push(LocationSpec {
@@ -217,6 +230,13 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
             has_hooks: true,
             hooks_field: F::Command,
         },
+        purge_data_only: false,
+    });
+
+    specs.push(LocationSpec {
+        label: "Codex CLI AGENTS.md",
+        path: d.codex_dir.join("AGENTS.md"),
+        kind: K::MarkdownBlock,
         purge_data_only: false,
     });
 
@@ -427,6 +447,12 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
         kind: K::OwnedFile,
         purge_data_only: false,
     });
+    specs.push(LocationSpec {
+        label: "Amp /icm-remember-session",
+        path: d.home.join(".config/amp/skills/icm-remember-session.md"),
+        kind: K::OwnedFile,
+        purge_data_only: false,
+    });
 
     // --- Pi (pi.dev / earendil-works/pi) — issue #259 ---
     specs.push(LocationSpec {
@@ -554,9 +580,12 @@ mod tests {
             "Claude Code hooks",
             "Claude Code /recall",
             "Claude Code /remember",
+            "Claude Code /remember-session",
+            "Claude Code CLAUDE.md",
             "Claude Desktop MCP",
             "Codex CLI MCP",
             "Codex CLI hooks",
+            "Codex CLI AGENTS.md",
             "Gemini CLI",
             "Gemini CLI GEMINI.md",
             "Copilot CLI MCP",
@@ -578,6 +607,7 @@ mod tests {
             "Amp MCP",
             "Amp /icm-recall",
             "Amp /icm-remember",
+            "Amp /icm-remember-session",
             "Pi AGENTS.md",
             "Pi /icm-recall",
             "Pi /icm-remember",

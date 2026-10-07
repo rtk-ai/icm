@@ -5884,6 +5884,10 @@ icm topics                                # list all topics\n\
 ```\n\
 <!-- icm:end -->";
 
+        let icm_block = for_this_shell(icm_block);
+
+        let icm_block: &str = &icm_block;
+
         // Global write targets: (tool_label, detect_name, path).
         // Tools that support a HOME-level instruction file get one here
         // and the cwd file is only written when --per-project is set.
@@ -5989,6 +5993,8 @@ else
 fi
 ```
 ";
+        let icm_recall_prompt = for_this_shell(icm_recall_prompt);
+        let icm_recall_prompt: &str = &icm_recall_prompt;
         let icm_remember_prompt = "\
 Store the following in ICM memory: $ARGUMENTS
 
@@ -5997,6 +6003,8 @@ Run:
 icm remember \"$ARGUMENTS\"
 ```
 ";
+        let icm_remember_prompt = for_this_shell(icm_remember_prompt);
+        let icm_remember_prompt: &str = &icm_remember_prompt;
         let icm_remember_session_prompt = "\
 Checkpoint this session: store non-obvious, reusable lessons in ICM long-term memory.
 
@@ -6024,6 +6032,8 @@ Example:
 
 End with a one-line recap.
 ";
+        let icm_remember_session_prompt = for_this_shell(icm_remember_session_prompt);
+        let icm_remember_session_prompt: &str = &icm_remember_session_prompt;
         // Claude Code: ~/.claude/commands/ (or $CLAUDE_CONFIG_DIR/commands/)
         let claude_skills_dir = claude_dir.join("commands");
         if force || detect_tool("Claude Code", &home, &vscode_data) {
@@ -6083,6 +6093,8 @@ icm recall \"query\"
 
 Do this BEFORE responding to the user. Not optional.
 ";
+        let cursor_icm_rule = for_this_shell(cursor_icm_rule);
+        let cursor_icm_rule: &str = &cursor_icm_rule;
         if force || detect_tool("Cursor", &home, &vscode_data) {
             if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
                 &cursor_rules_dir.join("icm.mdc"),
@@ -6546,6 +6558,40 @@ description: ICM persistent memory — /{name}
     }
 
     Ok(())
+}
+
+/// The text of an instruction block or a skill, as written on this system.
+///
+/// In PowerShell `icm` is a built-in alias of `Invoke-Command` and takes
+/// precedence over a program on the PATH: an agent that follows `icm recall
+/// ...` there gets a parameter error. `icm.exe` names the program in
+/// PowerShell, cmd and Git Bash alike, so Windows gets that spelling.
+fn for_this_shell(text: &str) -> std::borrow::Cow<'_, str> {
+    command_text_for(text, cfg!(windows))
+}
+
+/// [`for_this_shell`] with the system named, so both spellings are tested
+/// on any host. Only command positions change: the start of a line (indented
+/// or not) and an opening backtick. Prose such as "ICM" is left alone.
+fn command_text_for(text: &str, windows: bool) -> std::borrow::Cow<'_, str> {
+    if !windows {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    for (n, line) in text.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let (lead, rest) = line.split_at(indent);
+        out.push_str(lead);
+        let rest = match rest.strip_prefix("icm ") {
+            Some(tail) => format!("icm.exe {tail}"),
+            None => rest.to_string(),
+        };
+        out.push_str(&rest.replace("`icm ", "`icm.exe "));
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Inject ICM instruction block into a markdown file (CLAUDE.md, AGENTS.md, GEMINI.md, etc.)
@@ -18062,5 +18108,39 @@ mod cmd_recall_v2_tests {
         req.topic = Some("other");
         let json = render_recall_v2(&store, None, &req, recall_format::RecallFormat::Json).unwrap();
         assert_eq!(json_len(&json), 1);
+    }
+}
+
+#[cfg(test)]
+mod shell_text_tests {
+    use super::command_text_for;
+
+    #[test]
+    fn unix_text_is_left_untouched() {
+        let text = "icm recall \"q\"\nuse `icm store` when done\n";
+        assert_eq!(command_text_for(text, false), text);
+    }
+
+    #[test]
+    fn windows_names_the_program_where_a_command_is_typed() {
+        let text = "## Persistent memory (ICM)\n\
+                    icm recall \"query\"   # search\n\
+                    1. **Error resolved** \u{2192} `icm store -t errors-resolved`\n\
+                    \x20   icm remember \"<fact>\" --topic t\n\
+                    You MUST call `icm store`. See https://github.com/rtk-ai/icm for more.\n";
+        let out = command_text_for(text, true);
+        assert!(out.contains("\nicm.exe recall \"query\""), "{out}");
+        assert!(out.contains("`icm.exe store -t errors-resolved`"), "{out}");
+        assert!(out.contains("    icm.exe remember \"<fact>\""), "{out}");
+        // Prose and URLs keep the project name.
+        assert!(out.contains("## Persistent memory (ICM)"), "{out}");
+        assert!(
+            out.contains("https://github.com/rtk-ai/icm for more."),
+            "{out}"
+        );
+        // A command named in a sentence is one the agent may type as is.
+        assert!(out.contains("You MUST call `icm.exe store`."), "{out}");
+        // Nothing is doubled on a second pass.
+        assert_eq!(command_text_for(&out, true), out);
     }
 }

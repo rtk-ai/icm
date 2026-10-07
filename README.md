@@ -128,6 +128,8 @@ curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
 irm https://raw.githubusercontent.com/rtk-ai/icm/main/install.ps1 | iex
 ```
 
+On Windows, type `icm.exe` in PowerShell: there `icm` alone is a built-in alias of `Invoke-Command`. cmd and Git Bash accept both, and `icm init` writes `icm.exe` in the instructions it gives your agents.
+
 Keyword search works everywhere. Run `icm embeddings status` to see whether semantic search is on: it is built into the macOS Apple Silicon, Windows and `.rpm` builds; the Linux glibc archives and the `.deb` need one `icm embeddings download`; the Intel Mac build needs your own ONNX Runtime (`ORT_DYLIB_PATH`); the static Linux musl build is keyword-only. Nix, building from source, version pinning and the details: [reference](docs/reference.md#install).
 
 ## Setup

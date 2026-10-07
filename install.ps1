@@ -163,7 +163,10 @@ if ($PreviousVersion) {
 }
 Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor Green
-Write-Host "    1. icm init              # instructions, skills and hooks for the AI tools it detects"
-Write-Host "    2. icm init --mode all   # optional: also register the MCP server"
+Write-Host "    1. icm.exe init              # instructions, skills and hooks for the AI tools it detects"
+Write-Host "    2. icm.exe init --mode all   # optional: also register the MCP server"
 Write-Host "    3. Restart your AI tool to activate"
+Write-Host ""
+Write-Host "  In PowerShell, type icm.exe: plain 'icm' is a built-in alias of Invoke-Command." -ForegroundColor Yellow
+Write-Host "  cmd and Git Bash accept both."
 Write-Host ""

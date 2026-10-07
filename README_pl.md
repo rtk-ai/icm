@@ -71,13 +71,16 @@ Na [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 pytań wielokrotnego 
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | opublikowany przez zestaw testowy |
 | Bazowe wyszukiwanie hybrydowe | 84.4% (497 / 589) | 24.2k tokens | opublikowany przez zestaw testowy |
 
-Samo wyszukiwanie, na LoCoMo, bez modelu odpowiadającego: odsetek pytań, dla których co najmniej jedna sesja wzorcowa (gold) znajduje się wśród najwyższych wyników. To jest dowód dotyczący samego silnika przywoływania. Przebiegi v2 otrzymały datę każdej sesji i datę pytania; poprzedni silnik nie przyjmuje daty na wejściu, więc jego przebiegi nie otrzymały żadnej.
+Samo wyszukiwanie, na LoCoMo, bez modelu odpowiadającego: odsetek pytań, dla których co najmniej jedna sesja wzorcowa (gold) znajduje się wśród najwyższych wyników. To jest dowód dotyczący samego silnika przywoływania.
 
-| Najwyższe wyniki | Poprzedni silnik (`legacy`) | Silnik przywoływania v2 | Poprzedni silnik, bez modelu embeddingów | Silnik przywoływania v2, bez modelu embeddingów |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| Silnik przywoływania | Wyszukiwanie | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (domyślny) | słowa kluczowe + model embeddingów | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (domyślny) | tylko słowa kluczowe | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | słowa kluczowe + model embeddingów | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | tylko słowa kluczowe | 12.0% | 17.4% | 29.8% |
+
+Oba silniki zmierzono na tej samej wersji 0.11. Przebiegi silnika 0.11 otrzymały datę każdej sesji i datę pytania; silnik 0.10 nie przyjmuje dat, więc jego przebiegi nie otrzymały żadnej.
 
 LongMemEval-S, samo wyszukiwanie, bez LLM (ICM z domyślnym modelem embeddingów; 500 pytań; do każdego pytania dołączonych jest około 48 wcześniejszych sesji do przeszukania; jedno wspomnienie na sesję, tylko wypowiedzi użytkownika, tak jak indeksuje je MemPalace; ICM nie dostaje żadnej daty):
 
@@ -214,13 +217,13 @@ Przywoływanie łączy do trzech rankingów metodą reciprocal rank fusion (RRF)
 Wszystko znajduje się w jednym pliku SQLite, bez zewnętrznej usługi:
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config` pokazuje aktywną konfigurację; [config/default.toml](config/default.toml) zawiera listę wszystkich opcji. Szczegóły: [dokumentacja referencyjna](docs/reference.md#how-it-works).
+`icm config` pokazuje aktywną konfigurację; [config/default.toml](config/default.toml) zawiera listę wszystkich opcji. Szczegóły: [dokumentacja referencyjna](docs/reference.md#how-it-works), [diagramy architektury](docs/architecture.md#architecture-at-a-glance).
 
 <a id="documentation"></a>
 ## Dokumentacja

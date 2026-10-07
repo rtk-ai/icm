@@ -42,26 +42,39 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
 }
 
 /// Detect the target triple for this platform.
-fn detect_target() -> Result<(&'static str, &'static str)> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
+fn detect_target() -> Result<(String, &'static str)> {
+    target_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "musl"),
+    )
+}
 
-    let target_suffix = match os {
-        "macos" => "apple-darwin",
-        "linux" => "unknown-linux-gnu",
-        "windows" => "pc-windows-msvc",
-        _ => bail!("Unsupported OS: {os}"),
-    };
-
+/// The release archive that replaces a binary built for `os` / `arch`.
+///
+/// A static musl binary must be replaced by the musl archive: it is the one
+/// `install.sh` picks on Alpine and on systems whose glibc is older than
+/// the gnu archive needs, and the gnu archive does not start there.
+fn target_for(os: &str, arch: &str, musl: bool) -> Result<(String, &'static str)> {
     let arch = match arch {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
         _ => bail!("Unsupported architecture: {arch}"),
     };
-
+    let target_suffix = match os {
+        "macos" => "apple-darwin",
+        "linux" if musl => {
+            if arch != "x86_64" {
+                bail!("no static musl release exists for {arch}; reinstall with install.sh");
+            }
+            "unknown-linux-musl"
+        }
+        "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
+        _ => bail!("Unsupported OS: {os}"),
+    };
     let ext = if os == "windows" { "zip" } else { "tar.gz" };
-    let target = Box::leak(format!("{arch}-{target_suffix}").into_boxed_str());
-    Ok((target, ext))
+    Ok((format!("{arch}-{target_suffix}"), ext))
 }
 
 /// Fetch the latest release tag from the GitHub API.
@@ -118,7 +131,7 @@ fn parse_expected_sha(checksums: &str, filename: &str) -> Result<String> {
 fn extract_binary(archive: &[u8], is_zip: bool) -> Result<Vec<u8>> {
     if is_zip {
         // Windows: zip containing icm.exe
-        bail!("zip extraction not supported — use the standalone installer on Windows");
+        bail!("{WINDOWS_UPGRADE_HINT}");
     }
 
     // Unix: tar.gz containing icm
@@ -173,6 +186,60 @@ fn write_new_binary(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// What to do instead of `icm upgrade --apply` on Windows, where the release
+/// is a zip this command does not unpack.
+const WINDOWS_UPGRADE_HINT: &str = "icm upgrade --apply is not available on Windows. \
+     Run the installer again instead:\n  \
+     irm https://raw.githubusercontent.com/rtk-ai/icm/main/install.ps1 | iex";
+
+/// Start the freshly written binary and check it reports the version being
+/// installed, before it takes the place of the one that works.
+///
+/// A download can be intact and still not run here: a binary for another
+/// libc, or one that needs a newer glibc than this system has.
+fn verify_new_binary(path: &Path, expected_version: &str) -> Result<()> {
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| {
+            format!(
+                "the downloaded binary does not start ({}); the installed binary is unchanged",
+                path.display()
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let reported = stdout.split_whitespace().nth(1).unwrap_or("");
+    if !out.status.success() || reported != expected_version {
+        bail!(
+            "the downloaded binary did not report version {expected_version} \
+             (exit {}, output {:?}); the installed binary is unchanged",
+            out.status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            stdout.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Print what the new binary says about semantic search. A release may load
+/// its ONNX Runtime on demand where the previous one had it built in; without
+/// this line the upgrade would turn semantic search off without a word.
+fn report_embeddings_status(binary: &Path) {
+    let Ok(out) = std::process::Command::new(binary)
+        .args(["embeddings", "status"])
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    if let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) {
+        eprintln!("Semantic search: {}", line.trim());
+    }
+}
+
 /// Run the upgrade flow: fetch latest, verify checksum, replace binary.
 pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION");
@@ -199,6 +266,11 @@ pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
         eprintln!("Update available: {current_version} → {latest_version}");
         eprintln!("Run 'icm upgrade --apply' to install.");
         return Ok(());
+    }
+
+    // Say so before downloading anything.
+    if cfg!(windows) {
+        bail!("{WINDOWS_UPGRADE_HINT}");
     }
 
     // Detect package-managed installations — refuse to avoid breaking metadata
@@ -259,12 +331,17 @@ pub fn cmd_upgrade(apply: bool, check_only: bool) -> Result<()> {
 
     eprintln!("Installing to {}...", current_exe.display());
 
-    // Write new binary to .new.
+    // Write new binary to .new, and try it before it replaces anything.
     write_new_binary(&new_path, &new_binary)?;
+    if let Err(e) = verify_new_binary(&new_path, latest_version) {
+        let _ = std::fs::remove_file(&new_path);
+        return Err(e);
+    }
 
     swap_binary_into_place(&new_path, &current_exe, &backup_path)?;
 
     eprintln!("Successfully upgraded to {latest_version}");
+    report_embeddings_status(&current_exe);
     Ok(())
 }
 
@@ -357,6 +434,69 @@ mod tests {
     }
 
     /// Sanity check for the normal case: no pre-existing entry at all.
+    #[test]
+    fn a_musl_binary_is_replaced_by_the_musl_archive() {
+        let t = |os, arch, musl| target_for(os, arch, musl).map(|(t, e)| (t, e.to_string()));
+        assert_eq!(
+            t("linux", "x86_64", true).unwrap(),
+            ("x86_64-unknown-linux-musl".into(), "tar.gz".into())
+        );
+        assert_eq!(
+            t("linux", "x86_64", false).unwrap().0,
+            "x86_64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            t("linux", "aarch64", false).unwrap().0,
+            "aarch64-unknown-linux-gnu"
+        );
+        // No musl archive is published for aarch64: say so rather than
+        // install the gnu one, which would not start.
+        assert!(t("linux", "aarch64", true).is_err());
+        assert_eq!(
+            t("macos", "aarch64", false).unwrap().0,
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(
+            t("windows", "x86_64", false).unwrap(),
+            ("x86_64-pc-windows-msvc".into(), "zip".into())
+        );
+        assert!(t("freebsd", "x86_64", false).is_err());
+        assert!(t("linux", "riscv64", false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_does_not_run_or_reports_another_version_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let good = script("good", "echo 'icm 1.2.3'");
+        assert!(verify_new_binary(&good, "1.2.3").is_ok());
+
+        let other = script("other", "echo 'icm 1.2.2'");
+        let err = verify_new_binary(&other, "1.2.3").unwrap_err().to_string();
+        assert!(err.contains("did not report version 1.2.3"), "{err}");
+        assert!(err.contains("unchanged"), "{err}");
+
+        let failing = script("failing", "echo 'icm 1.2.3'; exit 3");
+        assert!(verify_new_binary(&failing, "1.2.3").is_err());
+
+        // Not an executable for this system at all (the wrong-libc case).
+        let garbage = tmp.path().join("garbage");
+        std::fs::write(&garbage, b"\x7fELF not really").unwrap();
+        std::fs::set_permissions(&garbage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = verify_new_binary(&garbage, "1.2.3")
+            .unwrap_err()
+            .to_string();
+        // Depending on the system this is a failed exec or a shell's exit 127.
+        assert!(err.contains("unchanged"), "{err}");
+    }
+
     #[test]
     fn write_new_binary_creates_a_fresh_file() {
         let tmp = tempfile::TempDir::new().unwrap();

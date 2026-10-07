@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.11.1](https://github.com/rtk-ai/icm/compare/icm-v0.11.0...icm-v0.11.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **install:** the Windows installer runs from a file; correct next steps ([53fbeef](https://github.com/rtk-ai/icm/commit/53fbeefeabcf6de4d8b7b01c3604f5afcbbdbc23))
+* **upgrade:** never replace a working binary with one that does not start ([3f0b86a](https://github.com/rtk-ai/icm/commit/3f0b86aba0ebd19264190144e1b8dcfdfe210288))
+* **windows:** icm.exe where PowerShell would run Invoke-Command; uninstall leaves nothing ([#487](https://github.com/rtk-ai/icm/issues/487)) ([97f77b9](https://github.com/rtk-ai/icm/commit/97f77b93d9a1118a6ba005b3a23c8479948f03ae))
+
 ## [0.11.0](https://github.com/rtk-ai/icm/compare/icm-v0.10.65...icm-v0.11.0) (2026-10-06)
 
 

@@ -71,13 +71,16 @@ memories[1]{id,topic,importance,weight,summary}:
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | 하네스 공개 결과 |
 | 하이브리드 검색 기준선 | 84.4% (497 / 589) | 24.2k tokens | 하네스 공개 결과 |
 
-답변 모델 없이 LoCoMo에서 검색만 평가한 결과입니다. 정답 세션 중 하나 이상이 상위 결과에 포함된 질문의 비율이며, 이것이 검색 엔진 자체에 대한 근거입니다. v2 실행에는 각 세션의 날짜와 질문의 날짜를 제공했습니다. 이전 엔진은 날짜 입력이 없으므로 이전 엔진 실행에는 날짜를 제공하지 않았습니다.
+답변 모델 없이 LoCoMo에서 검색만 평가한 결과입니다. 정답 세션 중 하나 이상이 상위 결과에 포함된 질문의 비율이며, 이것이 검색 엔진 자체에 대한 근거입니다.
 
-| 상위 결과 수 | 이전 엔진 (`legacy`) | 검색 엔진 v2 | 이전 엔진, 임베딩 모델 없음 | 검색 엔진 v2, 임베딩 모델 없음 |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| 검색 엔진 | 검색 방식 | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (기본값) | 키워드 + 임베딩 모델 | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (기본값) | 키워드만 | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | 키워드 + 임베딩 모델 | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | 키워드만 | 12.0% | 17.4% | 29.8% |
+
+두 엔진 모두 동일한 0.11 빌드로 측정했습니다. 0.11 엔진 실행에는 각 세션의 날짜와 질문의 날짜를 제공했습니다. 0.10 엔진에는 날짜 입력이 없어 해당 실행에는 날짜를 제공하지 않았습니다.
 
 LongMemEval-S, 검색만 평가, LLM 없음(ICM은 기본 임베딩 모델 사용, 500문항, 질문마다 검색 대상인 과거 세션 약 48개, MemPalace의 인덱싱 방식대로 세션당 메모리 하나에 사용자 발화만 포함, ICM에는 날짜를 제공하지 않음):
 
@@ -214,13 +217,13 @@ ICM은 **memoirs**(개념과 타입이 있는 관계로 이루어진 영구 지�
 모든 것은 외부 서비스 없이 SQLite 파일 하나에 저장됩니다:
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config`는 현재 적용된 설정을 보여 주며, [config/default.toml](config/default.toml)에 모든 옵션이 나열되어 있습니다. 자세한 내용: [레퍼런스](docs/reference.md#how-it-works).
+`icm config`는 현재 적용된 설정을 보여 주며, [config/default.toml](config/default.toml)에 모든 옵션이 나열되어 있습니다. 자세한 내용: [레퍼런스](docs/reference.md#how-it-works), [아키텍처 다이어그램](docs/architecture.md#architecture-at-a-glance).
 
 <a id="documentation"></a>
 ## 문서

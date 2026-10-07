@@ -384,7 +384,7 @@ Single SQLite file with WAL mode. No external services.
 
 ```
 macOS:   ~/Library/Application Support/dev.icm.icm/memories.db
-Linux:   ~/.local/share/dev.icm.icm/memories.db
+Linux:   ~/.local/share/icm/memories.db
 ```
 
 Override: `--db <path>` flag or `ICM_DB` environment variable.
@@ -538,7 +538,7 @@ Si vous utilisez le binaire pre-compile depuis les releases GitHub, les embeddin
 **Solutions :**
 - Localisez la base :
   - macOS : `~/Library/Application Support/dev.icm.icm/memories.db`
-  - Linux : `~/.local/share/dev.icm.icm/memories.db`
+  - Linux : `~/.local/share/icm/memories.db`
 - Sauvegardez le fichier `.db` et ses fichiers WAL (`.db-wal`, `.db-shm`)
 - Supprimez et reconstruisez si necessaire — la migration est automatique
 - Pour tester avec une base propre : `icm --db /tmp/test.db stats`
@@ -883,7 +883,7 @@ La base SQLite gere des millions de lignes sans probleme. Les benchmarks montren
 rm ~/Library/Application\ Support/dev.icm.icm/memories.db*
 
 # Linux
-rm ~/.local/share/dev.icm.icm/memories.db*
+rm ~/.local/share/icm/memories.db*
 ```
 
 La base est recreee automatiquement au prochain lancement.

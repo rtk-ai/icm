@@ -71,13 +71,16 @@ memories[1]{id,topic,importance,weight,summary}:
 | Hindsight | 86.6% (510 / 589) | 15.8k tokens | 测试框架公布 |
 | 混合搜索基线 | 84.4% (497 / 589) | 24.2k tokens | 测试框架公布 |
 
-仅检索，在 LoCoMo 上，不使用作答模型：至少有一个标准答案会话出现在靠前结果中的问题所占的比例。这是召回引擎本身的证据。v2 的运行接收了每个会话的日期和问题的日期；之前的引擎没有日期输入，因此它的运行没有接收任何日期。
+仅检索，在 LoCoMo 上，不使用作答模型：至少有一个标准答案会话出现在靠前结果中的问题所占的比例。这是召回引擎本身的证据。
 
-| 靠前结果数 | 之前的引擎（`legacy`） | 召回引擎 v2 | 之前的引擎，无嵌入模型 | 召回引擎 v2，无嵌入模型 |
-|:-----------:|:--------------:|:----------------:|:--------------:|:----------------:|
-| 5 | 76.5% | **86.7%** | 12.0% | **88.6%** |
-| 10 | 83.0% | **93.3%** | 17.4% | **94.2%** |
-| 20 | 87.7% | **97.9%** | 29.8% | **97.5%** |
+| 召回引擎 | 搜索 | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (默认) | 关键词 + 嵌入模型 | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (默认) | 仅关键词 | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | 关键词 + 嵌入模型 | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | 仅关键词 | 12.0% | 17.4% | 29.8% |
+
+两个引擎均使用同一个 0.11 构建进行测量。0.11 引擎的运行获得了每个会话的日期和问题的日期；0.10 引擎没有日期输入，因此其运行未获得任何日期。
 
 LongMemEval-S，仅检索，不使用 LLM（ICM 使用其默认嵌入模型；500 个问题；每个问题附带约 48 个需要搜索的历史会话；每个会话一条记忆，仅包含用户发言，与 MemPalace 的索引方式相同；不向 ICM 提供日期）：
 
@@ -214,13 +217,13 @@ ICM 还会保存 **memoirs**（由概念和带类型的关系组成的永久知�
 所有数据都存放在一个 SQLite 文件中，不依赖任何外部服务：
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db     # macOS
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
 ~/.local/share/icm/memories.db                            # Linux
 %APPDATA%\icm\icm\data\memories.db                        # Windows
 <project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-`icm config` 显示当前生效的配置；[config/default.toml](config/default.toml) 列出了所有选项。详情：[参考文档](docs/reference.md#how-it-works)。
+`icm config` 显示当前生效的配置；[config/default.toml](config/default.toml) 列出了所有选项。详情：[参考文档](docs/reference.md#how-it-works)、[架构图](docs/architecture.md#architecture-at-a-glance)。
 
 <a id="documentation"></a>
 ## 文档

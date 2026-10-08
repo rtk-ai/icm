@@ -204,9 +204,53 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     "project": {
                         "type": "string",
                         "description": "Project filter (segment-aware). Defaults to the server's cwd directory name. Pass an empty string to disable the filter and search across all projects."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "default": "text",
+                        "description": "Output shape. `json` returns an array of records with `id`, `topic`, `summary`, `importance`, `weight`, `keywords`, `related_ids` and timestamps, for clients that parse the result"
                     }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "icm_memory_related",
+            "description": "List the memories linked to one memory, following the links ICM stores between related memories. Use after a recall with `format: \"json\"`, which gives the ids.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "ID of the memory to start from"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "default": 1,
+                        "minimum": 1,
+                        "maximum": 3,
+                        "description": "How many links to follow from the start memory"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Max number of results, nearest first"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project filter, as in icm_memory_recall. Linked memories of another project are left out and not followed. Pass an empty string to follow links across projects."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "default": "text",
+                        "description": "Output shape. `json` returns the same records as icm_memory_recall, with a `hops` field"
+                    }
+                },
+                "required": ["id"]
             }
         }),
         json!({
@@ -824,6 +868,7 @@ pub fn call_tool_with_config(
         // Memory tools
         "icm_memory_store" => tool_store(store, embedder, args, compact, auto_consolidate),
         "icm_memory_recall" => tool_recall(store, embedder, args, compact),
+        "icm_memory_related" => tool_related(store, args, compact),
         "icm_memory_forget" => tool_forget(store, args),
         "icm_memory_forget_topic" => tool_forget_topic(store, args),
         "icm_memory_update" => tool_update(store, embedder, args),
@@ -1007,6 +1052,21 @@ fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 fn get_i64(args: &Value, key: &str, default: i64) -> i64 {
     args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+}
+
+/// The project a recall is scoped to. The explicit `project` argument wins
+/// (an empty string disables the filter); otherwise it is derived from the
+/// server's cwd through the shared icm-core detection (git remote first) —
+/// the CLI hooks store under that name, so a raw cwd basename would
+/// silently miss on renamed checkouts (audit finding).
+fn project_scope(args: &Value) -> Option<String> {
+    match get_str(args, "project") {
+        Some("") => None,
+        Some(p) => Some(p.to_string()),
+        None => std::env::current_dir()
+            .ok()
+            .and_then(|p| icm_core::project::project_from_path(&p.to_string_lossy())),
+    }
 }
 
 fn resolve_memoir(store: &Store, name: &str) -> Result<Memoir, ToolResult> {
@@ -1227,6 +1287,104 @@ fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
     output
 }
 
+/// Output shape of `icm_memory_recall` and `icm_memory_related` (#476).
+/// `Text` is what the tools always printed; `Json` is for clients that
+/// parse the result and need each record's id and links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+/// The `format` argument. Absent means `Text`; an unknown value is refused
+/// rather than answered in a shape the caller did not ask for.
+fn output_format(args: &Value) -> Result<OutputFormat, String> {
+    match args.get("format") {
+        None | Some(Value::Null) => Ok(OutputFormat::Text),
+        Some(Value::String(s)) if s == "text" => Ok(OutputFormat::Text),
+        Some(Value::String(s)) if s == "json" => Ok(OutputFormat::Json),
+        Some(other) => Err(format!(
+            "invalid format {other}: expected \"text\" or \"json\""
+        )),
+    }
+}
+
+/// Longest `raw_excerpt` shown per memory. The excerpt can hold up to 64 KB;
+/// dumping it in full for every hit floods the client LLM's context (audit
+/// finding). The full excerpt stays in the store.
+const MAX_RAW_IN_RECALL: usize = 2048;
+
+/// `raw` cut to [`MAX_RAW_IN_RECALL`] bytes on a character boundary.
+fn capped_raw(raw: &str) -> &str {
+    if raw.len() <= MAX_RAW_IN_RECALL {
+        return raw;
+    }
+    let mut cut = MAX_RAW_IN_RECALL;
+    while !raw.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &raw[..cut]
+}
+
+/// One memory as a JSON record (#476). `score` is present only when a
+/// similarity was computed (negative means none, as in the text view);
+/// `hops` only in `icm_memory_related`. JSON escapes the text itself, so
+/// nothing is flattened here.
+fn memory_json(mem: &Memory, score: f32, hops: Option<usize>) -> Value {
+    // Three decimals, as in the text view: an f32 printed as a JSON number
+    // would otherwise read 0.9750000238418579.
+    let rounded = |v: f32| (f64::from(v) * 1000.0).round() / 1000.0;
+    let mut record = json!({
+        "id": mem.id,
+        "topic": mem.topic,
+        "summary": mem.summary,
+        "importance": mem.importance.to_string(),
+        "weight": rounded(mem.weight),
+        "keywords": mem.keywords,
+        "related_ids": mem.related_ids,
+        "created_at": mem.created_at.to_rfc3339(),
+        "updated_at": mem.updated_at.to_rfc3339(),
+    });
+    if score >= 0.0 {
+        record["score"] = json!(rounded(score));
+    }
+    if let Some(hops) = hops {
+        record["hops"] = json!(hops);
+    }
+    if let Some(raw) = mem.raw_excerpt.as_deref() {
+        let shown = capped_raw(raw);
+        record["raw_excerpt"] = json!(shown);
+        if shown.len() < raw.len() {
+            record["raw_excerpt_bytes"] = json!(raw.len());
+        }
+    }
+    record
+}
+
+/// The answer of a recall in the requested shape. In `Json` the server's
+/// compact setting does not apply: the caller asked for the records.
+fn render_memories(memories: &[(Memory, f32)], compact: bool, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Text => format_memory_output(memories, compact),
+        OutputFormat::Json => Value::Array(
+            memories
+                .iter()
+                .map(|(mem, score)| memory_json(mem, *score, None))
+                .collect(),
+        )
+        .to_string(),
+    }
+}
+
+/// What a recall with no match answers: the usual sentence, or an empty
+/// array for a caller that parses JSON.
+fn no_memories(format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Text => MSG_NO_MEMORIES.into(),
+        OutputFormat::Json => "[]".into(),
+    }
+}
+
 /// Append one recalled memory to `output`. Kept separate from the loop so
 /// the v2 token budget can charge a hit exactly what is printed for it.
 fn push_memory_output(output: &mut String, mem: &Memory, score: f32, compact: bool) {
@@ -1258,20 +1416,17 @@ fn push_memory_output(output: &mut String, mem: &Memory, score: f32, compact: bo
         let flattened_keywords: Vec<String> = mem.keywords.iter().map(|k| flatten(k)).collect();
         output.push_str(&format!("  keywords: {}\n", flattened_keywords.join(", ")));
     }
+    if !mem.related_ids.is_empty() {
+        // Ids are generated by ICM, but `related_ids` is a stored field
+        // like the others: flattened for the same reason.
+        let related: Vec<String> = mem.related_ids.iter().map(|id| flatten(id)).collect();
+        output.push_str(&format!("  related: {}\n", related.join(", ")));
+    }
     if let Some(ref raw) = mem.raw_excerpt {
-        // raw_excerpt can hold up to 64 KB per memory; dumping it in
-        // full for every hit floods the client LLM's context (audit
-        // finding). Cap the recall view — the full excerpt stays in
-        // the store.
-        const MAX_RAW_IN_RECALL: usize = 2048;
-        if raw.len() > MAX_RAW_IN_RECALL {
-            let mut cut = MAX_RAW_IN_RECALL;
-            while !raw.is_char_boundary(cut) {
-                cut -= 1;
-            }
+        let shown = capped_raw(raw);
+        if shown.len() < raw.len() {
             output.push_str(&format!(
-                "  raw: {}… [truncated, {} bytes total]\n",
-                &raw[..cut],
+                "  raw: {shown}… [truncated, {} bytes total]\n",
                 raw.len()
             ));
         } else {
@@ -1287,12 +1442,24 @@ fn push_memory_output(output: &mut String, mem: &Memory, score: f32, compact: bo
 /// and is accepted. Anything else is refused rather than ignored, which
 /// would silently fall back to a count-based recall.
 fn recall_max_tokens(args: &Value) -> Result<Option<usize>, String> {
-    let whole = |f: f64| (f.is_finite() && f.fract() == 0.0).then_some(f as i64);
     let value = match args.get("max_tokens") {
         None | Some(Value::Null) => return Ok(None),
         Some(v) => v,
     };
-    let tokens = match value {
+    match whole_number(value) {
+        Some(n) => Ok(Some(n.clamp(100, 32_000) as usize)),
+        None => Err(format!(
+            "invalid max_tokens {value}: expected a whole number of tokens (100 to 32000)"
+        )),
+    }
+}
+
+/// A whole number from a tool argument: a JSON integer, a whole float
+/// (`3.0`, a valid JSON Schema `integer`) or a numeric string (`"3"`).
+/// `None` for anything else.
+fn whole_number(value: &Value) -> Option<i64> {
+    let whole = |f: f64| (f.is_finite() && f.fract() == 0.0).then_some(f as i64);
+    match value {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().and_then(whole)),
         Value::String(s) => {
             let s = s.trim();
@@ -1301,11 +1468,22 @@ fn recall_max_tokens(args: &Value) -> Result<Option<usize>, String> {
                 .or_else(|| s.parse::<f64>().ok().and_then(whole))
         }
         _ => None,
+    }
+}
+
+/// A count argument (`depth`, `limit`) of `icm_memory_related`, clamped to
+/// `1..=max`. A value that is not a whole number is refused rather than
+/// replaced by the default: `depth: "three"` answered at depth 1 would read
+/// as "there are no deeper links".
+fn count_arg(args: &Value, key: &str, default: i64, max: i64) -> Result<usize, String> {
+    let value = match args.get(key) {
+        None | Some(Value::Null) => return Ok(default as usize),
+        Some(v) => v,
     };
-    match tokens {
-        Some(n) => Ok(Some(n.clamp(100, 32_000) as usize)),
+    match whole_number(value) {
+        Some(n) => Ok(n.clamp(1, max) as usize),
         None => Err(format!(
-            "invalid max_tokens {value}: expected a whole number of tokens (100 to 32000)"
+            "invalid {key} {value}: expected a whole number (1 to {max})"
         )),
     }
 }
@@ -1364,14 +1542,10 @@ fn tool_recall_on(
     // derive it from the server's cwd via the shared icm-core detection
     // (git remote first) — the CLI hooks store under that name, so a raw
     // cwd basename would silently miss on renamed checkouts (audit finding).
-    let project_arg = get_str(args, "project");
-    let cwd_project = std::env::current_dir()
-        .ok()
-        .and_then(|p| icm_core::project::project_from_path(&p.to_string_lossy()));
-    let project: Option<String> = match project_arg {
-        Some("") => None,
-        Some(p) => Some(p.to_string()),
-        None => cwd_project,
+    let project = project_scope(args);
+    let format = match output_format(args) {
+        Ok(f) => f,
+        Err(msg) => return ToolResult::error(msg),
     };
 
     if engine == RecallEngine::V2 {
@@ -1385,7 +1559,7 @@ fn tool_recall_on(
             now: None,
             expand_neighbors: true,
         };
-        return tool_recall_v2(store, embedder, &req, compact);
+        return tool_recall_v2(store, embedder, &req, compact, format);
     }
 
     let project_filter = |m: &Memory| -> bool {
@@ -1451,10 +1625,10 @@ fn tool_recall_on(
                 let _ = store.batch_update_access(&ids);
 
                 if expanded.is_empty() {
-                    return ToolResult::text(MSG_NO_MEMORIES.into());
+                    return ToolResult::text(no_memories(format));
                 }
 
-                return ToolResult::text(format_memory_output(&expanded, compact));
+                return ToolResult::text(render_memories(&expanded, compact, format));
             }
         }
     }
@@ -1507,13 +1681,13 @@ fn tool_recall_on(
     let _ = store.batch_update_access(&ids);
 
     if expanded.is_empty() {
-        return ToolResult::text(MSG_NO_MEMORIES.into());
+        return ToolResult::text(no_memories(format));
     }
 
     // FTS-path results have synthetic scores — reset to -1.0 for display
     // so we don't claim a hybrid-search confidence we didn't compute.
     let for_display: Vec<(Memory, f32)> = expanded.into_iter().map(|(m, _)| (m, -1.0)).collect();
-    ToolResult::text(format_memory_output(&for_display, compact))
+    ToolResult::text(render_memories(&for_display, compact, format))
 }
 
 /// Result cap for the v2 engine. Without a budget the published 1..=20
@@ -1543,16 +1717,23 @@ fn tool_recall_v2(
     embedder: Option<&dyn Embedder>,
     req: &RecallRequest<'_>,
     compact: bool,
+    format: OutputFormat,
 ) -> ToolResult {
     // The legacy path answered a blank query with "no memories", not with
     // an error.
     if req.query.trim().is_empty() {
-        return ToolResult::text(MSG_NO_MEMORIES.into());
+        return ToolResult::text(no_memories(format));
     }
     let shown = |score: f32| if embedder.is_some() { score } else { -1.0 };
     let rendered_tokens = |mem: &Memory, score: f32| {
-        let mut text = String::new();
-        push_memory_output(&mut text, mem, shown(score), compact);
+        let text = match format {
+            OutputFormat::Text => {
+                let mut text = String::new();
+                push_memory_output(&mut text, mem, shown(score), compact);
+                text
+            }
+            OutputFormat::Json => memory_json(mem, shown(score), None).to_string(),
+        };
         icm_core::estimate_tokens(&text)
     };
     let outcome = match req.run_with_cost(store, embedder, &rendered_tokens) {
@@ -1560,14 +1741,131 @@ fn tool_recall_v2(
         Err(e) => return ToolResult::error(format!("search error: {e}")),
     };
     if outcome.hits.is_empty() {
-        return ToolResult::text(MSG_NO_MEMORIES.into());
+        return ToolResult::text(no_memories(format));
     }
     let scored: Vec<(Memory, f32)> = outcome
         .hits
         .into_iter()
         .map(|h| (h.memory, shown(h.score)))
         .collect();
-    ToolResult::text(format_memory_output(&scored, compact))
+    ToolResult::text(render_memories(&scored, compact, format))
+}
+
+/// Result cap of `icm_memory_related`, as published in its schema.
+const RELATED_MAX_LIMIT: i64 = 50;
+/// Deepest walk `icm_memory_related` does, as published in its schema.
+const RELATED_MAX_DEPTH: i64 = 3;
+
+/// `icm_memory_related`: the memories linked to one memory (#476).
+///
+/// Walks `related_ids` breadth-first from `id`, nearest first, up to
+/// `depth` links away. The project scope is the one of
+/// `icm_memory_recall`: a linked memory of another project is left out and
+/// its own links are not followed, so the walk cannot leave the project
+/// through it. A start memory outside the scope is an error, not an empty
+/// answer that would read as "no links". Ids that no longer exist are
+/// skipped.
+fn tool_related(store: &Store, args: &Value, compact: bool) -> ToolResult {
+    let format = match output_format(args) {
+        Ok(f) => f,
+        Err(msg) => return ToolResult::error(msg),
+    };
+    let id = match get_str(args, "id").map(str::trim) {
+        Some(id) if !id.is_empty() => id,
+        _ => return ToolResult::error("missing required field: id".into()),
+    };
+    let depth = match count_arg(args, "depth", 1, RELATED_MAX_DEPTH) {
+        Ok(n) => n,
+        Err(msg) => return ToolResult::error(msg),
+    };
+    let limit = match count_arg(args, "limit", 10, RELATED_MAX_LIMIT) {
+        Ok(n) => n,
+        Err(msg) => return ToolResult::error(msg),
+    };
+    let project = project_scope(args);
+    let in_scope = |m: &Memory| match project.as_deref() {
+        None => true,
+        Some(p) => is_preference_topic(&m.topic) || project_matches(&m.topic, Some(p)),
+    };
+
+    let start = match store.get(id) {
+        Ok(Some(m)) => m,
+        Ok(None) => return ToolResult::error(format!("memory not found: {id}")),
+        Err(e) => return ToolResult::error(format!("failed to get memory {id}: {e}")),
+    };
+    if !in_scope(&start) {
+        return ToolResult::error(format!(
+            "memory {id} (topic {:?}) is outside project {:?}. Pass `project: \"\"` to follow \
+             links across projects.",
+            start.topic,
+            project.as_deref().unwrap_or_default()
+        ));
+    }
+
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::from([start.id.clone()]);
+    let mut frontier = vec![start];
+    let mut found: Vec<(Memory, usize)> = Vec::new();
+    'walk: for hop in 1..=depth {
+        let mut ids: Vec<String> = Vec::new();
+        for mem in &frontier {
+            for related in &mem.related_ids {
+                if seen.insert(related.clone()) {
+                    ids.push(related.clone());
+                }
+            }
+        }
+        if ids.is_empty() {
+            break;
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut fetched = match store.get_many(&refs) {
+            Ok(f) => f,
+            Err(e) => return ToolResult::error(format!("failed to get linked memories: {e}")),
+        };
+        frontier = Vec::new();
+        for related in &ids {
+            let Some(mem) = fetched.remove(related) else {
+                continue;
+            };
+            if !in_scope(&mem) {
+                continue;
+            }
+            if found.len() >= limit {
+                break 'walk;
+            }
+            found.push((mem.clone(), hop));
+            frontier.push(mem);
+        }
+    }
+
+    if found.is_empty() {
+        return ToolResult::text(match format {
+            OutputFormat::Text => "No related memories.".into(),
+            OutputFormat::Json => "[]".into(),
+        });
+    }
+
+    // Following a link is a read of the memory, as in recall.
+    let found_ids: Vec<&str> = found.iter().map(|(m, _)| m.id.as_str()).collect();
+    let _ = store.batch_update_access(&found_ids);
+
+    ToolResult::text(match format {
+        OutputFormat::Json => Value::Array(
+            found
+                .iter()
+                .map(|(mem, hops)| memory_json(mem, -1.0, Some(*hops)))
+                .collect(),
+        )
+        .to_string(),
+        OutputFormat::Text => {
+            let mut output = String::new();
+            for (mem, _) in &found {
+                push_memory_output(&mut output, mem, -1.0, compact);
+            }
+            output
+        }
+    })
 }
 
 fn tool_forget(store: &Store, args: &Value) -> ToolResult {
@@ -5454,6 +5752,501 @@ description = "A test project"
             );
             assert!(!res.is_error, "{query:?}");
             assert_eq!(res.content[0].text, MSG_NO_MEMORIES, "{query:?}");
+        }
+    }
+
+    // ── #476: ids and links for clients that parse the result ───────────
+
+    use icm_core::Importance;
+
+    fn parsed(result: &ToolResult) -> Vec<Value> {
+        assert!(!result.is_error, "{}", result.content[0].text);
+        serde_json::from_str::<Value>(&result.content[0].text)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {}", result.content[0].text))
+            .as_array()
+            .expect("a JSON array")
+            .clone()
+    }
+
+    fn ids_of(records: &[Value]) -> Vec<String> {
+        records
+            .iter()
+            .map(|r| r["id"].as_str().expect("id").to_string())
+            .collect()
+    }
+
+    /// A small graph in project `alpha`:
+    ///
+    /// ```text
+    /// a ──► b ──► c
+    /// │     └───► a          (cycle back to the start)
+    /// ├───► other ──► hidden (other is in project beta; hidden is in alpha
+    /// │                       but reachable through other only)
+    /// └───► an id that no longer exists
+    /// ```
+    struct Graph {
+        store: Store,
+        a: Memory,
+        b: Memory,
+        c: Memory,
+        other: Memory,
+        hidden: Memory,
+    }
+
+    fn graph() -> Graph {
+        let mem =
+            |topic: &str, text: &str| Memory::new(topic.into(), text.into(), Importance::High);
+        let mut a = mem("decisions-alpha", "Alpha stores sessions in Redis");
+        let mut b = mem("decisions-alpha", "Redis runs with append-only persistence");
+        let c = mem("context-alpha", "The persistence volume is a 20 GB disk");
+        let mut other = mem("decisions-beta", "Beta keeps sessions in Postgres");
+        let hidden = mem("context-alpha", "Reachable through a beta memory only");
+        a.related_ids = vec![
+            b.id.clone(),
+            other.id.clone(),
+            "01NOLONGERTHERE00000000000".into(),
+        ];
+        b.related_ids = vec![c.id.clone(), a.id.clone()];
+        other.related_ids = vec![hidden.id.clone()];
+        let store = test_store();
+        for m in [&a, &b, &c, &other, &hidden] {
+            store.store(m.clone()).unwrap();
+        }
+        Graph {
+            store,
+            a,
+            b,
+            c,
+            other,
+            hidden,
+        }
+    }
+
+    #[test]
+    fn recall_json_gives_each_record_its_id_and_links() {
+        let g = graph();
+        // Compact is the server default: it must not change a JSON answer.
+        for compact in [true, false] {
+            let result = call_tool(
+                &g.store,
+                None,
+                "icm_memory_recall",
+                &json!({"query": "sessions Redis", "project": "alpha", "format": "json"}),
+                compact,
+            );
+            let records = parsed(&result);
+            let a = records
+                .iter()
+                .find(|r| r["id"] == json!(g.a.id))
+                .unwrap_or_else(|| panic!("a is missing: {records:?}"));
+            assert_eq!(a["topic"], "decisions-alpha");
+            assert_eq!(a["summary"], "Alpha stores sessions in Redis");
+            assert_eq!(a["importance"], "high");
+            assert_eq!(a["related_ids"], json!(g.a.related_ids));
+            assert!(a["keywords"].is_array());
+            // Three decimals, not the f32's full expansion.
+            let weight = a["weight"].to_string();
+            assert!(weight.len() <= 5, "{weight}");
+            for stamp in ["created_at", "updated_at"] {
+                let text = a[stamp].as_str().expect(stamp);
+                assert!(chrono::DateTime::parse_from_rfc3339(text).is_ok(), "{text}");
+            }
+            // No embedder took part: there is no similarity to report.
+            assert!(a.get("score").is_none(), "{a}");
+            assert!(a.get("hops").is_none(), "{a}");
+            // The project filter still applies.
+            assert!(!ids_of(&records).contains(&g.other.id));
+        }
+    }
+
+    #[test]
+    fn recall_json_is_the_same_on_the_legacy_engine() {
+        let g = graph();
+        let args = json!({"query": "sessions Redis", "project": "alpha", "format": "json"});
+        let result = tool_recall_on(&g.store, None, &args, true, RecallEngine::Legacy, None);
+        let ids = ids_of(&parsed(&result));
+        assert!(ids.contains(&g.a.id), "{ids:?}");
+        assert!(!ids.contains(&g.other.id), "{ids:?}");
+    }
+
+    #[test]
+    fn recall_json_with_no_match_is_an_empty_array() {
+        let g = graph();
+        for query in ["zzzunknownword", "   "] {
+            for engine in [RecallEngine::V2, RecallEngine::Legacy] {
+                let args = json!({"query": query, "project": "alpha", "format": "json"});
+                let result = tool_recall_on(&g.store, None, &args, true, engine, None);
+                assert!(!result.is_error);
+                assert_eq!(result.content[0].text, "[]", "{query:?} {engine:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn recall_refuses_a_format_it_does_not_know() {
+        let g = graph();
+        for format in [json!("xml"), json!("JSON"), json!(1), json!(true)] {
+            let result = call_tool(
+                &g.store,
+                None,
+                "icm_memory_recall",
+                &json!({"query": "sessions", "project": "alpha", "format": format}),
+                true,
+            );
+            assert!(result.is_error, "{format}");
+            let text = &result.content[0].text;
+            assert!(
+                text.contains("\"text\"") && text.contains("\"json\""),
+                "{text}"
+            );
+        }
+        // Naming the default explicitly is the default.
+        let named = call_tool(
+            &g.store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "sessions Redis", "project": "alpha", "format": "text"}),
+            true,
+        );
+        let default = call_tool(
+            &g.store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "sessions Redis", "project": "alpha"}),
+            true,
+        );
+        assert_eq!(named.content[0].text, default.content[0].text);
+    }
+
+    #[test]
+    fn recall_text_keeps_its_compact_shape_and_lists_links_in_the_full_one() {
+        let g = graph();
+        let args = json!({"query": "sessions Redis", "project": "alpha"});
+        // Compact: `[topic] summary` lines and nothing else, as before.
+        let compact = call_tool(&g.store, None, "icm_memory_recall", &args, true);
+        let text = &compact.content[0].text;
+        assert!(text.lines().all(|l| l.starts_with('[')), "{text}");
+        assert!(
+            !text.contains(&g.a.id) && !text.contains("related:"),
+            "{text}"
+        );
+        // Full: the links of a memory, on their own line.
+        let full = call_tool(&g.store, None, "icm_memory_recall", &args, false);
+        let text = &full.content[0].text;
+        assert!(
+            text.contains(&format!("  related: {}", g.a.related_ids.join(", "))),
+            "{text}"
+        );
+        // A memory without links has no such line.
+        let c = call_tool(
+            &g.store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "persistence volume disk", "project": "alpha", "limit": 1}),
+            false,
+        );
+        let text = &c.content[0].text;
+        assert!(
+            text.contains(&g.c.id) && !text.contains("related:"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn recall_json_caps_the_raw_excerpt_like_the_text_view() {
+        let store = test_store();
+        let mut long = Memory::new(
+            "context-alpha".into(),
+            "Stack trace of the import failure".into(),
+            Importance::Medium,
+        );
+        // Multi-byte text: the cut must land on a character boundary.
+        long.raw_excerpt = Some("é".repeat(3000));
+        let mut short = Memory::new(
+            "context-alpha".into(),
+            "Short note about the import failure".into(),
+            Importance::Medium,
+        );
+        short.raw_excerpt = Some("exit code 2".into());
+        store.store(long.clone()).unwrap();
+        store.store(short.clone()).unwrap();
+
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "import failure", "project": "alpha", "format": "json"}),
+            true,
+        );
+        let records = parsed(&result);
+        let of = |id: &str| {
+            records
+                .iter()
+                .find(|r| r["id"] == json!(id))
+                .unwrap()
+                .clone()
+        };
+        let long = of(&long.id);
+        let shown = long["raw_excerpt"].as_str().unwrap();
+        assert!(shown.len() <= MAX_RAW_IN_RECALL && shown.len() >= MAX_RAW_IN_RECALL - 1);
+        assert!(shown.chars().all(|c| c == 'é'));
+        assert_eq!(long["raw_excerpt_bytes"], 6000);
+        let short = of(&short.id);
+        assert_eq!(short["raw_excerpt"], "exit code 2");
+        assert!(short.get("raw_excerpt_bytes").is_none());
+    }
+
+    #[test]
+    fn recall_json_respects_the_token_budget() {
+        let store = test_store();
+        for i in 0..40 {
+            store
+                .store(Memory::new(
+                    "context-alpha".into(),
+                    format!("Deployment note {i}: the rollout of service {i} went through staging first and took a while"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let budget = 600usize;
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "deployment rollout staging", "project": "alpha", "format": "json", "max_tokens": budget}),
+            true,
+        );
+        let records = parsed(&result);
+        assert!(
+            !records.is_empty() && records.len() < 40,
+            "{}",
+            records.len()
+        );
+        // What is charged is what is printed: the records fit the budget.
+        let printed: usize = records
+            .iter()
+            .map(|r| icm_core::estimate_tokens(&r.to_string()))
+            .sum();
+        assert!(
+            printed <= budget,
+            "{printed} tokens for a budget of {budget}"
+        );
+    }
+
+    fn related(g: &Graph, args: Value, compact: bool) -> ToolResult {
+        call_tool(&g.store, None, "icm_memory_related", &args, compact)
+    }
+
+    #[test]
+    fn related_walks_the_links_nearest_first() {
+        let g = graph();
+        let one = parsed(&related(
+            &g,
+            json!({"id": g.a.id, "project": "alpha", "format": "json"}),
+            true,
+        ));
+        assert_eq!(ids_of(&one), vec![g.b.id.clone()]);
+        assert_eq!(one[0]["hops"], 1);
+        assert_eq!(one[0]["related_ids"], json!(g.b.related_ids));
+
+        let two = parsed(&related(
+            &g,
+            json!({"id": g.a.id, "depth": 2, "project": "alpha", "format": "json"}),
+            true,
+        ));
+        // b links back to a: the start is never part of the answer.
+        assert_eq!(ids_of(&two), vec![g.b.id.clone(), g.c.id.clone()]);
+        assert_eq!(two[1]["hops"], 2);
+
+        // Deeper than the graph, and deeper than the published maximum.
+        for depth in [3, 99] {
+            let all = parsed(&related(
+                &g,
+                json!({"id": g.a.id, "depth": depth, "project": "alpha", "format": "json"}),
+                true,
+            ));
+            assert_eq!(ids_of(&all), vec![g.b.id.clone(), g.c.id.clone()]);
+        }
+    }
+
+    #[test]
+    fn related_stays_inside_the_project() {
+        let g = graph();
+        // In alpha: `other` (beta) is left out, and `hidden`, which only it
+        // links to, is not reached through it.
+        let scoped = ids_of(&parsed(&related(
+            &g,
+            json!({"id": g.a.id, "depth": 3, "project": "alpha", "format": "json"}),
+            true,
+        )));
+        assert!(
+            !scoped.contains(&g.other.id) && !scoped.contains(&g.hidden.id),
+            "{scoped:?}"
+        );
+
+        // Across projects, on request.
+        let all = ids_of(&parsed(&related(
+            &g,
+            json!({"id": g.a.id, "depth": 3, "project": "", "format": "json"}),
+            true,
+        )));
+        assert_eq!(
+            all,
+            vec![
+                g.b.id.clone(),
+                g.other.id.clone(),
+                g.c.id.clone(),
+                g.hidden.id.clone()
+            ]
+        );
+
+        // A start memory of another project is an error, not "no links".
+        let outside = related(&g, json!({"id": g.other.id, "project": "alpha"}), true);
+        assert!(outside.is_error);
+        let text = &outside.content[0].text;
+        assert!(
+            text.contains("alpha") && text.contains("decisions-beta"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn related_honors_the_limit_and_counts_the_read() {
+        let g = graph();
+        let one = ids_of(&parsed(&related(
+            &g,
+            json!({"id": g.a.id, "depth": 3, "limit": 1, "project": "", "format": "json"}),
+            true,
+        )));
+        assert_eq!(one, vec![g.b.id.clone()]);
+        // Following a link is a read of the memory it leads to, not of the
+        // ones the limit left out.
+        let count = |id: &str| g.store.get(id).unwrap().unwrap().access_count;
+        assert_eq!(count(&g.b.id), 1);
+        assert_eq!(count(&g.c.id), 0);
+    }
+
+    #[test]
+    fn related_answers_in_text_too() {
+        let g = graph();
+        let compact = related(
+            &g,
+            json!({"id": g.a.id, "depth": 2, "project": "alpha"}),
+            true,
+        );
+        assert_eq!(
+            compact.content[0].text,
+            "[decisions-alpha] Redis runs with append-only persistence\n\
+             [context-alpha] The persistence volume is a 20 GB disk\n"
+        );
+        let full = related(&g, json!({"id": g.a.id, "project": "alpha"}), false);
+        let text = &full.content[0].text;
+        assert!(text.starts_with(&format!("--- {} ---\n", g.b.id)), "{text}");
+        assert!(!text.contains("score"), "{text}");
+
+        // A memory with no link, in both shapes.
+        let none = related(&g, json!({"id": g.c.id, "project": "alpha"}), true);
+        assert!(!none.is_error);
+        assert_eq!(none.content[0].text, "No related memories.");
+        let none = related(
+            &g,
+            json!({"id": g.c.id, "project": "alpha", "format": "json"}),
+            true,
+        );
+        assert_eq!(none.content[0].text, "[]");
+    }
+
+    #[test]
+    fn related_reports_what_it_cannot_start_from() {
+        let g = graph();
+        let missing = related(&g, json!({"project": "alpha"}), true);
+        assert!(missing.is_error && missing.content[0].text.contains("id"));
+        let blank = related(&g, json!({"id": "  "}), true);
+        assert!(blank.is_error && blank.content[0].text.contains("id"));
+        let unknown = related(
+            &g,
+            json!({"id": "01NOLONGERTHERE00000000000", "project": ""}),
+            true,
+        );
+        assert!(unknown.is_error);
+        assert!(unknown.content[0].text.contains("memory not found"));
+        let format = related(&g, json!({"id": g.a.id, "format": "yaml"}), true);
+        assert!(format.is_error && format.content[0].text.contains("\"json\""));
+    }
+
+    #[test]
+    fn related_reads_depth_and_limit_however_the_client_writes_them() {
+        let g = graph();
+        let ask = |depth: Value, limit: Value| {
+            related(
+                &g,
+                json!({"id": g.a.id, "depth": depth, "limit": limit, "project": "", "format": "json"}),
+                true,
+            )
+        };
+        // A whole float and a numeric string are the number they spell:
+        // two links away from `a`, across projects, is everything; one
+        // link away is `b` and `other` only.
+        for depth in [json!(2), json!(2.0), json!("2"), json!(" 2 ")] {
+            assert_eq!(
+                parsed(&ask(depth.clone(), json!(50))).len(),
+                4,
+                "depth {depth}"
+            );
+        }
+        assert_eq!(parsed(&ask(json!(1.0), json!(50))).len(), 2);
+        for limit in [json!(2), json!(2.0), json!("2")] {
+            assert_eq!(
+                parsed(&ask(json!(3), limit.clone())).len(),
+                2,
+                "limit {limit}"
+            );
+        }
+        // Out of range is brought back into range, in both directions.
+        assert_eq!(parsed(&ask(json!(-4), json!(0))).len(), 1);
+        assert_eq!(parsed(&ask(json!(u64::MAX), json!(u64::MAX))).len(), 4);
+        // Anything else is refused: answering at the default depth would
+        // read as "there is nothing further".
+        for (depth, limit, key) in [
+            (json!(2.5), json!(10), "depth"),
+            (json!("three"), json!(10), "depth"),
+            (json!(true), json!(10), "depth"),
+            (json!(1), json!(1.5), "limit"),
+            (json!(1), json!([2]), "limit"),
+        ] {
+            let result = ask(depth.clone(), limit.clone());
+            assert!(result.is_error, "depth {depth} limit {limit}");
+            assert!(result.content[0].text.contains(&format!("invalid {key}")));
+        }
+    }
+
+    #[test]
+    fn the_tool_list_publishes_the_format_option_and_the_related_tool() {
+        for has_embedder in [false, true] {
+            let defs = tool_definitions(has_embedder);
+            let tools = defs["tools"].as_array().unwrap();
+            let named = |name: &str| {
+                tools
+                    .iter()
+                    .find(|t| t["name"] == name)
+                    .unwrap_or_else(|| panic!("{name} is not listed"))
+            };
+            let recall = named("icm_memory_recall");
+            assert_eq!(
+                recall["inputSchema"]["properties"]["format"]["enum"],
+                json!(["text", "json"])
+            );
+            assert_eq!(recall["inputSchema"]["required"], json!(["query"]));
+            let related = named("icm_memory_related");
+            assert_eq!(related["inputSchema"]["required"], json!(["id"]));
+            assert_eq!(
+                related["inputSchema"]["properties"]["depth"]["maximum"],
+                RELATED_MAX_DEPTH
+            );
+            assert_eq!(
+                related["inputSchema"]["properties"]["limit"]["maximum"],
+                RELATED_MAX_LIMIT
+            );
         }
     }
 }

@@ -207,7 +207,7 @@ icm stats
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```
 
-ICM はさらに、**memoirs**（概念と型付きの関係からなる永続的なナレッジグラフ）、**feedback**（学習に使う修正）、**逐語的なトランスクリプト**も保持し、**31 個の MCP ツール**（埋め込みモデルなしでは 30 個）、埋め込みモデルを読み込んだ状態に保つ **HTTP API**、**ターミナルダッシュボード**（`icm dashboard`）を提供します。すべて[リファレンス](docs/reference.md)に記載されています。
+ICM はさらに、**memoirs**（概念と型付きの関係からなる永続的なナレッジグラフ）、**feedback**（学習に使う修正）、**逐語的なトランスクリプト**も保持し、**32 個の MCP ツール**（埋め込みモデルなしでは 31 個）、埋め込みモデルを読み込んだ状態に保つ **HTTP API**、**ターミナルダッシュボード**（`icm dashboard`）を提供します。すべて[リファレンス](docs/reference.md)に記載されています。
 
 <a id="how-it-works"></a>
 ## 仕組み
@@ -234,7 +234,7 @@ ICM はさらに、**memoirs**（概念と型付きの関係からなる永続�
 | [技術アーキテクチャ](docs/architecture.md) | クレート構成、検索パイプライン、減衰モデル、sqlite-vec の統合、テスト |
 | [ユーザーガイド](docs/guide.md) | インストール、トピックの整理、集約、抽出、トラブルシューティング |
 | [製品概要](docs/product.md) | ユースケース、ベンチマーク、代替手段との比較 |
-| [リファレンス](docs/reference.md) | インストールオプション、ツールごとのセットアップ、CLI、31 個の MCP ツール、HTTP API、ダッシュボード、内部構造 |
+| [リファレンス](docs/reference.md) | インストールオプション、ツールごとのセットアップ、CLI、32 個の MCP ツール、HTTP API、ダッシュボード、内部構造 |
 | [ベンチマークアダプタ](bench/amb/README.md) | 上記の比較の実施方法と再現方法 |
 | [デモ](docs/demonstrations.md) | ストレージのマイクロベンチマークと小さなデモ |
 

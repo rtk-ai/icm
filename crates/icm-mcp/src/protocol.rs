@@ -117,6 +117,16 @@ impl ToolResult {
             last.text.push_str(hint);
         }
     }
+
+    /// Add a note as a content block of its own, leaving the blocks before
+    /// it untouched. For answers a client parses (`format: "json"`): text
+    /// appended to the block would make it invalid JSON.
+    pub fn push_note(&mut self, note: &str) {
+        self.content.push(TextContent {
+            content_type: "text".into(),
+            text: note.into(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +183,16 @@ mod tests {
         let mut result = ToolResult::text("original".into());
         result.append_hint("\n[nudge]");
         assert_eq!(result.content[0].text, "original\n[nudge]");
+    }
+
+    #[test]
+    fn push_note_leaves_the_answer_as_it_was() {
+        let mut result = ToolResult::text("[{\"id\":\"a\"}]".into());
+        result.push_note("[nudge]");
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.content[0].text, "[{\"id\":\"a\"}]");
+        assert_eq!(result.content[1].text, "[nudge]");
+        assert_eq!(result.content[1].content_type, "text");
     }
 
     #[test]

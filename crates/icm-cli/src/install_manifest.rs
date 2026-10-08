@@ -182,10 +182,19 @@ pub(crate) fn default_manifest_path() -> PathBuf {
 
 fn sha256_of(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
+    use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut f, &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    // sha2 0.11 hashers no longer implement io::Write: feed it by chunks.
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(icm_core::to_hex(&hasher.finalize()))
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` UTC. Manifest is JSON so colons are fine

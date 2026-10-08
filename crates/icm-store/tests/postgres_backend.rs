@@ -53,7 +53,7 @@ fn postgres_core_memory_surface() {
 
     // A unique topic namespace keeps this test isolated from any other
     // data already in the target database.
-    let ns = format!("itest-{}", ulid::Ulid::new());
+    let ns = format!("itest-{}", ulid::Ulid::generate());
     let store =
         Store::with_dims(std::path::Path::new("ignored"), 384).expect("connect + migrate postgres");
 
@@ -125,7 +125,7 @@ fn postgres_vector_knn_ranks_semantically() {
     if skip_if_no_pg() {
         return;
     }
-    let ns = format!("itest-vec-{}", ulid::Ulid::new());
+    let ns = format!("itest-vec-{}", ulid::Ulid::generate());
     // Use the store's configured dimension. An existing database is
     // authoritative on its dims, so build vectors that size regardless of
     // what we request here.
@@ -186,7 +186,7 @@ fn postgres_delete_cleans_up_dangling_related_ids() {
     )
     .expect("connect + migrate postgres");
 
-    let ns = format!("itest-related-{}", ulid::Ulid::new());
+    let ns = format!("itest-related-{}", ulid::Ulid::generate());
     let mut a = mem(&ns, "memory a", Importance::Medium);
     let mut b = mem(&ns, "memory b", Importance::Medium);
     let mut c = mem(&ns, "memory c", Importance::Medium);
@@ -243,7 +243,7 @@ fn postgres_consolidate_topic_cleans_up_dangling_related_ids_in_other_memories()
     )
     .expect("connect + migrate postgres");
 
-    let ns = format!("itest-cons-{}", ulid::Ulid::new());
+    let ns = format!("itest-cons-{}", ulid::Ulid::generate());
     let a_id = store
         .store(mem(&ns, "memory a", Importance::Medium))
         .expect("store a");

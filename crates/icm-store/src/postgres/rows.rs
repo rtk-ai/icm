@@ -67,7 +67,7 @@ pub(crate) fn summary_hash(topic: &str, summary: &str) -> String {
     h.update(topic_n.as_bytes());
     h.update(b"\0");
     h.update(summary_n.as_bytes());
-    format!("{:x}", h.finalize())
+    icm_core::to_hex(&h.finalize())
 }
 
 pub(crate) const MAX_SUMMARY_BYTES: usize = 64 * 1024;

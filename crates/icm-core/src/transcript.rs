@@ -52,7 +52,7 @@ impl Session {
     pub fn new(agent: String, project: Option<String>, metadata: Option<String>) -> Self {
         let now = Utc::now();
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             agent,
             project,
             started_at: now,
@@ -84,7 +84,7 @@ impl Message {
         metadata: Option<String>,
     ) -> Self {
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             session_id,
             role,
             content,

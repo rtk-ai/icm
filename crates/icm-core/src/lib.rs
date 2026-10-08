@@ -95,3 +95,26 @@ pub fn topic_matches(memory_topic: &str, filter: &str) -> bool {
 pub fn keyword_matches(keywords: &[String], filter: &str) -> bool {
     keywords.iter().any(|k| k.contains(filter))
 }
+
+/// Lowercase hexadecimal of `bytes`, two digits per byte: how ICM writes a
+/// content hash or a file checksum. sha2 0.11 digests no longer format
+/// with `{:x}`, so every hash goes through this one function.
+pub fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+#[cfg(test)]
+mod to_hex_tests {
+    use super::to_hex;
+
+    #[test]
+    fn writes_two_lowercase_digits_per_byte() {
+        assert_eq!(to_hex(&[]), "");
+        assert_eq!(to_hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+    }
+}

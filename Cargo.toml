@@ -38,7 +38,7 @@ anyhow = "1"
 
 # Utils
 chrono = { version = "0.4", features = ["serde"] }
-ulid = "1"
+ulid = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Project detection (git remote / worktree resolution)
@@ -58,7 +58,7 @@ walkdir = "2"
 # HTTP (cloud sync)
 ureq = { version = "2", features = ["json"] }
 rpassword = "5"
-sha2 = "0.10"
+sha2 = "0.11"
 flate2 = "1"
 tar = "0.4.45"
 # Windows onnxruntime runtime (issue #345) ships as a .zip, unlike the unix
@@ -82,4 +82,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tower-http = { version = "0.7", features = ["trace", "cors"] }
 rust-embed = "8"
 mime_guess = "2"
-getrandom = "0.2"
+getrandom = "0.4"

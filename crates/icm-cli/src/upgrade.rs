@@ -112,7 +112,7 @@ fn download_bytes(url: &str) -> Result<Vec<u8>> {
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    icm_core::to_hex(&hasher.finalize())
 }
 
 /// Parse the expected SHA256 for a file from a `sha256sum` output.

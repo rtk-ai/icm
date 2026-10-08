@@ -57,7 +57,7 @@ fn opensearch_core_memory_surface() {
         return;
     }
 
-    let ns = format!("itest-{}", ulid::Ulid::new());
+    let ns = format!("itest-{}", ulid::Ulid::generate());
     let store = Store::with_dims(std::path::Path::new("ignored"), 384)
         .expect("connect + migrate opensearch");
 
@@ -129,7 +129,7 @@ fn opensearch_vector_knn_ranks_semantically() {
     if skip_if_no_os() {
         return;
     }
-    let ns = format!("itest-vec-{}", ulid::Ulid::new());
+    let ns = format!("itest-vec-{}", ulid::Ulid::generate());
     let store = Store::with_dims(
         std::path::Path::new("ignored"),
         icm_core::DEFAULT_EMBEDDING_DIMS,
@@ -183,7 +183,7 @@ fn opensearch_delete_cleans_up_dangling_related_ids() {
     )
     .expect("connect + migrate opensearch");
 
-    let ns = format!("itest-related-{}", ulid::Ulid::new());
+    let ns = format!("itest-related-{}", ulid::Ulid::generate());
     let mut a = mem(&ns, "memory a", Importance::Medium);
     let mut b = mem(&ns, "memory b", Importance::Medium);
     let mut c = mem(&ns, "memory c", Importance::Medium);
@@ -240,7 +240,7 @@ fn opensearch_consolidate_topic_cleans_up_dangling_related_ids_in_other_memories
     )
     .expect("connect + migrate opensearch");
 
-    let ns = format!("itest-cons-{}", ulid::Ulid::new());
+    let ns = format!("itest-cons-{}", ulid::Ulid::generate());
     let a_id = store
         .store(mem(&ns, "memory a", Importance::Medium))
         .expect("store a");

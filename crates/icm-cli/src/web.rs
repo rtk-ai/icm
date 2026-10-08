@@ -80,8 +80,7 @@ pub fn resolve_password(cfg: &WebConfig) -> Result<String> {
 
     // 4. Auto-generate
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf)
-        .map_err(|e| anyhow::anyhow!("failed to generate password: {e}"))?;
+    getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("failed to generate password: {e}"))?;
     let generated: String = buf.iter().map(|b| format!("{b:02x}")).collect();
 
     // Save to credentials file. Owner-only (0600) from the moment the file

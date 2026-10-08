@@ -10028,27 +10028,85 @@ fn briefing_refresh_marker(cache: &std::path::Path) -> PathBuf {
 ///
 /// * a marker younger than `backoff` means an attempt is in flight or just
 ///   failed — do not pile on;
-/// * an older (or missing) marker is replaced through `create_new`, which is
-///   atomic on every platform, so two SessionEnds racing for the same
-///   project cannot both win.
+/// * an older (or missing) marker is replaced, and the caller wins.
 ///
-/// Pure with respect to the store; only touches the marker file.
+/// Reading the marker's age and replacing it must be one step across
+/// processes: when the window has elapsed, every session that ends at that
+/// moment finds the same old marker, and without a guard two of them can
+/// each remove it and create their own. [`BriefingClaimGuard`] makes the
+/// step exclusive; a caller that cannot take the guard loses, since whoever
+/// holds it is either winning the claim or about to find it taken.
+///
+/// Pure with respect to the store; only touches the marker and its guard.
 fn try_claim_briefing_refresh(marker: &std::path::Path, backoff: std::time::Duration) -> bool {
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Some(_guard) = BriefingClaimGuard::take(marker) else {
+        return false;
+    };
     if let Ok(modified) = std::fs::metadata(marker).and_then(|m| m.modified()) {
         if modified.elapsed().map(|age| age < backoff).unwrap_or(true) {
             return false;
         }
-        // Stale marker from a previous window: clear it so create_new can win.
+        // Marker from a previous window: replace it.
         let _ = std::fs::remove_file(marker);
-    }
-    if let Some(parent) = marker.parent() {
-        let _ = std::fs::create_dir_all(parent);
     }
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(marker)
         .is_ok()
+}
+
+/// How long a [`BriefingClaimGuard`] file may exist before it is taken for
+/// the leftover of a process that died while holding it. The guard is held
+/// for a few file operations, so a minute is far beyond any live holder.
+const BRIEFING_CLAIM_GUARD_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Cross-process mutex around the check-and-replace of a refresh marker:
+/// `<marker>.lock`, created with `create_new` (atomic on every platform) and
+/// removed on drop.
+struct BriefingClaimGuard {
+    path: PathBuf,
+}
+
+impl BriefingClaimGuard {
+    /// `None` when another process holds the guard. A guard older than
+    /// [`BRIEFING_CLAIM_GUARD_MAX_AGE`] is a leftover: it is cleared so the
+    /// next session end can claim, and this call still loses.
+    fn take(marker: &std::path::Path) -> Option<Self> {
+        let mut name = marker
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".lock");
+        let path = marker.with_file_name(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Some(Self { path }),
+            Err(_) => {
+                let leftover = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age > BRIEFING_CLAIM_GUARD_MAX_AGE);
+                if leftover {
+                    let _ = std::fs::remove_file(&path);
+                }
+                None
+            }
+        }
+    }
+}
+
+impl Drop for BriefingClaimGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Build the LLM prompt that compiles a project's memories into a structured
@@ -12475,6 +12533,62 @@ mod hook_start_tests {
                 .sum()
         });
         assert_eq!(wins, 1);
+    }
+
+    #[test]
+    fn briefing_refresh_claim_races_on_an_expired_marker_have_one_winner() {
+        // The window has elapsed for everyone at once: many sessions end
+        // together and all find the same old marker. Exactly one of them
+        // may replace it.
+        let backoff = std::time::Duration::from_secs(30 * 60);
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for round in 0..200 {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("proj.md.refresh");
+            std::fs::File::create(&marker)
+                .unwrap()
+                .set_modified(an_hour_ago)
+                .unwrap();
+            let wins: usize = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| s.spawn(|| try_claim_briefing_refresh(&marker, backoff)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap() as usize)
+                    .sum()
+            });
+            assert_eq!(wins, 1, "round {round}");
+        }
+    }
+
+    #[test]
+    fn briefing_refresh_claim_recovers_from_a_guard_left_by_a_dead_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("proj.md.refresh");
+        let guard = dir.path().join("proj.md.refresh.lock");
+        let backoff = std::time::Duration::from_secs(30 * 60);
+
+        // A live guard (another process is claiming right now): lose, and
+        // leave its guard alone.
+        std::fs::File::create(&guard).unwrap();
+        assert!(!try_claim_briefing_refresh(&marker, backoff));
+        assert!(guard.exists());
+        assert!(!marker.exists());
+
+        // The same file, an hour old, is what a killed process leaves
+        // behind. This call clears it; the next one claims.
+        std::fs::File::options()
+            .write(true)
+            .open(&guard)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert!(!try_claim_briefing_refresh(&marker, backoff));
+        assert!(!guard.exists());
+        assert!(try_claim_briefing_refresh(&marker, backoff));
+        assert!(marker.exists());
+        assert!(!guard.exists(), "the guard is released after a claim");
     }
 
     #[test]

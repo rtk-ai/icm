@@ -683,10 +683,10 @@ async fn handle_store(
     if let Some(raw) = req.raw.as_deref().filter(|s| !s.is_empty()) {
         mem.raw_excerpt = Some(raw.to_string());
     }
-    if let Some(emb) = state.embedder_ref() {
-        if let Ok(v) = emb.embed(&format!("{} {}", mem.topic, mem.summary)) {
-            mem.embedding = Some(v);
-        }
+    if let Some(emb) = state.embedder_ref()
+        && let Ok(v) = emb.embed(&format!("{} {}", mem.topic, mem.summary))
+    {
+        mem.embedding = Some(v);
     }
 
     let outcome = lock_store(&state).store(mem.clone());
@@ -773,10 +773,10 @@ async fn handle_consolidate(
     let mut build = |_covered: &[&Memory], summary: String| {
         // The engine sets the importance from what the pass covers.
         let mut consolidated = Memory::new(req.topic.clone(), summary, Importance::Medium);
-        if let Some(emb) = embedder {
-            if let Ok(v) = emb.embed(&consolidated.embed_text()) {
-                consolidated.embedding = Some(v);
-            }
+        if let Some(emb) = embedder
+            && let Ok(v) = emb.embed(&consolidated.embed_text())
+        {
+            consolidated.embedding = Some(v);
         }
         consolidated
     };

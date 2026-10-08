@@ -135,13 +135,13 @@ pub fn activate_if_present() -> bool {
     if user_set_dylib() {
         return true;
     }
-    if let Some(lib) = managed_lib_path() {
-        if lib.is_file() {
-            // SAFETY: reached from `main` before the embedder, or any other
-            // thread, is started: nothing reads the environment concurrently.
-            unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib) };
-            return true;
-        }
+    if let Some(lib) = managed_lib_path()
+        && lib.is_file()
+    {
+        // SAFETY: reached from `main` before the embedder, or any other
+        // thread, is started: nothing reads the environment concurrently.
+        unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib) };
+        return true;
     }
     false
 }
@@ -370,10 +370,10 @@ pub fn ensure_for_run(interactive: bool) -> bool {
         return false;
     }
     // Respect a previous decline.
-    if let Some(marker) = declined_marker() {
-        if marker.exists() {
-            return false;
-        }
+    if let Some(marker) = declined_marker()
+        && marker.exists()
+    {
+        return false;
     }
     let prompt = format!(
         "Enable semantic (vector) search? This downloads ONNX Runtime {ORT_VERSION} \

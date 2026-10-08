@@ -74,12 +74,12 @@ pub fn select_within_budget(
         }
     }
 
-    if kept.is_empty() {
-        if let Some(&first) = costs.first() {
-            kept.push(0);
-            used_tokens = first;
-            skipped = skipped.saturating_sub(1);
-        }
+    if kept.is_empty()
+        && let Some(&first) = costs.first()
+    {
+        kept.push(0);
+        used_tokens = first;
+        skipped = skipped.saturating_sub(1);
     }
 
     BudgetSelection {

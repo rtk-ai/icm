@@ -35,10 +35,10 @@ fn cap_bytes(s: &str, max_bytes: usize) -> &str {
 /// `session_id` is absent. Returns `None` only when neither is present
 /// — caller skips archiving rather than create a junk-keyed row.
 pub fn session_id_from_stdin(json: &Value) -> Option<String> {
-    if let Some(s) = json.get("session_id").and_then(|v| v.as_str()) {
-        if !s.is_empty() {
-            return Some(s.to_string());
-        }
+    if let Some(s) = json.get("session_id").and_then(|v| v.as_str())
+        && !s.is_empty()
+    {
+        return Some(s.to_string());
     }
     json.get("transcript_path")
         .and_then(|v| v.as_str())

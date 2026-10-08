@@ -109,12 +109,12 @@ impl ProviderKind {
 /// set by whatever launched us — so those providers are skipped here and
 /// only run when the config or a CLI flag names them.
 pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
-    if let Ok(forced) = std::env::var("ICM_INVOKER") {
-        if let Ok(p) = ProviderKind::parse(&forced) {
-            if p != ProviderKind::Auto && !p.is_api_key() {
-                return p;
-            }
-        }
+    if let Ok(forced) = std::env::var("ICM_INVOKER")
+        && let Ok(p) = ProviderKind::parse(&forced)
+        && p != ProviderKind::Auto
+        && !p.is_api_key()
+    {
+        return p;
     }
     if std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CLI").is_ok() {
         return ProviderKind::Claude;

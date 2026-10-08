@@ -96,10 +96,10 @@ pub fn extract_and_store_with_embedder(
         // extracted fact was permanently invisible to vector search and,
         // worse, systematically outranked in `search_hybrid` (70% vector
         // weight) by unrelated memories that happened to have one.
-        if let Some(emb) = embedder {
-            if let Ok(vec) = emb.embed(&mem.embed_text()) {
-                mem.embedding = Some(vec);
-            }
+        if let Some(emb) = embedder
+            && let Ok(vec) = emb.embed(&mem.embed_text())
+        {
+            mem.embedding = Some(vec);
         }
         store.store(mem)?;
         stored += 1;
@@ -113,10 +113,10 @@ pub fn extract_and_store_with_embedder(
             raw.to_string(),
             Importance::Low,
         );
-        if let Some(emb) = embedder {
-            if let Ok(vec) = emb.embed(&mem.embed_text()) {
-                mem.embedding = Some(vec);
-            }
+        if let Some(emb) = embedder
+            && let Ok(vec) = emb.embed(&mem.embed_text())
+        {
+            mem.embedding = Some(vec);
         }
         store.store(mem)?;
         stored = 1;
@@ -515,12 +515,11 @@ pub fn extract_facts_public_with_embedder(
     project: &str,
     embedder: Option<&dyn Embedder>,
 ) -> Vec<(String, String, Importance, Option<AnchorKind>)> {
-    if let Some(emb) = embedder {
-        if let Ok(scorer) = SemanticScorer::new(emb) {
-            if let Ok(facts) = extract_facts_semantic(text, project, emb, &scorer) {
-                return facts;
-            }
-        }
+    if let Some(emb) = embedder
+        && let Ok(scorer) = SemanticScorer::new(emb)
+        && let Ok(facts) = extract_facts_semantic(text, project, emb, &scorer)
+    {
+        return facts;
     }
     extract_facts_with_kind(text, project)
 }
@@ -1226,10 +1225,11 @@ fn is_keepable_fragment(s: &str) -> bool {
     // tokens further down. Digits, quotes and other non-alphabetic
     // starts are allowed (e.g. `0.10.42 shipped with the dedup fix`,
     // `"DECISION:" lines from a transcript dump`).
-    if let Some(first) = stripped.chars().next() {
-        if first.is_alphabetic() && first.is_lowercase() {
-            return false;
-        }
+    if let Some(first) = stripped.chars().next()
+        && first.is_alphabetic()
+        && first.is_lowercase()
+    {
+        return false;
     }
 
     // Catch dangling URL/path tokens at the end. Boundary detection

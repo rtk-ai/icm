@@ -271,10 +271,8 @@ fn recall_with_depth(
     if req.query.trim().is_empty() {
         return Err(IcmError::InvalidInput("query must not be empty".into()));
     }
-    if bookkeeping {
-        if let Err(e) = store.maybe_auto_decay() {
-            tracing::warn!(error = %e, "auto-decay failed during recall");
-        }
+    if bookkeeping && let Err(e) = store.maybe_auto_decay() {
+        tracing::warn!(error = %e, "auto-decay failed during recall");
     }
 
     let limit = req.limit.clamp(1, MAX_LIMIT);

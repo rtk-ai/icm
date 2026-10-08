@@ -1435,10 +1435,10 @@ fn host_of(authority: &str) -> Option<String> {
     if authority.starts_with('[') && port.is_none() && !authority.ends_with(']') {
         return None;
     }
-    if let Some(port) = port {
-        if port.parse::<u16>().is_err() {
-            return None;
-        }
+    if let Some(port) = port
+        && port.parse::<u16>().is_err()
+    {
+        return None;
     }
     Some(host.to_ascii_lowercase())
 }
@@ -1524,13 +1524,13 @@ fn warn_cleartext_once(name: &str, base_url: &str) {
 fn is_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(err);
     while let Some(e) = current {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if matches!(
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && matches!(
                 io.kind(),
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ) {
-                return true;
-            }
+            )
+        {
+            return true;
         }
         current = e.source();
     }

@@ -524,12 +524,12 @@ impl MemoirStore for SqliteStore {
             // Outgoing links
             let outgoing = self.get_links_from(&current_id)?;
             for link in outgoing {
-                if !visited.contains(&link.target_id) {
-                    if let Some(c) = self.get_concept(&link.target_id)? {
-                        visited.insert(c.id.clone());
-                        queue.push_back((c.id.clone(), current_depth + 1));
-                        concepts.push(c);
-                    }
+                if !visited.contains(&link.target_id)
+                    && let Some(c) = self.get_concept(&link.target_id)?
+                {
+                    visited.insert(c.id.clone());
+                    queue.push_back((c.id.clone(), current_depth + 1));
+                    concepts.push(c);
                 }
                 links.push(link);
             }
@@ -537,12 +537,12 @@ impl MemoirStore for SqliteStore {
             // Incoming links
             let incoming = self.get_links_to(&current_id)?;
             for link in incoming {
-                if !visited.contains(&link.source_id) {
-                    if let Some(c) = self.get_concept(&link.source_id)? {
-                        visited.insert(c.id.clone());
-                        queue.push_back((c.id.clone(), current_depth + 1));
-                        concepts.push(c);
-                    }
+                if !visited.contains(&link.source_id)
+                    && let Some(c) = self.get_concept(&link.source_id)?
+                {
+                    visited.insert(c.id.clone());
+                    queue.push_back((c.id.clone(), current_depth + 1));
+                    concepts.push(c);
                 }
                 links.push(link);
             }

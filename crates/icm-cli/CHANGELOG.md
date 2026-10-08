@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.3](https://github.com/rtk-ai/icm/compare/icm-v0.11.2...icm-v0.11.3) (2026-10-08)
+
+
+### Features
+
+* **mcp:** give recalled memories their id and links, and a tool to follow them ([#498](https://github.com/rtk-ai/icm/issues/498)) ([61e54f3](https://github.com/rtk-ai/icm/commit/61e54f30be6a44c50fe0ae44a0357cb02634c9c4))
+
+
+### Bug Fixes
+
+* **summarizer,hook:** cheap claude worker and one briefing refresh per window ([#473](https://github.com/rtk-ai/icm/issues/473)) ([fc1daa5](https://github.com/rtk-ai/icm/commit/fc1daa50a62caf4dec6c73ca5fce610d8c3b182e))
+
 ## [0.11.2](https://github.com/rtk-ai/icm/compare/icm-v0.11.1...icm-v0.11.2) (2026-10-07)
 
 

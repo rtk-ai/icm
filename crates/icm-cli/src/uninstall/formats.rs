@@ -523,7 +523,7 @@ pub(crate) fn rewrite_toml_mcp_array(
 ) -> Result<StripResult> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let mut value: toml::Value = content.parse()?;
+    let mut value: toml::Value = toml::from_str(&content)?;
     let result = strip_toml_mcp_array(&mut value, array, name);
     if matches!(result, StripResult::Removed { .. }) {
         let out = toml::to_string_pretty(&value)?;
@@ -536,7 +536,7 @@ pub(crate) fn rewrite_toml_mcp_array(
 pub(crate) fn rewrite_toml_hooks_array(path: &std::path::Path) -> Result<StripResult> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let mut value: toml::Value = content.parse()?;
+    let mut value: toml::Value = toml::from_str(&content)?;
     let result = strip_toml_hooks_array(&mut value);
     if matches!(result, StripResult::Removed { .. }) {
         let out = toml::to_string_pretty(&value)?;
@@ -729,7 +729,7 @@ transport = "stdio"
 command = "/x/icm"
 args = ["serve"]
 "#;
-        let mut v: toml::Value = src.parse().unwrap();
+        let mut v: toml::Value = toml::from_str(src).unwrap();
         let r = strip_toml_mcp_array(&mut v, "mcp_servers", "icm");
         assert_eq!(r, StripResult::Removed { removed: 1 });
         // Array had only icm -> dropped.
@@ -749,7 +749,7 @@ command = "/x/icm"
 name = "other"
 command = "/x/o"
 "#;
-        let mut v: toml::Value = src.parse().unwrap();
+        let mut v: toml::Value = toml::from_str(src).unwrap();
         let r = strip_toml_mcp_array(&mut v, "mcp_servers", "icm");
         assert_eq!(r, StripResult::Removed { removed: 1 });
         let entries = v["mcp_servers"].as_array().unwrap();
@@ -760,7 +760,7 @@ command = "/x/o"
     #[test]
     fn strip_toml_mcp_array_noop_when_absent() {
         let src = "[[mcp_servers]]\nname = \"other\"\n";
-        let mut v: toml::Value = src.parse().unwrap();
+        let mut v: toml::Value = toml::from_str(src).unwrap();
         assert_eq!(
             strip_toml_mcp_array(&mut v, "mcp_servers", "icm"),
             StripResult::NoOp
@@ -782,7 +782,7 @@ type = "pre_tool"
 match = "bash"
 command = "/x/icm hook pre"
 "#;
-        let mut v: toml::Value = src.parse().unwrap();
+        let mut v: toml::Value = toml::from_str(src).unwrap();
         let r = strip_toml_hooks_array(&mut v);
         assert_eq!(r, StripResult::Removed { removed: 1 });
         let entries = v["hooks"].as_array().unwrap();
@@ -798,7 +798,7 @@ name = "icm-post-tool"
 type = "post_tool"
 command = "/x/icm hook post"
 "#;
-        let mut v: toml::Value = src.parse().unwrap();
+        let mut v: toml::Value = toml::from_str(src).unwrap();
         let r = strip_toml_hooks_array(&mut v);
         assert_eq!(r, StripResult::Removed { removed: 1 });
         assert!(v.get("hooks").is_none());
@@ -815,7 +815,7 @@ name = "notes"
 type = "post_agent"
 command = "bash -c 'echo icm hook is mentioned; /usr/bin/my-tool run'"
 "#;
-        let mut v: toml::Value = src.parse().unwrap();
+        let mut v: toml::Value = toml::from_str(src).unwrap();
         assert_eq!(strip_toml_hooks_array(&mut v), StripResult::NoOp);
     }
 

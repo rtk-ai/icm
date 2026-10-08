@@ -234,7 +234,7 @@ fn scan_toml(spec: &LocationSpec, table: &str, entry: &str) -> Result<Vec<Locati
 /// `name` (canonically `[[mcp_servers]] name = "icm"`).
 fn scan_toml_mcp_array(spec: &LocationSpec, array: &str, name: &str) -> Result<Vec<LocationHit>> {
     let content = std::fs::read_to_string(&spec.path)?;
-    let parsed: toml::Value = content.parse()?;
+    let parsed: toml::Value = toml::from_str(&content)?;
     let mut hits = Vec::new();
     if let Some(entries) = parsed.get(array).and_then(|v| v.as_array()) {
         for entry in entries {
@@ -257,7 +257,7 @@ fn scan_toml_mcp_array(spec: &LocationSpec, array: &str, name: &str) -> Result<V
 /// invokes the icm binary. One hit per ICM entry.
 fn scan_toml_hooks_array(spec: &LocationSpec, array: &str) -> Result<Vec<LocationHit>> {
     let content = std::fs::read_to_string(&spec.path)?;
-    let parsed: toml::Value = content.parse()?;
+    let parsed: toml::Value = toml::from_str(&content)?;
     let mut hits = Vec::new();
     if let Some(entries) = parsed.get(array).and_then(|v| v.as_array()) {
         for entry in entries {

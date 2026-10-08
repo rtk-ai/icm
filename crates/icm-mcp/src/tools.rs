@@ -1,12 +1,12 @@
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use icm_core::{
-    add_backrefs, auto_link_memory, build_wake_up, find_similar_memory, format_local,
-    is_preference_topic, keyword_matches, project_matches, topic_matches, AutoLinkOptions, Concept,
-    ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, DEDUP_SIMILARITY_THRESHOLD,
-    MSG_NO_MEMORIES,
+    AutoLinkOptions, Concept, ConceptLink, DEDUP_SIMILARITY_THRESHOLD, Embedder, Feedback,
+    FeedbackStore, Label, MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Relation,
+    WakeUpFormat, WakeUpOptions, add_backrefs, auto_link_memory, build_wake_up,
+    find_similar_memory, format_local, is_preference_topic, keyword_matches, project_matches,
+    topic_matches,
 };
 use icm_store::{RecallEngine, RecallRequest, Store};
 
@@ -937,7 +937,7 @@ fn tool_transcript_record(store: &Store, args: &Value) -> ToolResult {
         None => {
             return ToolResult::error(format!(
                 "invalid role '{role_str}'; must be user|assistant|system|tool"
-            ))
+            ));
         }
     };
     let content = match args.get("content").and_then(|v| v.as_str()) {
@@ -3080,7 +3080,9 @@ fn tool_feedback_record(
             if compact {
                 ToolResult::text(format!("ok {id}"))
             } else {
-                ToolResult::text(format!("Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"))
+                ToolResult::text(format!(
+                    "Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"
+                ))
             }
         }
         Err(e) => ToolResult::error(format!("failed to store feedback: {e}")),
@@ -3495,9 +3497,11 @@ mod tests {
             json!({"topic": "t", "summary": "a and b", "ids": ids}),
         );
         assert!(!result.is_error, "{:?}", result.content);
-        assert!(result.content[0]
-            .text
-            .contains("1 of the listed ones are critical"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("1 of the listed ones are critical")
+        );
         let after = store.get_by_topic("t").unwrap();
         assert_eq!(after.len(), 2);
         let summary = after.iter().find(|m| m.id != critical).unwrap();
@@ -4029,9 +4033,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("content exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("content exceeds maximum length")
+        );
     }
 
     #[test]
@@ -4744,9 +4750,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("topic exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("topic exceeds maximum length")
+        );
     }
 
     #[test]
@@ -4761,9 +4769,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("content exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("content exceeds maximum length")
+        );
     }
 
     #[test]
@@ -5338,7 +5348,7 @@ description = "A test project"
     /// tool actually returns.
     #[test]
     fn test_recall_max_tokens_bounds_the_rendered_output() {
-        use icm_core::{estimate_tokens, Importance};
+        use icm_core::{Importance, estimate_tokens};
         if std::env::var_os("ICM_RECALL_ENGINE").is_some() {
             return;
         }
@@ -5708,10 +5718,12 @@ description = "A test project"
         // Limit: clamped to 20 without a budget, default 5.
         let res = call_tool(&store, None, "icm_memory_recall", &args, true);
         assert_eq!(res.content[0].text.lines().count(), 20);
-        assert!(res.content[0]
-            .text
-            .lines()
-            .all(|l| l.starts_with("[t] shape probe entry ")));
+        assert!(
+            res.content[0]
+                .text
+                .lines()
+                .all(|l| l.starts_with("[t] shape probe entry "))
+        );
         let res = call_tool(
             &store,
             None,

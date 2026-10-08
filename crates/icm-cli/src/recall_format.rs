@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use clap::ValueEnum;
-use icm_core::{format_local, Memory};
+use icm_core::{Memory, format_local};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

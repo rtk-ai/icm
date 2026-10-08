@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Read, Write};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{debug, error};
 
 use icm_core::Embedder;

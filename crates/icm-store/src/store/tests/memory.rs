@@ -632,9 +632,11 @@ fn consolidate_ids_uses_one_topic_for_the_lookup_and_the_write() {
     assert_eq!(store.count_by_topic("t").unwrap(), 1);
 
     // A different topic for the lookup and for the summary is a caller bug.
-    assert!(store
-        .consolidate_ids("t", &[], make_memory("u", "x"))
-        .is_err());
+    assert!(
+        store
+            .consolidate_ids("t", &[], make_memory("u", "x"))
+            .is_err()
+    );
 
     // Right ids, wrong topic: stale, and no orphan summary under "T".
     let ids: Vec<String> = ["c", "d"]
@@ -910,9 +912,11 @@ fn test_consolidate_no_stale_fts_results() {
     // The consolidated memory should be findable
     let consolidated_results = store.search_fts("errors resolved parser", 10).unwrap();
     assert_eq!(consolidated_results.len(), 1);
-    assert!(consolidated_results[0]
-        .summary
-        .contains("All errors resolved"));
+    assert!(
+        consolidated_results[0]
+            .summary
+            .contains("All errors resolved")
+    );
 
     // Verify topic has exactly 1 memory
     let topic_mems = store.get_by_topic("errors-resolved").unwrap();

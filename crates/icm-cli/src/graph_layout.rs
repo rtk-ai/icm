@@ -676,9 +676,11 @@ mod tests_3d {
 
         let single = layout_3d(&ids, &edges, &clusters, 2, 1);
         assert_eq!(single.len(), n);
-        assert!(single
-            .values()
-            .all(|p| p.0.is_finite() && p.1.is_finite() && p.2.is_finite()));
+        assert!(
+            single
+                .values()
+                .all(|p| p.0.is_finite() && p.1.is_finite() && p.2.is_finite())
+        );
         for workers in [2, 7] {
             assert_eq!(
                 layout_3d(&ids, &edges, &clusters, 2, workers),

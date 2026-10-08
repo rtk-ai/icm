@@ -21,9 +21,9 @@ use chrono::{DateTime, Local, Utc};
 
 use icm_core::temporal::parse_query_window_at;
 use icm_core::{
-    estimate_tokens, is_preference_topic, keyword_matches, parse_query_window, project_matches,
-    select_within_budget, topic_matches, Embedder, IcmError, IcmResult, Memory, MemoryStore,
-    RankedHit, RankedQuery, TimeWindow, ITEM_OVERHEAD_TOKENS,
+    Embedder, ITEM_OVERHEAD_TOKENS, IcmError, IcmResult, Memory, MemoryStore, RankedHit,
+    RankedQuery, TimeWindow, estimate_tokens, is_preference_topic, keyword_matches,
+    parse_query_window, project_matches, select_within_budget, topic_matches,
 };
 
 use crate::backend::Store;

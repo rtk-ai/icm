@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use icm_core::{is_preference_topic, project_matches, Embedder, Importance, Memory, MemoryStore};
+use icm_core::{Embedder, Importance, Memory, MemoryStore, is_preference_topic, project_matches};
 use icm_store::{RecallEngine, RecallRequest, Store};
 
 use crate::extract_semantic::{AnchorKind, SemanticScorer};
@@ -199,11 +199,7 @@ fn cap_importance(value: Importance, cap: Importance) -> Importance {
         Importance::Medium => 2,
         Importance::Low => 1,
     };
-    if rank(value) > rank(cap) {
-        cap
-    } else {
-        value
-    }
+    if rank(value) > rank(cap) { cap } else { value }
 }
 
 /// Query tokens worth matching against `search_by_keywords`: alphanumeric
@@ -1742,8 +1738,7 @@ mod tests {
 
     #[test]
     fn test_extract_conversational_constraint() {
-        let text =
-            "The fastembed crate does not work with cross-compilation for ARM64 on Linux CI runners";
+        let text = "The fastembed crate does not work with cross-compilation for ARM64 on Linux CI runners";
         let facts = extract_facts(text, "test");
         assert!(!facts.is_empty(), "should extract constraint");
     }

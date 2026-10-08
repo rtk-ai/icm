@@ -5642,6 +5642,15 @@ pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     if cmd.contains(pattern) {
         return true;
     }
+    // A quoted program path (`"C:/.../icm.exe" hook pre`, as written for
+    // agents that run hooks through cmd.exe) puts a quote between the
+    // binary and `hook`: compare without the quotes.
+    if cmd.contains('"') {
+        let unquoted = cmd.replace('"', "");
+        if cmd_matches_icm_pattern(&unquoted, pattern) {
+            return true;
+        }
+    }
     // (a) `icm hook ...` written as `icm.exe hook ...`
     let with_exe = pattern.replacen("icm hook", "icm.exe hook", 1);
     if with_exe != pattern && cmd.contains(&with_exe) {
@@ -6635,7 +6644,7 @@ description: ICM persistent memory — /{name}
                 "icm-pretool",
                 "pre_tool",
                 Some("bash"),
-                &format!("{} hook pre", icm_bin_str),
+                &vibe_hook_command(&icm_bin_str, "pre"),
                 5.0,
                 &["icm hook pre", "icm-pretool"],
                 force,
@@ -6647,7 +6656,7 @@ description: ICM persistent memory — /{name}
                 "icm-post-tool",
                 "post_tool",
                 None,
-                &format!("{} hook post", icm_bin_str),
+                &vibe_hook_command(&icm_bin_str, "post"),
                 10.0,
                 &["icm hook post", "icm-post-tool", "icm hook"],
                 force,
@@ -6808,8 +6817,38 @@ struct DoctorTarget {
 
 /// Inspect a single hook command string. Returns `Some((bin_path, exists))`
 /// if the command references ICM, `None` if it should be skipped.
+/// The program a hook command runs: a leading double-quoted path
+/// (`"C:/Program Files/icm/icm.exe" hook pre`) without its quotes, or else
+/// the first word.
+fn leading_program(cmd: &str) -> &str {
+    let trimmed = cmd.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        if let Some(end) = rest.find('"') {
+            return &rest[..end];
+        }
+    }
+    trimmed.split_whitespace().next().unwrap_or("")
+}
+
+/// The command Mistral Vibe runs for an ICM hook. Vibe starts hooks through
+/// the platform shell, which is cmd.exe on Windows: there an unquoted
+/// `C:/Users/.../icm.exe` is read as `C:` followed by a switch, and the hook
+/// fails. The path is quoted on Windows, and anywhere it holds a space.
+fn vibe_hook_command(icm_bin: &str, subcommand: &str) -> String {
+    vibe_hook_command_for(icm_bin, subcommand, cfg!(windows))
+}
+
+/// Pure, testable core of [`vibe_hook_command`].
+fn vibe_hook_command_for(icm_bin: &str, subcommand: &str, windows: bool) -> String {
+    if windows || icm_bin.contains(' ') {
+        format!("\"{icm_bin}\" hook {subcommand}")
+    } else {
+        format!("{icm_bin} hook {subcommand}")
+    }
+}
+
 pub(crate) fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
-    let bin_path = cmd.split_whitespace().next().unwrap_or("");
+    let bin_path = leading_program(cmd);
     // Harden against false positives (security review): require the invoked
     // *binary* to actually be an icm binary, not merely a command that mentions
     // "icm hook" somewhere (e.g. a note/arg of an unrelated tool). Otherwise
@@ -16840,7 +16879,8 @@ mod doctor_tests {
 
 #[cfg(test)]
 mod windows_path_tests {
-    //! Regression tests for issue #180.
+    //! Regression tests for issue #180, and for the Mistral Vibe hook
+    //! commands (quoted for cmd.exe).
     //!
     //! Two failure modes on Windows:
     //!
@@ -16854,6 +16894,43 @@ mod windows_path_tests {
     //!    substring never matches. Init re-adds the hook on every run,
     //!    and `doctor` reports zero hooks even when they're configured.
     use super::*;
+
+    #[test]
+    fn vibe_hooks_quote_the_binary_for_cmd_exe() {
+        use super::vibe_hook_command_for;
+        assert_eq!(
+            vibe_hook_command_for("C:/Users/p/.local/bin/icm.exe", "pre", true),
+            "\"C:/Users/p/.local/bin/icm.exe\" hook pre"
+        );
+        assert_eq!(
+            vibe_hook_command_for("/home/p/.local/bin/icm", "post", false),
+            "/home/p/.local/bin/icm hook post"
+        );
+        // A space needs the quotes on any platform.
+        assert_eq!(
+            vibe_hook_command_for("/Users/p/My Tools/icm", "pre", false),
+            "\"/Users/p/My Tools/icm\" hook pre"
+        );
+    }
+
+    #[test]
+    fn quoted_hook_commands_are_still_recognised_as_icm() {
+        use super::{check_icm_hook_command, cmd_matches_icm_pattern};
+        let quoted = "\"C:/Program Files/icm/icm.exe\" hook pre";
+        assert!(cmd_matches_icm_pattern(quoted, "icm hook pre"));
+        assert!(cmd_matches_icm_pattern(quoted, "icm hook"));
+        assert_eq!(
+            check_icm_hook_command(quoted).map(|(bin, _)| bin),
+            Some("C:/Program Files/icm/icm.exe")
+        );
+        assert_eq!(
+            check_icm_hook_command("\"/usr/local/bin/icm\" hook post").map(|(bin, _)| bin),
+            Some("/usr/local/bin/icm")
+        );
+        // Quotes do not make another program an ICM hook.
+        assert!(check_icm_hook_command("\"C:/tools/other.exe\" icm hook pre").is_none());
+        assert!(check_icm_hook_command("mytool --note \"run icm hook later\"").is_none());
+    }
     use std::path::PathBuf;
 
     #[test]

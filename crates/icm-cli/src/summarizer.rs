@@ -406,6 +406,20 @@ const CLAUDE_WORKER_SYSTEM_PROMPT: &str =
 /// short `--system-prompt` replaces the default one. The child does nothing
 /// but answer the summarization prompt.
 fn claude_cli_args(model: &str) -> Vec<&str> {
+    let mut args = claude_cli_isolation_args(model);
+    args.extend([
+        "--tools",
+        "",
+        "--no-session-persistence",
+        "--system-prompt",
+        CLAUDE_WORKER_SYSTEM_PROMPT,
+    ]);
+    args
+}
+
+/// The isolation flags alone (#322), without the cost flags of #472. Used
+/// again when the installed `claude` is too old to know the newer flags.
+fn claude_cli_isolation_args(model: &str) -> Vec<&str> {
     vec![
         "-p",
         "--model",
@@ -413,12 +427,15 @@ fn claude_cli_args(model: &str) -> Vec<&str> {
         "--setting-sources",
         "",
         "--strict-mcp-config",
-        "--tools",
-        "",
-        "--no-session-persistence",
-        "--system-prompt",
-        CLAUDE_WORKER_SYSTEM_PROMPT,
     ]
+}
+
+/// True when `claude` refused to start because it does not know one of the
+/// flags it was given (`error: unknown option '--tools'`): an older Claude
+/// Code. The call is then repeated with [`claude_cli_isolation_args`], which
+/// costs more per call but keeps summaries working.
+fn claude_rejected_a_flag(err: &anyhow::Error) -> bool {
+    err.to_string().contains("unknown option")
 }
 
 /// Environment for the `claude` worker (#472): a summary needs no extended
@@ -426,13 +443,20 @@ fn claude_cli_args(model: &str) -> Vec<&str> {
 const CLAUDE_WORKER_ENV: &[(&str, &str)] = &[("MAX_THINKING_TOKENS", "0")];
 
 /// An empty, stable directory to run the `claude` worker from (#472). The
-/// worker used to inherit the cwd of the session that just ended, and with
-/// it every `CLAUDE.md` above that directory — project instructions that
-/// have nothing to do with summarizing and only add tokens. Created on
-/// demand under the system temp dir; falls back to no cwd override if it
-/// cannot be created.
+/// worker used to inherit the cwd of the session that just ended, so each
+/// project left its own entry under `~/.claude/projects/`. It lives in ICM's
+/// own cache directory, which belongs to the user: a fixed name under the
+/// system temp dir would be shared by every account on a Linux machine, and
+/// the first one to create it could lock the others out or fill it. Created
+/// on demand; `None` (no cwd override) if it cannot be resolved or created.
 fn claude_worker_dir() -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join("icm-worker");
+    let cache = directories::ProjectDirs::from("dev", "icm", "icm")?;
+    claude_worker_dir_in(cache.cache_dir())
+}
+
+/// Pure, testable core of [`claude_worker_dir`]: `<cache>/worker`.
+fn claude_worker_dir_in(cache: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = cache.join("worker");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -445,14 +469,20 @@ impl Summarizer for ClaudeCliSummarizer {
         let model = req.model.unwrap_or("claude-haiku-4-5");
         let args = claude_cli_args(model);
         let dir = claude_worker_dir();
-        run_cli_in(
-            "claude",
-            &args,
-            req.prompt,
-            req.timeout,
-            CLAUDE_WORKER_ENV,
-            dir.as_deref(),
-        )
+        let run = |args: &[&str]| {
+            run_cli_in(
+                "claude",
+                args,
+                req.prompt,
+                req.timeout,
+                CLAUDE_WORKER_ENV,
+                dir.as_deref(),
+            )
+        };
+        match run(&args) {
+            Err(e) if claude_rejected_a_flag(&e) => run(&claude_cli_isolation_args(model)),
+            other => other,
+        }
         .map(trim_response)
     }
 }
@@ -1284,12 +1314,45 @@ mod tests {
     }
 
     #[test]
-    fn claude_worker_dir_is_an_empty_directory() {
-        let dir = claude_worker_dir().expect("temp dir must be creatable");
+    fn claude_worker_dir_is_created_empty_under_the_given_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = claude_worker_dir_in(cache.path()).expect("worker dir must be creatable");
+        assert_eq!(dir, cache.path().join("worker"));
         assert!(dir.is_dir());
-        assert!(dir.starts_with(std::env::temp_dir()));
-        // No project instructions can be inherited from inside it.
-        assert!(!dir.join("CLAUDE.md").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // Asking again returns the same directory.
+        assert_eq!(claude_worker_dir_in(cache.path()), Some(dir));
+    }
+
+    #[test]
+    fn claude_worker_dir_is_none_when_it_cannot_be_created() {
+        // A file where the cache directory should be.
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("cache");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        assert_eq!(claude_worker_dir_in(&not_a_dir), None);
+    }
+
+    #[test]
+    fn an_old_claude_gets_the_isolation_flags_only() {
+        // What `run_cli_in` reports when the CLI does not know a flag.
+        let old =
+            anyhow::anyhow!("claude exited with exit status: 1: error: unknown option '--tools'");
+        assert!(claude_rejected_a_flag(&old));
+        let auth = anyhow::anyhow!(
+            "claude exited with exit status: 1: Failed to authenticate: OAuth session expired"
+        );
+        assert!(!claude_rejected_a_flag(&auth));
+
+        let fallback = claude_cli_isolation_args("claude-haiku-4-5");
+        assert!(fallback.contains(&"--setting-sources"));
+        assert!(fallback.contains(&"--strict-mcp-config"));
+        assert!(!fallback.contains(&"--tools"));
+        assert!(!fallback.contains(&"--no-session-persistence"));
+        assert!(!fallback.contains(&"--system-prompt"));
+        // The full list starts with the same flags, in the same order.
+        let full = claude_cli_args("claude-haiku-4-5");
+        assert_eq!(&full[..fallback.len()], &fallback[..]);
     }
 
     #[test]

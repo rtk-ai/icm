@@ -7073,7 +7073,7 @@ fn check_vibe_hooks(home: &str) -> (usize, usize) {
             return (0, 0);
         }
     };
-    let parsed: toml::Value = match content.parse() {
+    let parsed: toml::Value = match toml::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
             println!("[Mistral Vibe] {}: parse error ({e})", path.display());
@@ -7114,9 +7114,8 @@ fn disable_vibe_hooks(home: &str, dry_run: bool) -> Result<usize> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
-    let mut config: toml::Value = content
-        .parse()
-        .with_context(|| format!("invalid TOML in {}", path.display()))?;
+    let mut config: toml::Value =
+        toml::from_str(&content).with_context(|| format!("invalid TOML in {}", path.display()))?;
 
     let Some(root) = config.as_table_mut() else {
         return Ok(0);
@@ -8667,8 +8666,7 @@ fn inject_vibe_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Resu
     let mut config: toml::Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("cannot read {}", config_path.display()))?;
-        content
-            .parse::<toml::Value>()
+        toml::from_str::<toml::Value>(&content)
             .with_context(|| format!("invalid TOML in {}", config_path.display()))?
     } else {
         if let Some(parent) = config_path.parent() {
@@ -8763,8 +8761,7 @@ fn inject_vibe_hook(
     let mut config: toml::Value = if hooks_path.exists() {
         let content = std::fs::read_to_string(hooks_path)
             .with_context(|| format!("cannot read {}", hooks_path.display()))?;
-        content
-            .parse::<toml::Value>()
+        toml::from_str::<toml::Value>(&content)
             .with_context(|| format!("invalid TOML in {}", hooks_path.display()))?
     } else {
         if let Some(parent) = hooks_path.parent() {
@@ -13805,7 +13802,7 @@ mod inject_vibe_tests {
 
     fn read_toml(path: &Path) -> toml::Value {
         let raw = std::fs::read_to_string(path).unwrap();
-        raw.parse().unwrap()
+        toml::from_str(&raw).unwrap()
     }
 
     #[test]

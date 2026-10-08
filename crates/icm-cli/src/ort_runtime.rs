@@ -137,7 +137,9 @@ pub fn activate_if_present() -> bool {
     }
     if let Some(lib) = managed_lib_path() {
         if lib.is_file() {
-            std::env::set_var(ORT_DYLIB_ENV, &lib);
+            // SAFETY: reached from `main` before the embedder, or any other
+            // thread, is started: nothing reads the environment concurrently.
+            unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib) };
             return true;
         }
     }
@@ -330,7 +332,9 @@ pub fn download(progress: bool) -> Result<PathBuf> {
     if let Some(marker) = declined_marker() {
         let _ = std::fs::remove_file(marker);
     }
-    std::env::set_var(ORT_DYLIB_ENV, &lib_path);
+    // SAFETY: reached from `main` before the embedder, or any other
+    // thread, is started: nothing reads the environment concurrently.
+    unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib_path) };
     if progress {
         eprintln!(
             "Installed onnxruntime {ORT_VERSION} → {}",

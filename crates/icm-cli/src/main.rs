@@ -14120,13 +14120,13 @@ mod read_only_requested_tests {
         let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("ICM_READONLY").ok();
         match value {
-            Some(v) => std::env::set_var("ICM_READONLY", v),
-            None => std::env::remove_var("ICM_READONLY"),
+            Some(v) => unsafe { std::env::set_var("ICM_READONLY", v) },
+            None => unsafe { std::env::remove_var("ICM_READONLY") },
         }
         body();
         match prev {
-            Some(v) => std::env::set_var("ICM_READONLY", v),
-            None => std::env::remove_var("ICM_READONLY"),
+            Some(v) => unsafe { std::env::set_var("ICM_READONLY", v) },
+            None => unsafe { std::env::remove_var("ICM_READONLY") },
         }
     }
 
@@ -14179,7 +14179,7 @@ mod resolve_db_path_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_cwd = std::env::current_dir().unwrap();
         let prev_icm_db = std::env::var("ICM_DB").ok();
-        std::env::remove_var("ICM_DB");
+        unsafe { std::env::remove_var("ICM_DB") };
 
         let dir = tempfile::tempdir().unwrap();
         // macOS: /tmp (and TMPDIR) is a symlink into /private/tmp — the
@@ -14194,15 +14194,15 @@ mod resolve_db_path_tests {
 
         std::env::set_current_dir(prev_cwd).unwrap();
         match prev_icm_db {
-            Some(v) => std::env::set_var("ICM_DB", v),
-            None => std::env::remove_var("ICM_DB"),
+            Some(v) => unsafe { std::env::set_var("ICM_DB", v) },
+            None => unsafe { std::env::remove_var("ICM_DB") },
         }
     }
 
     #[test]
     fn cli_flag_wins_over_everything() {
         with_isolated_cwd(|_| {
-            std::env::set_var("ICM_DB", "/should/not/win");
+            unsafe { std::env::set_var("ICM_DB", "/should/not/win") };
             let cfg = config::Config::default();
             let resolved = resolve_db_path(Some(PathBuf::from("/explicit/flag.db")), &cfg);
             assert_eq!(resolved, PathBuf::from("/explicit/flag.db"));
@@ -14212,7 +14212,7 @@ mod resolve_db_path_tests {
     #[test]
     fn env_var_wins_when_no_flag() {
         with_isolated_cwd(|_| {
-            std::env::set_var("ICM_DB", "/from/env.db");
+            unsafe { std::env::set_var("ICM_DB", "/from/env.db") };
             let cfg = config::Config::default();
             let resolved = resolve_db_path(None, &cfg);
             assert_eq!(resolved, PathBuf::from("/from/env.db"));
@@ -14331,7 +14331,7 @@ mod cli_config_dir_tests {
     fn falls_back_to_home_when_env_unset() {
         // Use a uniquely-named env var so we don't race with a real one.
         let var = "ICM_TEST_FAKE_ENV_VAR_THAT_DOES_NOT_EXIST";
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
         assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
     }
@@ -14339,9 +14339,9 @@ mod cli_config_dir_tests {
     #[test]
     fn uses_env_var_when_set() {
         let var = "ICM_TEST_CLI_CONFIG_DIR_OVERRIDE";
-        std::env::set_var(var, "/tmp/custom-cli-home");
+        unsafe { std::env::set_var(var, "/tmp/custom-cli-home") };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(dir, PathBuf::from("/tmp/custom-cli-home"));
     }
 
@@ -14349,9 +14349,9 @@ mod cli_config_dir_tests {
     fn empty_env_var_falls_back_to_home() {
         // An accidentally-empty `export FOO=` should not produce a useless empty path.
         let var = "ICM_TEST_CLI_CONFIG_DIR_EMPTY";
-        std::env::set_var(var, "");
+        unsafe { std::env::set_var(var, "") };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
     }
 }
@@ -15526,7 +15526,7 @@ mod cli_contracts_tests {
     /// An API-key summarizer config pointed at a loopback stub, with its key
     /// in a variable unique to the calling test.
     fn stub_summarizer(base_url: &str, key_var: &str) -> config::SummarizerConfig {
-        std::env::set_var(key_var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(key_var, "placeholder-not-a-real-key") };
         config::SummarizerConfig {
             provider: "openai".into(),
             model: "test-model".into(),
@@ -15568,7 +15568,7 @@ mod cli_contracts_tests {
             .unwrap();
 
         let result = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_EXACT_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_EXACT_KEY") };
         result.unwrap();
 
         assert_eq!(seen.try_iter().count(), 1);
@@ -15606,7 +15606,7 @@ mod cli_contracts_tests {
         }
 
         let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_CAP_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_CAP_KEY") };
         result.unwrap();
 
         let prompts: Vec<String> = seen.try_iter().collect();
@@ -15649,7 +15649,7 @@ mod cli_contracts_tests {
         }
 
         let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_PASS2_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_PASS2_KEY") };
         let err = result.expect_err("the second pass failed");
         assert!(err.downcast_ref::<SummarizerFailed>().is_some(), "{err}");
 
@@ -15696,7 +15696,7 @@ mod cli_contracts_tests {
         let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_RACE_KEY");
 
         let result = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_RACE_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_RACE_KEY") };
         result.unwrap();
 
         let prompt = seen.try_iter().next().expect("provider called");
@@ -15804,7 +15804,7 @@ mod cli_contracts_tests {
         let again = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None).unwrap();
         assert_eq!(again.passes, 0);
         cmd_consolidate_all(&store, 1, &cfg, None, None, None, false, None).unwrap();
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_CRITICAL_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_CRITICAL_KEY") };
         assert_eq!(seen.try_iter().count(), 0, "the provider was called again");
         assert_eq!(store.count_by_topic("t").unwrap(), 2);
     }
@@ -15828,7 +15828,7 @@ mod cli_contracts_tests {
         let store = Store::in_memory().unwrap();
         seed(&store);
         let run = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None).unwrap();
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY") };
         assert_eq!((run.replaced, run.too_large, run.unfolded), (4, 1, 1));
         let prompt = seen.try_iter().next().expect("the small ones were sent");
         assert!(
@@ -15854,7 +15854,7 @@ mod cli_contracts_tests {
         seed(&store);
         store.enqueue_pending_consolidation("t", "").unwrap();
         cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path).unwrap();
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY_P");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY_P") };
         let jobs = store.list_consolidation_jobs(None, 10).unwrap();
         assert_eq!(jobs[0].status, "failed");
         assert!(
@@ -15901,7 +15901,7 @@ mod cli_contracts_tests {
         store.enqueue_pending_consolidation("busy", "").unwrap();
         cmd_consolidate_pending(&store, None, &cfg, 20, None, None, false, &db_path).unwrap();
         let direct = cmd_consolidate(&store, "busy", false, &cfg, None, None, None, None).unwrap();
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_QUEUE_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_QUEUE_KEY") };
         assert_eq!(direct.passes, 0);
         assert_eq!(seen.try_iter().count(), 0, "the lone summary was sent back");
         let left = store.get_by_topic("busy").unwrap();
@@ -15935,7 +15935,7 @@ mod cli_contracts_tests {
         seed_topic(&store, "c", &facts("c", 3));
 
         let result = cmd_consolidate_all(&store, 2, &cfg, None, None, None, false, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_ALL_GOES_ON_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_ALL_GOES_ON_KEY") };
         let msg = result.expect_err("one topic failed").to_string();
         assert!(
             msg.contains("2 topic(s) consolidated, 1 failed, 0 not attempted"),
@@ -15994,7 +15994,7 @@ mod cli_contracts_tests {
         let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_STALE_KEY");
 
         let run = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_STALE_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_STALE_KEY") };
         let run = run.unwrap();
         assert_eq!(run.passes, 1);
 
@@ -16080,7 +16080,7 @@ mod cli_contracts_tests {
             .collect();
         seed_topic(&store, "big", &texts);
         let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_PARTIAL_MSG_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_PARTIAL_MSG_KEY") };
         let msg = result.expect_err("the second pass failed").to_string();
         assert!(
             msg.contains("memories of the topic were already folded into a partial summary"),
@@ -16095,7 +16095,7 @@ mod cli_contracts_tests {
     fn cmd_consolidate_replaces_originals_with_the_api_key_providers_summary() {
         let (base_url, seen) = http_stub(vec![(200, openai_reply("merged by the model"))]);
         let var = "ICM_TEST_CONSOLIDATE_API_KEY";
-        std::env::set_var(var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(var, "placeholder-not-a-real-key") };
         let cfg = config::SummarizerConfig {
             provider: "openai".into(),
             model: "test-model".into(),
@@ -16121,7 +16121,7 @@ mod cli_contracts_tests {
             None,
             None,
         );
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         result.unwrap();
 
         let request = seen
@@ -16187,7 +16187,7 @@ mod cli_contracts_tests {
             .enqueue_pending_extraction("proj", "Bash", "some tool output")
             .unwrap();
         let var = "ICM_TEST_EXTRACT_PENDING_API_KEY";
-        std::env::set_var(var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(var, "placeholder-not-a-real-key") };
         let cfg = config::SummarizerConfig {
             provider: "openai".into(),
             model: "test-model".into(),
@@ -16196,7 +16196,7 @@ mod cli_contracts_tests {
             ..config::SummarizerConfig::default()
         };
         let result = cmd_extract_pending(&store, None, &cfg, 10, None, None, false, &db_path);
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         result.unwrap();
 
         let request = seen
@@ -16239,7 +16239,7 @@ mod cli_contracts_tests {
             .enqueue_pending_extraction("proj", "Bash", "some tool output")
             .unwrap();
         let var = "ICM_TEST_EXTRACT_PENDING_THINK_KEY";
-        std::env::set_var(var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(var, "placeholder-not-a-real-key") };
         let cfg = config::SummarizerConfig {
             provider: "openai".into(),
             model: "qwen3".into(),
@@ -16248,7 +16248,7 @@ mod cli_contracts_tests {
             ..config::SummarizerConfig::default()
         };
         let result = cmd_extract_pending(&store, None, &cfg, 10, None, None, false, &db_path);
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         result.unwrap();
 
         let facts: Vec<String> = store
@@ -16359,7 +16359,7 @@ mod cli_contracts_tests {
             false,
             &db_path,
         );
-        std::env::remove_var("ICM_TEST_EXTRACT_PENDING_401_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_EXTRACT_PENDING_401_KEY") };
         result.unwrap();
 
         assert_eq!(seen.try_iter().count(), 1, "one call, then the fallback");
@@ -16421,7 +16421,7 @@ mod cli_contracts_tests {
         let store = Store::in_memory().unwrap();
         seed(&store);
         let result = cmd_consolidate_all(&store, 2, &cfg, None, None, None, false, None);
-        std::env::remove_var("ICM_TEST_BATCH_401_KEY_A");
+        unsafe { std::env::remove_var("ICM_TEST_BATCH_401_KEY_A") };
         let msg = result
             .expect_err("exit status must show the failure")
             .to_string();
@@ -16440,7 +16440,7 @@ mod cli_contracts_tests {
             store.enqueue_pending_consolidation(topic, "").unwrap();
         }
         let result = cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path);
-        std::env::remove_var("ICM_TEST_BATCH_401_KEY_P");
+        unsafe { std::env::remove_var("ICM_TEST_BATCH_401_KEY_P") };
         result.unwrap();
         assert_eq!(
             seen.try_iter().count(),
@@ -16474,7 +16474,7 @@ mod cli_contracts_tests {
                 .unwrap();
         }
         let result = cmd_consolidate(&store, "t", false, &cfg, Some("ollama"), None, None, None);
-        std::env::remove_var("ICM_TEST_FLAG_OTHER_PROVIDER_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_FLAG_OTHER_PROVIDER_KEY") };
         let err = result
             .expect_err("ollama has no model of its own")
             .to_string();
@@ -16528,7 +16528,7 @@ mod cli_contracts_tests {
 
         let key = "sk-log-NotARealKey-0123456789";
         let var = "ICM_TEST_LOG_REDACTION_KEY";
-        std::env::set_var(var, key);
+        unsafe { std::env::set_var(var, key) };
         let mut headers_seen = Vec::new();
         for (kind, reply) in [
             (
@@ -16570,7 +16570,7 @@ mod cli_contracts_tests {
                     .unwrap(),
             );
         }
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         tracing::warn!("log-pipeline-marker");
 
         // The key did travel in the non-masked headers…

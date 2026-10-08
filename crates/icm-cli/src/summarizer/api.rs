@@ -2263,7 +2263,7 @@ mod tests {
     fn key_is_read_from_the_configured_variable() {
         // A name unique to this test, so no other test races on it.
         let var = "ICM_TEST_SUMMARIZER_KEY_READ";
-        std::env::set_var(var, format!("  {KEY}\n"));
+        unsafe { std::env::set_var(var, format!("  {KEY}\n")) };
         let (server, handle) = ok(success_body(ProviderKind::Anthropic, "ok"));
         let p = ApiSummarizer::new(
             ProviderKind::Anthropic,
@@ -2275,7 +2275,7 @@ mod tests {
         )
         .unwrap();
         let out = p.summarize(&request(None));
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(out.unwrap(), "ok");
         // Surrounding whitespace from a sloppy `export` is trimmed.
         assert_eq!(handle.join().unwrap().header("x-api-key"), Some(KEY));
@@ -2554,7 +2554,7 @@ mod tests {
     #[test]
     fn unsendable_key_is_rejected_without_being_printed() {
         let var = "ICM_TEST_SUMMARIZER_KEY_UNSENDABLE";
-        std::env::set_var(var, format!("{KEY} trailing words"));
+        unsafe { std::env::set_var(var, format!("{KEY} trailing words")) };
         let p = ApiSummarizer::new(
             ProviderKind::OpenAi,
             &ApiOptions {
@@ -2565,7 +2565,7 @@ mod tests {
         )
         .unwrap();
         let err = p.summarize(&request(Some("m"))).unwrap_err().to_string();
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert!(err.contains(var), "{err}");
         assert!(err.contains("re-export"), "{err}");
         assert_no_key("unsendable key", &err);
@@ -2693,11 +2693,11 @@ mod tests {
             base_url: String::new(),
             workspace_id: String::new(),
         };
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         let unset = describe_config("anthropic", "", &opts).join("\n");
-        std::env::set_var(var, KEY);
+        unsafe { std::env::set_var(var, KEY) };
         let set = describe_config("anthropic", "", &opts).join("\n");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
 
         assert!(
             unset.contains(&format!("api_key_env = {var} (NOT set")),

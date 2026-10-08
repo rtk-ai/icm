@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.4](https://github.com/rtk-ai/icm/compare/icm-v0.11.3...icm-v0.11.4) (2026-10-08)
+
+
+### Bug Fixes
+
+* **deps:** release the dependency updates and their security fixes ([#503](https://github.com/rtk-ai/icm/issues/503)) ([f5ca48c](https://github.com/rtk-ai/icm/commit/f5ca48ca18e7557be6b2b396a7ad68cd6d057cba))
+
 ## [0.11.3](https://github.com/rtk-ai/icm/compare/icm-v0.11.2...icm-v0.11.3) (2026-10-08)
 
 

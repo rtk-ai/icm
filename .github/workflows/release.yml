@@ -1,8 +1,37 @@
 name: Release
 
+# Builds the release artifacts (release-build.yml), publishes them to the
+# GitHub release for a tag, and updates the Homebrew formula.
+#
+# Callers:
+#   - cd.yml, for every stable release (release-please) and every develop
+#     pre-release. This is the only automatic trigger. The former
+#     `release: published` trigger is gone on purpose: release-please
+#     publishes with a GitHub App token, so that event fired too and every
+#     release was built and uploaded twice, by two racing runs that produced
+#     different bytes (the tap got two "icm 0.10.63" commits 15 seconds
+#     apart with different SHA256 sums).
+#   - by hand (workflow_dispatch). It defaults to a dry run: nothing is
+#     published unless `dry_run` is unticked. For a plain "does everything
+#     still build" check, use the "Release build check" workflow instead.
+#
+# Order of operations for a stable release, so that install.sh and
+# `icm upgrade` (both follow /releases/latest) never see a release without
+# its assets:
+#   1. cd.yml flags the release release-please just created as a
+#      pre-release, which takes it out of /releases/latest;
+#   2. everything is built, smoke-tested and checked against the manifest
+#      (scripts/release-check.sh) BEFORE anything is uploaded;
+#   3. the assets are uploaded, downloaded back and verified again, and the
+#      release notes get their heading on semantic search per file;
+#   4. only then is the release promoted to a full release and to "latest".
+# If any step fails, "latest" still points at the previous complete release.
+#
+# The assets are always built from the commit the run is on. A tag that
+# already exists must point at that same commit, or nothing is uploaded: to
+# publish again under an existing tag, run this workflow from the tag.
+
 on:
-  release:
-    types: [published]
   workflow_call:
     inputs:
       tag:
@@ -14,307 +43,284 @@ on:
         required: false
         default: false
         type: boolean
+      dry_run:
+        description: 'Build and verify only, publish nothing'
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g., v0.0.1)'
+        description: 'Tag to release (e.g. icm-v0.10.66). Built from the ref this workflow is run from: for a tag that already exists, run it from that tag.'
         required: true
       prerelease:
         description: 'Mark the release as pre-release'
         required: false
         default: false
         type: boolean
+      dry_run:
+        description: 'Dry run: build and verify only, publish nothing'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
-  contents: write
-
-env:
-  CARGO_TERM_COLOR: always
+  contents: read
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-          # Build the glibc binaries on an older runner (glibc 2.35) so they
-          # run on Debian 12 "Bookworm" (glibc 2.36) and other current distros
-          # — ubuntu-latest's glibc is too new (issue #330).
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-            archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
-            archive: tar.gz
-          # Fully-static musl binary for old-glibc distros (issue #330:
-          # Debian Bookworm's glibc 2.36 is older than ubuntu-latest's).
-          # No embeddings: ort/onnxruntime has no static musl build.
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: tar.gz
-            flags: --no-default-features --features backend-sqlite,tui,http-api
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Build (cross aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} -p icm-cli --features vendored-openssl
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-
-      - name: Build
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
-        # Target-specific, so a no-op for non-musl targets: sqlite-vec.c uses
-        # BSD type names (u_int8_t/…) that glibc provides but musl does not.
-        env:
-          CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
-        run: cargo build --release --target ${{ matrix.target }} -p icm-cli ${{ matrix.flags }}
-
-      - name: Package (Unix)
-        if: matrix.archive == 'tar.gz'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar -czvf ../../../icm-${{ matrix.target }}.${{ matrix.archive }} icm
-          cd ../../..
-
-      - name: Package (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/icm.exe" -DestinationPath "icm-${{ matrix.target }}.zip"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: icm-${{ matrix.target }}
-          path: icm-${{ matrix.target }}.${{ matrix.archive }}
-
-  build-deb:
-    name: Build .deb
-    # Older glibc (2.35) so the packaged binary runs on Debian 12 (#330).
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
-
-      - name: Build .deb
-        run: cargo deb -p icm-cli
-
-      - name: Prepare artifacts
-        run: |
-          mkdir -p deb-out
-          cp target/debian/*.deb deb-out/
-          # Create version-agnostic name
-          cp target/debian/*.deb deb-out/icm_amd64.deb
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: icm-deb
-          path: deb-out/*.deb
-
-  build-rpm:
-    name: Build .rpm
+  plan:
+    name: Plan
     runs-on: ubuntu-latest
-    container: fedora:latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      expected_version: ${{ steps.plan.outputs.expected_version }}
+      publish: ${{ steps.plan.outputs.publish }}
     steps:
-      - name: Install dependencies
-        run: dnf install -y git rust cargo rpm-build openssl-devel pkg-config perl-FindBin perl-File-Compare gcc-c++
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm
-
-      - name: Build release
-        run: cargo build --release -p icm-cli
-
-      - name: Generate .rpm
-        run: cargo generate-rpm -p crates/icm-cli
-
-      - name: Prepare artifacts
+      - name: Resolve tag, version and mode
+        id: plan
+        env:
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          mkdir -p rpm-out
-          cp target/generate-rpm/*.rpm rpm-out/
-          # Create version-agnostic name
-          VERSION=$(grep '^version' crates/icm-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          cp target/generate-rpm/*.rpm "rpm-out/icm-${VERSION}-1.x86_64.rpm"
-          cp target/generate-rpm/*.rpm rpm-out/icm.x86_64.rpm
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: icm-rpm
-          path: rpm-out/*.rpm
-
-  release:
-    name: Create Release
-    needs: [build, build-deb, build-rpm]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Get version
-        id: version
-        # inputs.tag is set for both workflow_call and workflow_dispatch.
-        # github.event_name in a reusable workflow reflects the PARENT's event
-        # (e.g. 'push' when release-please.yml calls us), so we cannot branch
-        # on it to detect workflow_call — check inputs.tag first instead.
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "version=${{ inputs.tag }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "release" ]; then
-            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          case "$TAG" in
+            ''|*[!A-Za-z0-9._-]*)
+              echo "::error::invalid tag '$TAG'"
+              exit 1
+              ;;
+          esac
+          # Strip tag prefixes: "icm-v0.10.1" → "0.10.1", "v0.10.1" → "0.10.1"
+          version="${TAG#icm-v}"
+          version="${version#v}"
+          # A stable release must be built from the commit that carries its
+          # version: every binary has to report exactly this number.
+          # Pre-release tags (icm-dev-v0.10.66-rc.12) are ahead of the
+          # version in Cargo.toml, so there is nothing to compare.
+          expected_version=""
+          if [ "$PRERELEASE" != "true" ]; then
+            if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::a stable release tag must look like icm-vX.Y.Z, got '$TAG'"
+              exit 1
+            fi
+            expected_version="$version"
+          fi
+          # Publishing takes an explicit "false": an empty or unexpected
+          # value (an input renamed, a new caller) is a dry run.
+          publish=false
+          if [ "$DRY_RUN" = "false" ]; then
+            publish=true
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "expected_version=$expected_version"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG version=$version prerelease=$PRERELEASE publish=$publish" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$publish" != "true" ]; then
+            # Said on the run page, so a release that was meant to publish
+            # and did not is not mistaken for one that did.
+            echo "::notice title=Dry run::$TAG is built and verified, nothing is published (dry_run is '$DRY_RUN')."
           fi
 
-      - name: Flatten artifacts
+  build:
+    name: Build
+    needs: plan
+    uses: ./.github/workflows/release-build.yml
+    with:
+      expected_version: ${{ needs.plan.outputs.expected_version }}
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish release assets
+    # `needs: build` is the first gate: one failed build, one failed smoke
+    # test or one missing asset and this job does not run at all.
+    needs: [plan, build]
+    if: ${{ needs.plan.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      is_latest: ${{ steps.finalize.outputs.is_latest }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.build.outputs.version }}
+      PRERELEASE: ${{ inputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refuse a tag that points at another commit
+        # The bundle was built from $GITHUB_SHA. Uploading it under a tag
+        # that sits on a different commit would replace the files of that
+        # release with a build of other code: between two releases the
+        # version number alone does not tell them apart.
         run: |
-          mkdir -p release
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release/ \;
+          set -euo pipefail
+          # One line for a lightweight tag, a second "^{}" line with the
+          # commit for an annotated one, nothing when the tag does not exist.
+          refs=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          tag_commit=$(printf '%s\n' "$refs" | awk '
+            index($2, "^{}") { peeled = $1 }
+            NF && !index($2, "^{}") { plain = $1 }
+            END { print (peeled != "" ? peeled : plain) }')
+          if [ -z "$tag_commit" ]; then
+            echo "Tag $TAG does not exist yet: it will be created on $GITHUB_SHA."
+          elif [ "$tag_commit" = "$GITHUB_SHA" ]; then
+            echo "Tag $TAG points at $GITHUB_SHA, the commit that was built."
+          else
+            echo "::error::tag $TAG points at $tag_commit but this run built $GITHUB_SHA: nothing was uploaded. Run this workflow from the tag $TAG itself to publish its own code."
+            exit 1
+          fi
 
-      - name: Create checksums
+      - name: Download the verified release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+
+      - name: Check the bundle once more before upload
+        run: sh scripts/release-check.sh verify release "$VERSION"
+
+      - name: Upload assets
         run: |
-          cd release
-          sha256sum * > checksums.txt
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Stable path: release-please created the release (notes included).
+            gh release upload "$TAG" release/* --clobber
+          else
+            # Pre-release path, or a tag released by hand. `gh release create`
+            # uploads to a draft and publishes it only once every asset is in.
+            # Always created as a pre-release; "Promote" below decides.
+            gh release create "$TAG" release/* \
+              --title "$TAG" \
+              --generate-notes \
+              --target "$GITHUB_SHA" \
+              --prerelease
+          fi
 
-      - name: Upload Release Assets
-        # Runs for release (direct event), workflow_call (inputs.tag set),
-        # and falls through for workflow_dispatch (handled by Create Release).
-        if: steps.version.outputs.version != '' && github.event_name != 'workflow_dispatch'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.version }}
-          prerelease: ${{ inputs.prerelease == true }}
-          generate_release_notes: ${{ inputs.prerelease == true }}
-          files: release/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify what GitHub serves
+        # The second gate, on the real thing: download every asset back,
+        # require exactly the expected set and matching SHA256 sums.
+        run: |
+          set -euo pipefail
+          rm -rf published
+          gh release download "$TAG" --dir published
+          sh scripts/release-check.sh verify published "$VERSION"
+          cmp release/checksums.txt published/checksums.txt
 
-      - name: Create Release
-        if: github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: icm ${{ steps.version.outputs.version }}
-          draft: false
-          prerelease: ${{ inputs.prerelease == true }}
-          generate_release_notes: true
-          files: release/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Head the release notes with semantic search per file
+        # Some builds leave semantic search off until the user runs a
+        # command, and an update can take it away: said first in the notes,
+        # before the release becomes "latest". The text comes from the same
+        # manifest the builds were checked against. Runs once per release:
+        # the marker line tells a re-run the heading is already there.
+        run: |
+          set -euo pipefail
+          sh scripts/release-check.sh notes "$VERSION" > notes-head.md
+          marker=$(head -n 1 notes-head.md)
+          gh release view "$TAG" --json body --jq .body > notes-body.md
+          if grep -Fq -- "$marker" notes-body.md; then
+            echo "The release notes already carry the heading."
+          else
+            { cat notes-head.md; echo; cat notes-body.md; } > notes.md
+            gh release edit "$TAG" --notes-file notes.md
+          fi
+
+      - name: Promote the release
+        id: finalize
+        run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # "latest" goes to the highest stable version, so re-publishing the
+          # assets of an older tag never moves it backwards.
+          newest=$( { gh release list --exclude-drafts --exclude-pre-releases --limit 100 \
+                        --json tagName --jq '.[].tagName'; echo "$TAG"; } \
+                    | { grep -E '^icm-v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1 )
+          if [ "$newest" = "$TAG" ]; then
+            gh release edit "$TAG" --prerelease=false --latest
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$TAG is older than $newest: published, but not marked latest"
+            gh release edit "$TAG" --prerelease=false --latest=false
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+          fi
 
   homebrew:
     name: Update Homebrew formula
-    needs: [release]
-    # Skip the Homebrew tap update for pre-releases; stable channels only.
-    if: ${{ inputs.prerelease != true }}
+    needs: [plan, publish]
+    # Stable releases only, and only for the newest one.
+    if: ${{ inputs.prerelease != true && needs.publish.outputs.is_latest == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - name: Get version
-        id: version
-        run: |
-          TAG="${{ inputs.tag }}"
-          if [ -z "$TAG" ]; then
-            TAG="${{ github.event.release.tag_name }}"
-          fi
-          # Strip tag prefixes: "icm-v0.10.1" → "0.10.1", "v0.10.1" → "0.10.1"
-          VERSION="${TAG#icm-v}"
-          VERSION="${VERSION#v}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Download checksums
         run: |
-          gh release download "${{ steps.version.outputs.tag }}" \
+          gh release download "$TAG" \
             --repo rtk-ai/icm \
             --pattern checksums.txt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Parse checksums
-        id: sha
+      - name: Write formula
         # Match field 2 exactly so the lookup is unambiguous even if other
-        # rows with overlapping prefixes ever land in checksums.txt.
+        # rows with overlapping prefixes ever land in checksums.txt. A
+        # missing sum stops the job: an empty sha256 must never reach the tap.
         run: |
-          sha_for() { awk -v f="$1" '$2 == f {print $1; exit}' checksums.txt; }
-          echo "arm=$(sha_for icm-aarch64-apple-darwin.tar.gz)" >> $GITHUB_OUTPUT
-          echo "intel=$(sha_for icm-x86_64-apple-darwin.tar.gz)" >> $GITHUB_OUTPUT
-          echo "linux=$(sha_for icm-x86_64-unknown-linux-gnu.tar.gz)" >> $GITHUB_OUTPUT
-          echo "linux_arm=$(sha_for icm-aarch64-unknown-linux-gnu.tar.gz)" >> $GITHUB_OUTPUT
-
-      - name: Update formula
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.tag }}"
-          cat > icm.rb << 'FORMULA'
+          set -euo pipefail
+          sha_for() {
+            sum=$(awk -v f="$1" '$2 == f {print $1; exit}' checksums.txt)
+            if ! printf '%s' "$sum" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::no SHA256 for $1 in checksums.txt" >&2
+              return 1
+            fi
+            printf '%s' "$sum"
+          }
+          SHA_ARM=$(sha_for icm-aarch64-apple-darwin.tar.gz)
+          SHA_INTEL=$(sha_for icm-x86_64-apple-darwin.tar.gz)
+          SHA_LINUX=$(sha_for icm-x86_64-unknown-linux-gnu.tar.gz)
+          SHA_LINUX_ARM=$(sha_for icm-aarch64-unknown-linux-gnu.tar.gz)
+          BASE="https://github.com/rtk-ai/icm/releases/download/${TAG}"
+          # Unquoted heredoc: only the ${...} shell variables above are
+          # expanded. Ruby's #{...} is left alone by the shell.
+          cat > icm.rb << FORMULA
           class Icm < Formula
             desc "Permanent memory for AI agents — MCP server with hybrid search"
             homepage "https://github.com/rtk-ai/icm"
-            version "VERSION_PLACEHOLDER"
+            version "${VERSION}"
             license "Apache-2.0"
 
             on_macos do
               on_intel do
-                url "https://github.com/rtk-ai/icm/releases/download/TAG_PLACEHOLDER/icm-x86_64-apple-darwin.tar.gz"
-                sha256 "SHA_INTEL_PLACEHOLDER"
+                url "${BASE}/icm-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_INTEL}"
               end
               on_arm do
-                url "https://github.com/rtk-ai/icm/releases/download/TAG_PLACEHOLDER/icm-aarch64-apple-darwin.tar.gz"
-                sha256 "SHA_ARM_PLACEHOLDER"
+                url "${BASE}/icm-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_ARM}"
               end
             end
 
             on_linux do
               on_intel do
-                url "https://github.com/rtk-ai/icm/releases/download/TAG_PLACEHOLDER/icm-x86_64-unknown-linux-gnu.tar.gz"
-                sha256 "SHA_LINUX_PLACEHOLDER"
+                url "${BASE}/icm-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX}"
               end
               on_arm do
-                url "https://github.com/rtk-ai/icm/releases/download/TAG_PLACEHOLDER/icm-aarch64-unknown-linux-gnu.tar.gz"
-                sha256 "SHA_LINUX_ARM_PLACEHOLDER"
+                url "${BASE}/icm-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
               end
             end
 
@@ -322,33 +328,59 @@ jobs:
               bin.install "icm"
             end
 
+            def caveats
+              if OS.linux?
+                <<~EOS
+                  Keyword search works out of the box. For semantic search,
+                  fetch the ONNX Runtime once:
+                    icm embeddings download
+                EOS
+              elsif Hardware::CPU.intel?
+                <<~EOS
+                  Keyword search works out of the box. No ONNX Runtime 1.24+ is
+                  published for Intel Macs: for semantic search, set
+                  ORT_DYLIB_PATH to your own libonnxruntime.dylib.
+                EOS
+              end
+            end
+
             test do
               assert_match "icm #{version}", shell_output("#{bin}/icm --version")
             end
           end
           FORMULA
-          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" icm.rb
-          sed -i "s/TAG_PLACEHOLDER/$TAG/g" icm.rb
-          sed -i "s/SHA_INTEL_PLACEHOLDER/${{ steps.sha.outputs.intel }}/g" icm.rb
-          sed -i "s/SHA_ARM_PLACEHOLDER/${{ steps.sha.outputs.arm }}/g" icm.rb
-          sed -i "s/SHA_LINUX_PLACEHOLDER/${{ steps.sha.outputs.linux }}/g" icm.rb
-          sed -i "s/SHA_LINUX_ARM_PLACEHOLDER/${{ steps.sha.outputs.linux_arm }}/g" icm.rb
-          # Remove leading spaces from heredoc
-          sed -i 's/^          //' icm.rb
+          cat icm.rb
 
       - name: Push to homebrew-tap
+        # By now the release is complete and promoted. A push that fails
+        # (an expired HOMEBREW_TAP_TOKEN, for one) is reported as a warning
+        # and does not fail the run: a failure here would make cd.yml skip
+        # the 'latest' tag and the back-merge of a release that is out.
         run: |
           CONTENT=$(base64 -w 0 icm.rb)
-          SHA=$(gh api repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb --jq '.sha' 2>/dev/null || echo "")
-          if [ -n "$SHA" ]; then
-            gh api -X PUT repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb \
-              -f message="icm ${{ steps.version.outputs.version }}" \
-              -f content="$CONTENT" \
-              -f sha="$SHA"
+          push_formula() {
+            SHA=$(gh api repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb --jq '.sha' 2>/dev/null || echo "")
+            if [ -n "$SHA" ]; then
+              gh api -X PUT repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb \
+                -f message="icm ${VERSION}" \
+                -f content="$CONTENT" \
+                -f sha="$SHA"
+            else
+              gh api -X PUT repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb \
+                -f message="icm ${VERSION}" \
+                -f content="$CONTENT"
+            fi
+          }
+          if push_formula > push.log 2>&1; then
+            echo "Formula/icm.rb in rtk-ai/homebrew-tap now installs icm ${VERSION}."
           else
-            gh api -X PUT repos/rtk-ai/homebrew-tap/contents/Formula/icm.rb \
-              -f message="icm ${{ steps.version.outputs.version }}" \
-              -f content="$CONTENT"
+            cat push.log
+            echo "::warning title=Homebrew formula not updated::Release ${TAG} is published, but the push to rtk-ai/homebrew-tap failed: brew still installs the previous version. Check the HOMEBREW_TAP_TOKEN secret, then re-run this job."
+            {
+              echo "### Homebrew formula not updated"
+              echo "Release ${TAG} is published and complete. The push of Formula/icm.rb to rtk-ai/homebrew-tap failed, so \`brew install icm\` still gives the previous version."
+              echo "Check the HOMEBREW_TAP_TOKEN secret, then re-run this job: it only rewrites the formula."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

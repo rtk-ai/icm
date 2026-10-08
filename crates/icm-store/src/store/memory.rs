@@ -7,15 +7,18 @@
 use super::*;
 use rusqlite::OptionalExtension;
 
-impl MemoryStore for SqliteStore {
-    fn store(&self, memory: Memory) -> IcmResult<String> {
-        let memory = validate_and_normalize(memory)?;
+/// sqlite-vec's error for a vector whose length differs from the index.
+fn is_dimension_mismatch(e: &IcmError) -> bool {
+    e.to_string().contains("Dimension mismatch")
+}
 
+impl SqliteStore {
+    fn store_in_transaction(&self, memory: &Memory) -> IcmResult<String> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
-        match self.store_inner(&memory) {
+        match self.store_inner(memory) {
             Ok(id) => {
                 self.conn.execute_batch("COMMIT;").map_err(db_err)?;
                 Ok(id)
@@ -24,6 +27,30 @@ impl MemoryStore for SqliteStore {
                 let _ = self.conn.execute_batch("ROLLBACK;");
                 Err(e)
             }
+        }
+    }
+}
+
+impl MemoryStore for SqliteStore {
+    fn store(&self, memory: Memory) -> IcmResult<String> {
+        let memory = validate_and_normalize(memory)?;
+
+        match self.store_in_transaction(&memory) {
+            // The vector does not fit the index: another process re-embedded
+            // the database under a model of another dimension while this
+            // one (an MCP or HTTP server started earlier) kept its embedder.
+            // The memory matters more than its vector — store it without
+            // one rather than lose it; `icm embed` fills the vector later.
+            Err(e) if memory.embedding.is_some() && is_dimension_mismatch(&e) => {
+                tracing::warn!(
+                    "embedding dimension does not match the vector index; \
+                     storing the memory without a vector: {e}"
+                );
+                let mut without_vector = memory;
+                without_vector.embedding = None;
+                self.store_in_transaction(&without_vector)
+            }
+            other => other,
         }
     }
 
@@ -492,7 +519,9 @@ impl MemoryStore for SqliteStore {
         }
         let refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let changed = self.conn.execute(&sql, refs.as_slice()).map_err(db_err)?;
+        let changed = self.with_bookkeeping_timeout(|| {
+            self.conn.execute(&sql, refs.as_slice()).map_err(db_err)
+        })?;
         self.cache_invalidate_many(ids);
         Ok(changed)
     }
@@ -644,100 +673,17 @@ impl MemoryStore for SqliteStore {
     }
 
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()> {
-        // The consolidated memory goes through the same validation as any
-        // other write — MCP `icm_memory_consolidate` passes a caller-provided
-        // summary that previously bypassed every size/content check.
-        let consolidated = validate_and_normalize(consolidated)?;
+        self.replace_with_consolidated(topic, None, consolidated)
+            .map(|_| ())
+    }
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(db_err)?;
-
-        // Manual-testing finding: captured before the delete below, since
-        // afterward the rows (and thus this query) are gone. Used to clean
-        // up any *other* memory's related_ids that pointed at these —
-        // same dangling-reference bug already fixed for the single-id
-        // `delete`, reachable here too since this is a second, separate
-        // bulk-delete code path.
-        let deleted_ids: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM memories WHERE topic = ?1 AND importance != 'critical'")
-                .map_err(db_err)?;
-            let rows = stmt
-                .query_map(params![topic], |row| row.get::<_, String>(0))
-                .map_err(db_err)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
-        };
-
-        // `critical` memories are never deleted — same contract as
-        // `apply_decay` and `prune`. Consolidation replaces the expendable
-        // tail of a topic, not its "never forget" entries (audit finding:
-        // this DELETE previously wiped critical memories too).
-        // Clean vec_memories for entries about to be deleted
-        if let Err(e) = self.conn.execute(
-            "DELETE FROM vec_memories WHERE memory_id IN (
-                SELECT id FROM memories WHERE topic = ?1 AND importance != 'critical'
-            )",
-            params![topic],
-        ) {
-            tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after vec_memories delete failed");
-            let _ = self.conn.execute_batch("ROLLBACK;");
-            return Err(IcmError::Database(e.to_string()));
-        }
-
-        if let Err(e) = self.conn.execute(
-            "DELETE FROM memories WHERE topic = ?1 AND importance != 'critical'",
-            params![topic],
-        ) {
-            tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after memories delete failed");
-            let _ = self.conn.execute_batch("ROLLBACK;");
-            return Err(IcmError::Database(e.to_string()));
-        }
-
-        if !deleted_ids.is_empty() {
-            let ids_json = serde_json::to_string(&deleted_ids).map_err(IcmError::from)?;
-            if let Err(e) = self.conn.execute(
-                "UPDATE memories
-                    SET related_ids = (
-                        SELECT COALESCE(json_group_array(value), '[]')
-                        FROM json_each(memories.related_ids)
-                        WHERE value NOT IN (SELECT value FROM json_each(?1))
-                    )
-                    WHERE EXISTS (
-                        SELECT 1 FROM json_each(memories.related_ids)
-                        WHERE value IN (SELECT value FROM json_each(?1))
-                    )",
-                params![ids_json],
-            ) {
-                tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after related_ids cleanup failed");
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                return Err(IcmError::Database(e.to_string()));
-            }
-        }
-
-        if let Err(e) = self.store_inner(&consolidated) {
-            tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after store failed");
-            let _ = self.conn.execute_batch("ROLLBACK;");
-            return Err(e);
-        }
-
-        // Rebuild FTS index to eliminate any ghost entries from the external
-        // content table.  This guarantees search results stay consistent after
-        // bulk deletes (fixes #44).
-        if let Err(e) = self
-            .conn
-            .execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")
-        {
-            tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after FTS rebuild failed");
-            let _ = self.conn.execute_batch("ROLLBACK;");
-            return Err(IcmError::Database(e.to_string()));
-        }
-
-        self.conn.execute_batch("COMMIT;").map_err(db_err)?;
-        // Bulk delete + re-insert touches arbitrarily many cached entries.
-        self.cache_clear();
-        Ok(())
+    fn consolidate_ids(
+        &self,
+        topic: &str,
+        read: &[icm_core::ReadMemory],
+        consolidated: Memory,
+    ) -> IcmResult<icm_core::Consolidated> {
+        self.replace_with_consolidated(topic, Some(read), consolidated)
     }
 
     fn count(&self) -> IcmResult<usize> {
@@ -863,6 +809,219 @@ impl MemoryStore for SqliteStore {
             avg_weight,
             oldest_memory,
             newest_memory,
+        })
+    }
+}
+
+impl SqliteStore {
+    /// Shared body of `consolidate_topic` (`only = None`: every non-critical
+    /// memory of the topic) and `consolidate_ids` (`only = Some`: the listed
+    /// memories, provided they are still what the caller read). One
+    /// transaction: either the memories are gone and the consolidated one
+    /// is in, or nothing changed.
+    fn replace_with_consolidated(
+        &self,
+        topic: &str,
+        only: Option<&[icm_core::ReadMemory]>,
+        consolidated: Memory,
+    ) -> IcmResult<icm_core::Consolidated> {
+        // The consolidated memory goes through the same validation as any
+        // other write — MCP `icm_memory_consolidate` passes a caller-provided
+        // summary that previously bypassed every size/content check.
+        let consolidated = validate_and_normalize(consolidated)?;
+        // The summary is written under the normalized topic; the memories
+        // must be looked up under that same topic, or a caller passing
+        // " t" would remove nothing and add a stray summary to "t".
+        if topic.trim() != consolidated.topic {
+            return Err(IcmError::InvalidInput(format!(
+                "consolidation topic {topic:?} does not match the summary's topic {:?}",
+                consolidated.topic
+            )));
+        }
+        let topic = consolidated.topic.as_str();
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(db_err)?;
+        let rollback = |what: &str, e: IcmError| -> IcmError {
+            tracing::warn!(topic, error = %e, "consolidate: rolling back after {what} failed");
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            e
+        };
+
+        // The exact set this call removes, resolved inside the transaction
+        // and used for every statement below — so the vec rows, the memory
+        // rows and the related_ids cleanup can never disagree, and nothing
+        // that joined the topic after the caller read it is touched.
+        //
+        // `critical` memories are never deleted — same contract as
+        // `apply_decay` and `prune`. Consolidation replaces the expendable
+        // tail of a topic, not its "never forget" entries (audit finding:
+        // this DELETE previously wiped critical memories too).
+        let deleted_ids: Vec<String> = match only {
+            None => {
+                let collected = self
+                    .conn
+                    .prepare(
+                        "SELECT id FROM memories WHERE topic = ?1 AND importance != 'critical'",
+                    )
+                    .and_then(|mut stmt| {
+                        stmt.query_map(params![topic], |row| row.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    });
+                match collected {
+                    Ok(ids) => ids,
+                    Err(e) => return Err(rollback("id lookup", db_err(e))),
+                }
+            }
+            Some(read) => {
+                let wanted: Vec<&str> = read.iter().map(|r| r.id.as_str()).collect();
+                let wanted_json = match serde_json::to_string(&wanted) {
+                    Ok(json) => json,
+                    Err(e) => return Err(rollback("id encoding", IcmError::from(e))),
+                };
+                // What the listed memories are *now*: (importance, summary).
+                let current = self
+                    .conn
+                    .prepare(
+                        "SELECT id, importance, summary FROM memories
+                          WHERE topic = ?1 AND id IN (SELECT value FROM json_each(?2))",
+                    )
+                    .and_then(|mut stmt| {
+                        stmt.query_map(params![topic, wanted_json], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+                    });
+                let current = match current {
+                    Ok(rows) => rows,
+                    Err(e) => return Err(rollback("id lookup", db_err(e))),
+                };
+                // Gone, moved to another topic, or edited since it was
+                // read: the summary no longer stands for the topic's
+                // content. Write nothing and say which ones.
+                let mut changed = Vec::new();
+                let mut removable = Vec::new();
+                for item in read.iter().filter(|r| r.id != consolidated.id) {
+                    match current.get(&item.id) {
+                        None => changed.push(item.id.clone()),
+                        Some((_, now)) if item.summary.as_ref().is_some_and(|was| was != now) => {
+                            changed.push(item.id.clone())
+                        }
+                        Some((importance, _)) if importance != "critical" => {
+                            removable.push(item.id.clone())
+                        }
+                        Some(_) => {}
+                    }
+                }
+                if !changed.is_empty() {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    return Ok(icm_core::Consolidated::Stale { changed });
+                }
+                removable
+            }
+        };
+
+        if !deleted_ids.is_empty() {
+            let ids_json = match serde_json::to_string(&deleted_ids) {
+                Ok(json) => json,
+                Err(e) => return Err(rollback("id encoding", IcmError::from(e))),
+            };
+            // Clean vec_memories for entries about to be deleted
+            if let Err(e) = self.conn.execute(
+                "DELETE FROM vec_memories
+                  WHERE memory_id IN (SELECT value FROM json_each(?1))",
+                params![ids_json],
+            ) {
+                return Err(rollback(
+                    "vec_memories delete",
+                    IcmError::Database(e.to_string()),
+                ));
+            }
+            if let Err(e) = self.conn.execute(
+                "DELETE FROM memories WHERE id IN (SELECT value FROM json_each(?1))",
+                params![ids_json],
+            ) {
+                return Err(rollback(
+                    "memories delete",
+                    IcmError::Database(e.to_string()),
+                ));
+            }
+            // Manual-testing finding: clean up any *other* memory's
+            // related_ids that pointed at the deleted rows — same
+            // dangling-reference bug already fixed for the single-id
+            // `delete`, reachable here too since this is a second, separate
+            // bulk-delete code path.
+            if let Err(e) = self.conn.execute(
+                "UPDATE memories
+                    SET related_ids = (
+                        SELECT COALESCE(json_group_array(value), '[]')
+                        FROM json_each(memories.related_ids)
+                        WHERE value NOT IN (SELECT value FROM json_each(?1))
+                    )
+                    WHERE EXISTS (
+                        SELECT 1 FROM json_each(memories.related_ids)
+                        WHERE value IN (SELECT value FROM json_each(?1))
+                    )",
+                params![ids_json],
+            ) {
+                return Err(rollback(
+                    "related_ids cleanup",
+                    IcmError::Database(e.to_string()),
+                ));
+            }
+        }
+
+        // `store_inner` returns the id actually used: the caller's on a
+        // normal insert, an existing row's when a memory with the same
+        // summary already exists (dedup merge). That row can be in another
+        // topic — the dedup hash ignores the topic's case — in which case
+        // the originals would be gone and the summary nowhere in this
+        // topic: refuse the whole thing.
+        let written_id = match self.store_inner(&consolidated) {
+            Ok(id) => id,
+            Err(e) => return Err(rollback("store", e)),
+        };
+        if written_id != consolidated.id {
+            let landed: Result<String, _> = self.conn.query_row(
+                "SELECT topic FROM memories WHERE id = ?1",
+                params![written_id],
+                |row| row.get(0),
+            );
+            match landed {
+                Ok(t) if t == topic => {}
+                Ok(other) => {
+                    return Err(rollback(
+                        "store",
+                        IcmError::InvalidInput(format!(
+                            "an identical summary already exists in topic {other:?} (memory \
+                             {written_id}); nothing was consolidated"
+                        )),
+                    ))
+                }
+                Err(e) => return Err(rollback("store", db_err(e))),
+            }
+        }
+
+        // Rebuild FTS index to eliminate any ghost entries from the external
+        // content table.  This guarantees search results stay consistent after
+        // bulk deletes (fixes #44).
+        if let Err(e) = self
+            .conn
+            .execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")
+        {
+            return Err(rollback("FTS rebuild", IcmError::Database(e.to_string())));
+        }
+
+        self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+        // Bulk delete + re-insert touches arbitrarily many cached entries.
+        self.cache_clear();
+        Ok(icm_core::Consolidated::Replaced {
+            removed: deleted_ids.len(),
+            id: written_id,
         })
     }
 }

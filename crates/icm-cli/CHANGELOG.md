@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.11.2](https://github.com/rtk-ai/icm/compare/icm-v0.11.1...icm-v0.11.2) (2026-10-07)
+
+
+### Bug Fixes
+
+* **release:** count commits from every crate and version them together ([#493](https://github.com/rtk-ai/icm/issues/493)) ([d4be9fb](https://github.com/rtk-ai/icm/commit/d4be9fb52389783847dde01cc98660aff37a9147))
+* **release:** keep Cargo.lock in step with the released version ([9da9bb9](https://github.com/rtk-ai/icm/commit/9da9bb92b9bea48d7957b935da08c95520461978))
+
+## [0.11.1](https://github.com/rtk-ai/icm/compare/icm-v0.11.0...icm-v0.11.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **install:** the Windows installer runs from a file; correct next steps ([53fbeef](https://github.com/rtk-ai/icm/commit/53fbeefeabcf6de4d8b7b01c3604f5afcbbdbc23))
+* **upgrade:** never replace a working binary with one that does not start ([3f0b86a](https://github.com/rtk-ai/icm/commit/3f0b86aba0ebd19264190144e1b8dcfdfe210288))
+* **windows:** icm.exe where PowerShell would run Invoke-Command; uninstall leaves nothing ([#487](https://github.com/rtk-ai/icm/issues/487)) ([97f77b9](https://github.com/rtk-ai/icm/commit/97f77b93d9a1118a6ba005b3a23c8479948f03ae))
+
+## [0.11.0](https://github.com/rtk-ai/icm/compare/icm-v0.10.65...icm-v0.11.0) (2026-10-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **consolidate:** `icm_memory_consolidate` needs `ids` to replace anything. Called with only `topic` (or `topic` and `summary`), which used to replace the whole topic, it now writes nothing and answers with the topic's memories and their ids, to be passed back in `ids`.
+
+### Features
+
+* **recall:** rank-fusion recall engine v2, now the default ([ce3e7d0](https://github.com/rtk-ai/icm/commit/ce3e7d0ac12716b5cbff1f6288b90ba4daf0856a))
+* **summarizer:** API-key providers; consolidate only what was summarized ([f8b61f6](https://github.com/rtk-ai/icm/commit/f8b61f61658997f0583decca96e421049c75e232))
+* **web:** 3D memory-relationship graph with topic clustering ([#470](https://github.com/rtk-ai/icm/issues/470)) ([046c3a7](https://github.com/rtk-ai/icm/commit/046c3a7305d3ba4105d39f5b6f9a8c2362a17f6e))
+
+
+### Bug Fixes
+
+* **consolidate:** consolidate_ids replaces only the memories that were read ([61c3f38](https://github.com/rtk-ai/icm/commit/61c3f387d5e03e3ec8cb66fd6912a7dca1abd578))
+* **store:** open without the write lock and keep vectors across a model change ([3b20919](https://github.com/rtk-ai/icm/commit/3b209199092139b6b5a9166cdc804a4d4f63361d))
+
 ## [0.10.65](https://github.com/rtk-ai/icm/compare/icm-v0.10.64...icm-v0.10.65) (2026-09-08)
 
 

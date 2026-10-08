@@ -46,6 +46,7 @@ The following are **high-risk** and warrant extra scrutiny (and ideally a second
 - **`crates/icm-store/src/**`** — all SQL and the SQLite schema/migrations (injection, corruption, data loss)
 - **`crates/icm-mcp/src/tools.rs`** — MCP tool argument parsing and validation (untrusted client input)
 - **`crates/icm-cli/src/summarizer.rs`** — spawns the configured LLM CLI (e.g. `claude -p`); must stay isolated and never build a shell string from untrusted input
+- **`crates/icm-cli/src/summarizer/api.rs`** — calls LLM APIs with a user-supplied key. The key must come from the environment only, travel in a header (never the URL) to the host in `base_url` and nowhere else (redirects are not followed; a vendor's default key variable is only sent to that vendor's host), and never reach an error message, a log line or `icm config`. The log half of that also depends on `http_client_log_allowed` in `main.rs`, which keeps the HTTP client's header dump out of the log on any `RUST_LOG`. `config.toml` is trusted input: whoever can write it (or set `ICM_CONFIG`) chooses `base_url` and which environment variable is sent there — a project-level config must never be allowed to set `[*.summarizer]`
 - **Hook entry points in `crates/icm-cli/src/main.rs`** — parse untrusted tool output / transcripts from stdin; must never crash the calling agent
 
 ### Tier 2: Distribution

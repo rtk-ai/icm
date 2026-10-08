@@ -1,0 +1,1 @@
+const t={critical:"text-red-400",high:"text-orange-400",medium:"text-blue-400",low:"text-gray-400"},r={critical:"bg-red-600",high:"bg-orange-500",medium:"bg-blue-500",low:"bg-gray-500"};function o(e){return t[e.toLowerCase()]??"text-gray-400"}function a(e){return r[e.toLowerCase()]??"bg-gray-500"}export{a,o as i};

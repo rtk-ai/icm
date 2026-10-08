@@ -12,7 +12,7 @@
 //! ```
 //!
 //! On Linux `<icm-data-dir>` resolves to `~/.local/share/icm/`, on macOS
-//! to `~/Library/Application Support/icm/`. Override the root with
+//! to `~/Library/Application Support/dev.icm.icm/`. Override the root with
 //! `--backup-dir <PATH>`. Restore is `cp -a <backup>/files/. /` — the
 //! relative tree under `files/` mirrors the original absolute paths with
 //! the leading `/` stripped, so a recursive copy lands every config back

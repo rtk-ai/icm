@@ -1,0 +1,104 @@
+# Agent images for the sdebench ICM arm: a coding agent + the `icm` binary built
+# from this checkout. One target per agent (claude, codex, opencode).
+#
+# Build context is the repository root (the binary is compiled from crates/):
+#
+#   docker build -f bench/coding/Dockerfile.agent-icm --target claude \
+#     --build-arg CLAUDE_CODE_VERSION=<x.y.z> -t icm-sde-agent-claude .
+#   docker build -f bench/coding/Dockerfile.agent-icm --target codex \
+#     --build-arg CODEX_VERSION=<x.y.z> -t icm-sde-agent-codex .
+#   docker build -f bench/coding/Dockerfile.agent-icm --target opencode \
+#     -t icm-sde-agent-opencode .
+#
+# The image is built for the machine that runs the harness (the upstream harness
+# drives a local Docker daemon), so no --platform is forced here: an arm64
+# laptop gets a native arm64 image.
+#
+# Why not the upstream agent images plus a mounted binary: upstream uses
+# node:22-slim (Debian bookworm, glibc 2.36), and the ONNX Runtime that `icm`
+# links needs glibc >= 2.38 (see bench/amb/Dockerfile). These images use trixie.
+#
+# Nothing ICM-specific is wired here. `icm init` runs inside each task's
+# container (container/setup.sh), exactly as on a user's machine. The image
+# only provides: the binaries, an isolated database path, and the same
+# permission allow-list idea as the upstream image (headless agents refuse
+# tools that are not allowed), extended to ICM's MCP tools.
+#
+# The no-memory control arm must use the SAME image (same agent version, same
+# base): run the upstream `vanilla` arm with SDE_AGENT_IMAGE_CLAUDE pointing at
+# this image. Without `icm init` the binary is inert: no hook, no MCP entry, no
+# instruction mentions it.
+
+FROM rust:1-trixie AS icm-build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# main.rs embeds plugins/opencode-icm.ts via include_str!
+COPY plugins ./plugins
+# No --locked: the committed Cargo.lock can lag the workspace version by one
+# release, which --locked turns into a build failure (same note as bench/amb).
+RUN cargo build --release -p icm-cli
+
+FROM node:22-trixie-slim AS base
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates python3 libssl3t64 libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=icm-build /src/target/release/icm /usr/local/bin/icm
+# One database per task container, never the default platform path. ICM_CONFIG
+# points at a file written here: ICM runs on its built-in defaults, whatever
+# the builder's own configuration is, with ONE setting changed.
+#
+# `extraction.summarizer.provider` defaults to `auto`. With it, ICM's
+# PostToolUse hook queues raw tool output and its SessionEnd hook starts a
+# worker that runs the agent's own CLI (`claude -p --model claude-haiku-4-5`)
+# to extract facts: model calls made with the benchmark's key, inside the task,
+# that the harness never sees and the result's cost does not contain. `none`
+# selects ICM's local extractor (rules + the embedding model, no LLM), so the
+# arm calls no model of its own. container/setup.sh refuses a task whose
+# effective provider is not the one the run asked for (ICM_SDE_EXTRACTION).
+ARG ICM_EXTRACTION_PROVIDER=none
+RUN mkdir -p /opt/icm-bench /root/icm \
+    && printf '[extraction.summarizer]\nprovider = "%s"\n' "$ICM_EXTRACTION_PROVIDER" \
+       > /opt/icm-bench/config.toml
+ENV HOME=/root \
+    ICM_DB=/root/icm/memories.db \
+    ICM_CONFIG=/opt/icm-bench/config.toml
+# Pre-download ICM's default embedding model (about 2 GB, ~/.cache/icm/models).
+# Without it every task container would download it on the first `icm recall`
+# or MCP recall the agent makes. Set ICM_PREWARM=0 to skip (keyword search only
+# until the model is fetched at run time).
+ARG ICM_PREWARM=1
+RUN if [ "$ICM_PREWARM" = "1" ]; then \
+      icm --db /tmp/warm.db store -t warm -c "warm the embedding model cache" \
+      && rm -f /tmp/warm.db*; \
+    fi
+WORKDIR /work
+
+# ── Claude Code ──────────────────────────────────────────────────────────────
+FROM base AS claude
+# Pin the agent: an unpinned `npm i -g` installs whatever is current on the day
+# of the build, and two arms built on different days would differ by more than
+# their memory. Record the version in the run's description.
+ARG CLAUDE_CODE_VERSION=latest
+RUN npm i -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+# Same allow-list as the upstream image (a headless claude refuses Bash without
+# it, and --dangerously-skip-permissions is refused as root), plus ICM's MCP
+# tools, which a headless run would otherwise deny one by one.
+RUN mkdir -p /root/.claude \
+    && printf '{"permissions":{"allow":["Bash","Edit","Write","Read","Glob","Grep","MultiEdit","LS","mcp__icm"],"defaultMode":"acceptEdits"}}' \
+       > /root/.claude/settings.json
+
+# ── Codex CLI ────────────────────────────────────────────────────────────────
+FROM base AS codex
+ARG CODEX_VERSION=latest
+RUN npm i -g @openai/codex@${CODEX_VERSION}
+
+# ── opencode ─────────────────────────────────────────────────────────────────
+FROM base AS opencode
+# Upstream pins 1.16.2 and its vanilla baseline imports past sessions with a
+# store layout written for that version.
+ARG OPENCODE_VERSION=1.16.2
+RUN npm i -g opencode-ai@${OPENCODE_VERSION}
+RUN mkdir -p /root/.config/opencode \
+    && printf '{"permission":{"bash":"allow","edit":"allow","webfetch":"allow"}}' \
+       > /root/.config/opencode/opencode.json

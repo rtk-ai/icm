@@ -12,10 +12,10 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use icm_core::{
-    Concept, ConceptLink, Embedder, Fact, FactsStats, FactsStore, Feedback, FeedbackStats,
-    FeedbackStore, IcmError, IcmResult, Label, Memoir, MemoirStats, MemoirStore, Memory,
-    MemoryStore, Message, PatternCluster, Relation, Role, Session, StoreStats, TopicHealth,
-    TranscriptHit, TranscriptStats, TranscriptStore,
+    Concept, ConceptLink, Embedder, EmbeddingState, Fact, FactsStats, FactsStore, Feedback,
+    FeedbackStats, FeedbackStore, IcmError, IcmResult, Label, Memoir, MemoirStats, MemoirStore,
+    Memory, MemoryStore, Message, PatternCluster, RankedHit, RankedQuery, Relation, Role, Session,
+    StoreStats, TopicHealth, TranscriptHit, TranscriptStats, TranscriptStore,
 };
 
 use crate::common::{
@@ -410,6 +410,190 @@ impl Store {
         }
     }
 
+    /// Peek what the database says about its embeddings (dimension, model,
+    /// whether any vector is stored) without opening it for writing. Only
+    /// the SQLite backend has a file to peek into; the others report
+    /// `Ok(None)`, which callers treat as "nothing to protect".
+    pub fn read_embedding_state(path: &Path) -> IcmResult<Option<EmbeddingState>> {
+        match BackendKind::from_env()? {
+            BackendKind::Sqlite => {
+                #[cfg(feature = "backend-sqlite")]
+                {
+                    SqliteStore::read_embedding_state(path)
+                }
+                #[cfg(not(feature = "backend-sqlite"))]
+                {
+                    let _ = path;
+                    Ok(None)
+                }
+            }
+            BackendKind::Postgres | BackendKind::OpenSearch => {
+                let _ = path;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Count `(memories with a vector, memories)` without a full open, for
+    /// `icm doctor`. `Ok(None)` outside the SQLite backend.
+    pub fn read_embedding_coverage(path: &Path) -> IcmResult<Option<(usize, usize)>> {
+        match BackendKind::from_env()? {
+            BackendKind::Sqlite => {
+                #[cfg(feature = "backend-sqlite")]
+                {
+                    SqliteStore::read_embedding_coverage(path)
+                }
+                #[cfg(not(feature = "backend-sqlite"))]
+                {
+                    let _ = path;
+                    Ok(None)
+                }
+            }
+            BackendKind::Postgres | BackendKind::OpenSearch => {
+                let _ = path;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drop every stored vector and recreate the vector index at `new_dims`
+    /// (the explicit `icm embed --migrate` path). Returns the number of
+    /// memories whose embedding was cleared. SQLite only: the remote
+    /// backends size their vector column themselves.
+    pub fn reset_vector_index(&self, new_dims: usize) -> IcmResult<usize> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.reset_vector_index(new_dims),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(_) => {
+                let _ = new_dims;
+                Err(IcmError::Unsupported("reset_vector_index".into()))
+            }
+            #[cfg(feature = "opensearch")]
+            Store::OpenSearch(_) => {
+                let _ = new_dims;
+                Err(IcmError::Unsupported("reset_vector_index".into()))
+            }
+        }
+    }
+
+    /// [`Self::reset_vector_index`] that also records `model` as the new
+    /// owner of the index, in the same transaction. SQLite only.
+    pub fn reset_vector_index_for_model(&self, new_dims: usize, model: &str) -> IcmResult<usize> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.reset_vector_index_for_model(new_dims, model),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = (new_dims, model);
+                Err(IcmError::Unsupported("reset_vector_index_for_model".into()))
+            }
+        }
+    }
+
+    /// The embedding state of the open store, read on its live connection
+    /// (unlike [`Self::read_embedding_state`], which peeks at a file).
+    /// `Ok(None)` outside the SQLite backend: nothing to arbitrate there.
+    pub fn embedding_state(&self) -> IcmResult<Option<EmbeddingState>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.embedding_state().map(Some),
+            #[allow(unreachable_patterns)]
+            _ => Ok(None),
+        }
+    }
+
+    /// Record the embedding model unless one is already recorded; never
+    /// overwrites. Returns whether it was written. Best effort, short lock
+    /// wait. `Ok(false)` outside the SQLite backend.
+    pub fn record_embedding_model(&self, model: &str) -> IcmResult<bool> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.record_embedding_model(model),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = model;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Set the vector of one memory without rewriting the rest of the row.
+    /// `Ok(false)` when the memory no longer exists. The remote backends
+    /// have no such write: they re-read the memory and `update` it, which
+    /// narrows the window for a lost concurrent edit but does not close it.
+    pub fn set_embedding(&self, id: &str, embedding: &[f32]) -> IcmResult<bool> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.set_embedding(id, embedding),
+            #[allow(unreachable_patterns)]
+            _ => match self.get(id)? {
+                Some(mut memory) => {
+                    memory.embedding = Some(embedding.to_vec());
+                    self.update(&memory)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+        }
+    }
+
+    /// Rank-fused search for the v2 recall engine: deep candidates, `keep`
+    /// applied before the cut, optional temporal arm. Only SQLite implements
+    /// it; the remote backends fall back to their existing search.
+    pub fn search_ranked(
+        &self,
+        q: &RankedQuery<'_>,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> IcmResult<Vec<RankedHit>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.search_ranked(q, keep),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(_) => self.search_ranked_fallback(q, keep),
+            #[cfg(feature = "opensearch")]
+            Store::OpenSearch(_) => self.search_ranked_fallback(q, keep),
+        }
+    }
+
+    /// [`Self::search_ranked`] for backends without rank fusion: the
+    /// backend's own `search_hybrid` when a query embedding is supplied, its
+    /// full-text search otherwise. `keep` still runs before the cut to
+    /// `q.limit`, but there are no per-arm ranks and `q.window` is ignored.
+    #[cfg(any(feature = "postgres", feature = "opensearch"))]
+    fn search_ranked_fallback(
+        &self,
+        q: &RankedQuery<'_>,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> IcmResult<Vec<RankedHit>> {
+        let scored: Vec<(Memory, f32)> = match q.embedding {
+            Some(embedding) => self.search_hybrid(q.text, embedding, q.depth)?,
+            // Full-text search has no score: derive one from the position,
+            // on the scale `rrf_fuse` gives a single list (first = 1.0).
+            None => self
+                .search_fts(q.text, q.depth.min(100))?
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let k = icm_core::RRF_K;
+                    (m, (k + 1.0) / (k + 1.0 + i as f32))
+                })
+                .collect(),
+        };
+        Ok(scored
+            .into_iter()
+            .filter(|(m, _)| keep(m))
+            .take(q.limit)
+            .map(|(memory, score)| RankedHit {
+                memory,
+                score,
+                fts_rank: None,
+                vec_rank: None,
+                time_rank: None,
+            })
+            .collect())
+    }
+
     /// Whether the active store was opened read-only.
     pub fn is_readonly(&self) -> bool {
         dispatch!(self, is_readonly())
@@ -632,6 +816,14 @@ impl MemoryStore for Store {
     }
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()> {
         dispatch!(self, consolidate_topic(topic, consolidated))
+    }
+    fn consolidate_ids(
+        &self,
+        topic: &str,
+        read: &[icm_core::ReadMemory],
+        consolidated: Memory,
+    ) -> IcmResult<icm_core::Consolidated> {
+        dispatch!(self, consolidate_ids(topic, read, consolidated))
     }
     fn count(&self) -> IcmResult<usize> {
         dispatch!(self, count())

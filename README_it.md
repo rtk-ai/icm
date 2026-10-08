@@ -1,566 +1,252 @@
-[English](README.md) | [Français](README_fr.md) | [Español](README_es.md) | [Deutsch](README_de.md) | **Italiano** | [Português](README_pt.md) | [Nederlands](README_nl.md) | [Polski](README_pl.md) | [Русский](README_ru.md) | [日本語](README_ja.md) | [中文](README_zh.md) | [العربية](README_ar.md) | [한국어](README_ko.md)
+[English](README.md) | [Français](README_fr.md) | [Español](README_es.md) | [Deutsch](README_de.md) | [Italiano](README_it.md) | [Português](README_pt.md) | [Nederlands](README_nl.md) | [Polski](README_pl.md) | [Русский](README_ru.md) | [日本語](README_ja.md) | [中文](README_zh.md) | [العربية](README_ar.md) | [한국어](README_ko.md)
 
-<p align="center">
-  <img src="assets/banner.png" alt="ICM — Infinite Context Memory" width="600">
-</p>
+Questa è una traduzione di README.md (inglese), che fa da riferimento; in caso di differenze, vale la versione inglese.
 
 <h1 align="center">ICM</h1>
 
 <p align="center">
-  Memoria permanente per agenti AI. Binario singolo, zero dipendenze, nativo MCP.
+  <b>Memoria a lungo termine per agenti di coding IA, condivisa tra i tuoi strumenti.</b><br>
+  Un binario, un file SQLite. Nessuna chiamata a un LLM per salvare o richiamare una memoria.
 </p>
 
 <p align="center">
   <a href="https://github.com/rtk-ai/icm/actions/workflows/ci.yml"><img src="https://github.com/rtk-ai/icm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/rtk-ai/icm/releases/latest"><img src="https://img.shields.io/github/v/release/rtk-ai/icm?color=purple" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Source--Available-orange.svg" alt="Source-Available"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
 </p>
 
----
+Spiega lunedì a Claude Code come il tuo progetto gestisce l'autenticazione, e la sessione di Gemini CLI di martedì lo sa già. ICM conserva ciò che i tuoi agenti di coding imparano (decisioni, fix, convenzioni, preferenze) in un unico file SQLite sulla tua macchina, e ne restituisce la parte rilevante all'inizio di ogni sessione e a ogni prompt che invii. Fino a 18 agenti ed editor condividono questa memoria, così smetti di rispiegare il tuo progetto ogni volta che apri una sessione o cambi strumento.
 
-ICM offre al tuo agente AI una vera memoria — non uno strumento per prendere appunti, non un gestore di contesto, ma una **memoria**.
+- **92.9% su LoCoMo (1,540 domande, media di tre esecuzioni), alla pari con Hindsight (92.0%)**, con un terzo di contesto in meno per domanda. [Dettagli e avvertenze più sotto](#benchmark-comparison).
+- **Nessuna chiamata a un LLM per salvare o richiamare.** Hindsight, Mem0, Graphiti (Zep) e claude-mem chiamano per impostazione predefinita un LLM per ogni memoria che salvano. ICM no. Solo la sua estrazione automatica di fatti dall'output degli strumenti passa per lo strumento LLM da riga di comando che usi già, quando ce n'è uno installato; `provider = "none"` mantiene locale anche quella (vedi [Avvio rapido](#quickstart)).
+- **Utile anche senza modello di embedding.** Il recall per sole parole chiave mette almeno una delle sessioni giuste nella top 5 per l'88.6% delle domande di LoCoMo, con una mediana di 6.8 ms per richiamo su Linux x86-64.
+- **97.4% su LongMemEval-S, retrieval senza LLM**: una delle sessioni giuste nella top 5 per 487 domande su 500, contro il 96.6% di MemPalace e il 95.2% di agentmemory sulla stessa misura.
+- **Non è in testa ovunque.** Su PersonaMem (le preferenze di un utente che cambiano nel tempo) è in testa Hindsight: 86.6% contro l'81.7% di ICM.
 
-```
-                       ICM (Infinite Context Memory)
-            ┌──────────────────────┬─────────────────────────┐
-            │   MEMORIES (Topics)  │   MEMOIRS (Knowledge)   │
-            │                      │                         │
-            │  Episodic, temporal  │  Permanent, structured  │
-            │                      │                         │
-            │  ┌───┐ ┌───┐ ┌───┐  │    ┌───┐               │
-            │  │ m │ │ m │ │ m │  │    │ C │──depends_on──┐ │
-            │  └─┬─┘ └─┬─┘ └─┬─┘  │    └───┘              │ │
-            │    │decay │     │    │      │ refines      ┌─▼─┐│
-            │    ▼      ▼     ▼    │    ┌─▼─┐            │ C ││
-            │  weight decreases    │    │ C │──part_of──>└───┘│
-            │  over time unless    │    └───┘                 │
-            │  accessed/critical   │  Concepts + Relations    │
-            ├──────────────────────┴─────────────────────────┤
-            │             SQLite + FTS5 + sqlite-vec          │
-            │        Hybrid search: BM25 (30%) + cosine (70%) │
-            └─────────────────────────────────────────────────┘
+<p align="center">
+  <img src="assets/demo.svg" alt="Terminale: tre memorie salvate con icm store, poi due domande a cui risponde icm recall, ognuna restituendo la memoria giusta">
+</p>
+
+<a id="quickstart"></a>
+
+## Avvio rapido
+
+```bash
+brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
+icm init                                   # instructions, skills and hooks for every agent it detects
 ```
 
-**Due modelli di memoria:**
+Questa è tutta la configurazione. Apri una nuova sessione in Claude Code, Codex, Gemini CLI o Copilot CLI: il tuo agente ora parte con un breve pacchetto delle memorie più importanti del progetto in cui si trova (quelle il cui topic porta il nome del repository, come `decisions-myapp` in un repository chiamato `myapp`, più le tue preferenze) e riceve le memorie rilevanti per ogni prompt che invii. Ciò che impara dall'output dei suoi strumenti viene messo in coda, e la coda viene trasformata in memorie alla fine di ogni sessione di Claude Code; con gli altri strumenti, esegui `icm extract-pending` (da un cron job, per esempio).
 
-- **Memories** — archivia/recupera con decadimento temporale basato sull'importanza. Le memorie critiche non svaniscono mai, quelle a bassa importanza decadono naturalmente. Filtra per topic o parola chiave.
-- **Memoirs** — grafi di conoscenza permanenti. Concetti collegati da relazioni tipizzate (`depends_on`, `contradicts`, `superseded_by`, ...). Filtra per etichetta.
-- **Feedback** — registra le correzioni quando le previsioni AI sono errate. Cerca gli errori passati prima di fare nuove previsioni. Apprendimento a ciclo chiuso.
+Il salvataggio e il richiamo restano sulla tua macchina. L'estrazione automatica passa del testo allo strumento LLM da riga di comando che usi già (Claude Code, Codex o Gemini CLI), quando ce n'è uno installato; imposta `provider = "none"` sotto `[extraction.summarizer]` per mantenerla del tutto locale.
+
+Per vederlo funzionare subito, salva e richiama a mano:
+
+```console
+$ icm store -t decisions-myapp -c "Auth uses short-lived JWTs, refreshed through /auth/refresh" -i high
+Stored: 01M47YY6CHVZ48BYKQRCRNZTCF
+
+$ icm recall "how does auth work"
+memories[1]{id,topic,importance,weight,summary}:
+  01M47YY6CHVZ48BYKQRCRNZTCF,decisions-myapp,high,0.975,"Auth uses short-lived JWTs, refreshed through /auth/refresh"
+```
+
+Il primo salvataggio o richiamo con ricerca semantica scarica una sola volta il modello di embedding multilingue (`Qdrant/multilingual-e5-large-onnx`, circa 2 GB). Per provare ICM senza, aggiungi `--no-embeddings` (recall per parole chiave, come nell'output qui sopra) oppure scegli un modello più leggero nella configurazione. `icm init` scrive hook e istruzioni nella configurazione di ogni agente rilevato; `icm uninstall --dry-run` mostra come rimuoverli. Windows, Linux, Nix e compilazione dai sorgenti: [Installazione](#install).
+
+<a id="benchmark-comparison"></a>
+
+## Confronto dei benchmark
+
+Accuratezza delle risposte su [LoCoMo](https://github.com/snap-research/locomo) (10 conversazioni lunghe, 1,540 domande), misurata con l'harness pubblico [Agent Memory Benchmark](https://github.com/vectorize-io/agent-memory-benchmark): il sistema di memoria recupera il contesto, `gemini-3.1-pro-preview` risponde a partire da quello, `gemini-2.5-flash-lite` giudica la risposta.
+
+| Sistema | Accuratezza LoCoMo | Contesto per domanda | Chiamate LLM per salvare una memoria | Si esegue come | Risultato |
+|--------|:---------------:|:--------------------:|:---------------------------:|---------|--------|
+| **ICM** 0.11.0 (motore di recall v2) | **92.9%** (1,430, 1,433 e 1,430 / 1,540 in tre esecuzioni) | 24.1k token | nessuna | un binario Rust, file SQLite | nostre esecuzioni, 2026-10-06 |
+| Hindsight | 92.0% (1,417 / 1,540) | 36.2k token | estrazione di fatti via LLM | servizio Python, PostgreSQL + pgvector | pubblicato dall'harness |
+| Baseline di ricerca ibrida (dense + sparse, RRF) | 79.1% (1,218 / 1,540) | 22.2k token | nessuna | Qdrant | pubblicato dall'harness |
+
+Su [PersonaMem](https://arxiv.org/abs/2504.14225) 32k (589 domande a scelta multipla sulle preferenze di un utente che cambiano nel tempo, stesso harness e stesso modello di risposta, valutate per corrispondenza della lettera):
+
+| Sistema | Accuratezza PersonaMem | Contesto per domanda | Risultato |
+|--------|:-------------------:|:--------------------:|--------|
+| **ICM** 0.11.0 (motore di recall v2) | **81.7%** (486, 486 e 472 / 589 in tre esecuzioni) | 16.2k token | nostre esecuzioni, 2026-10-06 |
+| Hindsight | 86.6% (510 / 589) | 15.8k token | pubblicato dall'harness |
+| Baseline di ricerca ibrida | 84.4% (497 / 589) | 24.2k token | pubblicato dall'harness |
+
+Il solo retrieval, su LoCoMo, senza modello di risposta: la quota di domande per cui almeno una sessione gold è tra i primi risultati. Questa è la prova che riguarda il motore di recall in sé.
+
+| Motore di recall | Ricerca | Top 5 | Top 10 | Top 20 |
+|---|---|:---:|:---:|:---:|
+| **0.11** (predefinito) | parole chiave + modello di embedding | **86.7%** | **93.3%** | **97.9%** |
+| **0.11** (predefinito) | solo parole chiave | **88.6%** | **94.2%** | **97.5%** |
+| 0.10 (`--engine legacy`) | parole chiave + modello di embedding | 76.5% | 83.0% | 87.7% |
+| 0.10 (`--engine legacy`) | solo parole chiave | 12.0% | 17.4% | 29.8% |
+
+I due motori sono stati misurati con la stessa versione 0.11. Le esecuzioni del motore 0.11 hanno ricevuto la data di ogni sessione e la data della domanda; il motore 0.10 non ha un input di data, quindi le sue esecuzioni non ne hanno ricevuta nessuna.
+
+LongMemEval-S, solo retrieval, senza LLM (ICM con il suo modello di embedding predefinito; 500 domande; ogni domanda è accompagnata da circa 48 sessioni passate in cui cercare; una memoria per sessione, solo i turni dell'utente, come li indicizza MemPalace; nessuna data fornita a ICM):
+
+| Sessioni giuste nella top 5 | **ICM** 0.11.0 | MemPalace | agentmemory | Solo BM25 |
+|---|:---:|:---:|:---:|:---:|
+| Almeno una (la misura pubblicata) | **97.4%** (487 / 500) | 96.6% (483 / 500) | 95.2% (476 / 500) | 94.6% |
+| Tutte | **88.6%** (443 / 500) | 85.0% | 81.8% | 81.2% |
+
+I valori di MemPalace e agentmemory sono ricalcolati con il nostro script di valutazione a partire dai file di risultati che ciascun progetto pubblica; corrispondono ai numeri pubblicati. agentmemory indicizza tutti i turni di una sessione; su quell'unità BM25 da solo raggiunge il 96.2% e l'83.0%. Un semplice BM25 arriva già intorno al 95% sulla prima misura, ed è per questo che la seconda, tutte le sessioni giuste, distingue meglio i sistemi.
+
+Cosa mostrano e cosa non mostrano questi numeri:
+
+- **Su LoCoMo ICM e Hindsight sono alla pari.** Le tre esecuzioni di ICM (92.9%, 93.1%, 92.9%) sono ciascuna circa 1 punto sopra il 92.0% pubblicato da Hindsight, un distacco di circa 14 domande, entro l'errore di campionamento (intervallo al 95% per ICM: da 91.6 a 94.2). ICM ci arriva con un terzo di contesto in meno e senza chiamare un LLM quando salva una memoria.
+- **Su PersonaMem Hindsight è avanti** di 4.9 punti, al di fuori dell'errore di campionamento (intervallo al 95% per ICM: da 78.6 a 84.8). ICM è anche 2.7 punti sotto la baseline di ricerca ibrida, entro quell'intervallo, leggendo un terzo di contesto in meno. Le tre esecuzioni vanno dall'80.1% all'82.5%.
+- **Condizioni non identiche.** L'harness è mantenuto da Vectorize, il fornitore di Hindsight. I risultati LoCoMo pubblicati sono precedenti a una modifica che ha impostato a 0 la temperatura della risposta e del giudice; la nostra esecuzione usa l'harness attuale (commit `f618ed7`) e Vertex AI.
+- **Con 50 chunk viene restituita gran parte di ogni conversazione,** quindi questa accuratezza misura anche il modello di risposta. La tabella del retrieval è la prova che riguarda il motore di recall in sé.
+- **Tre esecuzioni per dataset.** Il modello di risposta varia da un'esecuzione all'altra: 0.2 punti su LoCoMo, 2.4 punti su PersonaMem. Gli intervalli qui sopra coprono il campionamento delle domande.
+
+<details>
+<summary>Risultati per categoria, latenza e altre avvertenze</summary>
+
+- **Per tipo di domanda** (LoCoMo, etichette dell'harness, tre esecuzioni): open-domain 96.7% (841 domande), temporal 90.9% (321), single-hop 88.8% (282), multi-hop 78.8% (96).
+- **Latenza.** Latenza mediana di richiamo tra 137 e 149 ms sui nodi con 4 vCPU del cluster durante le esecuzioni su LoCoMo; 272 sessioni acquisite senza alcuna chiamata LLM. Nelle esecuzioni di solo retrieval su Linux x86-64: mediana di 136 ms con gli embedding, 6.8 ms con le sole parole chiave.
+- **Date delle sessioni.** L'adattatore del benchmark scrive la data di ogni sessione nel testo della memoria di ICM; Hindsight riceve le stesse date come metadati, e ogni sistema riceve la data della domanda.
+- **La categoria più debole sono le 96 domande che l'harness etichetta come multi-hop** (78.8%). I nomi delle categorie non coincidono tra i benchmark: altre valutazioni di LoCoMo chiamano questa categoria open-domain, e chiamano multi-hop le 282 domande che l'harness etichetta come single-hop (qui 88.8%). Confronta in base al numero di domande, non all'etichetta.
+- **Il motore di recall v2 è quello predefinito** per `icm recall`, lo strumento MCP `icm_memory_recall`, `/recall` via HTTP e l'hook del prompt. Il motore precedente resta disponibile per tornare indietro o per confrontare: `icm recall --engine legacy`, `"engine": "legacy"` su `/recall` via HTTP, oppure `ICM_RECALL_ENGINE=legacy`.
+
+</details>
+
+I risultati domanda per domanda di ogni esecuzione (tre per dataset, più l'esecuzione di recall su LongMemEval-S) sono in [`bench/amb/results/`](bench/amb/results/); l'adattatore, le impostazioni esatte e i comandi per riprodurli sono in [`bench/amb/README.md`](bench/amb/README.md).
+
+<a id="one-memory-for-every-tool"></a>
+
+## Una sola memoria per tutti gli strumenti
+
+Ogni strumento configurato da `icm init` legge e scrive lo stesso database SQLite, e i topic (`decisions-myapp`, `preferences`, `errors-resolved`, ...) non sono separati per strumento. Una memoria salvata da Claude Code è subito visibile a Codex, Gemini, Cursor, Roo, Amp, Aider, ...
+
+Preferisci l'isolamento? `icm init --per-project` crea un database locale al progetto sotto `.icm/` (e scrive i file di istruzioni degli agenti, come `CLAUDE.md` e `AGENTS.md`, nella directory corrente); `--db <path>` o `ICM_DB` puntano a qualsiasi altro file. Ogni percorso è un corpus indipendente.
+
+> **Stato del progetto: beta.** ICM è pre-1.0: modifiche incompatibili possono arrivare in qualsiasi release minore, e i formati di configurazione di hook e MCP possono cambiare. Beta si riferisce alla stabilità dell'API, non all'utilità quotidiana: io (il maintainer) uso ICM ogni giorno come memoria principale per programmare con l'IA. Il mio focus principale è [rtk](https://github.com/rtk-ai/rtk), quindi issue e pull request vengono esaminate secondo la disponibilità.
+>
+> Apache-2.0, distribuito **così com'è, senza garanzie di alcun tipo** (vedi [LICENSE](LICENSE)). Prima di qualsiasi operazione distruttiva, esegui prima l'equivalente in sola lettura (`icm uninstall --dry-run`, `icm uninstall --check`).
+
+<a id="install"></a>
 
 ## Installazione
 
 ```bash
-# Homebrew (macOS / Linux)
+# macOS / Linux, Homebrew
 brew tap rtk-ai/tap && brew install icm
 
-# Installazione rapida
+# macOS / Linux, script (verifies SHA256 against the release checksums)
 curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
 
-# Dal sorgente
-cargo install --path crates/icm-cli
+# Windows, PowerShell
+irm https://raw.githubusercontent.com/rtk-ai/icm/main/install.ps1 | iex
 ```
+
+La ricerca per parole chiave funziona ovunque. Esegui `icm embeddings status` per vedere se la ricerca semantica è attiva: è inclusa nelle build per macOS Apple Silicon, Windows e `.rpm`; gli archivi Linux glibc e il `.deb` richiedono un `icm embeddings download`; la build per Mac Intel richiede un tuo ONNX Runtime (`ORT_DYLIB_PATH`); la build statica Linux musl supporta solo le parole chiave. Nix, compilazione dai sorgenti, pinning della versione e i dettagli: [riferimento](docs/reference.md#install).
+
+<a id="setup"></a>
 
 ## Configurazione
 
 ```bash
-# Rileva e configura automaticamente tutti gli strumenti supportati
-icm init
+icm init                  # global database, every detected agent
+icm init --per-project    # database under .icm/ at the git root
+icm init --mode all       # also register the MCP server in every tool that supports it
 ```
 
-Configura **17 strumenti** con un solo comando ([guida completa alle integrazioni](docs/integrations.md)):
+La modalità predefinita (`standard`) scrive istruzioni, skill e hook, senza server MCP. `--mode all` aggiunge il server MCP; con questa (più `--per-project` per Aider, il cui file di convenzioni è per progetto) si coprono i 18 strumenti qui sotto ([guida all'integrazione](docs/integrations.md)):
 
-| Strumento | MCP | Hook | CLI | Skills |
-|-----------|:---:|:----:|:---:|:------:|
-| Claude Code | `~/.claude.json` | 5 hook | `CLAUDE.md` | `/recall` `/remember` |
-| Claude Desktop | JSON | — | — | — |
-| Gemini CLI | `~/.gemini/settings.json` | 5 hook | `GEMINI.md` | — |
-| Codex CLI | `~/.codex/config.toml` | 4 hook | `AGENTS.md` | — |
-| Copilot CLI | `~/.copilot/mcp-config.json` | 4 hook | `.github/copilot-instructions.md` | — |
-| Cursor | `~/.cursor/mcp.json` | — | — | regola `.mdc` |
-| Windsurf | JSON | — | `.windsurfrules` | — |
-| VS Code | `~/Library/.../Code/User/mcp.json` | — | — | — |
-| Amp | JSON | — | — | `/icm-recall` `/icm-remember` |
-| Amazon Q | JSON | — | — | — |
-| Cline | VS Code globalStorage | — | — | — |
-| Roo Code | VS Code globalStorage | — | — | regola `.md` |
-| Kilo Code | VS Code globalStorage | — | — | — |
-| Zed | `~/.zed/settings.json` | — | — | — |
-| OpenCode | JSON | plugin TS | — | — |
-| Continue.dev | `~/.continue/config.yaml` | — | — | — |
-| Aider | — | — | `.aider.conventions.md` | — |
+| Strumento | Server MCP | Hook |
+|------|:---:|:-----:|
+| Claude Code | sì | sì |
+| Claude Desktop | sì | — |
+| Gemini CLI | sì | sì |
+| Codex CLI | sì | sì |
+| Copilot CLI | sì | sì |
+| Cursor | sì | — |
+| Windsurf | sì | — |
+| VS Code | sì | — |
+| Amp | sì | — |
+| Amazon Q | sì | — |
+| Cline | sì | — |
+| Roo Code | sì | — |
+| Kilo Code | sì | — |
+| Zed | sì | — |
+| OpenCode | sì | sì |
+| Continue.dev | sì | — |
+| Aider | — | — |
+| Pi | — | — |
 
-Oppure manualmente:
+Oppure registra il server MCP a mano: `claude mcp add icm -- icm serve` (qualsiasi client MCP: comando `icm`, argomenti `["serve"]`).
 
-```bash
-# Claude Code
-claude mcp add icm -- icm serve
+Cosa fanno gli hook:
 
-# Modalità compatta (risposte più brevi, risparmio di token)
-claude mcp add icm -- icm serve --compact
-
-# Qualsiasi client MCP: command = "icm", args = ["serve"]
-```
-
-### Skills / regole
-
-```bash
-icm init --mode skill
-```
-
-Installa comandi slash e regole per Claude Code (`/recall`, `/remember`), Cursor (regola `.mdc`), Roo Code (regola `.md`), e Amp (`/icm-recall`, `/icm-remember`).
-
-### Istruzioni CLI
-
-```bash
-icm init --mode cli
-```
-
-Inietta le istruzioni ICM nel file di istruzioni di ogni strumento:
-
-| Strumento | File |
-|-----------|------|
-| Claude Code | `CLAUDE.md` |
-| GitHub Copilot | `.github/copilot-instructions.md` |
-| Windsurf | `.windsurfrules` |
-| OpenAI Codex | `AGENTS.md` |
-| Gemini | `~/.gemini/GEMINI.md` |
-
-### Hook (5 strumenti)
-
-```bash
-icm init --mode hook
-```
-
-Installa hook di estrazione automatica e richiamo automatico per tutti gli strumenti supportati:
-
-| Strumento | SessionStart | PreTool | PostTool | Compact | PromptRecall | Config |
-|-----------|:-----------:|:-------:|:--------:|:-------:|:------------:|--------|
-| Claude Code | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.claude/settings.json` |
-| Gemini CLI | `icm hook start` | `icm hook pre` | `icm hook post` | `icm hook compact` | `icm hook prompt` | `~/.gemini/settings.json` |
-| Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `~/.codex/hooks.json` |
-| Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
-| OpenCode | avvio sessione | — | estrazione tool | compattazione | — | `~/.config/opencode/plugins/icm.ts` |
-
-**Cosa fa ogni hook:**
-
-| Hook | Funzione |
-|------|----------|
-| `icm hook start` | Inietta un pacchetto di avvio con le memorie critiche/importanti all'inizio della sessione (~500 token) |
-| `icm hook pre` | Autorizza automaticamente i comandi CLI `icm` (senza richiesta di permesso) |
+| Hook | Cosa fa |
+|------|-------------|
+| `icm hook start` | Inietta all'inizio della sessione un pacchetto di risveglio con le memorie critical/high (~500 token) |
+| `icm hook pre` | Consente automaticamente i comandi CLI di `icm` (nessuna richiesta di permesso) |
 | `icm hook post` | Estrae fatti dall'output degli strumenti ogni N chiamate (estrazione automatica) |
 | `icm hook compact` | Estrae memorie dalla trascrizione prima della compressione del contesto |
-| `icm hook prompt` | Inietta il contesto recuperato all'inizio di ogni prompt utente |
+| `icm hook prompt` | Inietta il contesto richiamato all'inizio di ogni prompt dell'utente |
 
-## CLI vs MCP
+Tabelle degli hook per strumento, skill, file di istruzioni e la nota su Codex: [riferimento](docs/reference.md#setup).
 
-ICM può essere usato tramite CLI (comandi `icm`) o server MCP (`icm serve`). Entrambi accedono allo stesso database.
+<a id="use"></a>
 
-| | CLI | MCP |
-|---|-----|-----|
-| **Latenza** | ~30ms (binario diretto) | ~50ms (JSON-RPC stdio) |
-| **Costo in token** | 0 (basato su hook, invisibile) | ~20-50 token/chiamata (schema tool) |
-| **Configurazione** | `icm init --mode hook` | `icm init --mode mcp` |
-| **Compatibile con** | Claude Code, Gemini, Codex, Copilot, OpenCode (tramite hook) | Tutti i 17 strumenti compatibili MCP |
-| **Estrazione automatica** | Sì (gli hook attivano `icm extract`) | Sì (i tool MCP chiamano store) |
-| **Ideale per** | Utenti avanzati, risparmio di token | Compatibilità universale |
-
-## CLI
-
-### Memories (episodiche, con decadimento)
+## Utilizzo
 
 ```bash
-# Archivia
+# Store
 icm store -t "my-project" -c "Use PostgreSQL for the main DB" -i high -k "db,postgres"
 
-# Recupera
+# Recall
 icm recall "database choice"
 icm recall "auth setup" --topic "my-project" --limit 10
 icm recall "architecture" --keyword "postgres"
 
-# Gestione
+# Manage
 icm forget <memory-id>
 icm consolidate --topic "my-project"
 icm topics
 icm stats
 
-# Estrai fatti dal testo (basato su regole, zero costo LLM)
+# Extract facts from text (rule-based, no LLM call)
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```
 
-### Memoirs (grafi di conoscenza permanenti)
+ICM conserva anche **memoirs** (grafi di conoscenza permanenti di concetti e relazioni tipizzate), **feedback** (correzioni da cui imparare) e **trascrizioni letterali**, ed espone **31 strumenti MCP** (30 senza modello di embedding), una **API HTTP** che mantiene caricato il modello di embedding e una **dashboard da terminale** (`icm dashboard`). Tutto è descritto nel [riferimento](docs/reference.md).
 
-```bash
-# Crea un memoir
-icm memoir create -n "system-architecture" -d "System design decisions"
-
-# Aggiungi concetti con etichette
-icm memoir add-concept -m "system-architecture" -n "auth-service" \
-  -d "Handles JWT tokens and OAuth2 flows" -l "domain:auth,type:service"
-
-# Collega concetti
-icm memoir link -m "system-architecture" --from "api-gateway" --to "auth-service" -r depends-on
-
-# Cerca con filtro per etichetta
-icm memoir search -m "system-architecture" "authentication"
-icm memoir search -m "system-architecture" "service" --label "domain:auth"
-
-# Ispeziona il vicinato
-icm memoir inspect -m "system-architecture" "auth-service" -D 2
-
-# Esporta grafo (formati: json, dot, ascii, ai)
-icm memoir export -m "system-architecture" -f ascii   # Box-drawing con barre di confidenza
-icm memoir export -m "system-architecture" -f dot      # Graphviz DOT (colore = livello di confidenza)
-icm memoir export -m "system-architecture" -f ai       # Markdown ottimizzato per contesto LLM
-icm memoir export -m "system-architecture" -f json     # JSON strutturato con tutti i metadati
-
-# Genera visualizzazione SVG
-icm memoir export -m "system-architecture" -f dot | dot -Tsvg > graph.svg
-```
-
-## Tool MCP (31)
-
-### Tool per le memorie
-
-| Tool | Descrizione |
-|------|-------------|
-| `icm_memory_store` | Archivia con deduplicazione automatica (similarità >85% → aggiorna invece di duplicare) |
-| `icm_memory_recall` | Cerca per query, filtra per topic e/o parola chiave |
-| `icm_memory_update` | Modifica una memoria in-place (contenuto, importanza, parole chiave) |
-| `icm_memory_forget` | Elimina una memoria tramite ID |
-| `icm_memory_consolidate` | Unisce tutte le memorie di un topic in un unico riepilogo |
-| `icm_memory_list_topics` | Elenca tutti i topic con i relativi conteggi |
-| `icm_memory_stats` | Statistiche globali della memoria |
-| `icm_memory_health` | Controllo igienico per topic (obsolescenza, necessità di consolidazione) |
-| `icm_memory_embed_all` | Ricalcola gli embedding per la ricerca vettoriale |
-
-### Tool per i memoir (grafi di conoscenza)
-
-| Tool | Descrizione |
-|------|-------------|
-| `icm_memoir_create` | Crea un nuovo memoir (contenitore di conoscenza) |
-| `icm_memoir_list` | Elenca tutti i memoir |
-| `icm_memoir_show` | Mostra i dettagli del memoir e tutti i concetti |
-| `icm_memoir_add_concept` | Aggiunge un concetto con etichette |
-| `icm_memoir_refine` | Aggiorna la definizione di un concetto |
-| `icm_memoir_search` | Ricerca full-text, opzionalmente filtrata per etichetta |
-| `icm_memoir_search_all` | Cerca in tutti i memoir |
-| `icm_memoir_link` | Crea una relazione tipizzata tra concetti |
-| `icm_memoir_inspect` | Ispeziona il concetto e il vicinato nel grafo (BFS) |
-| `icm_memoir_export` | Esporta il grafo (json, dot, ascii, ai) con livelli di confidenza |
-
-### Tool per il feedback (apprendere dagli errori)
-
-| Tool | Descrizione |
-|------|-------------|
-| `icm_feedback_record` | Registra una correzione quando una previsione AI era errata |
-| `icm_feedback_search` | Cerca le correzioni passate per informare le previsioni future |
-| `icm_feedback_stats` | Statistiche del feedback: conteggio totale, dettaglio per topic, più applicate |
-
-### Tipi di relazione
-
-`part_of` · `depends_on` · `related_to` · `contradicts` · `refines` · `alternative_to` · `caused_by` · `instance_of` · `superseded_by`
+<a id="how-it-works"></a>
 
 ## Come funziona
 
-### Modello di memoria duale
+Il recall fonde fino a tre liste ordinate tramite reciprocal rank fusion (RRF): il matching per parole chiave **FTS5 BM25**, sempre attivo; la **ricerca vettoriale semantica** tramite sqlite-vec quando è caricato un modello di embedding (predefinito `Qdrant/multilingual-e5-large-onnx`, 1024 dimensioni, 100+ lingue); e una **finestra di date** quando la query nomina un periodo ("last week", "in March 2024"). I filtri per progetto, topic e parola chiave si applicano prima del taglio. Le memorie sbiadiscono nel tempo in base alla loro importanza (`critical` non sbiadisce mai); con un modello di embedding caricato, una nuova memoria quasi identica a un'altra dello stesso topic (similarità del coseno superiore a 0.95) viene fusa con essa; e il modello che ha prodotto i vettori salvati è registrato nel database, quindi cambiare `model` nella configurazione non li cancella mai (`icm embed --migrate` è il modo esplicito per cambiare modello).
 
-**Memoria episodica (Topics)** cattura decisioni, errori, preferenze. Ogni memoria ha un peso che decade nel tempo in base all'importanza:
-
-| Importanza | Decadimento | Eliminazione | Comportamento |
-|-----------|-------------|--------------|---------------|
-| `critical` | nessuno | mai | Mai dimenticata, mai eliminata |
-| `high` | lento (0.5x tasso) | mai | Svanisce lentamente, mai eliminata automaticamente |
-| `medium` | normale | sì | Decadimento standard, eliminata quando il peso è sotto la soglia |
-| `low` | rapido (2x tasso) | sì | Dimenticata rapidamente |
-
-Il decadimento è **consapevole degli accessi**: le memorie richiamate frequentemente decadono più lentamente (`decay / (1 + access_count × 0.1)`). Applicato automaticamente al recupero (se >24h dall'ultimo decadimento).
-
-**L'igiene della memoria** è integrata:
-- **Deduplicazione automatica**: archiviare contenuti con similarità >85% rispetto a una memoria esistente nello stesso topic la aggiorna invece di creare un duplicato
-- **Suggerimenti di consolidazione**: quando un topic supera le 7 voci, `icm_memory_store` avvisa il chiamante di consolidare
-- **Controllo dello stato**: `icm_memory_health` riporta il numero di voci per topic, il peso medio, le voci obsolete e le necessità di consolidazione
-- **Nessuna perdita silenziosa di dati**: le memorie critiche e ad alta importanza non vengono mai eliminate automaticamente
-
-**Memoria semantica (Memoirs)** cattura la conoscenza strutturata come un grafo. I concetti sono permanenti — vengono raffinati, mai fatti decadere. Usa `superseded_by` per contrassegnare i fatti obsoleti invece di eliminarli.
-
-### Ricerca ibrida
-
-Con gli embedding abilitati, ICM utilizza la ricerca ibrida:
-- **FTS5 BM25** (30%) — corrispondenza full-text per parole chiave
-- **Similarità coseno** (70%) — ricerca vettoriale semantica tramite sqlite-vec
-
-Modello predefinito: `intfloat/multilingual-e5-base` (768d, 100+ lingue). Configurabile nel tuo [file di configurazione](#configurazione):
-
-```toml
-[embeddings]
-# enabled = false                          # Disabilita completamente (nessun download del modello)
-model = "intfloat/multilingual-e5-base"    # 768d, multilingue (predefinito)
-# model = "intfloat/multilingual-e5-small" # 384d, multilingue (più leggero)
-# model = "intfloat/multilingual-e5-large" # 1024d, multilingue (migliore precisione)
-# model = "Xenova/bge-small-en-v1.5"      # 384d, solo inglese (più veloce)
-# model = "jinaai/jina-embeddings-v2-base-code"  # 768d, ottimizzato per codice
-```
-
-Per saltare completamente il download del modello di embedding, usa uno di questi:
-```bash
-icm --no-embeddings serve          # Flag CLI
-ICM_NO_EMBEDDINGS=1 icm serve     # Variabile d'ambiente
-```
-Oppure imposta `enabled = false` nel tuo file di configurazione. ICM tornerà alla ricerca per parole chiave FTS5 (funziona comunque, ma senza corrispondenza semantica).
-
-La modifica del modello ricrea automaticamente l'indice vettoriale (gli embedding esistenti vengono cancellati e possono essere rigenerati con `icm_memory_embed_all`).
-
-### Storage
-
-Un singolo file SQLite. Nessun servizio esterno, nessuna dipendenza di rete.
+Tutto sta in un unico file SQLite, senza servizi esterni:
 
 ```
-~/Library/Application Support/dev.icm.icm/memories.db                    # macOS
-~/.local/share/dev.icm.icm/memories.db                                   # Linux
-C:\Users\<user>\AppData\Local\icm\icm\data\memories.db                   # Windows
+~/Library/Application Support/dev.icm.icm/memories.db     # macOS (dev.icm.icm is the app identifier, not a dev build)
+~/.local/share/icm/memories.db                            # Linux
+%APPDATA%\icm\icm\data\memories.db                        # Windows
+<project-root>/.icm/memories.db                           # icm init --per-project
 ```
 
-### Configurazione
+`icm config` mostra la configurazione attiva; [config/default.toml](config/default.toml) elenca tutte le opzioni. Dettagli: [riferimento](docs/reference.md#how-it-works), [diagrammi di architettura](docs/architecture.md#architecture-at-a-glance).
 
-```bash
-icm config                    # Mostra la configurazione attiva
-```
-
-Posizione del file di configurazione (specifica per piattaforma, o `$ICM_CONFIG`):
-
-```
-~/Library/Application Support/dev.icm.icm/config.toml                    # macOS
-~/.config/icm/config.toml                                                # Linux
-C:\Users\<user>\AppData\Roaming\icm\icm\config\config.toml              # Windows
-```
-
-Vedi [config/default.toml](config/default.toml) per tutte le opzioni.
-
-## Multi-progetto e multi-agente
-
-ICM è progettato per il caso in cui un singolo utente collabora con molti agenti su molti progetti. Le memorie devono restare pertinenti: una decisione del progetto A non deve mai infiltrarsi nel progetto B, e un agente `dev` non deve essere idratato con ciò che un agente `mentor` ha memorizzato.
-
-### Isolamento del progetto
-
-ICM delimita le memorie tramite **convenzione di nomenclatura dei topic**, non tramite una colonna separata. La convenzione:
-
-```
-{kind}-{project}              # e.g. decisions-icm, errors-resolved-icm, contexte-rtk-cloud
-preferences                   # global, always included
-identity                      # global, always included
-```
-
-`icm_wake_up { project: "icm" }` esegue un matching **segment-aware**: `"icm"` corrisponde a `decisions-icm`, `errors-icm-core`, `contexte-icm` — ma mai a `icmp-notes` (nessun falso positivo). I topic vengono divisi sui caratteri `-`, `.`, `_`, `/`, `:`. I topic di preference e identity sono cross-progetto per design — la guida a livello utente non viene mai rimossa.
-
-L'hook `UserPromptSubmit` (`icm hook prompt`) e l'hook `SessionStart` (`icm hook start`) derivano entrambi il progetto dal campo `cwd` nel JSON dell'hook (`basename` della directory di lavoro). Esegui ogni progetto dalla sua directory dedicata e l'isolamento è automatico.
-
-### Scrivere buone memorie
-
-`icm_memory_store` richiede che l'agente scelga `topic` e `content` — non esiste un classificatore automatico. Best practice:
-
-| Campo | Linee guida |
-|------|----------|
-| `topic` | `{kind}-{project}`. Tipi: `decisions`, `errors-resolved`, `contexte`, `preferences`. |
-| `content` | Un fatto per store. Riassunto denso in inglese — `topic + content` è il testo dell'embedding. |
-| `raw_excerpt` | Solo verbatim (codice, messaggio di errore esatto, output di comando). |
-| `keywords` | 3–5 termini per potenziare il retrieval BM25. |
-| `importance` | `critical` per non dimenticare mai, `high` per le decisioni di progetto, `medium` di default, `low` per l'effimero. |
-
-ICM si occupa del resto: **dedup all'85% di similarità**, **auto-link** tra memorie semanticamente vicine, **auto-consolidamento** oltre le 10 entry per topic, e **decay** ponderato sul conteggio degli accessi. Un fatto per chiamata batte i dump in batch — il retriever classifica più in alto i fatti memorizzati individualmente.
-
-### Ruoli multi-agente
-
-ICM non dispone ancora di una colonna `role` di prima classe. Oggi i ruoli sono emulati tramite suffissi di topic più directory di lavoro per agente:
-
-```
-decisions-icm-dev             # dev agent: code patterns, library choices, refactors
-decisions-icm-architect       # architect: design, workflows, subtask decomposition
-decisions-icm-mentor          # mentor / BA: business goals, non-technical context
-```
-
-Ogni agente gira nella propria directory di lavoro (`~/projects/icm-dev/`, `~/projects/icm-architect/`, ...) in modo che `icm hook prompt` e `icm hook start` derivino un segmento di progetto diverso da `cwd` e richiamino solo le memorie corrispondenti. Le preferenze restano globali — l'identità dell'utente è trasversale a tutti i ruoli.
-
-All'interno di un singolo agente, puoi anche restringere manualmente il recall:
-
-```jsonc
-// icm_memory_recall
-{ "query": "auth flow", "topic": "decisions-icm-architect", "limit": 5 }
-```
-
-Un campo `role` di prima classe (con filtraggio nativo in wake-up e recall) è nella roadmap. Fino ad allora, la convenzione del suffisso di topic è il pattern supportato.
-
-## Estrazione automatica
-
-ICM estrae le memorie automaticamente tramite tre livelli:
-
-```
-  Livello 0: Hook a pattern       Livello 1: PreCompact          Livello 2: UserPromptSubmit
-  (zero costo LLM)                (zero costo LLM)               (zero costo LLM)
-  ┌──────────────────┐            ┌──────────────────┐          ┌──────────────────┐
-  │ PostToolUse hook  │            │ PreCompact hook   │          │ UserPromptSubmit  │
-  │                   │            │                   │          │                   │
-  │ • Errori Bash     │            │ Contesto sul      │          │ L'utente invia    │
-  │ • commit git      │            │ punto di essere   │          │ un prompt →       │
-  │ • cambiam. config │            │ compresso →       │          │ icm recall        │
-  │ • decisioni       │            │ estrai memorie    │          │ → inietta context │
-  │ • preferenze      │            │ dalla trascrizione│          │                   │
-  │ • apprendimenti   │            │ prima che vadano  │          │ L'agente inizia   │
-  │ • vincoli         │            │ perdute per sempre│          │ con le memorie    │
-  │                   │            │                   │          │ pertinenti già    │
-  │ Basato su regole, │            │ Stessi pattern +  │          │ caricate          │
-  │ nessun LLM        │            │ --store-raw fallbk│          │                   │
-  └──────────────────┘            └──────────────────┘          └──────────────────┘
-```
-
-| Livello | Stato | Costo LLM | Comando hook | Descrizione |
-|---------|-------|-----------|-------------|-------------|
-| Livello 0 | Implementato | 0 | `icm hook post` | Estrazione di parole chiave basata su regole dall'output degli strumenti |
-| Livello 1 | Implementato | 0 | `icm hook compact` | Estrazione dalla trascrizione prima della compressione del contesto |
-| Livello 2 | Implementato | 0 | `icm hook prompt` | Iniezione delle memorie recuperate ad ogni prompt utente |
-
-Tutti e 3 i livelli vengono installati automaticamente da `icm init --mode hook`.
-
-### Confronto con le alternative
-
-| Sistema | Metodo | Costo LLM | Latenza | Cattura la compattazione? |
-|---------|--------|-----------|---------|--------------------------|
-| **ICM** | Estrazione a 3 livelli | da 0 a ~500 tok/sessione | 0ms | **Sì (PreCompact)** |
-| Mem0 | 2 chiamate LLM/messaggio | ~2k tok/messaggio | 200-2000ms | No |
-| claude-mem | PostToolUse + async | ~1-5k tok/sessione | 8ms hook | No |
-| MemGPT/Letta | Autogestione dell'agente | 0 marginale | 0ms | No |
-| DiffMem | Diff basati su Git | 0 | 0ms | No |
-
-## Benchmark
-
-### Performance di archiviazione
-
-```
-ICM Benchmark (1000 memories, 384d embeddings)
-──────────────────────────────────────────────────────────
-Store (no embeddings)      1000 ops      34.2 ms      34.2 µs/op
-Store (with embeddings)    1000 ops      51.6 ms      51.6 µs/op
-FTS5 search                 100 ops       4.7 ms      46.6 µs/op
-Vector search (KNN)         100 ops      59.0 ms     590.0 µs/op
-Hybrid search               100 ops      95.1 ms     951.1 µs/op
-Decay (batch)                 1 ops       5.8 ms       5.8 ms/op
-──────────────────────────────────────────────────────────
-```
-
-Apple M1 Pro, SQLite in-memory, single-threaded. `icm bench --count 1000`
-
-### Efficienza degli agenti
-
-Flusso di lavoro multi-sessione con un progetto Rust reale (12 file, ~550 righe). Le sessioni dalla 2 in poi mostrano i maggiori guadagni mentre ICM recupera invece di rileggere i file.
-
-```
-ICM Agent Benchmark (10 sessions, model: haiku, 3 runs averaged)
-══════════════════════════════════════════════════════════════════
-                            Without ICM         With ICM      Delta
-Session 2 (recall)
-  Turns                             5.7              4.0       -29%
-  Context (input)                 99.9k            67.5k       -32%
-  Cost                          $0.0298          $0.0249       -17%
-
-Session 3 (recall)
-  Turns                             3.3              2.0       -40%
-  Context (input)                 74.7k            41.6k       -44%
-  Cost                          $0.0249          $0.0194       -22%
-══════════════════════════════════════════════════════════════════
-```
-
-`icm bench-agent --sessions 10 --model haiku`
-
-### Ritenzione della conoscenza
-
-L'agente recupera fatti specifici da un documento tecnico denso attraverso le sessioni. La sessione 1 legge e memorizza; le sessioni 2+ rispondono a 10 domande fattuali **senza** il testo sorgente.
-
-```
-ICM Recall Benchmark (10 questions, model: haiku, 5 runs averaged)
-══════════════════════════════════════════════════════════════════════
-                                               No ICM     With ICM
-──────────────────────────────────────────────────────────────────────
-Average score                                      5%          68%
-Questions passed                                 0/10         5/10
-══════════════════════════════════════════════════════════════════════
-```
-
-`icm bench-recall --model haiku`
-
-### LLM locali (ollama)
-
-Stesso test con modelli locali — pura iniezione di contesto, nessun uso di strumenti necessario.
-
-```
-Model               Params   No ICM   With ICM     Delta
-─────────────────────────────────────────────────────────
-qwen2.5:14b           14B       4%       97%       +93%
-mistral:7b             7B       4%       93%       +89%
-llama3.1:8b            8B       4%       93%       +89%
-qwen2.5:7b             7B       4%       90%       +86%
-phi4:14b              14B       6%       79%       +73%
-llama3.2:3b            3B       0%       76%       +76%
-gemma2:9b              9B       4%       76%       +72%
-qwen2.5:3b             3B       2%       58%       +56%
-─────────────────────────────────────────────────────────
-```
-
-`scripts/bench-ollama.sh qwen2.5:14b`
-
-### Protocollo di test
-
-Tutti i benchmark utilizzano **chiamate API reali** — nessun mock, nessuna risposta simulata, nessuna risposta in cache.
-
-- **Benchmark degli agenti**: Crea un progetto Rust reale in una directory temporanea. Esegue N sessioni con `claude -p --output-format json`. Senza ICM: configurazione MCP vuota. Con ICM: server MCP reale + estrazione automatica + iniezione di contesto.
-- **Ritenzione della conoscenza**: Usa un documento tecnico fittizio (il "Protocollo Meridian"). Valuta le risposte tramite corrispondenza di parole chiave rispetto ai fatti attesi. Timeout di 120s per invocazione.
-- **Isolamento**: Ogni esecuzione utilizza la propria directory temporanea e un database SQLite nuovo. Nessuna persistenza tra sessioni.
-
-### Memoria unificata multi-agente
-
-Tutti i 17 strumenti condividono lo stesso database SQLite. Una memoria archiviata da Claude è immediatamente disponibile per Gemini, Codex, Copilot, Cursor e tutti gli altri strumenti.
-
-```
-ICM Multi-Agent Efficiency Benchmark (10 seeded facts, 5 CLI agents)
-╔══════════════╦═══════╦══════════╦════════╦═══════════╦═══════╗
-║ Agent        ║ Facts ║ Accuracy ║ Detail ║ Latency   ║ Score ║
-╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
-║ Claude Code  ║ 10/10 ║   100%   ║  5/5   ║    ~15s   ║   99  ║
-║ Gemini CLI   ║ 10/10 ║   100%   ║  5/5   ║    ~33s   ║   94  ║
-║ Copilot CLI  ║ 10/10 ║   100%   ║  5/5   ║    ~10s   ║  100  ║
-║ Cursor Agent ║ 10/10 ║   100%   ║  5/5   ║    ~16s   ║   99  ║
-║ Aider        ║ 10/10 ║   100%   ║  5/5   ║     ~5s   ║  100  ║
-╠══════════════╬═══════╬══════════╬════════╬═══════════╬═══════╣
-║ AVERAGE      ║       ║          ║        ║           ║   98  ║
-╚══════════════╩═══════╩══════════╩════════╩═══════════╩═══════╝
-```
-
-Punteggio = 60% accuratezza richiamo + 30% dettaglio fatti + 10% velocità. **98% efficienza multi-agente.**
-
-## Perché ICM
-
-| Funzionalità | ICM | Mem0 | Engram | AgentMemory |
-|-------------|:---:|:----:|:------:|:-----------:|
-| Strumenti supportati | **17** | Solo SDK | ~6-8 | ~10 |
-| Configurazione con un comando | `icm init` | SDK manuale | manuale | manuale |
-| Hook (richiamo automatico all'avvio) | 5 strumenti | nessuno | via MCP | 1 strumento |
-| Ricerca ibrida (FTS5 + vettoriale) | 30/70 ponderata | solo vettoriale | solo FTS5 | FTS5+vettoriale |
-| Embedding multilingue | 100+ lingue (768d) | dipende | nessuno | inglese 384d |
-| Grafo di conoscenza | Sistema Memoir | nessuno | nessuno | nessuno |
-| Decadimento temporale + consolidazione | consapevole degli accessi | nessuno | base | base |
-| Dashboard TUI | `icm dashboard` | nessuno | sì | visualizzatore web |
-| Estrazione automatica dall'output degli strumenti | 3 livelli, zero LLM | nessuno | nessuno | nessuno |
-| Ciclo di feedback/correzione | `icm_feedback_*` | nessuno | nessuno | nessuno |
-| Runtime | Binario singolo Rust | Python | Go | Node.js |
-| Local-first, zero dipendenze | File SQLite | cloud-first | SQLite | SQLite |
-| Accuratezza richiamo multi-agente | **98%** | N/A | N/A | 95.2% |
+<a id="documentation"></a>
 
 ## Documentazione
 
 | Documento | Descrizione |
-|-----------|-------------|
-| [Guida alle integrazioni](docs/integrations.md) | Configurazione per tutti i 17 strumenti: Claude Code, Copilot, Cursor, Windsurf, Zed, Amp, ecc. |
-| [Architettura tecnica](docs/architecture.md) | Struttura dei crate, pipeline di ricerca, modello di decadimento, integrazione sqlite-vec, test |
-| [Guida utente](docs/guide.md) | Installazione, organizzazione dei topic, consolidazione, estrazione, risoluzione dei problemi |
+|----------|-------------|
+| [Guida all'integrazione](docs/integrations.md) | Configurazione MCP per strumento: Claude Code, Cursor, Windsurf, Zed, Amp, Codex, Cline, Roo Code, ecc. |
+| [Architettura tecnica](docs/architecture.md) | Struttura dei crate, pipeline di ricerca, modello di decay, integrazione di sqlite-vec, test |
+| [Guida utente](docs/guide.md) | Installazione, organizzazione dei topic, consolidamento, estrazione, risoluzione dei problemi |
 | [Panoramica del prodotto](docs/product.md) | Casi d'uso, benchmark, confronto con le alternative |
+| [Riferimento](docs/reference.md) | Opzioni di installazione, configurazione per strumento, CLI, 31 strumenti MCP, API HTTP, dashboard, funzionamento interno |
+| [Adattatore del benchmark](bench/amb/README.md) | Come è stato eseguito il confronto qui sopra e come riprodurlo |
+| [Dimostrazioni](docs/demonstrations.md) | Micro-benchmark di archiviazione e piccole demo |
+
+<a id="license"></a>
 
 ## Licenza
 

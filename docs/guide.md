@@ -75,7 +75,14 @@ icm store -t "credentials" -c "Production DB is on port 5433, not 5432" -i criti
 icm recall "API design choices"
 icm recall "nginx" --topic "errors-resolved"
 icm recall "database" --keyword "postgres"
+
+# As many of the best matches as fit in 2000 tokens of output
+icm recall "deploy pipeline" --max-tokens 2000
 ```
+
+**Recall engine.** Recall ranks with the v2 engine: a full-text arm (BM25), a vector arm when embeddings are enabled, and a date arm when the query names a period ("last week", "in March 2024"), fused by rank; `--topic`, `--keyword` and `--project` are applied before results are cut. `--limit` cuts by count (default 5). `--max-tokens N` cuts by a token budget instead, estimated at four characters per token on the output format you chose, with `--limit` as a ceiling on the count.
+
+The engine before v2 is still available, to roll back or to compare: `icm recall --engine legacy`, or `ICM_RECALL_ENGINE=legacy` in the environment (this also switches the MCP tool, the HTTP API and the prompt hook). It has no token budget: `--max-tokens` with `legacy` is an error.
 
 **Importance levels:**
 
@@ -164,6 +171,60 @@ icm consolidate --topic "errors-resolved" --keep-originals
 
 ICM warns when a topic has >7 entries via the MCP `icm_memory_store` response.
 
+#### Summarizer providers: bring your own LLM, or your own token
+
+By default (`provider = "none"`) consolidation is a lexical join. A real summary needs an LLM, selected with `--summarizer-provider` or in `config.toml` (`[consolidate.summarizer]` for `consolidate` / `briefing`, `[extraction.summarizer]` for the hook extraction queue):
+
+- `claude`, `codex`, `gemini` — shell out to the CLI you are already logged into (`claude -p`, `codex exec`, `gemini -p`). No key, your existing quota.
+- `ollama` — local Ollama daemon (`OLLAMA_HOST`), `model` required.
+- `anthropic`, `openai`, `google` — call the vendor API directly with a key, for servers, CI and containers where no CLI is installed. `openai` also covers any OpenAI-compatible server (OpenRouter, Mistral, Groq, vLLM, LM Studio, …) through `base_url`.
+- `auto` — pick a CLI from the environment of the invoking tool. It never selects `anthropic` / `openai` / `google`: an API key in the environment is not spent unless you name the provider.
+- `none` — no LLM.
+
+```toml
+[consolidate.summarizer]
+provider = "anthropic"        # key from $ANTHROPIC_API_KEY
+# model = "claude-haiku-4-5"  # default: the provider's low-cost model
+# workspace_id = "wrkspc_…"   # only for a key not scoped to one workspace
+
+[extraction.summarizer]
+provider = "openai"
+base_url = "https://openrouter.ai/api/v1"   # any OpenAI-compatible endpoint
+api_key_env = "OPENROUTER_API_KEY"          # the variable's NAME, not the key
+model = "mistralai/mistral-small"           # required with a third-party base_url
+```
+
+**The key.** It is read from an environment variable, never from the config file, and sent in a header to the host in `base_url` only (redirects are not followed). On the vendor's own host the variable defaults to `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY`. On any other `base_url` nothing is sent unless `api_key_env` names a variable: a local server (LM Studio, vLLM) needs no key and no placeholder, and your real OpenAI key is never shipped to it by default. A gateway in front of a vendor needs `api_key_env` spelled out. `base_url` is `scheme://host[:port]/path` and nothing else: a query string, a fragment, credentials, or a host that is not a plain name or IP address is refused, so that the host ICM checks is the host the request goes to. `http://` is refused for the vendors' hosts and flagged for any other non-loopback host (the key and the text travel unencrypted). `icm config` shows the variable, whether it is set, and that warning — never the key. `RUST_LOG` cannot make the HTTP client print request headers.
+
+**A provider flag and the config.** `api_key_env`, `base_url`, `workspace_id` and `model` apply to the provider the config names. `--summarizer-provider` / `--provider` with a different provider ignores them (and says so): that provider runs on its own defaults, with `--summarizer-model` / `--model` if given. One exception: when the config names no provider (`none` or `auto`), its `model` is used for whichever provider the flag picks — `model = "qwen3:8b"` plus `--summarizer-provider ollama` keeps working.
+
+**Models.** Defaults when `model` is empty: `claude-haiku-4-5` (anthropic), `gpt-6-luna` (openai, sent with `reasoning_effort: none`), `gemini-3.5-flash-lite` (google) — each vendor's current low-cost model, not necessarily the cheapest ID on its price list: older or deprecated models may cost less, set `model` to use one. OpenAI's regional endpoints (`https://eu.api.openai.com/v1`, …) count as OpenAI. `max_tokens` is the approximate summary budget; the hard cap sent to the API is 4x that, with a minimum of 8192 on a vendor's own API (at most 64000 for anthropic) so reasoning models have room to answer, and of 2048 on any other `base_url`. A compatible server with a small context window (vLLM or TGI serving an 8K model) that rejects even that gets one retry at exactly 4x `max_tokens`: lower `max_tokens` to fit it. An Anthropic key that spans several workspaces needs `workspace_id`.
+
+**When the provider fails.** Rate limits and outages (429, 5xx, dropped connections) are retried twice within `timeout_secs`, honoring `retry-after`. After that — or at once for a missing key, 401/403, a spent quota, a redirect, a timeout, an empty, truncated or unfinished answer — the error says what to fix, and no memory is removed that was not summarized:
+
+- `consolidate`, `consolidate-all`, `consolidate-pending` and the dashboard report the failure and leave in place everything the provider did not summarize. A topic that takes several passes keeps the passes that succeeded: the error says how many memories were already folded into a partial summary. `icm consolidate -t <topic> --keep-originals` adds a lexical join next to the originals instead of waiting for the provider. This holds for the CLI providers too.
+- `consolidate-all` goes on to the next topic after one failure (it may be that topic's own: an answer cut short, a content filter) and stops after two in a row. It exits non-zero when a topic failed, and zero otherwise — including when a topic could only be folded in part.
+- `consolidate-pending` marks the job `failed` and leaves the rest of the queue pending. A topic is queued at most once.
+- `extract-pending` hands the affected rows to the local extractor.
+- `briefing` fails.
+
+An answer only counts when the provider says it finished normally: `end_turn` / `stop_sequence` (anthropic), `STOP` (google), `stop` and its equivalents (openai format), `done: true` with `done_reason: "stop"` (Ollama; older servers that send no `done_reason` are accepted unless the answer used the whole output cap). One cut by the output cap or the context window, stopped for any other reason, or with no finish reason at all, is discarded. On an OpenAI-compatible server a leading `<think>…</think>` scratchpad is removed from the answer, unless the memories being summarized mention such tags or a tag is left after it; an answer with a closing `</think>` and no opening tag is always refused: reasoning cannot be told from a quotation of the tag, and cutting there would store half a summary. Have the server separate the reasoning (vLLM `--reasoning-parser`, Groq `reasoning_format`), or use a model that does not emit it.
+
+Ollama is asked for a context window sized on the prompt (`num_ctx`) and an output cap of 4x `max_tokens`, minimum 2048 (`num_predict`): its default window is smaller than a full consolidation prompt and it would otherwise drop the start of it without saying so. If the window still fills up, the answer is discarded.
+
+**What a consolidation removes.** Only the memories whose text went into the summary, in the same transaction that writes it, and only if they still say what was read:
+
+- A memory stored while the provider was answering is kept. One edited or forgotten meanwhile makes the store refuse the summary; the pass is redone from a fresh read, so a correction is never deleted unsummarized and a forgotten memory never comes back through a summary. Two runs over the same topic do not leave two summaries.
+- `critical` memories take no part: they are never removed, never sent to be summarized, and the summary takes the highest importance of what it replaces (never `critical`).
+- A pass needs at least two memories; a topic with fewer is left alone, without a provider call.
+- A topic too large for one pass (more than 500 memories, more text than the provider prompt takes — about 20 000 characters — or, for the lexical join, than one memory can hold — 64 KB) is folded in several passes, each summary being an entry of the next where it fits. A memory too large to share a pass is set aside and reported, and the rest of the topic is consolidated without it.
+
+`POST /consolidate`, the web dashboard and the TUI go through the same code (the TUI does one pass per keypress and says how much is left). The MCP tool `icm_memory_consolidate` works in two steps, because the summary is the agent's: called with only `topic` it replaces nothing and lists the topic's memories with their ids; called with `summary` and the `ids` it covers, it replaces exactly those. Without `ids` it never replaces anything.
+
+**Auto-consolidation loses content.** `auto_consolidate_enabled` (off by default) is the one exception, by design: when no LLM summarizer is configured, its rollup keeps only the summaries of the 3 heaviest memories of the topic and deletes the other non-critical memories it read. Leave it off unless that is what you want, or configure `[consolidate.summarizer]`: the topic is then queued for a real summary (`icm consolidate-pending`) instead, on the CLI, hook and MCP store paths alike. It never removes memories it did not read.
+
+**Where your text goes.** With an API-key provider, the text being summarized is sent to that provider under its data terms: memory summaries for `consolidate` / `briefing`, and for `[extraction.summarizer]` the queued tool output as captured (up to 8 KB per entry, not redacted). For `google` in particular: with a key from a project without billing (free tier), Google's Gemini API terms say prompts and responses are used to improve its products and may be read by human reviewers, and that sensitive or confidential data must not be submitted; this does not apply in the EEA, Switzerland and the UK, nor to a key from a billing-enabled project. Use a billed project before pointing `[extraction.summarizer]` at `google` — see https://ai.google.dev/gemini-api/terms. The same goes for the `gemini` CLI signed into a free account.
+
 ### Decay and Pruning
 
 ```bash
@@ -220,6 +281,8 @@ icm recall-context "authentication" --limit 20
 
 Returns a formatted block ready for prompt prepending. Used by the SessionStart hook for automatic context loading.
 
+The prompt hook runs the same search on every message, on the default recall engine with keywords only: it never loads the embedding model and never writes to the database. `ICM_RECALL_ENGINE=legacy` switches it back to the previous search.
+
 ## Embedding Configuration
 
 Default: multilingual embeddings for semantic search across 100+ languages.
@@ -248,7 +311,7 @@ model = "intfloat/multilingual-e5-base"       # 768d, 100+ languages
 # model = "jinaai/jina-embeddings-v2-base-code"  # 768d
 ```
 
-Changing the model automatically migrates the vector index on next startup (existing embeddings are cleared). Regenerate with:
+The model that produced the stored vectors is recorded in the database and wins over the config file: editing `model` clears nothing. To change model, run `icm embed --migrate` (backup, new index, every memory re-embedded). Other uses of `icm embed`:
 
 ```bash
 icm embed                     # Embed all memories without embeddings
@@ -263,10 +326,10 @@ icm embed --topic "decisions" # Only one topic
 | Tool | What it does |
 |------|-------------|
 | `icm_memory_store` | Store a memory. Auto-dedup: >85% similar in same topic → update. Warns at >7 entries. |
-| `icm_memory_recall` | Search by query. Filters: `topic`, `keyword`, `limit`. Auto-decay if >24h. |
+| `icm_memory_recall` | Search by query. Filters: `topic`, `keyword`, `project`, `limit` (1 to 20). `max_tokens` returns as many of the best matches as fit in a token budget instead. Auto-decay if >24h. |
 | `icm_memory_update` | Edit content, importance, or keywords of an existing memory by ID. |
 | `icm_memory_forget` | Delete a memory by ID. |
-| `icm_memory_consolidate` | Replace all memories of a topic with a single summary. |
+| `icm_memory_consolidate` | Replace the memories you list (`ids`) with a summary you wrote from them. Called with only `topic`, it replaces nothing and lists the topic's memories with their ids. |
 | `icm_memory_list_topics` | List all topics with entry counts. |
 | `icm_memory_stats` | Total memories, topics, average weight, date range. |
 | `icm_memory_health` | Per-topic audit: staleness, consolidation needs, access patterns. |
@@ -321,7 +384,7 @@ Single SQLite file with WAL mode. No external services.
 
 ```
 macOS:   ~/Library/Application Support/dev.icm.icm/memories.db
-Linux:   ~/.local/share/dev.icm.icm/memories.db
+Linux:   ~/.local/share/icm/memories.db
 ```
 
 Override: `--db <path>` flag or `ICM_DB` environment variable.
@@ -435,7 +498,7 @@ L'agent devrait utiliser automatiquement `icm_memory_recall`. S'il ne le fait pa
 
 **Symptome :** ICM prend 30+ secondes au premier `store` ou `recall`.
 
-**Explication :** Le modele d'embedding (~100MB pour multilingual-e5-base) est telecharge a la premiere utilisation. Les executions suivantes chargent depuis le cache (~1-2s).
+**Explication :** Le modele d'embedding (environ 2 Go pour Qdrant/multilingual-e5-large-onnx, le modele par defaut) est telecharge a la premiere utilisation. Les executions suivantes chargent depuis le cache (~1-2s).
 
 **Solutions :**
 - C'est normal la premiere fois — attendez le telechargement
@@ -475,7 +538,7 @@ Si vous utilisez le binaire pre-compile depuis les releases GitHub, les embeddin
 **Solutions :**
 - Localisez la base :
   - macOS : `~/Library/Application Support/dev.icm.icm/memories.db`
-  - Linux : `~/.local/share/dev.icm.icm/memories.db`
+  - Linux : `~/.local/share/icm/memories.db`
 - Sauvegardez le fichier `.db` et ses fichiers WAL (`.db-wal`, `.db-shm`)
 - Supprimez et reconstruisez si necessaire — la migration est automatique
 - Pour tester avec une base propre : `icm --db /tmp/test.db stats`
@@ -780,7 +843,7 @@ La seule difference est le fichier de config et la cle JSON. `icm init` gere tou
 
 ### Q1 : ICM envoie-t-il des donnees sur internet ?
 
-**Non.** ICM stocke tout localement dans un fichier SQLite. Le modele d'embedding tourne localement (via fastembed/ONNX Runtime). Aucune donnee ne quitte votre machine. Le seul acces reseau est le telechargement initial du modele d'embedding (~100MB, une seule fois).
+**Pas pour stocker ni rappeler.** ICM stocke tout localement dans un fichier SQLite, et le modele d'embedding tourne localement (via fastembed/ONNX Runtime). Deux exceptions : le telechargement initial du modele d'embedding (environ 2 Go pour le modele par defaut, une seule fois), et l'extraction automatique, qui confie le texte capture a l'outil LLM en ligne de commande deja installe (Claude Code, Codex ou Gemini CLI) tant que `[extraction.summarizer] provider` vaut `"auto"` (le defaut). Avec `provider = "none"`, rien ne quitte la machine apres le telechargement du modele. Un fournisseur par cle API (`anthropic`, `openai`, `google`) envoie le texte resume a ce fournisseur, selon ses conditions.
 
 ### Q2 : Puis-je utiliser ICM avec plusieurs projets ?
 
@@ -807,7 +870,7 @@ Le CLI fusionne automatiquement les summaries (concatenation avec ` | `). Le MCP
 
 ### Q6 : Puis-je changer de modele d'embedding sans perdre mes donnees ?
 
-**Oui.** Les souvenirs (texte) sont toujours conserves. Seuls les vecteurs sont effaces et recreees. Apres avoir change le modele dans `config.toml`, lancez `icm embed --force` pour regenerer tous les vecteurs.
+**Oui.** Les souvenirs (texte) sont toujours conserves, et les vecteurs aussi tant que vous ne migrez pas : le modele qui a produit les vecteurs est enregistre dans la base et prime sur `config.toml`. Pour changer de modele, lancez `icm embed --migrate` : il ecrit une sauvegarde, recree l'index a la nouvelle dimension et recalcule tous les vecteurs.
 
 ### Q7 : Combien de souvenirs ICM peut-il gerer ?
 
@@ -820,7 +883,7 @@ La base SQLite gere des millions de lignes sans probleme. Les benchmarks montren
 rm ~/Library/Application\ Support/dev.icm.icm/memories.db*
 
 # Linux
-rm ~/.local/share/dev.icm.icm/memories.db*
+rm ~/.local/share/icm/memories.db*
 ```
 
 La base est recreee automatiquement au prochain lancement.
@@ -862,7 +925,7 @@ Le compteur se reinitialise a chaque `icm_memory_store`. C'est un rappel discret
 - `icm health` — check if memories decayed too much
 
 **Embeddings slow on first run**
-- Normal: model downloads on first use (~100MB for multilingual-e5-base)
+- Normal: model downloads on first use (about 2 GB for the default Qdrant/multilingual-e5-large-onnx)
 - Subsequent runs load from cache (~1-2s)
 - Build without embeddings: `cargo build --no-default-features`
 

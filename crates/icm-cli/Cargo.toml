@@ -1,12 +1,11 @@
-# release-please only tracks commits touching crates/icm-cli (see
-# release-please-config.json): a workspace-root Cargo.lock change on its
-# own is invisible to it and will never trigger a release by itself
-# (issue #458). If you change a dependency that only touches Cargo.lock,
-# pair it with a real fix/feat commit under this crate's path, or the
-# lockfile update will silently sit unreleased on develop/main.
+# release-please tracks the whole repository (package "." in
+# release-please-config.json), so a feat/fix commit anywhere, including one
+# that only touches icm-core, icm-store, icm-mcp or the root Cargo.lock,
+# opens a release PR (issue #458). The four crates share one version: the
+# release PR rewrites it in each Cargo.toml and in Cargo.lock.
 [package]
 name = "icm-cli"
-version = "0.10.65"
+version = "0.11.2"
 edition = "2021"
 description = "Permanent memory for AI agents"
 license = "Apache-2.0"
@@ -84,8 +83,9 @@ tracing-subscriber = { workspace = true }
 # explanation in [features] above). Cross-builds need it; native
 # builds don't pull it in.
 openssl = { version = "0.10", optional = true }
+# Used by summarizer.rs (local Ollama calls) and upgrade.rs (self-update
+# download) — NOT cloud-sync-exclusive, keep even though cloud.rs is gone.
 ureq = { workspace = true }
-rpassword = { workspace = true }
 sha2 = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
@@ -104,6 +104,7 @@ walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

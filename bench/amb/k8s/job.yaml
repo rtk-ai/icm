@@ -1,0 +1,192 @@
+# One benchmark run as a Kubernetes Indexed Job: SHARDS pods, each ingesting and
+# answering its own subset of isolation units, results synced to GCS.
+#
+# This file is a template. Render it with k8s/render.sh, which fills the defaults,
+# refuses a missing or malformed variable and escapes the description, then apply
+# it to the bench cluster with the context spelled out (the kubeconfig also holds
+# production):
+#
+#   export IMAGE=europe-west9-docker.pkg.dev/rtk-ai-labs-01/rtk-bench/icm-amb@sha256:<digest>
+#   export RUN_ID=v2-20261004 RESULTS_BUCKET=<bucket>
+#   export DATASET=locomo SPLIT=locomo10 SHARDS=3 PARALLELISM=3
+#   export ICM_AMB_ENGINE=v2 RUN_DESCRIPTION="ICM <git sha>, k=50"
+#   bench/amb/k8s/render.sh \
+#     | kubectl --context gke_rtk-ai-labs-01_europe-west9-a_rtk-bench apply -f -
+#
+# Variables (render.sh default in brackets):
+#   IMAGE, RUN_ID, DATASET, SPLIT, SHARDS, PARALLELISM, RESULTS_BUCKET   required
+#   RUN_NAME [icm], MEMORY [icm]  MEMORY: icm, bm25 (harness baseline, 10 chunks, no date) or
+#                                 full-context (no retrieval: the whole unit to the answer model)
+#   MODE [rag]                    `recall`: ingestion and retrieval only, no model call
+#                                 (recall_only.py; MEMORY icm or bm25; ICM_AMB_RECALL_UNIT
+#                                 session-user [default], session-all or chunk). The OMB_* and
+#                                 GOOGLE_* variables below are then unused.
+#   BACKOFF_LIMIT_PER_INDEX [1]   replacements of a failed pod, per shard. Keep 1 for a
+#                                 paid run: one replacement absorbs an eviction or a
+#                                 network failure; an error that repeats (a question the
+#                                 model cannot answer, a 400) is then paid twice at most,
+#                                 not four times as with 3. After a second failure read
+#                                 the pod log before applying the Job again.
+#   RUN_DESCRIPTION [empty]       free text for the result file; spaces allowed
+#   EXTRA_ARGS [empty]            extra `amb run` flags, split on spaces, no quoting
+#   ICM_AMB_ENGINE                required with MEMORY=icm, no default: v2, legacy or
+#                                 binary-default-no-dates. render.sh refuses the Job without it
+#                                 and entrypoint.sh stops the pod; the engine and the dates sent
+#                                 are appended to the description stored in the result file.
+#   ICM_AMB_STORE_DATE,           v2 only, 0 = do not send the document date (`created_at`) /
+#   ICM_AMB_QUERY_NOW [empty]     the question date (`now`). Both at 0: v2 as a system that is
+#                                 given no date, the setting to put next to published recall
+#                                 figures whose protocol sends the question text only.
+#   ICM_AMB_NO_EMBEDDINGS [empty] 1 = `icm serve --no-embeddings`: keyword-only recall
+#   ICM_AMB_* [empty]             other provider and launcher settings, empty = default
+#
+# Plain `envsubst < job.yaml` also works when every variable above is exported; an
+# unset BACKOFF_LIMIT_PER_INDEX then renders as null, which Kubernetes reads as "no
+# per-shard limit" (6 retries for the whole Job).
+#
+# RUN_ID ends up in the Job name and in pod hostnames: lowercase letters, digits
+# and hyphens only (no dots). Use a new RUN_ID for each run configuration: a pod
+# resumes from whatever result file its RUN_ID already holds in the bucket.
+# SHARDS=1 runs the whole split in one pod. Job names are unique per
+# (RUN_ID, DATASET, SPLIT, MEMORY), so a baseline and an improved binary, or icm
+# and bm25, can run side by side.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: amb-${RUN_ID}-${DATASET}-${SPLIT}-${MEMORY}
+  namespace: icm-bench
+  labels:
+    app.kubernetes.io/part-of: icm-amb
+    icm-amb/run-id: "${RUN_ID}"
+    icm-amb/dataset: "${DATASET}"
+spec:
+  completionMode: Indexed
+  completions: ${SHARDS}
+  parallelism: ${PARALLELISM}
+  # A replacement pod downloads the result file of the failed one and resumes at
+  # the first unfinished isolation unit. That only helps a dataset the harness
+  # saves unit by unit (LoCoMo; PersonaMem with ICM_AMB_UNIT_CHECKPOINT): a dataset
+  # run in one batch has nothing saved before its end and replays the whole shard.
+  backoffLimitPerIndex: ${BACKOFF_LIMIT_PER_INDEX}
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: icm-amb
+        icm-amb/run-id: "${RUN_ID}"
+    spec:
+      restartPolicy: Never
+      # entrypoint.sh forwards SIGTERM, waits TERM_WAIT (20 s) for the benchmark
+      # process, then uploads the result file: that has to fit in here.
+      terminationGracePeriodSeconds: 120
+      serviceAccountName: icm-amb
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: amb
+          image: ${IMAGE}
+          env:
+            - name: DATASET
+              value: "${DATASET}"
+            - name: SPLIT
+              value: "${SPLIT}"
+            - name: MEMORY
+              value: "${MEMORY}"
+            - name: MODE
+              value: "${MODE}"
+            - name: RUN_NAME
+              value: "${RUN_NAME}"
+            - name: RUN_ID
+              value: "${RUN_ID}"
+            - name: SHARDS
+              value: "${SHARDS}"
+            # `rank` deals the isolation units round-robin in sorted order: SHARDS = number
+            # of units gives one unit per pod (LoCoMo: 10). Empty = `hash` (sha1 modulo
+            # SHARDS; LoCoMo then needs SHARDS=26 to separate its 10 conversations).
+            - name: ICM_AMB_SHARD_BY
+              value: "${ICM_AMB_SHARD_BY}"
+            - name: RESULTS_BUCKET
+              value: "${RESULTS_BUCKET}"
+            - name: EXTRA_ARGS
+              value: "${EXTRA_ARGS}"
+            # Stored in the result file (`--description`), with the image reference
+            # appended by entrypoint.sh: the file names the build that produced it.
+            - name: RUN_DESCRIPTION
+              value: "${RUN_DESCRIPTION}"
+            - name: ICM_AMB_IMAGE
+              value: "${IMAGE}"
+            # The recall engine has no default: v2, legacy or binary-default-no-dates
+            # (render.sh and entrypoint.sh both refuse MEMORY=icm without it). The other
+            # provider settings fall back to the provider default when empty (k=50,
+            # 512-token chunks, date header on). See the header of icm_provider.py.
+            - name: ICM_AMB_ENGINE
+              value: "${ICM_AMB_ENGINE}"
+            - name: ICM_AMB_MAX_TOKENS
+              value: "${ICM_AMB_MAX_TOKENS}"
+            - name: ICM_AMB_K
+              value: "${ICM_AMB_K}"
+            - name: ICM_AMB_CHUNK_TOKENS
+              value: "${ICM_AMB_CHUNK_TOKENS}"
+            # 0 stores the chunks without their date/provenance line (ablation: the
+            # upstream bm25 and hybrid-search baselines give the answer model no date).
+            # Run it under its own RUN_ID and RUN_NAME.
+            - name: ICM_AMB_HEADER
+              value: "${ICM_AMB_HEADER}"
+            # v2 only. 0 keeps the document date (`created_at`) out of /store, the question
+            # date (`now`) out of /recall. Empty = sent. Run each variant under its own
+            # RUN_ID and RUN_NAME.
+            - name: ICM_AMB_STORE_DATE
+              value: "${ICM_AMB_STORE_DATE}"
+            - name: ICM_AMB_QUERY_NOW
+              value: "${ICM_AMB_QUERY_NOW}"
+            # 1 starts `icm serve --no-embeddings` (keyword-only recall).
+            - name: ICM_AMB_NO_EMBEDDINGS
+              value: "${ICM_AMB_NO_EMBEDDINGS}"
+            # Warm `icm serve` processes kept at once (default 1, about 3 GiB each;
+            # the pod limit is 12Gi). Each isolation unit is visited once, so a larger
+            # pool does not remove the one start per unit of a batch dataset.
+            - name: ICM_AMB_MAX_SERVERS
+              value: "${ICM_AMB_MAX_SERVERS}"
+            # MODE=recall only: what one indexed unit is (see the header of recall_only.py).
+            # Empty = session-user, the unit of the published LongMemEval recall figures.
+            - name: ICM_AMB_RECALL_UNIT
+              value: "${ICM_AMB_RECALL_UNIT}"
+            # Launcher: `personamem` makes the harness save after each user_id instead
+            # of once at the end (see the header of run_amb.py). Empty = upstream schedule.
+            - name: ICM_AMB_UNIT_CHECKPOINT
+              value: "${ICM_AMB_UNIT_CHECKPOINT}"
+            # Same models and mode as the published leaderboard runs; see README.md
+            # ("Running") for what differs: temperature and Vertex AI.
+            - name: OMB_ANSWER_LLM
+              value: gemini
+            - name: OMB_ANSWER_MODEL
+              value: gemini-3.1-pro-preview
+            - name: OMB_JUDGE_LLM
+              value: gemini
+            - name: OMB_JUDGE_MODEL
+              value: gemini-2.5-flash-lite
+            # Gemini through Vertex AI with the pod's Workload Identity (no API key).
+            - name: GOOGLE_GENAI_USE_VERTEXAI
+              value: "true"
+            - name: GOOGLE_CLOUD_PROJECT
+              value: rtk-ai-labs-01
+            - name: GOOGLE_CLOUD_LOCATION
+              value: global
+          resources:
+            # One pod per e2-standard-4 node (about 3.9 allocatable vCPU): the
+            # embedding model uses every core it is given and about 3 GiB of RAM.
+            requests:
+              cpu: "3"
+              memory: 6Gi
+              ephemeral-storage: 20Gi
+            limits:
+              memory: 12Gi
+              ephemeral-storage: 40Gi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: work
+          emptyDir: {}

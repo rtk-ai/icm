@@ -22,29 +22,36 @@ fn row_to_consolidation_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Consoli
 
 impl SqliteStore {
     /// Atomically increment the hook call counter and return the new value.
+    ///
+    /// Runs inside every PostToolUse hook, so it waits for the write lock
+    /// only briefly: a hook must not stall the agent's tool call for 30s
+    /// because another session is writing. The caller falls back to a
+    /// count of 1 on error, which only postpones the next extraction.
     pub fn increment_hook_counter(&self) -> IcmResult<usize> {
-        let count: usize = self
-            .conn
-            .query_row(
-                "INSERT INTO icm_metadata (key, value) VALUES ('hook_counter', '1')
-                 ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
-                 RETURNING CAST(value AS INTEGER)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(db_err)?;
-        Ok(count)
+        self.with_bookkeeping_timeout(|| {
+            self.conn
+                .query_row(
+                    "INSERT INTO icm_metadata (key, value) VALUES ('hook_counter', '1')
+                     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+                     RETURNING CAST(value AS INTEGER)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_err)
+        })
     }
 
     /// Reset the hook call counter to 0.
     pub fn reset_hook_counter(&self) -> IcmResult<()> {
-        self.conn
-            .execute(
-                "INSERT INTO icm_metadata (key, value) VALUES ('hook_counter', '0')
-                 ON CONFLICT(key) DO UPDATE SET value = '0'",
-                [],
-            )
-            .map_err(db_err)?;
+        self.with_bookkeeping_timeout(|| {
+            self.conn
+                .execute(
+                    "INSERT INTO icm_metadata (key, value) VALUES ('hook_counter', '0')
+                     ON CONFLICT(key) DO UPDATE SET value = '0'",
+                    [],
+                )
+                .map_err(db_err)
+        })?;
         Ok(())
     }
 
@@ -135,17 +142,37 @@ impl SqliteStore {
 
     /// Enqueue a topic for later LLM consolidation. Returns the generated
     /// row id.
+    ///
+    /// One `pending` job per topic: a topic that is already waiting is not
+    /// queued again (the id of the waiting job is returned). Every store
+    /// past the threshold used to add a job, and each job after the first
+    /// sent the lone summary back to the provider to be rewritten.
     pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
         let id = ulid::Ulid::new().to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
+        let inserted = self
+            .conn
             .execute(
                 "INSERT INTO pending_consolidations (id, topic, project, status, created_at)
-                 VALUES (?1, ?2, ?3, 'pending', ?4)",
+                 SELECT ?1, ?2, ?3, 'pending', ?4
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM pending_consolidations
+                         WHERE topic = ?2 AND status = 'pending')",
                 rusqlite::params![id, topic, project, now],
             )
             .map_err(db_err)?;
-        Ok(id)
+        if inserted > 0 {
+            return Ok(id);
+        }
+        self.conn
+            .query_row(
+                "SELECT id FROM pending_consolidations
+                  WHERE topic = ?1 AND status = 'pending'
+                  ORDER BY created_at LIMIT 1",
+                rusqlite::params![topic],
+                |row| row.get(0),
+            )
+            .map_err(db_err)
     }
 
     /// Pop up to `limit` oldest `pending` jobs (FIFO by enqueue time).
@@ -397,27 +424,34 @@ impl SqliteStore {
     /// Append one hook telemetry row. Errors are swallowed by callers in
     /// hook paths (logging must never block the user), but tests can
     /// inspect the `Result`.
+    ///
+    /// Waits for the write lock only briefly. This row is written at the
+    /// end of EVERY hook; at the normal 30s timeout a prompt hook that had
+    /// finished in half a second then sat 31s behind another session's
+    /// write (measured), stalling the user's prompt for a telemetry row.
     pub fn record_hook_event(&self, ev: &HookEventInsert) -> IcmResult<i64> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO hook_events
+        self.with_bookkeeping_timeout(|| {
+            self.conn
+                .execute(
+                    "INSERT INTO hook_events
                  (ts, event, project, session_id, tool_name,
                   duration_ms, exit_code, payload_size, note)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    now,
-                    ev.event,
-                    ev.project,
-                    ev.session_id,
-                    ev.tool_name,
-                    ev.duration_ms,
-                    ev.exit_code,
-                    ev.payload_size,
-                    ev.note,
-                ],
-            )
-            .map_err(db_err)?;
+                    rusqlite::params![
+                        now,
+                        ev.event,
+                        ev.project,
+                        ev.session_id,
+                        ev.tool_name,
+                        ev.duration_ms,
+                        ev.exit_code,
+                        ev.payload_size,
+                        ev.note,
+                    ],
+                )
+                .map_err(db_err)
+        })?;
         Ok(self.conn.last_insert_rowid())
     }
 

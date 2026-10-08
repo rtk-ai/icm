@@ -1,12 +1,21 @@
-//! Summarizer providers — call out to user-authenticated CLIs (Claude, Gemini,
-//! Codex) or a local HTTP daemon (Ollama) instead of bringing our own API key.
+//! Summarizer providers — bring your own LLM, or bring your own token.
 //!
-//! The user's existing CLI quota is reused, so summarization costs nothing
-//! extra in most cases. Auto-detection picks a sensible provider based on
-//! environment variables set by the invoking tool, with explicit overrides
-//! available via TOML config or CLI flags.
+//! "Own LLM": call out to user-authenticated CLIs (Claude, Gemini, Codex) or
+//! a local HTTP daemon (Ollama). The user's existing CLI quota is reused, so
+//! summarization costs nothing extra in most cases. Auto-detection picks a
+//! sensible provider based on environment variables set by the invoking
+//! tool, with explicit overrides available via TOML config or CLI flags.
+//!
+//! "Own token": call a hosted API directly with a key read from the
+//! environment (see [`api`]) — for servers, CI and containers where no CLI is
+//! installed. Those providers bill the key's owner, so they are never
+//! auto-detected: they run only when named explicitly.
 //!
 //! Tracks issue #165.
+
+mod api;
+
+pub use api::{describe_config, ApiOptions};
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -24,8 +33,20 @@ pub enum ProviderKind {
     Codex,
     Gemini,
     Ollama,
+    /// Anthropic Messages API, key from the environment.
+    Anthropic,
+    /// OpenAI Chat Completions API — or any server speaking it, via `base_url`.
+    OpenAi,
+    /// Google Gemini API, key from the environment.
+    Google,
     None,
 }
+
+/// Every accepted provider name, for error messages and help text. The CLI
+/// names (`claude`, `codex`, `gemini`) are products; the API-key names
+/// (`anthropic`, `openai`, `google`) are the vendors that bill the key.
+pub const PROVIDER_NAMES: &str =
+    "auto, claude, codex, gemini, ollama, anthropic, openai, google, none";
 
 impl ProviderKind {
     pub fn parse(s: &str) -> Result<Self> {
@@ -35,10 +56,11 @@ impl ProviderKind {
             "codex" => Ok(Self::Codex),
             "gemini" => Ok(Self::Gemini),
             "ollama" => Ok(Self::Ollama),
+            "anthropic" | "anthropic-api" => Ok(Self::Anthropic),
+            "openai" | "openai-api" | "openai-compatible" => Ok(Self::OpenAi),
+            "google" | "gemini-api" => Ok(Self::Google),
             "none" | "off" | "disabled" => Ok(Self::None),
-            other => bail!(
-                "unknown provider '{other}'; expected one of: auto, claude, codex, gemini, ollama, none",
-            ),
+            other => bail!("unknown provider '{other}'; expected one of: {PROVIDER_NAMES}"),
         }
     }
 
@@ -50,7 +72,29 @@ impl ProviderKind {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::Ollama => "ollama",
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Google => "google",
             Self::None => "none",
+        }
+    }
+
+    /// True for the providers that spend an API key's credit. These are
+    /// opt-in by name only: `auto` must never resolve to one of them.
+    pub fn is_api_key(&self) -> bool {
+        matches!(self, Self::Anthropic | Self::OpenAi | Self::Google)
+    }
+
+    /// The local binary this provider needs on PATH, if any. API-key
+    /// providers need none — their precondition is the key, checked at call
+    /// time with an error that names the variable to set.
+    pub fn cli_binary(&self) -> Option<&'static str> {
+        match self {
+            Self::Claude => Some("claude"),
+            Self::Codex => Some("codex"),
+            Self::Gemini => Some("gemini"),
+            Self::Ollama => Some("ollama"),
+            Self::Auto | Self::Anthropic | Self::OpenAi | Self::Google | Self::None => None,
         }
     }
 }
@@ -58,10 +102,16 @@ impl ProviderKind {
 /// Resolve `Auto` into a concrete provider by inspecting environment hints
 /// left by the invoking tool. Falls back to the configured `fallback` when
 /// no hint matches.
+///
+/// Never returns an API-key provider. A key sitting in the environment
+/// (`ANTHROPIC_API_KEY` is exported on plenty of dev machines for unrelated
+/// tools) is not consent to spend it, and neither is an `ICM_INVOKER` hint
+/// set by whatever launched us — so those providers are skipped here and
+/// only run when the config or a CLI flag names them.
 pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
     if let Ok(forced) = std::env::var("ICM_INVOKER") {
         if let Ok(p) = ProviderKind::parse(&forced) {
-            if p != ProviderKind::Auto {
+            if p != ProviderKind::Auto && !p.is_api_key() {
                 return p;
             }
         }
@@ -78,11 +128,104 @@ pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
     if std::env::var("OLLAMA_HOST").is_ok() {
         return ProviderKind::Ollama;
     }
-    if matches!(fallback, ProviderKind::Auto) {
+    if matches!(fallback, ProviderKind::Auto) || fallback.is_api_key() {
         ProviderKind::Claude
     } else {
         fallback
     }
+}
+
+/// Provider, API options and model a command should use once its CLI flags
+/// are merged with a `[*.summarizer]` section.
+pub struct Resolved {
+    /// Concrete provider (`auto` already resolved), or `None`.
+    pub kind: ProviderKind,
+    pub api: ApiOptions,
+    pub model: Option<String>,
+    /// Set when the section's settings were left out because a flag named a
+    /// different provider. For the caller to print.
+    pub note: Option<String>,
+}
+
+/// Merge CLI flags with a `[*.summarizer]` section. This is the only place
+/// that decides which options reach which provider.
+///
+/// `api_key_env`, `base_url` and `workspace_id` in the config were written
+/// for the provider the config names. When a flag names a different one
+/// they are dropped and that provider runs on its own defaults — otherwise
+/// `--summarizer-provider openai` on an `anthropic` config would send the
+/// Anthropic key to OpenAI. Providers are compared after parsing and after
+/// resolving `auto`, so an alias of the configured one (`gemini-api` for
+/// `google`), or `auto` landing on it, keeps the settings.
+///
+/// `model` follows the same rule with one exception: a config that names no
+/// provider (`none`, the default, or `auto`) wrote its `model` for whichever
+/// provider a flag picks — `model = "qwen3:8b"` plus
+/// `--summarizer-provider ollama` is the documented way to use Ollama. A
+/// model name is not a credential; at worst the provider rejects it.
+pub fn resolve(
+    cfg_provider: &str,
+    cfg_model: &str,
+    cfg_api: ApiOptions,
+    flag_provider: Option<&str>,
+    flag_model: Option<&str>,
+) -> Result<Resolved> {
+    let through_auto = |kind: ProviderKind| match kind {
+        ProviderKind::Auto => detect_provider(ProviderKind::Claude),
+        other => other,
+    };
+    let configured = ProviderKind::parse(cfg_provider);
+    let (declared, inherit_options, inherit_model) = match flag_provider {
+        Some(flag) => {
+            let flagged = ProviderKind::parse(flag)?;
+            let same = configured
+                .as_ref()
+                .is_ok_and(|c| through_auto(*c) == through_auto(flagged));
+            let unassigned = matches!(configured, Ok(ProviderKind::None) | Ok(ProviderKind::Auto));
+            (flagged, same, same || unassigned)
+        }
+        None => (configured?, true, true),
+    };
+    let kind = through_auto(declared);
+
+    let mut dropped: Vec<&str> = Vec::new();
+    let mut drop_if_set = |name: &'static str, value: &str| {
+        if !value.trim().is_empty() {
+            dropped.push(name);
+        }
+    };
+    let api = if inherit_options {
+        cfg_api
+    } else {
+        drop_if_set("api_key_env", &cfg_api.api_key_env);
+        drop_if_set("base_url", &cfg_api.base_url);
+        drop_if_set("workspace_id", &cfg_api.workspace_id);
+        ApiOptions::default()
+    };
+    if !inherit_model {
+        drop_if_set("model", cfg_model);
+    }
+    let note = (!dropped.is_empty()).then(|| {
+        format!(
+            "note: the config's {} {} written for provider '{}' and {} ignored for '{}', \
+             which runs on its own defaults",
+            dropped.join(", "),
+            if dropped.len() == 1 { "was" } else { "were" },
+            cfg_provider.trim(),
+            if dropped.len() == 1 { "is" } else { "are" },
+            declared.as_str(),
+        )
+    });
+    let non_empty = |m: &str| (!m.trim().is_empty()).then(|| m.trim().to_string());
+    let model = flag_model
+        .and_then(non_empty)
+        .or_else(|| non_empty(cfg_model).filter(|_| inherit_model));
+    Ok(Resolved {
+        kind,
+        api,
+        model,
+        note,
+    })
 }
 
 /// What the caller asks the provider to do.
@@ -100,13 +243,22 @@ pub trait Summarizer {
 }
 
 /// Build the right summarizer for a concrete kind. `Auto` and `None` are
-/// rejected — resolve them upstream first.
-pub fn make_summarizer(kind: ProviderKind) -> Result<Box<dyn Summarizer>> {
+/// rejected — resolve them upstream first. `api` is only read by the
+/// API-key providers.
+pub fn make_summarizer(kind: ProviderKind, api: &ApiOptions) -> Result<Box<dyn Summarizer>> {
     match kind {
         ProviderKind::Claude => Ok(Box::new(ClaudeCliSummarizer)),
         ProviderKind::Codex => Ok(Box::new(CodexCliSummarizer)),
         ProviderKind::Gemini => Ok(Box::new(GeminiCliSummarizer)),
         ProviderKind::Ollama => Ok(Box::new(OllamaSummarizer::default())),
+        // Infallible on purpose: a bad `api_key_env` / `base_url` is reported
+        // by the first `summarize()` call rather than here, so it takes each
+        // caller's existing provider-failed fallback. Failing here instead
+        // would abort `extract-pending` on every run and let the queue grow
+        // without bound behind a typo in the config.
+        ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::Google => {
+            Ok(api::make(kind, api))
+        }
         ProviderKind::Auto => Err(anyhow!(
             "Auto must be resolved with detect_provider() first"
         )),
@@ -349,6 +501,41 @@ impl Default for OllamaSummarizer {
 #[derive(Deserialize)]
 struct OllamaResponse {
     response: String,
+    /// `false` when generation was interrupted.
+    #[serde(default)]
+    done: Option<bool>,
+    /// `"length"` when `num_predict` cut the answer off.
+    #[serde(default)]
+    done_reason: Option<String>,
+    /// Tokens of the prompt the model actually evaluated.
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    /// Tokens generated.
+    #[serde(default)]
+    eval_count: Option<u64>,
+}
+
+/// Output cap sent to Ollama as `num_predict`: the same headroom over the
+/// `max_tokens` budget as the API-key providers get on a non-vendor host.
+/// The budget itself stays the one written in the prompt; sent verbatim it
+/// cut every answer a few tokens over it, which is now an error.
+fn ollama_num_predict(max_tokens: usize) -> usize {
+    max_tokens.saturating_mul(4).max(2048)
+}
+
+/// Context window asked of Ollama for one request. Its default (4096
+/// tokens, 2048 on older versions) is smaller than a full consolidation
+/// prompt, and it truncates what does not fit *silently* — keeping the end
+/// of the prompt, so the instructions and the heaviest memories go first —
+/// then answers normally. Sized on the prompt at a generous 3 characters
+/// per token plus the output cap, rounded up, and bounded: a prompt that
+/// needs more than the bound is caught by the checks on the response.
+fn ollama_num_ctx(prompt_len: usize, num_predict: usize) -> usize {
+    let needed = prompt_len / 3 + num_predict + 256;
+    needed
+        .div_ceil(1024)
+        .saturating_mul(1024)
+        .clamp(2048, 32_768)
 }
 
 impl Summarizer for OllamaSummarizer {
@@ -383,11 +570,17 @@ impl Summarizer for OllamaSummarizer {
         // recognize as thinking — and on every model when the user
         // hasn't opted into thinking mode (default).
         let suppress_think = is_thinking_model(model);
+        let num_predict = ollama_num_predict(req.max_tokens);
+        let num_ctx = ollama_num_ctx(req.prompt.len(), num_predict);
         let mut body = serde_json::json!({
             "model": model,
             "prompt": req.prompt,
             "stream": false,
-            "options": { "num_predict": req.max_tokens },
+            // A prompt that does not fit must be an error, not a silent
+            // cut. Servers that do not know these two fields ignore them.
+            "truncate": false,
+            "shift": false,
+            "options": { "num_predict": num_predict, "num_ctx": num_ctx },
         });
         if suppress_think {
             body["think"] = serde_json::Value::Bool(false);
@@ -403,6 +596,46 @@ impl Summarizer for OllamaSummarizer {
                     self.host
                 )
             })?;
+        // A cut-off answer is not a summary: stored as one, it would replace
+        // the memories it only half covers. Same rule as the API providers:
+        // only an answer the server says is finished counts. `done_reason`
+        // is recent; without it, an answer that used up `num_predict` is
+        // taken as cut.
+        let reason = resp.done_reason.as_deref().map(str::to_ascii_lowercase);
+        let used_the_cap = resp.eval_count.is_some_and(|n| n as usize >= num_predict);
+        let finished = resp.done == Some(true)
+            && match reason.as_deref() {
+                Some("stop") => true,
+                Some(_) => false,
+                None => !used_the_cap,
+            };
+        if !finished {
+            bail!(
+                "ollama stopped before finishing (model={model}, done={}, done_reason={}), \
+                 so the incomplete answer was discarded — the output cap sent as \
+                 num_predict was {num_predict} (4x `max_tokens`, minimum 2048): raise \
+                 `max_tokens` in the summarizer config, or pick a model that answers in \
+                 fewer tokens",
+                resp.done.map_or("missing".to_string(), |d| d.to_string()),
+                resp.done_reason
+                    .as_deref()
+                    .filter(|r| r.len() <= 40 && r.bytes().all(|b| b.is_ascii_graphic()))
+                    .unwrap_or("missing"),
+            );
+        }
+        // The window was full: part of the prompt did not get in (the model
+        // has a smaller context than was asked for, or the text is denser
+        // than estimated). The answer is about an input that was cut.
+        let evaluated = resp.prompt_eval_count.unwrap_or(0) + resp.eval_count.unwrap_or(0);
+        if resp.prompt_eval_count.is_some() && evaluated as usize >= num_ctx {
+            bail!(
+                "ollama filled its context window (model={model}, num_ctx={num_ctx}, {} \
+                 prompt tokens evaluated), so part of the input was not read and the answer \
+                 was discarded — use a model with a larger context window, or reduce the \
+                 input (a smaller `--limit` for extract-pending)",
+                resp.prompt_eval_count.unwrap_or(0),
+            );
+        }
         let trimmed = trim_response(resp.response);
         if trimmed.is_empty() {
             // The caller already prints "provider returned empty
@@ -467,7 +700,26 @@ fn trim_response(s: String) -> String {
 /// input. The model must not ask for more context, refuse to consolidate
 /// abstract content, or output any preamble — short technical entries like
 /// "Decision A" or "fact one" are legitimate inputs to merge as-is.
+/// How many characters of memories one consolidation prompt takes. A caller
+/// that selects what goes into a pass counts each memory as its length + 3
+/// (bullet and newline), exactly as [`build_consolidate_prompt_counted`]
+/// does.
+pub const CONSOLIDATE_INPUT_CAP: usize = 20_000;
+
+#[cfg(test)]
 pub fn build_consolidate_prompt(topic: &str, summaries: &[&str], max_tokens: usize) -> String {
+    build_consolidate_prompt_counted(topic, summaries, max_tokens).0
+}
+
+/// [`build_consolidate_prompt`], plus how many of `summaries` — always a
+/// prefix — made it into the prompt before the size cap. The caller must
+/// treat the rest as not summarized: only the entries counted here may be
+/// replaced by the provider's answer.
+pub fn build_consolidate_prompt_counted(
+    topic: &str,
+    summaries: &[&str],
+    max_tokens: usize,
+) -> (String, usize) {
     let mut p = String::new();
     p.push_str("Task: merge the memory entries below into one consolidated summary. ");
     p.push_str("The listed entries are the ENTIRE input — do not ask for more, do not ");
@@ -503,9 +755,10 @@ pub fn build_consolidate_prompt(topic: &str, summaries: &[&str], max_tokens: usi
     //    content) — pushed verbatim, one could forge a new "- " bullet or
     //    break out of the listing structure the model is told to treat as
     //    literal data. Flatten them, same fix as `recall_context`.
-    const AGGREGATE_INPUT_CHAR_CAP: usize = 20_000;
+    const AGGREGATE_INPUT_CHAR_CAP: usize = CONSOLIDATE_INPUT_CAP;
     let mut input_len = 0usize;
     let mut truncated = false;
+    let mut included = 0usize;
     for s in summaries {
         let flattened = s.replace(['\n', '\r'], " ");
         let line_len = 2 + flattened.len() + 1; // "- " + text + '\n'
@@ -517,13 +770,14 @@ pub fn build_consolidate_prompt(topic: &str, summaries: &[&str], max_tokens: usi
         p.push_str(&flattened);
         p.push('\n');
         input_len += line_len;
+        included += 1;
     }
     if truncated {
         p.push_str("- (additional entries omitted — input truncated at ~20000 chars)\n");
     }
 
     p.push_str("\nConsolidated output (plain text, no preamble):\n");
-    p
+    (p, included)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -534,6 +788,15 @@ pub fn build_consolidate_prompt(topic: &str, summaries: &[&str], max_tokens: usi
 mod tests {
     use super::*;
 
+    /// The detection tests below rewrite the same process-wide environment
+    /// variables; without this they race each other under the parallel test
+    /// runner (one sets `ICM_INVOKER` while another expects it unset).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn parse_provider_kinds() {
         assert_eq!(ProviderKind::parse("auto").unwrap(), ProviderKind::Auto);
@@ -542,6 +805,302 @@ mod tests {
         assert_eq!(ProviderKind::parse("none").unwrap(), ProviderKind::None);
         assert_eq!(ProviderKind::parse("off").unwrap(), ProviderKind::None);
         assert!(ProviderKind::parse("bogus").is_err());
+    }
+
+    /// The API-key names must not change what the pre-existing names mean:
+    /// `claude` / `codex` / `gemini` stay the CLIs.
+    #[test]
+    fn parse_keeps_cli_names_and_adds_api_key_names() {
+        for (name, kind) in [
+            ("claude", ProviderKind::Claude),
+            ("codex", ProviderKind::Codex),
+            ("gemini", ProviderKind::Gemini),
+            ("anthropic", ProviderKind::Anthropic),
+            ("anthropic-api", ProviderKind::Anthropic),
+            ("OpenAI", ProviderKind::OpenAi),
+            ("openai-compatible", ProviderKind::OpenAi),
+            ("google", ProviderKind::Google),
+            ("gemini-api", ProviderKind::Google),
+        ] {
+            assert_eq!(ProviderKind::parse(name).unwrap(), kind, "{name}");
+        }
+        for kind in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Gemini,
+        ] {
+            assert!(!kind.is_api_key());
+            assert!(kind.cli_binary().is_some());
+        }
+        for kind in [
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi,
+            ProviderKind::Google,
+        ] {
+            assert!(kind.is_api_key());
+            assert!(kind.cli_binary().is_none(), "{kind:?} needs no binary");
+            // Round-trips through its canonical name.
+            assert_eq!(ProviderKind::parse(kind.as_str()).unwrap(), kind);
+        }
+        let err = ProviderKind::parse("bogus").unwrap_err().to_string();
+        assert!(err.contains("anthropic") && err.contains("openai") && err.contains("google"));
+    }
+
+    /// `auto` must never spend someone's API credit by surprise: with every
+    /// conventional key variable set, and even with `ICM_INVOKER` or the
+    /// fallback naming an API-key provider, detection stays on a CLI.
+    #[test]
+    fn detect_never_picks_an_api_key_provider() {
+        let _env = env_lock();
+        let hints = [
+            "ICM_INVOKER",
+            "CLAUDECODE",
+            "CLAUDE_CLI",
+            "CODEX_HOME",
+            "CODEX_CLI",
+            "GEMINI_CLI",
+            "GOOGLE_CLOUD_PROJECT",
+            "OLLAMA_HOST",
+        ];
+        let keys = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ];
+        let snapshot: Vec<_> = hints.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in hints {
+            std::env::remove_var(k);
+        }
+        // Only presence matters here. A key variable the host already
+        // exports is left alone — never read, never overwritten — and only
+        // the ones this test had to add are removed afterwards.
+        let added: Vec<&str> = keys
+            .into_iter()
+            .filter(|k| std::env::var_os(k).is_none())
+            .collect();
+        for k in &added {
+            std::env::set_var(k, "placeholder-not-a-real-key");
+        }
+
+        let mut results = vec![
+            detect_provider(ProviderKind::Auto),
+            detect_provider(ProviderKind::Claude),
+            detect_provider(ProviderKind::Anthropic),
+        ];
+        for invoker in ["anthropic", "openai", "google", "gemini-api"] {
+            std::env::set_var("ICM_INVOKER", invoker);
+            results.push(detect_provider(ProviderKind::Auto));
+        }
+
+        // Restore env before asserting so failures don't poison later tests.
+        for (k, v) in snapshot {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        for k in added {
+            std::env::remove_var(k);
+        }
+
+        for got in results {
+            assert!(!got.is_api_key(), "auto resolved to {got:?}");
+            assert_eq!(got, ProviderKind::Claude);
+        }
+    }
+
+    fn openrouter_options() -> ApiOptions {
+        ApiOptions {
+            api_key_env: "OPENROUTER_API_KEY".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            workspace_id: String::new(),
+        }
+    }
+
+    /// A flag naming another provider must not inherit the key variable,
+    /// endpoint or model written for the configured one: that is how one
+    /// vendor's key ends up at another vendor.
+    #[test]
+    fn resolve_drops_config_options_when_the_flag_names_another_provider() {
+        let r = resolve(
+            "openai",
+            "mistralai/mistral-small",
+            openrouter_options(),
+            Some("anthropic"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.kind, ProviderKind::Anthropic);
+        assert_eq!(r.api.api_key_env, "", "falls back to ANTHROPIC_API_KEY");
+        assert_eq!(r.api.base_url, "", "falls back to api.anthropic.com");
+        assert_eq!(r.model, None, "falls back to the provider's default model");
+        let note = r.note.expect("dropping settings is said out loud");
+        assert!(note.contains("api_key_env, base_url, model"), "{note}");
+        assert!(
+            note.contains("'openai'") && note.contains("'anthropic'"),
+            "{note}"
+        );
+
+        // The symmetric case from the review: an Anthropic key variable must
+        // not be read for OpenAI.
+        let anthropic = ApiOptions {
+            api_key_env: "WORK_ANTHROPIC_KEY".into(),
+            workspace_id: "wrkspc_01".into(),
+            ..ApiOptions::default()
+        };
+        let r = resolve("anthropic", "", anthropic, Some("openai"), None).unwrap();
+        assert_eq!(r.kind, ProviderKind::OpenAi);
+        assert_eq!(r.api.api_key_env, "");
+        assert_eq!(r.api.workspace_id, "");
+
+        // Same rule for a CLI provider's model (a claude model is not a
+        // codex model), and nothing to announce when nothing was set.
+        let r = resolve(
+            "claude",
+            "claude-haiku-4-5",
+            ApiOptions::default(),
+            Some("codex"),
+            None,
+        )
+        .unwrap();
+        assert_eq!((r.kind, r.model.as_deref()), (ProviderKind::Codex, None));
+        let r = resolve("none", "", ApiOptions::default(), Some("ollama"), None).unwrap();
+        assert!(r.note.is_none());
+    }
+
+    /// A config that names no provider wrote its `model` for whichever one
+    /// a flag picks: `model = "qwen3:8b"` + `--summarizer-provider ollama`
+    /// is how Ollama has always been used, and what `icm health` suggests.
+    #[test]
+    fn resolve_keeps_the_model_of_a_config_that_names_no_provider() {
+        let _env = env_lock();
+        for cfg_provider in ["none", "auto"] {
+            let r = resolve(
+                cfg_provider,
+                "qwen3:8b",
+                ApiOptions::default(),
+                Some("ollama"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(r.kind, ProviderKind::Ollama, "{cfg_provider}");
+            assert_eq!(r.model.as_deref(), Some("qwen3:8b"), "{cfg_provider}");
+            assert!(r.note.is_none(), "{cfg_provider}: {:?}", r.note);
+        }
+        // Still only the model: endpoint and key variable never travel.
+        let r = resolve("none", "m", openrouter_options(), Some("openai"), None).unwrap();
+        assert_eq!(r.model.as_deref(), Some("m"));
+        assert_eq!(
+            (r.api.api_key_env.as_str(), r.api.base_url.as_str()),
+            ("", "")
+        );
+        assert!(r.note.is_some_and(|n| n.contains("api_key_env, base_url")));
+
+        // `auto` on the flag side that lands on the configured provider is
+        // the configured provider.
+        let prior = std::env::var("ICM_INVOKER").ok();
+        std::env::set_var("ICM_INVOKER", "ollama");
+        let r = resolve(
+            "ollama",
+            "qwen3:8b",
+            ApiOptions::default(),
+            Some("auto"),
+            None,
+        );
+        match prior {
+            Some(v) => std::env::set_var("ICM_INVOKER", v),
+            None => std::env::remove_var("ICM_INVOKER"),
+        }
+        let r = r.unwrap();
+        assert_eq!(
+            (r.kind, r.model.as_deref()),
+            (ProviderKind::Ollama, Some("qwen3:8b"))
+        );
+    }
+
+    #[test]
+    fn resolve_keeps_config_options_for_the_configured_provider_and_its_aliases() {
+        for flag in [
+            None,
+            Some("openai"),
+            Some("openai-compatible"),
+            Some("OpenAI-API"),
+        ] {
+            let r = resolve(
+                "openai",
+                "mistralai/mistral-small",
+                openrouter_options(),
+                flag,
+                None,
+            )
+            .unwrap();
+            assert_eq!(r.kind, ProviderKind::OpenAi, "{flag:?}");
+            assert_eq!(r.api.api_key_env, "OPENROUTER_API_KEY", "{flag:?}");
+            assert_eq!(r.api.base_url, "https://openrouter.ai/api/v1", "{flag:?}");
+            assert_eq!(r.model.as_deref(), Some("mistralai/mistral-small"));
+            assert!(r.note.is_none());
+        }
+        // The model flag always wins, with or without a provider flag.
+        let r = resolve(
+            "openai",
+            "from-config",
+            openrouter_options(),
+            None,
+            Some("from-flag"),
+        )
+        .unwrap();
+        assert_eq!(r.model.as_deref(), Some("from-flag"));
+        let r = resolve(
+            "openai",
+            "from-config",
+            openrouter_options(),
+            Some("google"),
+            Some("g"),
+        )
+        .unwrap();
+        assert_eq!(
+            (r.kind, r.model.as_deref()),
+            (ProviderKind::Google, Some("g"))
+        );
+
+        // A bad name is an error wherever it comes from, except a bad config
+        // name that a valid flag overrides.
+        assert!(resolve("bogus", "", ApiOptions::default(), None, None).is_err());
+        assert!(resolve("none", "", ApiOptions::default(), Some("bogus"), None).is_err());
+        let r = resolve("bogus", "m", ApiOptions::default(), Some("none"), None).unwrap();
+        assert_eq!((r.kind, r.model), (ProviderKind::None, None));
+        assert!(r.note.is_some_and(|n| n.contains("model")));
+    }
+
+    #[test]
+    fn make_summarizer_builds_api_key_providers_and_defers_config_errors_to_the_call() {
+        let opts = ApiOptions::default();
+        for kind in [
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi,
+            ProviderKind::Google,
+        ] {
+            let s = make_summarizer(kind, &opts).unwrap();
+            assert_eq!(s.name(), kind.as_str());
+        }
+        // A broken config still yields a summarizer; it fails when called.
+        let broken = ApiOptions {
+            api_key_env: "not a variable name".into(),
+            ..ApiOptions::default()
+        };
+        let s = make_summarizer(ProviderKind::OpenAi, &broken).unwrap();
+        assert_eq!(s.name(), "openai");
+        let req = SummarizeRequest {
+            prompt: "p",
+            model: None,
+            max_tokens: 10,
+            timeout: Duration::from_secs(1),
+        };
+        let err = s.summarize(&req).unwrap_err().to_string();
+        assert!(err.contains("NAME of an environment variable"), "{err}");
+        assert!(make_summarizer(ProviderKind::Auto, &opts).is_err());
+        assert!(make_summarizer(ProviderKind::None, &opts).is_err());
     }
 
     #[test]
@@ -618,8 +1177,39 @@ mod tests {
         );
     }
 
+    /// The count is what the caller is allowed to delete: it must be exactly
+    /// the entries that are in the prompt.
+    #[test]
+    fn build_prompt_reports_how_many_entries_it_included() {
+        let (p, n) = build_consolidate_prompt_counted("t", &["A", "B", "C"], 200);
+        assert_eq!(n, 3);
+        assert!(!p.contains("truncated"));
+
+        let entries: Vec<String> = (0..70)
+            .map(|i| format!("FACT{i:03} {}", "x".repeat(320)))
+            .collect();
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let (p, n) = build_consolidate_prompt_counted("t", &refs, 200);
+        assert!(n > 0 && n < 70, "{n} of 70 must fit under the cap");
+        for (i, _) in entries.iter().enumerate() {
+            assert_eq!(
+                p.contains(&format!("FACT{i:03} ")),
+                i < n,
+                "entry {i}, n = {n}"
+            );
+        }
+
+        // An entry too large for the cap on its own: nothing is included.
+        let huge = "y".repeat(30_000);
+        assert_eq!(
+            build_consolidate_prompt_counted("t", &[huge.as_str(), "small"], 200).1,
+            0
+        );
+    }
+
     #[test]
     fn detect_falls_back_to_claude_when_nothing_set() {
+        let _env = env_lock();
         // Save and clear any env that might leak from the host.
         let snapshot: Vec<_> = [
             "ICM_INVOKER",
@@ -704,6 +1294,7 @@ mod tests {
 
     #[test]
     fn detect_honors_explicit_invoker_env() {
+        let _env = env_lock();
         // Save then override.
         let prior = std::env::var("ICM_INVOKER").ok();
         std::env::set_var("ICM_INVOKER", "ollama");

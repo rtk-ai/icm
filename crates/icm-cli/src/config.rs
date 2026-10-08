@@ -13,6 +13,34 @@
 
 use std::path::PathBuf;
 
+/// Write `content` to `path` with owner-only (0600) permissions from creation,
+/// not as a follow-up `set_permissions` call — that ordering would leave a
+/// window (created with the process umask, often world-readable) where a
+/// crash between the two calls leaves the file durably readable by other
+/// local users.
+///
+/// Only used by the `web` feature's dashboard password file, which is off
+/// by default — hence the cfg gate (a default build has no caller).
+#[cfg(feature = "web")]
+pub(crate) fn write_secret_file(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, content)?;
+
+    Ok(())
+}
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -80,6 +108,12 @@ pub struct MemoryConfig {
     pub decay_rate: f32,
     pub prune_threshold: f32,
     /// Enable automatic consolidation when a topic exceeds the threshold.
+    ///
+    /// Off by default, and lossy by design when no LLM summarizer is
+    /// configured: the rollup keeps the summaries of the 3 heaviest
+    /// memories and replaces every non-`critical` memory it read with it —
+    /// the content of the others is gone. With `[consolidate.summarizer]`
+    /// set to a provider, the topic is queued for an LLM summary instead.
     pub auto_consolidate_enabled: bool,
     /// Number of entries in a topic before auto-consolidation triggers.
     pub auto_consolidate_threshold: usize,
@@ -216,7 +250,11 @@ impl ArchiveConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct SummarizerConfig {
-    /// auto | claude | codex | gemini | ollama | none
+    /// auto | claude | codex | gemini | ollama | anthropic | openai | google | none
+    ///
+    /// `claude` / `codex` / `gemini` shell out to the CLI you are already
+    /// logged into. `anthropic` / `openai` / `google` call the vendor's API
+    /// with a key from the environment, and are never picked by `auto`.
     pub provider: String,
     /// Empty = provider's cheap default (haiku, gemini-flash, etc.)
     pub model: String,
@@ -224,6 +262,20 @@ pub struct SummarizerConfig {
     pub max_tokens: usize,
     /// Per-call timeout in seconds. CLI shellouts can be slow on first run.
     pub timeout_secs: u64,
+    /// API-key providers only: NAME of the environment variable holding the
+    /// key. Empty = the provider's conventional one (`ANTHROPIC_API_KEY`,
+    /// `OPENAI_API_KEY`, `GEMINI_API_KEY`) when talking to the vendor's own
+    /// host, and no key at all for any other `base_url`. There is
+    /// deliberately no field for the key itself — it never belongs in this
+    /// file.
+    pub api_key_env: String,
+    /// API-key providers only: endpoint override. Empty = the vendor's own.
+    /// With `provider = "openai"` this reaches any OpenAI-compatible server
+    /// (OpenRouter, Mistral, Groq, vLLM, LM Studio, …).
+    pub base_url: String,
+    /// `anthropic` only: workspace id sent as `anthropic-workspace-id`,
+    /// required by API keys that are not scoped to a single workspace.
+    pub workspace_id: String,
 }
 
 impl Default for SummarizerConfig {
@@ -233,6 +285,20 @@ impl Default for SummarizerConfig {
             model: String::new(),
             max_tokens: 400,
             timeout_secs: 60,
+            api_key_env: String::new(),
+            base_url: String::new(),
+            workspace_id: String::new(),
+        }
+    }
+}
+
+impl SummarizerConfig {
+    /// The subset of this section the API-key providers read.
+    pub fn api_options(&self) -> crate::summarizer::ApiOptions {
+        crate::summarizer::ApiOptions {
+            api_key_env: self.api_key_env.clone(),
+            base_url: self.base_url.clone(),
+            workspace_id: self.workspace_id.clone(),
         }
     }
 }
@@ -520,6 +586,82 @@ instructions = "Custom instructions here"
         let (config, warning) = load_config_from(Some((path, true))).unwrap();
         assert_eq!(config.recall.limit, 42);
         assert!(warning.is_none());
+    }
+
+    /// A config written before the API-key providers existed must load
+    /// exactly as it did: same values, and the new fields at their inert
+    /// defaults (no key variable override, no endpoint override).
+    #[test]
+    fn summarizer_config_without_new_fields_reads_as_before() {
+        let legacy = r#"
+[consolidate.summarizer]
+provider = "claude"
+model = "claude-haiku-4-5"
+max_tokens = 300
+timeout_secs = 90
+
+[extraction.summarizer]
+provider = "ollama"
+model = "qwen3:8b"
+"#;
+        let config: Config = toml::from_str(legacy).unwrap();
+        let c = &config.consolidate.summarizer;
+        assert_eq!(c.provider, "claude");
+        assert_eq!(c.model, "claude-haiku-4-5");
+        assert_eq!(c.max_tokens, 300);
+        assert_eq!(c.timeout_secs, 90);
+        assert_eq!(c.api_key_env, "");
+        assert_eq!(c.base_url, "");
+        assert_eq!(c.workspace_id, "");
+        let e = &config.extraction.summarizer;
+        assert_eq!(e.provider, "ollama");
+        assert_eq!(e.model, "qwen3:8b");
+        assert_eq!(e.max_tokens, 400);
+        assert_eq!(e.timeout_secs, 60);
+        assert_eq!(e.api_key_env, "");
+        assert_eq!(e.base_url, "");
+
+        // No file at all: the shipped defaults are unchanged too — nothing
+        // defaults to a provider that spends an API key.
+        let defaults = Config::default();
+        assert_eq!(defaults.consolidate.summarizer.provider, "none");
+        assert_eq!(defaults.extraction.summarizer.provider, "auto");
+        for s in [
+            &defaults.consolidate.summarizer,
+            &defaults.extraction.summarizer,
+        ] {
+            assert_eq!(s.model, "");
+            assert_eq!(s.max_tokens, 400);
+            assert_eq!(s.timeout_secs, 60);
+            assert_eq!(s.api_key_env, "");
+            assert_eq!(s.base_url, "");
+        }
+    }
+
+    #[test]
+    fn summarizer_config_reads_api_key_provider_fields() {
+        let toml_str = r#"
+[consolidate.summarizer]
+provider = "openai"
+model = "mistral-small-latest"
+api_key_env = "MISTRAL_API_KEY"
+base_url = "https://api.mistral.ai/v1"
+
+[extraction.summarizer]
+provider = "anthropic"
+workspace_id = "wrkspc_01AbCdEf"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let c = &config.consolidate.summarizer;
+        assert_eq!(c.provider, "openai");
+        let opts = c.api_options();
+        assert_eq!(opts.api_key_env, "MISTRAL_API_KEY");
+        assert_eq!(opts.base_url, "https://api.mistral.ai/v1");
+        assert_eq!(opts.workspace_id, "");
+        // Each section carries its own options.
+        let e = config.extraction.summarizer.api_options();
+        assert_eq!(e.api_key_env, "");
+        assert_eq!(e.workspace_id, "wrkspc_01AbCdEf");
     }
 
     #[test]

@@ -84,10 +84,13 @@ detect_arch() {
 }
 
 # Choose the Linux libc flavor (issue #330). The default `unknown-linux-gnu`
-# binaries are built on glibc 2.35 and carry embeddings; systems older than
+# binaries are built on glibc 2.35 (the release build fails if they ever need
+# more: scripts/release-check.sh) and carry the embedding code; ONNX Runtime
+# itself is fetched once with `icm embeddings download`. Systems older than
 # that — or musl distros like Alpine — can't run them, so fall back to the
 # fully-static `unknown-linux-musl` build (keyword search only, no embeddings).
-# musl artifacts are published for x86_64 only.
+# musl artifacts are published for x86_64 only; on other architectures the
+# gnu build is tried and install_binary refuses it if it does not start.
 select_linux_libc() {
     if [ "$ARCH" != "x86_64" ]; then
         TARGET_SUFFIX="unknown-linux-gnu"
@@ -166,6 +169,8 @@ install_binary() {
     TARGET="${ARCH}-${TARGET_SUFFIX}"
 
     if [ "$OS" = "windows" ]; then
+        # Only x86_64 is published for Windows (same rule as install.ps1).
+        [ "$ARCH" = "x86_64" ] || error "No prebuilt icm for ${ARCH} Windows. Build from source: cargo install --git https://github.com/${REPO} icm-cli"
         EXT="zip"
         : "${INSTALL_DIR:=${LOCALAPPDATA:-$HOME}/icm/bin}"
     else
@@ -177,7 +182,11 @@ install_binary() {
     ARCHIVE_NAME="${BINARY_NAME}-${TARGET}.${EXT}"
     BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
     TEMP_DIR=$(mktemp -d)
-    trap 'rm -rf "$TEMP_DIR"' EXIT
+    # Staged next to the destination so the final move is a rename on the
+    # same filesystem, and so the test run below works even when the temp
+    # directory is mounted noexec.
+    STAGED="${INSTALL_DIR}/.${BINARY_NAME}.install.$$"
+    trap 'rm -rf "$TEMP_DIR" "$STAGED"' EXIT
 
     ARCHIVE="${TEMP_DIR}/${ARCHIVE_NAME}"
     info "Downloading ${ARCHIVE_NAME}"
@@ -200,15 +209,65 @@ install_binary() {
         require unzip
         unzip -oq "$ARCHIVE" -d "$TEMP_DIR"
         DEST="${INSTALL_DIR}/${BINARY_NAME}.exe"
-        mv -f "${TEMP_DIR}/${BINARY_NAME}.exe" "$DEST"
+        STAGED="${STAGED}.exe"
+        EXTRACTED="${TEMP_DIR}/${BINARY_NAME}.exe"
     else
         tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
         DEST="${INSTALL_DIR}/${BINARY_NAME}"
-        mv -f "${TEMP_DIR}/${BINARY_NAME}" "$DEST"
-        chmod +x "$DEST"
+        EXTRACTED="${TEMP_DIR}/${BINARY_NAME}"
     fi
+    [ -f "$EXTRACTED" ] || error "${ARCHIVE_NAME} does not contain ${BINARY_NAME}"
+
+    # Start the new binary before it replaces anything: a build that cannot
+    # run here (libc too old, wrong architecture) must not take the place of
+    # a working install.
+    cp "$EXTRACTED" "$STAGED"
+    chmod +x "$STAGED"
+    if ! "$STAGED" --version >/dev/null 2>&1; then
+        rm -f "$STAGED"
+        error "The downloaded binary (${TARGET}) does not start on this system — nothing was installed or replaced.
+On Linux the prebuilt binaries need glibc >= 2.35, or x86_64 for the static musl build.
+Build from source instead: cargo install --git https://github.com/${REPO} icm-cli"
+    fi
+    mv -f "$STAGED" "$DEST"
 
     info "Installed to ${DEST}"
+}
+
+# Say what this build can do for semantic search, in the binary's own words:
+# some builds link ONNX Runtime, others fetch it on demand, the static musl
+# build is keyword-only. Silent on releases that predate the subcommand.
+#
+# A build that leaves semantic search off until the user acts gets a warning
+# on top: icm itself only offers the download in a terminal, and says nothing
+# as an MCP server or from hooks. On an upgrade the warning matters most:
+# releases up to 0.10.63 carried the runtime on Linux and on Intel Macs, so
+# the upgrade is what turns semantic search off.
+# The patterns below are the wording of `icm embeddings status`; the release
+# build fails if that wording changes (scripts/release-check.sh, smoke).
+print_embeddings_status() {
+    status=$("$DEST" embeddings status 2>/dev/null) || return 0
+    [ -n "$status" ] || return 0
+    echo "  Semantic search:"
+    printf '%s\n' "$status" | sed 's/^/    /'
+    echo ""
+    case "$status" in
+        *"not installed"*"icm embeddings download"*)
+            warn "Semantic search is OFF until you run: ${BINARY_NAME} embeddings download"
+            ;;
+        *"no prebuilt runtime"*)
+            warn "Semantic search is OFF: no ONNX Runtime can be downloaded for this platform."
+            warn "To enable it, set ORT_DYLIB_PATH to your own ONNX Runtime library (see above)."
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+    warn "Until then icm uses keyword search only. As an MCP server and from hooks it does not ask."
+    if [ -n "$PREVIOUS_VERSION" ]; then
+        warn "If semantic search worked before this upgrade, it does not any more."
+    fi
+    echo ""
 }
 
 print_path_warning() {
@@ -250,10 +309,11 @@ main() {
     fi
     echo ""
     echo "  Next steps:"
-    echo "    1. icm init              # configure your AI tools (MCP)"
-    echo "    2. icm init --mode hook  # install Claude Code hooks"
+    echo "    1. icm init              # instructions, skills and hooks for the AI tools it detects"
+    echo "    2. icm init --mode all   # optional: also register the MCP server"
     echo "    3. Restart your AI tool to activate"
     echo ""
+    print_embeddings_status
     print_path_warning
 }
 

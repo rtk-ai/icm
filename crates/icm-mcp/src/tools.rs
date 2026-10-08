@@ -8,7 +8,7 @@ use icm_core::{
     MemoryStore, Relation, WakeUpFormat, WakeUpOptions, DEDUP_SIMILARITY_THRESHOLD,
     MSG_NO_MEMORIES,
 };
-use icm_store::Store;
+use icm_store::{RecallEngine, RecallRequest, Store};
 
 use crate::protocol::ToolResult;
 
@@ -29,6 +29,13 @@ const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
 pub struct AutoConsolidate {
     pub enabled: bool,
     pub threshold: usize,
+    /// An LLM summarizer is configured (`[consolidate.summarizer]` provider
+    /// other than `none`): a topic past the threshold is queued for
+    /// `icm consolidate-pending` instead of being rolled up on the spot.
+    /// The rollup keeps the 3 heaviest memories and deletes the rest; with
+    /// a summarizer configured the user asked for a real summary, and the
+    /// CLI store path already queues.
+    pub queue: bool,
 }
 
 impl Default for AutoConsolidate {
@@ -40,6 +47,7 @@ impl Default for AutoConsolidate {
         Self {
             enabled: true,
             threshold: AUTO_CONSOLIDATE_THRESHOLD,
+            queue: false,
         }
     }
 }
@@ -88,6 +96,26 @@ fn try_auto_consolidate(
 ) -> String {
     if !auto.enabled {
         return String::new();
+    }
+    if auto.queue {
+        // Same decision as `maybe_auto_consolidate` on the CLI store path.
+        return match store.count_by_topic(topic) {
+            Ok(n) if n > auto.threshold => match store.enqueue_pending_consolidation(topic, "") {
+                Ok(_) => format!(
+                    "Topic '{topic}' queued for consolidation (exceeded {} entries).",
+                    auto.threshold
+                ),
+                Err(e) => {
+                    tracing::warn!("enqueue consolidation failed for topic '{topic}': {e}");
+                    String::new()
+                }
+            },
+            Ok(_) => String::new(),
+            Err(e) => {
+                tracing::warn!("count_by_topic failed for '{topic}': {e}");
+                String::new()
+            }
+        };
     }
     match store.auto_consolidate_with_embedder(topic, auto.threshold, embedder) {
         Ok(true) => format!(
@@ -163,6 +191,12 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                         "maximum": 20,
                         "description": "Max number of results"
                     },
+                    "max_tokens": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 32000,
+                        "description": "Token budget (~4 chars/token): return as many of the best matches as fit, instead of `limit` results"
+                    },
                     "keyword": {
                         "type": "string",
                         "description": "Filter results by keyword (exact match on memory keywords)"
@@ -222,7 +256,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
         }),
         json!({
             "name": "icm_memory_consolidate",
-            "description": "Consolidate all memories of a topic into a single summary. Useful when a topic accumulates too many entries.",
+            "description": "Replace memories of a topic with one summary you wrote from them. Two steps: call with only `topic` to list the memories and their ids, then call with `summary` and the `ids` it covers. Only the listed memories are replaced; critical ones never are.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -232,10 +266,15 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     },
                     "summary": {
                         "type": "string",
-                        "description": "Consolidated summary to replace all memories in the topic"
+                        "description": "Your summary of the memories listed in `ids`"
+                    },
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ids of the memories the summary covers: only these are replaced. Call once WITHOUT ids (and without summary) to get the topic's memories with their ids; nothing is replaced by that call."
                     }
                 },
-                "required": ["topic", "summary"]
+                "required": ["topic"]
             }
         }),
         json!({
@@ -1181,6 +1220,16 @@ fn tool_store(
 }
 
 fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
+    let mut output = String::new();
+    for (mem, score) in memories {
+        push_memory_output(&mut output, mem, *score, compact);
+    }
+    output
+}
+
+/// Append one recalled memory to `output`. Kept separate from the loop so
+/// the v2 token budget can charge a hit exactly what is printed for it.
+fn push_memory_output(output: &mut String, mem: &Memory, score: f32, compact: bool) {
     // Audit finding: `summary` has no newline/CR validation at the store
     // layer (only `topic` is checked — see `validate_fields`), and it can
     // be LLM/tool-extracted from untrusted content. Written verbatim, a
@@ -1189,54 +1238,76 @@ fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
     // fake `[topic] ...` line. `keywords` has no validation at all. Flatten
     // both, same fix already applied to recall_context/render_detail.
     let flatten = |s: &str| s.replace(['\n', '\r'], " ");
-    let mut output = String::new();
     if compact {
-        for (mem, _) in memories {
-            output.push_str(&format!("[{}] {}\n", mem.topic, flatten(&mem.summary)));
-        }
+        output.push_str(&format!("[{}] {}\n", mem.topic, flatten(&mem.summary)));
+        return;
+    }
+    let summary = flatten(&mem.summary);
+    if score >= 0.0 {
+        output.push_str(&format!(
+            "--- {} [score: {:.3}] ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
+            mem.id, score, mem.topic, mem.importance, mem.weight, summary
+        ));
     } else {
-        for (mem, score) in memories {
-            let summary = flatten(&mem.summary);
-            if *score >= 0.0 {
-                output.push_str(&format!(
-                    "--- {} [score: {:.3}] ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
-                    mem.id, score, mem.topic, mem.importance, mem.weight, summary
-                ));
-            } else {
-                output.push_str(&format!(
-                    "--- {} ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
-                    mem.id, mem.topic, mem.importance, mem.weight, summary
-                ));
+        output.push_str(&format!(
+            "--- {} ---\n  topic: {}\n  importance: {}\n  weight: {:.3}\n  summary: {}\n",
+            mem.id, mem.topic, mem.importance, mem.weight, summary
+        ));
+    }
+    if !mem.keywords.is_empty() {
+        let flattened_keywords: Vec<String> = mem.keywords.iter().map(|k| flatten(k)).collect();
+        output.push_str(&format!("  keywords: {}\n", flattened_keywords.join(", ")));
+    }
+    if let Some(ref raw) = mem.raw_excerpt {
+        // raw_excerpt can hold up to 64 KB per memory; dumping it in
+        // full for every hit floods the client LLM's context (audit
+        // finding). Cap the recall view — the full excerpt stays in
+        // the store.
+        const MAX_RAW_IN_RECALL: usize = 2048;
+        if raw.len() > MAX_RAW_IN_RECALL {
+            let mut cut = MAX_RAW_IN_RECALL;
+            while !raw.is_char_boundary(cut) {
+                cut -= 1;
             }
-            if !mem.keywords.is_empty() {
-                let flattened_keywords: Vec<String> =
-                    mem.keywords.iter().map(|k| flatten(k)).collect();
-                output.push_str(&format!("  keywords: {}\n", flattened_keywords.join(", ")));
-            }
-            if let Some(ref raw) = mem.raw_excerpt {
-                // raw_excerpt can hold up to 64 KB per memory; dumping it in
-                // full for every hit floods the client LLM's context (audit
-                // finding). Cap the recall view — the full excerpt stays in
-                // the store.
-                const MAX_RAW_IN_RECALL: usize = 2048;
-                if raw.len() > MAX_RAW_IN_RECALL {
-                    let mut cut = MAX_RAW_IN_RECALL;
-                    while !raw.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    output.push_str(&format!(
-                        "  raw: {}… [truncated, {} bytes total]\n",
-                        &raw[..cut],
-                        raw.len()
-                    ));
-                } else {
-                    output.push_str(&format!("  raw: {raw}\n"));
-                }
-            }
-            output.push('\n');
+            output.push_str(&format!(
+                "  raw: {}… [truncated, {} bytes total]\n",
+                &raw[..cut],
+                raw.len()
+            ));
+        } else {
+            output.push_str(&format!("  raw: {raw}\n"));
         }
     }
-    output
+    output.push('\n');
+}
+
+/// The `max_tokens` argument of `icm_memory_recall`, clamped to the
+/// schema's 100..=32000. Clients do not all send a JSON integer: a whole
+/// float (`2000.0`) or a numeric string (`"2000"`) means the same thing
+/// and is accepted. Anything else is refused rather than ignored, which
+/// would silently fall back to a count-based recall.
+fn recall_max_tokens(args: &Value) -> Result<Option<usize>, String> {
+    let whole = |f: f64| (f.is_finite() && f.fract() == 0.0).then_some(f as i64);
+    let value = match args.get("max_tokens") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let tokens = match value {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().and_then(whole)),
+        Value::String(s) => {
+            let s = s.trim();
+            s.parse::<i64>()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().and_then(whole))
+        }
+        _ => None,
+    };
+    match tokens {
+        Some(n) => Ok(Some(n.clamp(100, 32_000) as usize)),
+        None => Err(format!(
+            "invalid max_tokens {value}: expected a whole number of tokens (100 to 32000)"
+        )),
+    }
 }
 
 fn tool_recall(
@@ -1245,9 +1316,35 @@ fn tool_recall(
     args: &Value,
     compact: bool,
 ) -> ToolResult {
-    // Auto-decay if >24h since last decay
-    if let Err(e) = store.maybe_auto_decay() {
-        tracing::warn!(error = %e, "auto-decay failed during recall");
+    // The v2 engine (rank fusion, token budget) is the default. The engine
+    // is not a tool parameter: `ICM_RECALL_ENGINE=legacy` in the server's
+    // environment brings back the previous one.
+    let max_tokens = match recall_max_tokens(args) {
+        Ok(v) => v,
+        Err(msg) => return ToolResult::error(msg),
+    };
+    let engine = match RecallEngine::resolve(None, max_tokens.is_some()) {
+        Ok(engine) => engine,
+        Err(e) => return ToolResult::error(format!("{e}")),
+    };
+    tool_recall_on(store, embedder, args, compact, engine, max_tokens)
+}
+
+/// `icm_memory_recall` on a given engine. Below the `V2` dispatch, the
+/// legacy path is the pre-v2 code, unchanged.
+fn tool_recall_on(
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    args: &Value,
+    compact: bool,
+    engine: RecallEngine,
+    max_tokens: Option<usize>,
+) -> ToolResult {
+    // Auto-decay if >24h since last decay. The v2 pipeline runs its own.
+    if engine == RecallEngine::Legacy {
+        if let Err(e) = store.maybe_auto_decay() {
+            tracing::warn!(error = %e, "auto-decay failed during recall");
+        }
     }
 
     let query = match get_str(args, "query") {
@@ -1276,6 +1373,21 @@ fn tool_recall(
         Some(p) => Some(p.to_string()),
         None => cwd_project,
     };
+
+    if engine == RecallEngine::V2 {
+        let req = RecallRequest {
+            query,
+            limit: v2_limit(args.get("limit").and_then(|v| v.as_i64()), max_tokens),
+            max_tokens,
+            topic,
+            keyword,
+            project: project.as_deref(),
+            now: None,
+            expand_neighbors: true,
+        };
+        return tool_recall_v2(store, embedder, &req, compact);
+    }
+
     let project_filter = |m: &Memory| -> bool {
         match project.as_deref() {
             None => true,
@@ -1404,6 +1516,60 @@ fn tool_recall(
     ToolResult::text(format_memory_output(&for_display, compact))
 }
 
+/// Result cap for the v2 engine. Without a budget the published 1..=20
+/// range applies, as on the legacy path. With a token budget the budget
+/// does the cutting, so the count is only a guard: up to 200, and 200 when
+/// the caller gave none (the schema default of 5 would make the budget
+/// pointless).
+fn v2_limit(requested: Option<i64>, max_tokens: Option<usize>) -> usize {
+    let (default, max) = if max_tokens.is_some() {
+        (200, 200)
+    } else {
+        (5, 20)
+    };
+    requested.unwrap_or(default).clamp(1, max) as usize
+}
+
+/// `icm_memory_recall` through the shared v2 pipeline. Filtering, neighbor
+/// expansion, the budget cut and the access-count update all happen inside
+/// the pipeline; the rendering is MCP's own, and each hit is charged
+/// against the budget for the text rendered here, in this mode.
+///
+/// Same output shape as the legacy path: a score is shown only when an
+/// embedder took part in the ranking. A keyword-only ranking has no
+/// similarity to report, and the legacy path showed none either.
+fn tool_recall_v2(
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    req: &RecallRequest<'_>,
+    compact: bool,
+) -> ToolResult {
+    // The legacy path answered a blank query with "no memories", not with
+    // an error.
+    if req.query.trim().is_empty() {
+        return ToolResult::text(MSG_NO_MEMORIES.into());
+    }
+    let shown = |score: f32| if embedder.is_some() { score } else { -1.0 };
+    let rendered_tokens = |mem: &Memory, score: f32| {
+        let mut text = String::new();
+        push_memory_output(&mut text, mem, shown(score), compact);
+        icm_core::estimate_tokens(&text)
+    };
+    let outcome = match req.run_with_cost(store, embedder, &rendered_tokens) {
+        Ok(o) => o,
+        Err(e) => return ToolResult::error(format!("search error: {e}")),
+    };
+    if outcome.hits.is_empty() {
+        return ToolResult::text(MSG_NO_MEMORIES.into());
+    }
+    let scored: Vec<(Memory, f32)> = outcome
+        .hits
+        .into_iter()
+        .map(|h| (h.memory, shown(h.score)))
+        .collect();
+    ToolResult::text(format_memory_output(&scored, compact))
+}
+
 fn tool_forget(store: &Store, args: &Value) -> ToolResult {
     let id = match get_str(args, "id") {
         Some(id) => id,
@@ -1453,17 +1619,99 @@ fn tool_learn(store: &Store, args: &Value) -> ToolResult {
     }
 }
 
+/// How many memories the listing answer of `icm_memory_consolidate` shows.
+const CONSOLIDATE_LISTING: usize = 40;
+
+/// `icm_memory_consolidate`: replace the memories the caller summarized.
+///
+/// The caller wrote `summary` from memories it read; `ids` says which. The
+/// tool never guesses: it used to replace everything the topic held, and in
+/// the default (compact) mode no tool output shows ids, so an agent that
+/// had seen the 5 to 20 memories a recall returns wiped out a topic of
+/// hundreds. Two choices were possible — show ids in recall output, or stop
+/// replacing blind. This does the second without touching recall: called
+/// without `ids`, the tool writes nothing and answers with the topic's
+/// memories and their ids, which is also what makes `ids` usable at all.
 fn tool_consolidate(store: &Store, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
     let topic = match get_str(args, "topic") {
-        Some(t) => t,
+        Some(t) => t.trim(),
         None => return ToolResult::error("missing required field: topic".into()),
+    };
+
+    let ids: Vec<String> = match args.get("ids") {
+        // Absent: answer with what there is to consolidate.
+        None | Some(Value::Null) => return consolidate_listing(store, topic),
+        Some(Value::Array(listed)) => {
+            // Empty is not "everything": at the store, an empty list
+            // replaces nothing, and here it must not mean the opposite.
+            if listed.is_empty() {
+                return ToolResult::error(
+                    "ids is empty: nothing was replaced. Pass the ids of the memories the \
+                     summary covers; call without `ids` to list them."
+                        .into(),
+                );
+            }
+            let mut ids = Vec::with_capacity(listed.len());
+            for id in listed {
+                match id.as_str() {
+                    Some(id) => ids.push(id.to_string()),
+                    None => return ToolResult::error("ids must be an array of strings".into()),
+                }
+            }
+            ids
+        }
+        Some(_) => return ToolResult::error("ids must be an array of strings".into()),
     };
     let summary = match get_str(args, "summary") {
         Some(s) => s,
         None => return ToolResult::error("missing required field: summary".into()),
     };
 
-    let mut consolidated = Memory::new(topic.into(), summary.into(), icm_core::Importance::High);
+    // The listed memories must be in this topic — a topic that differs by
+    // case or a blank used to match nothing and leave a stray summary
+    // behind, reported as a success. They also set the summary's
+    // importance: the highest of what it replaces, as on every other path.
+    let mut not_here: Vec<&str> = Vec::new();
+    let mut importance: Option<icm_core::Importance> = None;
+    let mut critical = 0usize;
+    for id in &ids {
+        match store.get(id) {
+            Ok(Some(m)) if m.topic == topic => {
+                if m.importance == icm_core::Importance::Critical {
+                    critical += 1;
+                } else {
+                    importance = Some(match importance {
+                        Some(best) => icm_core::max_importance(best, m.importance),
+                        None => m.importance,
+                    });
+                }
+            }
+            Ok(_) => not_here.push(id),
+            Err(e) => return ToolResult::error(format!("failed to get memory {id}: {e}")),
+        }
+    }
+    if !not_here.is_empty() {
+        return ToolResult::error(format!(
+            "nothing was replaced: {} of the listed ids are not in topic {topic:?} ({}). Check \
+             the topic's exact spelling, or call without `ids` to list its memories.",
+            not_here.len(),
+            not_here
+                .iter()
+                .take(5)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    let Some(importance) = importance else {
+        return ToolResult::error(
+            "nothing was replaced: every listed memory is critical, and critical memories are \
+             never consolidated."
+                .into(),
+        );
+    };
+
+    let mut consolidated = Memory::new(topic.into(), summary.into(), importance);
     // Same bug class as #394/#395/cmd_consolidate: this tool never attached
     // an embedding to the merged memory it creates.
     if let Some(emb) = embedder {
@@ -1472,10 +1720,91 @@ fn tool_consolidate(store: &Store, embedder: Option<&dyn Embedder>, args: &Value
         }
     }
 
-    match store.consolidate_topic(topic, consolidated) {
-        Ok(()) => ToolResult::text(format!("Consolidated topic: {topic}")),
+    // Only ids are known here, not what the caller read under them: the
+    // store checks that each is still in the topic, nothing more.
+    let read: Vec<icm_core::ReadMemory> = ids
+        .iter()
+        .map(|id| icm_core::ReadMemory {
+            id: id.clone(),
+            summary: None,
+        })
+        .collect();
+    match store.consolidate_ids(topic, &read, consolidated) {
+        Ok(icm_core::Consolidated::Replaced { removed, id }) => {
+            let left = store
+                .count_by_topic(topic)
+                .map(|n| n.saturating_sub(1))
+                .unwrap_or(0);
+            let mut text = format!(
+                "Consolidated topic: {topic} ({removed} memories replaced, summary id {id}"
+            );
+            if left > 0 {
+                text.push_str(&format!("; {left} other memories left in place"));
+            }
+            if critical > 0 {
+                text.push_str(&format!(
+                    "; {critical} of the listed ones are critical and are never replaced"
+                ));
+            }
+            text.push(')');
+            ToolResult::text(text)
+        }
+        Ok(icm_core::Consolidated::Stale { changed }) => ToolResult::error(format!(
+            "nothing was replaced: {} of the listed memories were removed or moved while this \
+             call was running ({}). Call without `ids` to list the topic again.",
+            changed.len(),
+            changed
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+        )),
         Err(e) => ToolResult::error(format!("failed to consolidate: {e}")),
     }
+}
+
+/// The answer to `icm_memory_consolidate` without `ids`: what the topic
+/// holds, with ids, and how to call again. Nothing is written.
+fn consolidate_listing(store: &Store, topic: &str) -> ToolResult {
+    let memories = match store.get_by_topic(topic) {
+        Ok(m) => m,
+        Err(e) => return ToolResult::error(format!("failed to get memories: {e}")),
+    };
+    let total = store.count_by_topic(topic).unwrap_or(memories.len());
+    let replaceable: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| m.importance != icm_core::Importance::Critical)
+        .collect();
+    if replaceable.len() < 2 {
+        return ToolResult::error(format!(
+            "nothing to consolidate in topic {topic:?}: it holds {total} memories, {} of which \
+             can be merged (critical memories never are).",
+            replaceable.len()
+        ));
+    }
+    let mut text = format!(
+        "Nothing was replaced: `ids` is required. Topic {topic:?} holds {total} memories; \
+         {} can be consolidated. Read the ones below, write a summary that covers them, and \
+         call again with `summary` and their `ids` — only those are replaced.\n",
+        replaceable.len()
+    );
+    for m in replaceable.iter().take(CONSOLIDATE_LISTING) {
+        let summary: String = m.summary.chars().take(300).collect();
+        let more = if m.summary.chars().count() > 300 {
+            "…"
+        } else {
+            ""
+        };
+        text.push_str(&format!("- {}: {summary}{more}\n", m.id));
+    }
+    if replaceable.len() > CONSOLIDATE_LISTING {
+        text.push_str(&format!(
+            "({} more not shown: consolidate these first, then call again.)\n",
+            replaceable.len() - CONSOLIDATE_LISTING
+        ));
+    }
+    ToolResult::error(text)
 }
 
 fn tool_list_topics(store: &Store) -> ToolResult {
@@ -2638,12 +2967,24 @@ mod tests {
         }
 
         let store = Store::in_memory_with_dims(64).unwrap();
+        let ids: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|s| {
+                store
+                    .store(Memory::new(
+                        "t".into(),
+                        (*s).into(),
+                        icm_core::Importance::Medium,
+                    ))
+                    .unwrap()
+            })
+            .collect();
         let embedder = StubEmbedder;
         let result = call_tool(
             &store,
             Some(&embedder),
             "icm_memory_consolidate",
-            &json!({"topic": "t", "summary": "merged summary"}),
+            &json!({"topic": "t", "summary": "merged summary", "ids": ids}),
             false,
         );
         assert!(!result.is_error, "{:?}", result.content);
@@ -2654,6 +2995,252 @@ mod tests {
             memories[0].embedding.is_some(),
             "consolidated memory must have an embedding attached"
         );
+    }
+
+    fn seed(store: &Store, topic: &str, texts: &[&str]) -> Vec<String> {
+        texts
+            .iter()
+            .map(|s| {
+                store
+                    .store(Memory::new(
+                        topic.into(),
+                        (*s).into(),
+                        icm_core::Importance::Medium,
+                    ))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn consolidate(store: &Store, args: Value) -> ToolResult {
+        call_tool(store, None, "icm_memory_consolidate", &args, true)
+    }
+
+    /// The summary an agent passes stands for the memories it read. With
+    /// their `ids`, a memory stored since — here, between the read and the
+    /// call — is not removed with them. The tool used to delete the topic.
+    #[test]
+    fn tool_consolidate_keeps_a_memory_stored_after_the_caller_read_the_topic() {
+        let store = test_store();
+        let read = seed(&store, "t", &["fact one", "fact two"]);
+        let late = seed(&store, "t", &["LATE-ARRIVAL"]).remove(0);
+
+        let result = consolidate(
+            &store,
+            json!({"topic": "t", "summary": "facts one and two", "ids": read}),
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+        let text = &result.content[0].text;
+        assert!(text.starts_with("Consolidated topic: t"), "{text}");
+        assert!(text.contains("2 memories replaced"), "{text}");
+        assert!(text.contains("1 other memories left in place"), "{text}");
+
+        assert!(
+            store.get(&late).unwrap().is_some(),
+            "the late memory is gone"
+        );
+        let mut left: Vec<String> = store
+            .get_by_topic("t")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.summary)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["LATE-ARRIVAL", "facts one and two"]);
+    }
+
+    /// In the default (compact) mode no tool shows memory ids, so an agent
+    /// could not pass `ids` — and without them the tool replaced everything
+    /// the topic held, including what the agent never read. Without `ids`
+    /// it now replaces nothing and answers with the memories and their ids.
+    #[test]
+    fn tool_consolidate_without_ids_lists_the_topic_and_replaces_nothing() {
+        let store = test_store();
+        let ids = seed(
+            &store,
+            "many",
+            &(0..60)
+                .map(|i| format!("fact {i:02}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        for args in [
+            json!({"topic": "many", "summary": "what the agent saw of it"}),
+            json!({"topic": "many"}),
+            json!({"topic": "many", "summary": "s", "ids": null}),
+        ] {
+            let result = consolidate(&store, args);
+            assert!(
+                result.is_error,
+                "a call that replaced nothing is not a success"
+            );
+            let text = &result.content[0].text;
+            assert!(
+                text.starts_with("Nothing was replaced: `ids` is required"),
+                "{text}"
+            );
+            assert!(text.contains("holds 60 memories"), "{text}");
+            // The ids the agent needs, with what each memory says.
+            let listed = ids.iter().filter(|id| text.contains(id.as_str())).count();
+            assert_eq!(listed, 40, "40 of the 60 are listed per call");
+            assert!(text.contains("20 more not shown"), "{text}");
+            assert_eq!(store.count_by_topic("many").unwrap(), 60, "nothing removed");
+        }
+
+        // The ids from the listing make the second step possible.
+        let listing = consolidate(&store, json!({"topic": "many"})).content[0]
+            .text
+            .clone();
+        let shown: Vec<String> = ids
+            .iter()
+            .filter(|id| listing.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let result = consolidate(
+            &store,
+            json!({"topic": "many", "summary": "the 40 listed", "ids": shown}),
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("40 memories replaced"));
+        assert_eq!(store.count_by_topic("many").unwrap(), 21);
+
+        // A topic with nothing to merge says so.
+        seed(&store, "one", &["alone"]);
+        let result = consolidate(&store, json!({"topic": "one"}));
+        assert!(result.content[0].text.contains("nothing to consolidate"));
+    }
+
+    /// `ids: []` is not "every memory": at the store an empty list replaces
+    /// nothing, and the tool used to turn it into the whole topic.
+    #[test]
+    fn tool_consolidate_with_an_empty_id_list_replaces_nothing() {
+        let store = test_store();
+        seed(&store, "t", &["a", "b", "c"]);
+        let result = consolidate(
+            &store,
+            json!({"topic": "t", "summary": "a and b", "ids": []}),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.content[0].text.contains("ids is empty"),
+            "{:?}",
+            result.content
+        );
+        assert_eq!(store.count_by_topic("t").unwrap(), 3);
+
+        let result = consolidate(&store, json!({"topic": "t", "summary": "x", "ids": [1, 2]}));
+        assert!(result.is_error);
+        assert_eq!(store.count_by_topic("t").unwrap(), 3);
+    }
+
+    /// Right ids, topic spelled differently (case, as a recall shows it and
+    /// dedup ignores it): nothing matched, yet a summary was written under
+    /// the misspelled topic and the answer was "Consolidated topic".
+    #[test]
+    fn tool_consolidate_refuses_ids_that_are_not_in_the_topic() {
+        let store = test_store();
+        let ids = seed(&store, "decisions-proj", &["a", "b"]);
+        let result = consolidate(
+            &store,
+            json!({"topic": "Decisions-proj", "summary": "a and b", "ids": ids}),
+        );
+        assert!(result.is_error);
+        let text = &result.content[0].text;
+        assert!(text.contains("not in topic \"Decisions-proj\""), "{text}");
+        assert_eq!(
+            store.count_by_topic("Decisions-proj").unwrap(),
+            0,
+            "orphan summary"
+        );
+        assert_eq!(store.count_by_topic("decisions-proj").unwrap(), 2);
+
+        // Blanks around the topic are the same topic.
+        let result = consolidate(
+            &store,
+            json!({"topic": " decisions-proj ", "summary": "a and b", "ids": ids}),
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(store.count_by_topic("decisions-proj").unwrap(), 1);
+
+        // Ids that no longer exist (already consolidated by someone else).
+        let result = consolidate(
+            &store,
+            json!({"topic": "decisions-proj", "summary": "again", "ids": ids}),
+        );
+        assert!(result.is_error);
+        assert_eq!(
+            store.count_by_topic("decisions-proj").unwrap(),
+            1,
+            "second summary"
+        );
+    }
+
+    /// The summary keeps the highest importance of what it replaces (it was
+    /// always `high`), and critical memories are neither replaced nor a
+    /// reason to promote it.
+    #[test]
+    fn tool_consolidate_gives_the_summary_the_importance_of_what_it_replaces() {
+        let store = test_store();
+        let mut ids = seed(&store, "t", &["a", "b"]);
+        let critical = store
+            .store(Memory::new(
+                "t".into(),
+                "never forget".into(),
+                icm_core::Importance::Critical,
+            ))
+            .unwrap();
+        ids.push(critical.clone());
+        let result = consolidate(
+            &store,
+            json!({"topic": "t", "summary": "a and b", "ids": ids}),
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0]
+            .text
+            .contains("1 of the listed ones are critical"));
+        let after = store.get_by_topic("t").unwrap();
+        assert_eq!(after.len(), 2);
+        let summary = after.iter().find(|m| m.id != critical).unwrap();
+        assert_eq!(summary.importance, icm_core::Importance::Medium);
+
+        let only_critical = consolidate(
+            &store,
+            json!({"topic": "t", "summary": "x", "ids": [critical]}),
+        );
+        assert!(only_critical.is_error);
+        assert_eq!(store.count_by_topic("t").unwrap(), 2);
+    }
+
+    /// With an LLM summarizer configured, a topic past the threshold is
+    /// queued — once — for a real summary, as the CLI store path does. The
+    /// MCP path used to run the 3-memory rollup regardless, deleting the
+    /// rest, exactly what the docs say configuring a summarizer avoids.
+    #[test]
+    fn auto_consolidation_queues_instead_of_rolling_up_when_a_summarizer_is_configured() {
+        let store = test_store();
+        let queued = AutoConsolidate {
+            enabled: true,
+            threshold: 3,
+            queue: true,
+        };
+        for i in 0..8 {
+            let r = store_via_mcp(&store, "busy", i, queued);
+            assert!(!r.is_error);
+        }
+        assert_eq!(
+            store.count_by_topic("busy").unwrap(),
+            8,
+            "nothing rolled up"
+        );
+        let jobs = store.list_pending_consolidation_jobs(50).unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "one pending job per topic, not one per store"
+        );
+        assert_eq!(jobs[0].topic, "busy");
     }
 
     #[test]
@@ -2796,19 +3383,32 @@ mod tests {
 
     /// Audit regression: the schema advertises limit <= 20 but the code
     /// accepted 100 — the clamp must match the published contract.
+    ///
+    /// The 30 probes are stored with auto-consolidation off. With the
+    /// default test policy (on, threshold 10) they were rolled up as they
+    /// came, the rollup keeping only 3 of them: fewer than 20 occurrences
+    /// were left in the whole store, and the assertion passed whatever the
+    /// clamp did. Thirty separate memories and an exact count test the
+    /// clamp itself.
     #[test]
     fn test_recall_limit_clamped_to_schema_max() {
         let store = test_store();
         for i in 0..30 {
-            let r = call_tool(
+            let r = call_tool_with_config(
                 &store,
                 None,
                 "icm_memory_store",
                 &json!({"topic": "t", "content": format!("clamp probe entry number {i}")}),
                 false,
+                AutoConsolidate {
+                    enabled: false,
+                    threshold: AUTO_CONSOLIDATE_THRESHOLD,
+                    queue: false,
+                },
             );
             assert!(!r.is_error);
         }
+        assert_eq!(store.count_by_topic("t").unwrap(), 30);
         let recall_result = call_tool(
             &store,
             None,
@@ -2821,20 +3421,12 @@ mod tests {
             .text
             .matches("clamp probe entry")
             .count();
-        assert!(
-            hits <= 20,
-            "limit must clamp to the schema max of 20, got {hits} hits"
+        assert_eq!(
+            hits, 20,
+            "30 memories match and 100 were asked for: the schema max of 20 must apply"
         );
     }
 
-    /// Audit regression: filtering was previously applied AFTER the store
-    /// already truncated results to `limit` — if every one of the top-N
-    /// global hits belonged to a different topic than the requested filter,
-    /// recall reported "no memories" even though a matching memory existed
-    /// further down the ranked list. `search_by_keywords` orders by
-    /// `weight DESC`, so 5 higher-weight "noise" memories in another topic
-    /// starve out a lower-weight matching memory in the target topic when
-    /// `limit=5` and no oversampling is applied.
     #[test]
     fn test_recall_topic_filter_does_not_starve_on_higher_weight_noise() {
         let store = test_store();
@@ -3223,22 +3815,35 @@ mod tests {
     fn test_consolidate_via_mcp() {
         let store = test_store();
         for i in 0..10 {
-            call_tool(
+            // Auto-consolidation off: this test is about the tool.
+            call_tool_with_config(
                 &store,
                 None,
                 "icm_memory_store",
                 &json!({"topic": "consolidate-me", "content": format!("detail {i}")}),
                 false,
+                AutoConsolidate {
+                    enabled: false,
+                    threshold: AUTO_CONSOLIDATE_THRESHOLD,
+                    queue: false,
+                },
             );
         }
+        let ids: Vec<String> = store
+            .get_by_topic("consolidate-me")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids.len(), 10);
         let result = call_tool(
             &store,
             None,
             "icm_memory_consolidate",
-            &json!({"topic": "consolidate-me", "summary": "All 10 details merged"}),
+            &json!({"topic": "consolidate-me", "summary": "All 10 details merged", "ids": ids}),
             false,
         );
-        assert!(!result.is_error);
+        assert!(!result.is_error, "{:?}", result.content);
         let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
         assert!(stats.content[0].text.contains("Memories: 1"));
     }
@@ -3264,6 +3869,7 @@ mod tests {
         let off = AutoConsolidate {
             enabled: false,
             threshold: 10,
+            queue: false,
         };
         for i in 0..14 {
             let r = store_via_mcp(&store, "t", i, off);
@@ -3287,6 +3893,7 @@ mod tests {
         let on = AutoConsolidate {
             enabled: true,
             threshold: 3,
+            queue: false,
         };
         let mut consolidated = false;
         for i in 0..6 {
@@ -4345,5 +4952,508 @@ description = "A test project"
             !text.contains("(+"),
             "should not claim links without embedder: {text}"
         );
+    }
+
+    // ── v2 recall engine: `max_tokens` ───────────────────────────────────
+
+    /// Store `n` memories straight through the store (the MCP store tool
+    /// would auto-consolidate a topic past 10 entries).
+    fn seed_probe_memories(store: &Store, topic: &str, phrase: &str, n: usize) {
+        use icm_core::Importance;
+        for i in 0..n {
+            let mem = Memory::new(
+                topic.into(),
+                format!("{phrase} number {i}"),
+                Importance::Medium,
+            );
+            store.store(mem).unwrap();
+        }
+    }
+
+    fn recall_schema() -> Value {
+        let defs = tool_definitions(false);
+        defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "icm_memory_recall")
+            .unwrap()["inputSchema"]["properties"]
+            .clone()
+    }
+
+    #[test]
+    fn test_recall_schema_advertises_max_tokens() {
+        let props = recall_schema();
+        assert_eq!(props["max_tokens"]["type"], "integer");
+        assert_eq!(props["max_tokens"]["minimum"], 100);
+        assert_eq!(props["max_tokens"]["maximum"], 32000);
+        // The engine is not a tool parameter: every schema property costs
+        // tokens to every agent. `$ICM_RECALL_ENGINE` selects it instead.
+        assert!(props.get("engine").is_none());
+        // The published limit contract is untouched.
+        assert_eq!(props["limit"]["maximum"], 20);
+        assert_eq!(props["limit"]["default"], 5);
+    }
+
+    #[test]
+    fn test_recall_v2_limit_bounds() {
+        // With a budget: the budget cuts, the count is a guard.
+        assert_eq!(v2_limit(None, Some(2000)), 200);
+        assert_eq!(v2_limit(Some(50), Some(2000)), 50);
+        assert_eq!(v2_limit(Some(5000), Some(2000)), 200);
+        assert_eq!(v2_limit(Some(0), Some(2000)), 1);
+        assert_eq!(v2_limit(Some(-3), Some(2000)), 1);
+        // Without one (engine forced by the environment): the schema range.
+        assert_eq!(v2_limit(None, None), 5);
+        assert_eq!(v2_limit(Some(100), None), 20);
+        assert_eq!(v2_limit(Some(0), None), 1);
+    }
+
+    /// A budget lifts the count cap: without one a recall returns at most
+    /// 20 results, a large budget returns all 60.
+    #[test]
+    fn test_recall_max_tokens_lifts_the_result_cap() {
+        if std::env::var_os("ICM_RECALL_ENGINE").is_some() {
+            return;
+        }
+        let store = test_store();
+        seed_probe_memories(&store, "t", "budget probe entry", 60);
+
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "budget probe entry", "project": "", "max_tokens": 32000}),
+            false,
+        );
+        assert!(!res.is_error, "{}", res.content[0].text);
+        let hits = res.content[0].text.matches("budget probe entry").count();
+        assert_eq!(hits, 60, "a large budget must lift the 20-result cap");
+        // No embedder took part: no score is claimed, as before.
+        assert!(!res.content[0].text.contains("[score: "));
+    }
+
+    /// The budget once charged the summary alone while the
+    /// detailed rendering also prints an id/score header, topic, importance,
+    /// weight, keywords and up to 2048 bytes of `raw_excerpt`: a budget of
+    /// 1000 rendered about 18 000 tokens. Measured here on the text the
+    /// tool actually returns.
+    #[test]
+    fn test_recall_max_tokens_bounds_the_rendered_output() {
+        use icm_core::{estimate_tokens, Importance};
+        if std::env::var_os("ICM_RECALL_ENGINE").is_some() {
+            return;
+        }
+        let store = test_store();
+        for i in 0..60 {
+            let mut mem = Memory::new(
+                "errors-resolved".into(),
+                format!("budget probe entry number {i} about the deploy pipeline"),
+                Importance::Medium,
+            );
+            mem.keywords = vec!["deploy".into(), "pipeline".into(), "budget".into()];
+            mem.raw_excerpt = Some(format!(
+                "{i} {}",
+                "error: connection refused at step; ".repeat(40)
+            ));
+            store.store(mem).unwrap();
+        }
+
+        for compact in [false, true] {
+            for budget in [1000, 4000] {
+                let res = call_tool(
+                    &store,
+                    None,
+                    "icm_memory_recall",
+                    &json!({"query": "budget probe entry", "project": "", "max_tokens": budget}),
+                    compact,
+                );
+                assert!(!res.is_error, "{}", res.content[0].text);
+                let text = &res.content[0].text;
+                let rendered = estimate_tokens(text);
+                let hits = text.matches("budget probe entry").count();
+                assert!(
+                    rendered <= budget,
+                    "compact={compact}: {hits} hits rendered as {rendered} tokens for a budget of {budget}"
+                );
+                // The budget is used, not just respected: either every
+                // match is there, or one more average hit would not fit
+                // (allowing one token of rounding per hit).
+                let one_more = rendered / hits.max(1) * 11 / 10;
+                assert!(
+                    hits == 60 || (hits >= 2 && rendered + one_more + hits >= budget),
+                    "compact={compact}: only {hits} hits ({rendered} tokens) for a budget of {budget}"
+                );
+            }
+        }
+
+        // Out-of-range budgets are clamped to the schema's 100..=32000, not
+        // rejected: a budget of 1 still returns what fits in 100.
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "budget probe entry", "project": "", "max_tokens": 1}),
+            true,
+        );
+        assert!(!res.is_error);
+        let text = &res.content[0].text;
+        assert!(text.lines().count() > 1);
+        assert!(estimate_tokens(text) <= 100);
+    }
+
+    /// The renderer was split into a per-memory writer so the v2 budget can
+    /// charge each hit what is printed for it: the output must not have
+    /// moved by a byte.
+    #[test]
+    fn format_memory_output_is_byte_stable() {
+        use icm_core::Importance;
+        let mut a = Memory::new(
+            "decisions-icm".into(),
+            "use sqlite".into(),
+            Importance::High,
+        );
+        a.id = "01AAA".into();
+        a.weight = 0.95;
+        a.keywords = vec!["storage".into(), "db".into()];
+        a.raw_excerpt = Some("raw text".into());
+        let mut b = Memory::new("notes".into(), "line one\nline two".into(), Importance::Low);
+        b.id = "01BBB".into();
+        let mut c = Memory::new("notes".into(), "long raw".into(), Importance::Medium);
+        c.id = "01CCC".into();
+        c.raw_excerpt = Some("é".repeat(1500));
+        let hits = vec![(a, 0.5), (b, -1.0), (c, 0.25)];
+
+        assert_eq!(
+            format_memory_output(&hits, true),
+            "[decisions-icm] use sqlite\n[notes] line one line two\n[notes] long raw\n"
+        );
+        let expected = format!(
+            "--- 01AAA [score: 0.500] ---\n  topic: decisions-icm\n  importance: high\n  \
+             weight: 0.950\n  summary: use sqlite\n  keywords: storage, db\n  raw: raw text\n\n\
+             --- 01BBB ---\n  topic: notes\n  importance: low\n  weight: 1.000\n  \
+             summary: line one line two\n\n\
+             --- 01CCC [score: 0.250] ---\n  topic: notes\n  importance: medium\n  \
+             weight: 1.000\n  summary: long raw\n  raw: {}… [truncated, 3000 bytes total]\n\n",
+            "é".repeat(1024)
+        );
+        assert_eq!(format_memory_output(&hits, false), expected);
+    }
+
+    /// Review remark: a `max_tokens` that was not a JSON integer (`2000.0`,
+    /// `"2000"`) was dropped without a word and the recall fell back to the
+    /// count-based engine.
+    #[test]
+    fn test_recall_max_tokens_accepts_whole_numbers_and_refuses_the_rest() {
+        assert_eq!(recall_max_tokens(&json!({})), Ok(None));
+        assert_eq!(recall_max_tokens(&json!({"max_tokens": null})), Ok(None));
+        for whole in [
+            json!(2000),
+            json!(2000.0),
+            json!("2000"),
+            json!(" 2000 "),
+            json!("2000.0"),
+        ] {
+            assert_eq!(
+                recall_max_tokens(&json!({"max_tokens": whole})),
+                Ok(Some(2000)),
+                "{whole}"
+            );
+        }
+        // Out-of-range whole numbers are clamped to the schema's range.
+        assert_eq!(recall_max_tokens(&json!({"max_tokens": 1})), Ok(Some(100)));
+        assert_eq!(recall_max_tokens(&json!({"max_tokens": -5})), Ok(Some(100)));
+        assert_eq!(
+            recall_max_tokens(&json!({"max_tokens": 1e12})),
+            Ok(Some(32_000))
+        );
+        assert_eq!(
+            recall_max_tokens(&json!({"max_tokens": u64::MAX})),
+            Ok(Some(32_000))
+        );
+        for bad in [
+            json!(2000.5),
+            json!("2k"),
+            json!(""),
+            json!("NaN"),
+            json!(true),
+            json!([2000]),
+            json!({"n": 2000}),
+        ] {
+            let err = recall_max_tokens(&json!({"max_tokens": bad})).unwrap_err();
+            assert!(err.contains("max_tokens"), "{bad}: {err}");
+        }
+
+        // Through the tool: accepted forms select the budgeted engine,
+        // refused ones are an error, not a silent count-based recall.
+        if std::env::var_os("ICM_RECALL_ENGINE").is_some() {
+            return;
+        }
+        let store = test_store();
+        seed_probe_memories(&store, "t", "budget probe entry", 60);
+        for whole in [json!(32000.0), json!("32000")] {
+            let res = call_tool(
+                &store,
+                None,
+                "icm_memory_recall",
+                &json!({"query": "budget probe entry", "project": "", "max_tokens": whole}),
+                true,
+            );
+            assert!(!res.is_error, "{}", res.content[0].text);
+            assert_eq!(res.content[0].text.lines().count(), 60, "{whole}");
+        }
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "budget probe entry", "project": "", "max_tokens": 2000.5}),
+            true,
+        );
+        assert!(res.is_error);
+        assert!(res.content[0].text.contains("max_tokens"));
+    }
+
+    /// The v2 path honors the same project / topic / keyword scope as the
+    /// legacy one, and an explicit `limit` still caps the count.
+    #[test]
+    fn test_recall_max_tokens_keeps_filters_and_limit() {
+        let store = test_store();
+        seed_probe_memories(&store, "context-alpha", "scoped probe entry", 30);
+        seed_probe_memories(&store, "context-beta", "scoped probe entry", 30);
+
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "scoped probe entry", "project": "alpha", "max_tokens": 32000}),
+            true,
+        );
+        assert!(!res.is_error, "{}", res.content[0].text);
+        let text = &res.content[0].text;
+        assert_eq!(text.lines().count(), 30, "{text}");
+        assert!(text.lines().all(|l| l.starts_with("[context-alpha] ")));
+
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({
+                "query": "scoped probe entry",
+                "project": "",
+                "topic": "context-beta",
+                "limit": 7,
+                "max_tokens": 32000
+            }),
+            true,
+        );
+        let text = &res.content[0].text;
+        assert_eq!(text.lines().count(), 7, "{text}");
+        assert!(text.lines().all(|l| l.starts_with("[context-beta] ")));
+
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "nothing matches zzzqqq", "project": "", "max_tokens": 2000}),
+            false,
+        );
+        assert!(!res.is_error);
+        assert_eq!(res.content[0].text, MSG_NO_MEMORIES);
+    }
+
+    /// Recalled memories get their access count bumped on the v2 path too.
+    #[test]
+    fn test_recall_max_tokens_updates_access_counts() {
+        let store = test_store();
+        seed_probe_memories(&store, "t", "access probe entry", 3);
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "access probe entry", "project": "", "max_tokens": 2000}),
+            true,
+        );
+        assert!(!res.is_error);
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|m| m.access_count == 1), "{all:?}");
+    }
+
+    /// The legacy engine, still selectable with `ICM_RECALL_ENGINE=legacy`,
+    /// renders what the tool rendered before v2 existed: full-text hits in
+    /// store order, clamped to 20, shown without a score.
+    #[test]
+    fn test_recall_legacy_engine_is_unchanged() {
+        for compact in [false, true] {
+            let store = test_store();
+            seed_probe_memories(&store, "t", "legacy probe entry", 30);
+            // Recall starts with the daily auto-decay, which changes the
+            // displayed weights on a fresh store: run it first, so the
+            // reference below sees the same rows the tool will. The
+            // reference is read before the call because recall then bumps
+            // access counts.
+            store.maybe_auto_decay().unwrap();
+            let expected: Vec<(Memory, f32)> = store
+                .search_fts("legacy probe entry", 20)
+                .unwrap()
+                .into_iter()
+                .map(|m| (m, -1.0))
+                .collect();
+            assert_eq!(expected.len(), 20);
+            let res = tool_recall_on(
+                &store,
+                None,
+                &json!({"query": "legacy probe entry", "project": "", "limit": 100}),
+                compact,
+                RecallEngine::Legacy,
+                None,
+            );
+            assert!(!res.is_error);
+            assert_eq!(
+                res.content[0].text,
+                format_memory_output(&expected, compact)
+            );
+            if !compact {
+                assert!(!res.content[0].text.contains("[score: "));
+            }
+        }
+    }
+
+    // ── v2 is the default engine ─────────────────────────────────────────
+
+    /// Deterministic bag-of-words embedder: texts sharing words are close.
+    struct WordEmbedder;
+    impl Embedder for WordEmbedder {
+        fn embed(&self, text: &str) -> icm_core::IcmResult<Vec<f32>> {
+            let mut v = vec![0.0_f32; 64];
+            for word in text.split(|c: char| !c.is_alphanumeric()) {
+                if !word.is_empty() {
+                    let bucket = word.to_lowercase().bytes().fold(7usize, |acc, b| {
+                        acc.wrapping_mul(31).wrapping_add(usize::from(b))
+                    }) % 64;
+                    v[bucket] += 1.0;
+                }
+            }
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            } else {
+                v[0] = 1.0;
+            }
+            Ok(v)
+        }
+        fn embed_batch(&self, texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+            texts.iter().map(|t| self.embed(t)).collect()
+        }
+        fn dimensions(&self) -> usize {
+            64
+        }
+    }
+
+    fn store_plain(store: &Store, topic: &str, summary: &str) {
+        use icm_core::Importance;
+        store
+            .store(Memory::new(
+                topic.into(),
+                summary.into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+    }
+
+    /// With no budget and no environment override the tool now ranks with
+    /// v2: a memory sharing only some of the query words is found, and the
+    /// one sharing the most comes first. The legacy full-text search needed
+    /// every word and returned the single exact match.
+    #[test]
+    fn test_recall_default_engine_is_v2() {
+        if std::env::var_os("ICM_RECALL_ENGINE").is_some() {
+            return;
+        }
+        let store = test_store();
+        store_plain(&store, "t", "kiwi only");
+        store_plain(&store, "t", "unrelated note about build caches");
+        store_plain(&store, "t", "kiwi mango papaya");
+        let args = json!({"query": "kiwi mango papaya", "project": ""});
+
+        let res = call_tool(&store, None, "icm_memory_recall", &args, true);
+        assert!(!res.is_error, "{}", res.content[0].text);
+        assert_eq!(
+            res.content[0].text,
+            "[t] kiwi mango papaya\n[t] kiwi only\n"
+        );
+
+        let legacy = tool_recall_on(&store, None, &args, true, RecallEngine::Legacy, None);
+        assert_eq!(legacy.content[0].text, "[t] kiwi mango papaya\n");
+    }
+
+    /// The default engine keeps the output contract of the tool: the
+    /// published 1..=20 limit, the same compact and detailed layouts, a
+    /// score only when an embedder ranked, and the same empty answer.
+    #[test]
+    fn test_recall_default_engine_keeps_the_output_shape() {
+        if std::env::var_os("ICM_RECALL_ENGINE").is_some() {
+            return;
+        }
+        let store = Store::in_memory_with_dims(64).unwrap();
+        for i in 0..30 {
+            let mut mem = Memory::new(
+                "t".into(),
+                format!("shape probe entry {i}"),
+                icm_core::Importance::Medium,
+            );
+            mem.embedding = Some(WordEmbedder.embed(&mem.embed_text()).unwrap());
+            store.store(mem).unwrap();
+        }
+        let args = json!({"query": "shape probe entry", "project": "", "limit": 100});
+
+        // Limit: clamped to 20 without a budget, default 5.
+        let res = call_tool(&store, None, "icm_memory_recall", &args, true);
+        assert_eq!(res.content[0].text.lines().count(), 20);
+        assert!(res.content[0]
+            .text
+            .lines()
+            .all(|l| l.starts_with("[t] shape probe entry ")));
+        let res = call_tool(
+            &store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "shape probe entry", "project": ""}),
+            true,
+        );
+        assert_eq!(res.content[0].text.lines().count(), 5);
+
+        // Detailed layout, keyword-only: no score, as on the legacy path.
+        let res = call_tool(&store, None, "icm_memory_recall", &args, false);
+        let text = &res.content[0].text;
+        assert_eq!(
+            text.matches("\n  topic: t\n  importance: medium\n").count(),
+            20
+        );
+        assert!(!text.contains("[score: "));
+        assert!(text.starts_with("--- "));
+
+        // Detailed layout with an embedder: a score on every entry.
+        let res = call_tool(
+            &store,
+            Some(&WordEmbedder),
+            "icm_memory_recall",
+            &args,
+            false,
+        );
+        assert_eq!(res.content[0].text.matches("[score: ").count(), 20);
+
+        // Nothing matches, or a blank query: the plain message, no error.
+        for query in ["zzzqqq", "  "] {
+            let res = call_tool(
+                &store,
+                None,
+                "icm_memory_recall",
+                &json!({"query": query, "project": ""}),
+                false,
+            );
+            assert!(!res.is_error, "{query:?}");
+            assert_eq!(res.content[0].text, MSG_NO_MEMORIES, "{query:?}");
+        }
     }
 }

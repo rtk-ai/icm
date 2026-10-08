@@ -1,0 +1,7 @@
+# Build context filter for Dockerfile.agent-icm (BuildKit reads <Dockerfile>.dockerignore).
+# The context is the repository root; only what the icm build needs is sent.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
+!plugins

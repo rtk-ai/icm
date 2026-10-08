@@ -1,0 +1,19 @@
+# Build the runner image natively on amd64 and push it to the bench registry.
+# Run from the repository root:
+#
+#   gcloud builds submit --project rtk-ai-labs-01 --config bench/amb/cloudbuild.yaml \
+#     --substitutions _TAG=baseline-0.10.65 .
+#
+# The tag should name the ICM build being measured, so a baseline image and an
+# improved one stay comparable side by side.
+substitutions:
+  _TAG: dev
+  _IMAGE: europe-west9-docker.pkg.dev/rtk-ai-labs-01/rtk-bench/icm-amb
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "bench/amb/Dockerfile", "-t", "${_IMAGE}:${_TAG}", "."]
+images:
+  - "${_IMAGE}:${_TAG}"
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 3600s

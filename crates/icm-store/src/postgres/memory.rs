@@ -437,6 +437,103 @@ impl MemoryStore for PostgresStore {
         Ok(())
     }
 
+    fn consolidate_ids(
+        &self,
+        topic: &str,
+        read: &[icm_core::ReadMemory],
+        consolidated: Memory,
+    ) -> IcmResult<icm_core::Consolidated> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("consolidate_ids".into()));
+        }
+        // Same contract as the SQLite backend, in one transaction: the
+        // listed memories are replaced only if each is still in the topic
+        // and, where the caller passed what it read, unchanged. The rows
+        // are locked (`FOR UPDATE`) so that holds until the delete.
+        let consolidated = validate_and_normalize(consolidated)?;
+        if topic.trim() != consolidated.topic {
+            return Err(IcmError::InvalidInput(format!(
+                "consolidation topic {topic:?} does not match the summary's topic {:?}",
+                consolidated.topic
+            )));
+        }
+        let topic = consolidated.topic.clone();
+        let wanted: Vec<String> = read.iter().map(|r| r.id.clone()).collect();
+        let mut c = self.conn()?;
+        let mut tx = c.transaction().map_err(pg_err)?;
+        let current: std::collections::HashMap<String, (String, String)> = tx
+            .query(
+                "SELECT id, importance, summary FROM memories \
+                  WHERE topic = $1 AND id = ANY($2::text[]) FOR UPDATE",
+                &[&topic, &wanted],
+            )
+            .map_err(pg_err)?
+            .iter()
+            .map(|row| (row.get(0), (row.get(1), row.get(2))))
+            .collect();
+        let mut changed = Vec::new();
+        let mut deleted_ids: Vec<String> = Vec::new();
+        for item in read.iter().filter(|r| r.id != consolidated.id) {
+            match current.get(&item.id) {
+                None => changed.push(item.id.clone()),
+                Some((_, now)) if item.summary.as_ref().is_some_and(|was| was != now) => {
+                    changed.push(item.id.clone())
+                }
+                Some((importance, _)) if importance != "critical" => {
+                    deleted_ids.push(item.id.clone())
+                }
+                Some(_) => {}
+            }
+        }
+        if !changed.is_empty() {
+            // Dropping the transaction rolls it back.
+            return Ok(icm_core::Consolidated::Stale { changed });
+        }
+
+        let mut removed = 0usize;
+        if !deleted_ids.is_empty() {
+            removed = tx
+                .execute(
+                    "DELETE FROM memories \
+                      WHERE id = ANY($1::text[]) AND topic = $2 AND importance <> 'critical'",
+                    &[&deleted_ids, &topic],
+                )
+                .map_err(pg_err)? as usize;
+            tx.execute(
+                "UPDATE memories
+                    SET related_ids = (
+                        SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)::text
+                        FROM jsonb_array_elements_text(related_ids::jsonb) AS elem
+                        WHERE elem <> ALL($1::text[])
+                    )
+                    WHERE related_ids::jsonb ?| $1::text[]",
+                &[&deleted_ids],
+            )
+            .map_err(pg_err)?;
+        }
+
+        let written_id = insert_or_merge_memory(&mut tx, &consolidated)?;
+        if written_id != consolidated.id {
+            // Deduplicated onto an existing memory: it must be in this
+            // topic, or the originals are gone and the summary is not here.
+            let landed: String = tx
+                .query_one("SELECT topic FROM memories WHERE id = $1", &[&written_id])
+                .map_err(pg_err)?
+                .get(0);
+            if landed != topic {
+                return Err(IcmError::InvalidInput(format!(
+                    "an identical summary already exists in topic {landed:?} (memory \
+                     {written_id}); nothing was consolidated"
+                )));
+            }
+        }
+        tx.commit().map_err(pg_err)?;
+        Ok(icm_core::Consolidated::Replaced {
+            removed,
+            id: written_id,
+        })
+    }
+
     fn count(&self) -> IcmResult<usize> {
         let mut c = self.conn()?;
         let row = c

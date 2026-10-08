@@ -1,0 +1,35 @@
+# Benchmark tooling on top of an existing runner image: same `icm` binary, same
+# embedding-model cache, new Python tooling. Use it when a run must measure the
+# very binary of an earlier run (the Dockerfile next to this one rebuilds ICM from
+# the current tree, which changes the binary under test).
+#
+# Build context is the repository root; BASE is the image to keep, by digest:
+#   docker build --platform linux/amd64 -f bench/amb/Dockerfile.tooling \
+#     --build-arg BASE=europe-west9-docker.pkg.dev/rtk-ai-labs-01/rtk-bench/icm-amb@sha256:<digest> \
+#     -t icm-amb:<tag> .
+# or on Cloud Build: see cloudbuild.tooling.yaml.
+#
+# The image also carries the LongMemEval-S file (277 MB, fetched from Hugging Face
+# with retries at build time), so the pods of a recall-only run do not each download
+# it. `--build-arg LONGMEMEVAL=0` leaves it out: entrypoint.sh then fetches it at
+# pod start, with the same retries.
+ARG BASE
+FROM ${BASE}
+ARG LONGMEMEVAL=1
+USER root
+COPY bench/amb/requirements.txt /opt/icm-amb/requirements.txt
+RUN pip install --no-cache-dir -r /opt/icm-amb/requirements.txt google-cloud-storage
+COPY bench/amb/icm_provider.py bench/amb/full_context_provider.py bench/amb/run_amb.py \
+     bench/amb/recall_at_k.py bench/amb/recall_only.py bench/amb/merge_recall.py \
+     bench/amb/merge_shards.py bench/amb/compare_builds.py bench/amb/dry_run_tokens.py \
+     bench/amb/gcs_sync.py bench/amb/fetch_dataset.py bench/amb/estimate_cost.py \
+     bench/amb/entrypoint.sh /opt/icm-amb/
+RUN chmod 0755 /opt/icm-amb/entrypoint.sh \
+    && mkdir -p /opt/icm-amb/data \
+    && if [ "${LONGMEMEVAL}" = "1" ]; then \
+         python /opt/icm-amb/fetch_dataset.py longmemeval /opt/icm-amb/data/longmemeval_s_cleaned.json; \
+       fi
+# Read by the harness' LongMemEval loader. When the file is not in the image
+# (LONGMEMEVAL=0) entrypoint.sh fetches it and points this variable at its copy.
+ENV LONGMEMEVAL_DATA_PATH=/opt/icm-amb/data/longmemeval_s_cleaned.json
+USER bench

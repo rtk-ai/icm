@@ -100,6 +100,15 @@ impl OpenSearchStore {
     // Async consolidation queue (issue #179)
 
     pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
+        // One `pending` job per topic, as on the SQL backends (best effort
+        // here: no transaction, so two writers can still race).
+        if let Some(waiting) = self
+            .list_pending_consolidation_jobs(10_000)?
+            .into_iter()
+            .find(|job| job.topic == topic)
+        {
+            return Ok(waiting.id);
+        }
         let id = ulid::Ulid::new().to_string();
         self.request(
             "PUT",

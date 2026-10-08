@@ -26,6 +26,23 @@ fn test_auto_consolidate_above_threshold() {
     assert_eq!(store.count_by_topic("bulk").unwrap(), 1);
 }
 
+/// The store reads a topic 500 memories at a time. The rollup replaces the
+/// memories that were read; the ones past the read used to be deleted with
+/// the rest of the topic without ever being looked at.
+#[test]
+fn auto_consolidate_only_removes_the_memories_it_read() {
+    let store = test_store();
+    for i in 0..520 {
+        store
+            .store(make_memory("many", &format!("fact {i:03}")))
+            .unwrap();
+    }
+    assert!(store.auto_consolidate("many", 10).unwrap());
+    // 500 rows read and replaced by the rollup; the 20 that were never read
+    // are still there.
+    assert_eq!(store.count_by_topic("many").unwrap(), 1 + 20);
+}
+
 #[test]
 fn test_auto_consolidate_with_embedder_attaches_embedding() {
     // Audit M2/AC2: the embedder-aware variant must produce a

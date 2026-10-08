@@ -90,6 +90,29 @@ impl SqliteStore {
     /// exactly one performs the backup and the rest skip it (KRIT-5).
     pub fn claim_backup_slot(&self, interval_days: u32) -> IcmResult<bool> {
         let now = chrono::Utc::now().to_rfc3339();
+        // Read first. The upsert below needs SQLite's write lock even when
+        // its WHERE clause ends up changing nothing, and this runs on every
+        // CLI open: with another process mid-write, a plain `icm topics`
+        // sat here for the whole 30s busy timeout (measured: 31s) before
+        // giving up on a backup that was not due anyway. The upsert stays
+        // the only thing that decides the race when a backup IS due.
+        let not_due: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM icm_metadata
+                     WHERE key = 'last_backup_at'
+                       AND COALESCE(
+                             value IS NULL
+                             OR julianday(?1) - julianday(value) >= ?2,
+                             0) = 0)",
+                rusqlite::params![now, f64::from(interval_days)],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if not_due {
+            return Ok(false);
+        }
         let changed = self
             .conn
             .execute(
@@ -225,6 +248,10 @@ impl SqliteStore {
         if self.readonly {
             return Ok(());
         }
+        self.with_bookkeeping_timeout(|| self.auto_decay_if_due())
+    }
+
+    fn auto_decay_if_due(&self) -> IcmResult<()> {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
 
@@ -253,28 +280,59 @@ impl SqliteStore {
             .filter(|d| d.is_finite() && *d > 0.0)
             .unwrap_or(1.0); // first run ever: preserve the historical single-step behavior
 
+        // Decay already applied within the last day: return before the
+        // upsert below. That statement takes the write lock even when its
+        // WHERE clause changes nothing, so every recall used to queue
+        // behind whichever process was writing.
+        let decayed_recently = last_decay_at
+            .as_deref()
+            .and_then(|prev| prev.parse::<DateTime<Utc>>().ok())
+            .is_some_and(|prev| {
+                let since = (now - prev).num_seconds();
+                (0..86_400).contains(&since)
+            });
+        if decayed_recently {
+            return Ok(());
+        }
+
         // Atomic check-and-update: only one caller wins the race. (A narrow
         // window between the read above and this claim could let a losing
         // racer's `elapsed_days` be computed from a slightly stale
         // timestamp, but only one claim ever succeeds — a day or two of
         // imprecision in a decay RATE is harmless, not worth a stricter
         // compare-and-swap loop.)
-        let changed = self
-            .conn
-            .execute(
-                "INSERT INTO icm_metadata (key, value) VALUES ('last_decay_at', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = ?1
-                 WHERE value IS NULL OR julianday(?1) - julianday(value) >= 1.0",
-                params![now_str],
-            )
+        //
+        // The claim and the decay it announces commit together. As two
+        // separate writes, a claim that went through followed by a decay
+        // that lost the write lock (this runs under the short bookkeeping
+        // timeout) recorded "decayed today" with nothing decayed, and the
+        // whole elapsed period's step was skipped until the next day.
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
-
-        if changed > 0 {
-            let factor = 0.95_f64.powf(elapsed_days) as f32;
-            self.apply_decay(factor)?;
+        let outcome: IcmResult<()> = (|| {
+            let changed = self
+                .conn
+                .execute(
+                    "INSERT INTO icm_metadata (key, value) VALUES ('last_decay_at', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = ?1
+                     WHERE value IS NULL OR julianday(?1) - julianday(value) >= 1.0",
+                    params![now_str],
+                )
+                .map_err(db_err)?;
+            if changed > 0 {
+                let factor = 0.95_f64.powf(elapsed_days) as f32;
+                self.apply_decay(factor)?;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => self.conn.execute_batch("COMMIT;").map_err(db_err),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
         }
-
-        Ok(())
     }
 
     /// Delete hook telemetry rows older than `cutoff_rfc3339`. Used by an
@@ -300,6 +358,13 @@ impl SqliteStore {
     /// [`auto_consolidate_with_embedder`] for new code so the
     /// consolidated memory keeps a fresh embedding instead of being
     /// silently un-recallable via vector search.
+    ///
+    /// **Lossy by design.** The rollup is the join of the summaries of the
+    /// 3 heaviest memories only; every other non-`critical` memory that was
+    /// read is replaced by it and its content is not kept anywhere. It is a
+    /// product choice ("keep the three that matter most"), off by default,
+    /// not a summary. Memories that were not read — past the 500-row read,
+    /// or stored meanwhile — are left alone.
     pub fn auto_consolidate(&self, topic: &str, threshold: usize) -> IcmResult<bool> {
         self.auto_consolidate_with_embedder(topic, threshold, None)
     }
@@ -372,6 +437,13 @@ impl SqliteStore {
         }
 
         let original_count = memories.len();
+        // The rollup stands for the memories read above, and only for those:
+        // a memory stored since, or one past the 500-row read, was never
+        // looked at and must not go with them. (The rollup itself keeps the
+        // 3 heaviest summaries, not all of them: that is this feature's
+        // long-standing design, unchanged here.)
+        let replaced: Vec<icm_core::ReadMemory> =
+            memories.iter().map(icm_core::ReadMemory::from).collect();
 
         // Build the consolidated memory
         let mut consolidated = Memory::new(topic.into(), consolidated_summary, Importance::High);
@@ -396,9 +468,11 @@ impl SqliteStore {
             }
         }
 
-        // Replace all memories in the topic with the consolidated one
-        self.consolidate_topic(topic, consolidated)?;
+        // Replace the memories that were read — not the whole topic
+        // `Stale`: one of them changed or went away since the read a few
+        // lines up. Nothing was written; the next store tries again.
+        let outcome = self.consolidate_ids(topic, &replaced, consolidated)?;
 
-        Ok(true)
+        Ok(matches!(outcome, icm_core::Consolidated::Replaced { .. }))
     }
 }

@@ -188,16 +188,26 @@ install_binary() {
     STAGED="${INSTALL_DIR}/.${BINARY_NAME}.install.$$"
     trap 'rm -rf "$TEMP_DIR" "$STAGED"' EXIT
 
-    ARCHIVE="${TEMP_DIR}/${ARCHIVE_NAME}"
-    info "Downloading ${ARCHIVE_NAME}"
-    curl -fsSL "${BASE_URL}/${ARCHIVE_NAME}" -o "$ARCHIVE" \
-        || error "Failed to download ${BASE_URL}/${ARCHIVE_NAME}"
-
-    # SHA256 verification — mandatory, never skipped.
+    # SHA256 verification — mandatory, never skipped. Fetched first so it
+    # doubles as the release's asset list.
     CHECKSUMS_FILE="${TEMP_DIR}/checksums.txt"
     info "Downloading checksums.txt"
     curl -fsSL "${BASE_URL}/checksums.txt" -o "$CHECKSUMS_FILE" \
         || error "Failed to download checksums.txt (required for integrity verification)"
+
+    # Some releases ship without the gnu build (its job failed in CI); the
+    # static musl build still runs on any x86_64 Linux, so fall back to it.
+    if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] \
+        && ! awk -v name="$ARCHIVE_NAME" '$2 == name {f=1} END {exit !f}' "$CHECKSUMS_FILE"; then
+        warn "${ARCHIVE_NAME} is not published for ${VERSION} — falling back to the static musl build (keyword search only; no embeddings)."
+        TARGET="x86_64-unknown-linux-musl"
+        ARCHIVE_NAME="${BINARY_NAME}-${TARGET}.${EXT}"
+    fi
+
+    ARCHIVE="${TEMP_DIR}/${ARCHIVE_NAME}"
+    info "Downloading ${ARCHIVE_NAME}"
+    curl -fsSL "${BASE_URL}/${ARCHIVE_NAME}" -o "$ARCHIVE" \
+        || error "Failed to download ${BASE_URL}/${ARCHIVE_NAME}"
 
     # checksums.txt format: "<sha256>  <filename>" (two spaces, sha256sum default).
     EXPECTED_SHA=$(awk -v name="$ARCHIVE_NAME" '$2 == name {print $1; exit}' "$CHECKSUMS_FILE")

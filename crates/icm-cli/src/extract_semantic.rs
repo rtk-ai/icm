@@ -77,8 +77,7 @@ struct Anchor {
 const POSITIVE_ANCHORS: &[Anchor] = &[
     Anchor {
         kind: AnchorKind::Decision,
-        pattern:
-            "We made a deliberate technical decision and chose this approach over the alternatives.",
+        pattern: "We made a deliberate technical decision and chose this approach over the alternatives.",
     },
     Anchor {
         kind: AnchorKind::Decision,
@@ -86,8 +85,7 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
     },
     Anchor {
         kind: AnchorKind::Decision,
-        pattern:
-            "We decided to go with this technology rather than the other one for our use case.",
+        pattern: "We decided to go with this technology rather than the other one for our use case.",
     },
     Anchor {
         kind: AnchorKind::BugFix,
@@ -95,8 +93,7 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
     },
     Anchor {
         kind: AnchorKind::BugFix,
-        pattern:
-            "We fixed a regression that was breaking the production deployment of the service.",
+        pattern: "We fixed a regression that was breaking the production deployment of the service.",
     },
     // Audit #185 B1: short conversational bugfix phrasings ("Fixed
     // the cache returning stale entries", "バグを修正しました",
@@ -109,8 +106,7 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
     },
     Anchor {
         kind: AnchorKind::Preference,
-        pattern:
-            "This is a coding rule or convention the user always wants followed across the project.",
+        pattern: "This is a coding rule or convention the user always wants followed across the project.",
     },
     Anchor {
         kind: AnchorKind::Preference,
@@ -129,8 +125,7 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
     },
     Anchor {
         kind: AnchorKind::Architecture,
-        pattern:
-            "This describes a component, module, or system architecture choice in the project.",
+        pattern: "This describes a component, module, or system architecture choice in the project.",
     },
     // Audit #185 B3: the original Architecture anchor was confused
     // with BugFix on "The X middleware sits between Y and Z" — too
@@ -147,8 +142,7 @@ const POSITIVE_ANCHORS: &[Anchor] = &[
     },
     Anchor {
         kind: AnchorKind::Constraint,
-        pattern:
-            "This is a hard constraint or limitation in the system that cannot be worked around.",
+        pattern: "This is a hard constraint or limitation in the system that cannot be worked around.",
     },
     // Audit #185 B2: phrasings like "X does not work with Y" /
     // "X breaks when Y" rejected even though they're textbook

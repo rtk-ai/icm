@@ -409,11 +409,13 @@ fn perf_search_fts_latency_with_1000_entries() {
     let store = test_store();
     for i in 0..1000 {
         store
-                .store(make_memory(
-                    &format!("topic-{}", i % 50),
-                    &format!("detailed description about system component {i} with features and architecture"),
-                ))
-                .unwrap();
+            .store(make_memory(
+                &format!("topic-{}", i % 50),
+                &format!(
+                    "detailed description about system component {i} with features and architecture"
+                ),
+            ))
+            .unwrap();
     }
     let start = std::time::Instant::now();
     for _ in 0..50 {

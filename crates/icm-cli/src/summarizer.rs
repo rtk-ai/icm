@@ -15,13 +15,13 @@
 
 mod api;
 
-pub use api::{describe_config, ApiOptions};
+pub use api::{ApiOptions, describe_config};
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 /// Concrete provider kinds. `Auto` is resolved to one of the others at call

@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::{
+    Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, Method, Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post},
-    Router,
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
@@ -1160,9 +1160,11 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let nodes = json["nodes"].as_array().unwrap();
             assert_eq!(nodes.len(), expected_nodes, "{path}");
-            assert!(nodes
-                .iter()
-                .all(|n| n["x"].is_f64() && n["y"].is_f64() && n["z"].is_f64()));
+            assert!(
+                nodes
+                    .iter()
+                    .all(|n| n["x"].is_f64() && n["y"].is_f64() && n["z"].is_f64())
+            );
         }
         assert!(
             state.store.try_lock().is_ok(),
@@ -1190,14 +1192,18 @@ mod tests {
         let graph = build_graph_response(&memories);
 
         assert_eq!(graph.nodes.len(), 3);
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|n| n.id == a.id && n.importance == "high"));
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|n| n.id == c.id && n.importance == "low"));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.id == a.id && n.importance == "high")
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.id == c.id && n.importance == "low")
+        );
 
         // Exactly one edge for the a<->b pair, not two.
         assert_eq!(graph.edges.len(), 1);

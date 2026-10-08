@@ -42,15 +42,15 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    build_wake_up, find_similar_memory, format_local, is_preference_topic, keyword_matches,
-    project_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance,
-    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions,
-    DEDUP_SIMILARITY_THRESHOLD, MSG_NO_MEMORIES,
+    Concept, ConceptLink, DEDUP_SIMILARITY_THRESHOLD, Feedback, FeedbackStore, Importance, Label,
+    MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
+    WakeUpOptions, build_wake_up, find_similar_memory, format_local, is_preference_topic,
+    keyword_matches, project_matches, topic_matches,
 };
 use icm_store::Store;
 
@@ -2022,7 +2022,7 @@ fn settle_embedder<E: icm_core::Embedder>(
                     "embeddings: could not read the embedding state of the database ({e}); \
                      running keyword-only."
                 )),
-            )
+            );
         }
     };
     let plan = plan_embeddings(Some(&state), requested, requested_model, load);
@@ -10288,7 +10288,9 @@ fn cmd_consolidate_pending(
     if failed == 0 {
         println!("Processed {done} job(s).");
     } else {
-        println!("Processed {done} job(s); {failed} failed (see errors above, retry with `icm consolidate-jobs --retry <id>`).");
+        println!(
+            "Processed {done} job(s); {failed} failed (see errors above, retry with `icm consolidate-jobs --retry <id>`)."
+        );
     }
     Ok(())
 }
@@ -11737,11 +11739,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
 
 #[cfg(feature = "bench")]
 fn pct_delta(a: f64, b: f64) -> f64 {
-    if a == 0.0 {
-        0.0
-    } else {
-        ((b - a) / a) * 100.0
-    }
+    if a == 0.0 { 0.0 } else { ((b - a) / a) * 100.0 }
 }
 
 #[cfg(feature = "bench")]
@@ -12940,8 +12938,8 @@ mod hook_start_tests {
                 .unwrap();
         }
         let cfg = config::SummarizerConfig::default(); // provider defaults to "none"
-                                                       // Bare run (no explicit provider) resolves to none → refuse (a batch
-                                                       // lexical join + delete of originals across the whole store).
+        // Bare run (no explicit provider) resolves to none → refuse (a batch
+        // lexical join + delete of originals across the whole store).
         assert!(cmd_consolidate_all(&store, 3, &cfg, None, None, None, false, None).is_err());
         // threshold 0 → refuse.
         assert!(
@@ -13261,10 +13259,12 @@ mod hook_start_tests {
         // The non-ICM hook survives.
         let post = after["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(post.len(), 1);
-        assert!(post[0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("othertool"));
+        assert!(
+            post[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("othertool")
+        );
         // The ICM-only event is dropped entirely.
         assert!(after["hooks"].get("SessionEnd").is_none());
         // MCP config and unrelated settings are untouched.
@@ -15309,10 +15309,12 @@ mod cli_contracts_tests {
         assert_eq!(jobs[0].id, job_id);
         assert_eq!(jobs[0].status, "done");
         assert!(jobs[0].completed_at.is_some());
-        assert!(store
-            .list_pending_consolidation_jobs(10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_pending_consolidation_jobs(10)
+                .unwrap()
+                .is_empty()
+        );
 
         // The topic itself must actually be consolidated (4 memories -> 1).
         let remaining = store.get_by_topic("t").unwrap();
@@ -15443,9 +15445,10 @@ mod cli_contracts_tests {
             cmd_consolidate(&store, "t", true, &cfg, None, None, None, None).unwrap();
             let all = store.get_by_topic("t").unwrap();
             assert_eq!(all.len(), 3, "{provider}: originals kept, join added");
-            assert!(all
-                .iter()
-                .any(|m| m.summary.contains("fact one") && m.summary.contains("fact two")));
+            assert!(
+                all.iter()
+                    .any(|m| m.summary.contains("fact one") && m.summary.contains("fact two"))
+            );
         }
     }
 
@@ -15907,11 +15910,13 @@ mod cli_contracts_tests {
         let left = store.get_by_topic("busy").unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].summary, "SUMMARY");
-        assert!(store
-            .list_consolidation_jobs(None, 10)
-            .unwrap()
-            .iter()
-            .all(|j| j.status == "done"));
+        assert!(
+            store
+                .list_consolidation_jobs(None, 10)
+                .unwrap()
+                .iter()
+                .all(|j| j.status == "done")
+        );
     }
 
     /// `consolidate-all` takes the biggest topic first — the one most
@@ -17267,9 +17272,11 @@ mod cmd_remember_tests {
         let memories = store.get_by_topic("icm").unwrap();
         assert_eq!(memories.len(), 2, "remember appends, never overwrites");
         assert!(memories.iter().any(|m| m.summary.contains("TODO")));
-        assert!(memories
-            .iter()
-            .any(|m| m.summary.contains("closes the recall gap")));
+        assert!(
+            memories
+                .iter()
+                .any(|m| m.summary.contains("closes the recall gap"))
+        );
     }
 }
 

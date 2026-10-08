@@ -39,41 +39,41 @@ pub mod wake_up;
 /// Default embedding vector dimensions (used when no embedder is configured).
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
-pub use auto_link::{add_backrefs, auto_link_memory, AutoLinkOptions};
-pub use budget::{estimate_tokens, select_within_budget, BudgetSelection, ITEM_OVERHEAD_TOKENS};
+pub use auto_link::{AutoLinkOptions, add_backrefs, auto_link_memory};
+pub use budget::{BudgetSelection, ITEM_OVERHEAD_TOKENS, estimate_tokens, select_within_budget};
 pub use context_snapshot::{
-    build_context_snapshot, build_context_snapshot_from_memories, ContextSnapshot,
-    ContextSnapshotOptions, SnapshotFormat, SnapshotSection, SNAPSHOT_HEADER,
+    ContextSnapshot, ContextSnapshotOptions, SNAPSHOT_HEADER, SnapshotFormat, SnapshotSection,
+    build_context_snapshot, build_context_snapshot_from_memories,
 };
 pub use embedder::Embedder;
-pub use embedding_policy::{decide, EmbeddingDecision, EmbeddingState, META_EMBEDDING_MODEL};
+pub use embedding_policy::{EmbeddingDecision, EmbeddingState, META_EMBEDDING_MODEL, decide};
 pub use error::{IcmError, IcmResult};
 pub use facts::{Fact, FactsStats};
 pub use facts_store::FactsStore;
 #[cfg(feature = "embeddings")]
-pub use fastembed_embedder::{FastEmbedder, DEFAULT_MODEL as DEFAULT_EMBEDDING_MODEL};
+pub use fastembed_embedder::{DEFAULT_MODEL as DEFAULT_EMBEDDING_MODEL, FastEmbedder};
 pub use feedback::{Feedback, FeedbackStats};
 pub use feedback_store::FeedbackStore;
-pub use fusion::{rrf_fuse, FusedHit, RankedHit, RankedList, RankedQuery, RRF_K};
+pub use fusion::{FusedHit, RRF_K, RankedHit, RankedList, RankedQuery, rrf_fuse};
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
 pub use memoir_store::MemoirStore;
 pub use memory::{
-    max_importance, Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats,
-    TopicHealth,
-};
-pub use store::{
-    find_similar_memory, merge_summaries, union_keywords, MemoryStore, DEDUP_SIMILARITY_THRESHOLD,
+    Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
+    max_importance,
 };
 pub use store::{Consolidated, ReadMemory};
-pub use temporal::{parse_instant, parse_query_window, TimeWindow};
+pub use store::{
+    DEDUP_SIMILARITY_THRESHOLD, MemoryStore, find_similar_memory, merge_summaries, union_keywords,
+};
+pub use temporal::{TimeWindow, parse_instant, parse_query_window};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;
 pub use wake_up::{
-    build_wake_up, build_wake_up_from_memories, is_preference_topic, project_matches, WakeUpFormat,
-    WakeUpOptions, EMPTY_PACK_HEADER,
+    EMPTY_PACK_HEADER, WakeUpFormat, WakeUpOptions, build_wake_up, build_wake_up_from_memories,
+    is_preference_topic, project_matches,
 };
 
-pub use learn::{learn_project, LearnResult};
+pub use learn::{LearnResult, learn_project};
 
 pub mod time_fmt;
 pub use time_fmt::format_local;

@@ -176,17 +176,20 @@ mod tests {
         // Compare via `Path::ends_with` (component-aware) so the test
         // works on both Unix and Windows path separators.
         assert_eq!(hits.len(), 2, "got: {hits:?}");
-        assert!(hits
-            .iter()
-            .any(|h| h.path.ends_with(Path::new("proj-a").join("CLAUDE.md"))));
+        assert!(
+            hits.iter()
+                .any(|h| h.path.ends_with(Path::new("proj-a").join("CLAUDE.md")))
+        );
         assert!(hits.iter().any(|h| {
             h.path
                 .ends_with(Path::new("proj-b").join("sub").join("AGENTS.md"))
         }));
         // Decoy must be ignored. Use components, not raw string.
-        assert!(!hits
-            .iter()
-            .any(|h| h.path.components().any(|c| c.as_os_str() == "node_modules")));
+        assert!(
+            !hits
+                .iter()
+                .any(|h| h.path.components().any(|c| c.as_os_str() == "node_modules"))
+        );
     }
 
     #[test]

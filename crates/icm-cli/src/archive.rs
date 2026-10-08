@@ -9,8 +9,8 @@
 //! so re-fires within the same Claude Code / Codex / Gemini turn land
 //! under the same row.
 
-use icm_core::transcript::Role;
 use icm_core::TranscriptStore;
+use icm_core::transcript::Role;
 use icm_store::Store;
 use serde_json::Value;
 

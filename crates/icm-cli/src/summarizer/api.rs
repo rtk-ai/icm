@@ -25,10 +25,10 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, anyhow, bail};
+use serde_json::{Value, json};
 
-use super::{trim_response, ProviderKind, SummarizeRequest, Summarizer};
+use super::{ProviderKind, SummarizeRequest, Summarizer, trim_response};
 
 /// Anthropic API version header. Dated, but it is the current (and only)
 /// stable value; newer behavior is opted into per feature, not by bumping it.
@@ -982,7 +982,9 @@ impl ApiSummarizer {
                         sent.ceiling, sent.budget,
                     )
                 };
-                anyhow!("{name} rejected the request (HTTP {code}, model={model}): {detail} — {advice}{hint}")
+                anyhow!(
+                    "{name} rejected the request (HTTP {code}, model={model}): {detail} — {advice}{hint}"
+                )
             }
             404 if self.workspace_id.is_some()
                 && detail.to_ascii_lowercase().contains("workspace") =>
@@ -2794,11 +2796,12 @@ mod tests {
         provider(ProviderKind::Anthropic, &server)
             .summarize_with_key(KEY, &request(None))
             .unwrap();
-        assert!(seen
-            .join()
-            .unwrap()
-            .header("anthropic-workspace-id")
-            .is_none());
+        assert!(
+            seen.join()
+                .unwrap()
+                .header("anthropic-workspace-id")
+                .is_none()
+        );
 
         // It is an Anthropic header: the other providers never send it.
         for kind in [ProviderKind::OpenAi, ProviderKind::Google] {
@@ -2808,11 +2811,12 @@ mod tests {
             build(kind, &opts)
                 .summarize_with_key(KEY, &request(Some("m")))
                 .unwrap();
-            assert!(seen
-                .join()
-                .unwrap()
-                .header("anthropic-workspace-id")
-                .is_none());
+            assert!(
+                seen.join()
+                    .unwrap()
+                    .header("anthropic-workspace-id")
+                    .is_none()
+            );
             let lines = describe_config(kind.as_str(), "m", &opts).join("\n");
             assert!(lines.contains("workspace_id = (ignored"), "{lines}");
         }
@@ -3288,10 +3292,12 @@ mod tests {
             let err = call(partial(Some(reason))).unwrap_err().to_string();
             assert!(err.contains("declined to answer"), "{reason}: {err}");
         }
-        assert!(call(partial(Some("MAX_TOKENS")))
-            .unwrap_err()
-            .to_string()
-            .contains("output ceiling"));
+        assert!(
+            call(partial(Some("MAX_TOKENS")))
+                .unwrap_err()
+                .to_string()
+                .contains("output ceiling")
+        );
         assert_eq!(
             call(partial(Some("STOP"))).unwrap(),
             "The retriever combines BM25 with"
@@ -3360,9 +3366,11 @@ mod tests {
             base_url: "http://127.0.0.1:8000/v1".into(),
             ..ApiOptions::default()
         };
-        assert!(!describe_config("openai", "m", &local)
-            .join("\n")
-            .contains("WARNING"));
+        assert!(
+            !describe_config("openai", "m", &local)
+                .join("\n")
+                .contains("WARNING")
+        );
     }
 
     #[test]
@@ -3605,23 +3613,31 @@ mod tests {
             assert!(!err.contains("fact 000"), "{reason}: partial text quoted");
         }
         // Missing altogether, and the upper-case spellings some gateways use.
-        assert!(call(partial(Value::Null))
-            .unwrap_err()
-            .to_string()
-            .contains("no finish_reason"));
-        assert!(call(partial(json!("MAX_TOKENS")))
-            .unwrap_err()
-            .to_string()
-            .contains("output ceiling"));
-        assert!(call(partial(json!("LENGTH")))
-            .unwrap_err()
-            .to_string()
-            .contains("output ceiling"));
+        assert!(
+            call(partial(Value::Null))
+                .unwrap_err()
+                .to_string()
+                .contains("no finish_reason")
+        );
+        assert!(
+            call(partial(json!("MAX_TOKENS")))
+                .unwrap_err()
+                .to_string()
+                .contains("output ceiling")
+        );
+        assert!(
+            call(partial(json!("LENGTH")))
+                .unwrap_err()
+                .to_string()
+                .contains("output ceiling")
+        );
         assert!(call(partial(json!("ERROR"))).is_err());
-        assert!(call(partial(json!("model_length")))
-            .unwrap_err()
-            .to_string()
-            .contains("context window"));
+        assert!(
+            call(partial(json!("model_length")))
+                .unwrap_err()
+                .to_string()
+                .contains("context window")
+        );
 
         for reason in [
             "stop",
@@ -4145,9 +4161,11 @@ mod tests {
             ProviderKind::OpenAi,
             "<think> blocks eat the budget; the answer follows </think>. Use think=false.",
         ));
-        assert!(provider(ProviderKind::OpenAi, &server)
-            .summarize_with_key(KEY, &req)
-            .is_err());
+        assert!(
+            provider(ProviderKind::OpenAi, &server)
+                .summarize_with_key(KEY, &req)
+                .is_err()
+        );
     }
 
     #[test]

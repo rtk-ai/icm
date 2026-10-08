@@ -23,7 +23,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 /// onnxruntime release to fetch. MUST stay ABI-compatible with the `ort`
@@ -486,8 +486,8 @@ mod tests {
         // Build a tiny .tgz: a providers sibling (must be ignored) + the real
         // versioned library. No symlink entry (tar builder appends regular
         // files), which still exercises the prefix/underscore filtering.
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
 
         fn tar_entry(builder: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8]) {
             let mut header = tar::Header::new_gnu();

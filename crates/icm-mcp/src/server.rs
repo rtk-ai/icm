@@ -378,11 +378,18 @@ fn handle_tools_call(
         && *calls_since_store >= STORE_NUDGE_THRESHOLD
         && calls_since_store.is_multiple_of(STORE_NUDGE_THRESHOLD)
     {
-        result.append_hint(&format!(
-            "\n[ICM: {} tool calls since last store. \
+        let hint = format!(
+            "[ICM: {} tool calls since last store. \
              Consider saving important context with icm_memory_store before it is lost.]",
             calls_since_store
-        ));
+        );
+        // An answer asked for as JSON is parsed by the client: the hint
+        // goes in a block of its own, not after the closing bracket.
+        if args.get("format").and_then(Value::as_str) == Some("json") {
+            result.push_note(&hint);
+        } else {
+            result.append_hint(&format!("\n{hint}"));
+        }
     }
 
     // `resultType` (issue #432): `CallToolResult` requires it in the
@@ -562,6 +569,98 @@ mod tests {
                 .is_some(),
             "expected _meta[\"io.modelcontextprotocol/serverInfo\"].name, got {:?}",
             result["_meta"]
+        );
+    }
+
+    /// One `tools/call` through the server, as the 10th call since the last
+    /// store: the one that carries the reminder to store.
+    fn nudged_call(store: &Store, name: &str, arguments: Value) -> Value {
+        let msg: JsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .unwrap();
+        let mut calls_since_store = STORE_NUDGE_THRESHOLD - 1;
+        let resp = handle_json_rpc_message(
+            msg,
+            store,
+            None,
+            true,
+            AutoConsolidate::default(),
+            &mut calls_since_store,
+            None,
+        )
+        .expect("a response");
+        assert_eq!(calls_since_store, STORE_NUDGE_THRESHOLD);
+        resp.result.expect("a result")
+    }
+
+    fn store_with_two_linked_memories() -> (Store, String) {
+        use icm_core::{Importance, Memory, MemoryStore};
+        let store = Store::in_memory().unwrap();
+        let mut a = Memory::new(
+            "context-alpha".into(),
+            "Alpha stores sessions in Redis".into(),
+            Importance::High,
+        );
+        let b = Memory::new(
+            "context-alpha".into(),
+            "Redis runs with append-only persistence".into(),
+            Importance::High,
+        );
+        a.related_ids = vec![b.id.clone()];
+        let id = a.id.clone();
+        store.store(a).unwrap();
+        store.store(b).unwrap();
+        (store, id)
+    }
+
+    /// The reminder used to be appended to the answer itself. After a JSON
+    /// answer that gave `[...]` followed by a line of text: every 10th
+    /// call, a client parsing the result failed on trailing data.
+    #[test]
+    fn the_store_reminder_does_not_break_a_json_answer() {
+        let (store, id) = store_with_two_linked_memories();
+        for (name, arguments) in [
+            (
+                "icm_memory_recall",
+                json!({"query": "sessions Redis", "project": "alpha", "format": "json"}),
+            ),
+            (
+                "icm_memory_related",
+                json!({"id": id, "project": "alpha", "format": "json"}),
+            ),
+        ] {
+            let result = nudged_call(&store, name, arguments);
+            let content = result["content"].as_array().unwrap();
+            assert_eq!(content.len(), 2, "{name}: {result}");
+            let records: Value = serde_json::from_str(content[0]["text"].as_str().unwrap())
+                .unwrap_or_else(|e| panic!("{name}: the answer is not JSON any more ({e})"));
+            assert!(!records.as_array().unwrap().is_empty(), "{name}");
+            let reminder = content[1]["text"].as_str().unwrap();
+            assert!(reminder.starts_with("[ICM: 10 tool calls since last store."));
+        }
+    }
+
+    /// A text answer keeps the reminder where it was: at the end of the
+    /// same block.
+    #[test]
+    fn the_store_reminder_still_ends_a_text_answer() {
+        let (store, _) = store_with_two_linked_memories();
+        let result = nudged_call(
+            &store,
+            "icm_memory_recall",
+            json!({"query": "sessions Redis", "project": "alpha"}),
+        );
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("[context-alpha] "), "{text}");
+        assert!(
+            text.contains("\n[ICM: 10 tool calls since last store."),
+            "{text}"
         );
     }
 }

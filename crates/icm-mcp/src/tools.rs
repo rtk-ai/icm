@@ -1442,12 +1442,24 @@ fn push_memory_output(output: &mut String, mem: &Memory, score: f32, compact: bo
 /// and is accepted. Anything else is refused rather than ignored, which
 /// would silently fall back to a count-based recall.
 fn recall_max_tokens(args: &Value) -> Result<Option<usize>, String> {
-    let whole = |f: f64| (f.is_finite() && f.fract() == 0.0).then_some(f as i64);
     let value = match args.get("max_tokens") {
         None | Some(Value::Null) => return Ok(None),
         Some(v) => v,
     };
-    let tokens = match value {
+    match whole_number(value) {
+        Some(n) => Ok(Some(n.clamp(100, 32_000) as usize)),
+        None => Err(format!(
+            "invalid max_tokens {value}: expected a whole number of tokens (100 to 32000)"
+        )),
+    }
+}
+
+/// A whole number from a tool argument: a JSON integer, a whole float
+/// (`3.0`, a valid JSON Schema `integer`) or a numeric string (`"3"`).
+/// `None` for anything else.
+fn whole_number(value: &Value) -> Option<i64> {
+    let whole = |f: f64| (f.is_finite() && f.fract() == 0.0).then_some(f as i64);
+    match value {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().and_then(whole)),
         Value::String(s) => {
             let s = s.trim();
@@ -1456,11 +1468,22 @@ fn recall_max_tokens(args: &Value) -> Result<Option<usize>, String> {
                 .or_else(|| s.parse::<f64>().ok().and_then(whole))
         }
         _ => None,
+    }
+}
+
+/// A count argument (`depth`, `limit`) of `icm_memory_related`, clamped to
+/// `1..=max`. A value that is not a whole number is refused rather than
+/// replaced by the default: `depth: "three"` answered at depth 1 would read
+/// as "there are no deeper links".
+fn count_arg(args: &Value, key: &str, default: i64, max: i64) -> Result<usize, String> {
+    let value = match args.get(key) {
+        None | Some(Value::Null) => return Ok(default as usize),
+        Some(v) => v,
     };
-    match tokens {
-        Some(n) => Ok(Some(n.clamp(100, 32_000) as usize)),
+    match whole_number(value) {
+        Some(n) => Ok(n.clamp(1, max) as usize),
         None => Err(format!(
-            "invalid max_tokens {value}: expected a whole number of tokens (100 to 32000)"
+            "invalid {key} {value}: expected a whole number (1 to {max})"
         )),
     }
 }
@@ -1751,8 +1774,14 @@ fn tool_related(store: &Store, args: &Value, compact: bool) -> ToolResult {
         Some(id) if !id.is_empty() => id,
         _ => return ToolResult::error("missing required field: id".into()),
     };
-    let depth = get_i64(args, "depth", 1).clamp(1, RELATED_MAX_DEPTH) as usize;
-    let limit = get_i64(args, "limit", 10).clamp(1, RELATED_MAX_LIMIT) as usize;
+    let depth = match count_arg(args, "depth", 1, RELATED_MAX_DEPTH) {
+        Ok(n) => n,
+        Err(msg) => return ToolResult::error(msg),
+    };
+    let limit = match count_arg(args, "limit", 10, RELATED_MAX_LIMIT) {
+        Ok(n) => n,
+        Err(msg) => return ToolResult::error(msg),
+    };
     let project = project_scope(args);
     let in_scope = |m: &Memory| match project.as_deref() {
         None => true,
@@ -6143,6 +6172,52 @@ description = "A test project"
         assert!(unknown.content[0].text.contains("memory not found"));
         let format = related(&g, json!({"id": g.a.id, "format": "yaml"}), true);
         assert!(format.is_error && format.content[0].text.contains("\"json\""));
+    }
+
+    #[test]
+    fn related_reads_depth_and_limit_however_the_client_writes_them() {
+        let g = graph();
+        let ask = |depth: Value, limit: Value| {
+            related(
+                &g,
+                json!({"id": g.a.id, "depth": depth, "limit": limit, "project": "", "format": "json"}),
+                true,
+            )
+        };
+        // A whole float and a numeric string are the number they spell:
+        // two links away from `a`, across projects, is everything; one
+        // link away is `b` and `other` only.
+        for depth in [json!(2), json!(2.0), json!("2"), json!(" 2 ")] {
+            assert_eq!(
+                parsed(&ask(depth.clone(), json!(50))).len(),
+                4,
+                "depth {depth}"
+            );
+        }
+        assert_eq!(parsed(&ask(json!(1.0), json!(50))).len(), 2);
+        for limit in [json!(2), json!(2.0), json!("2")] {
+            assert_eq!(
+                parsed(&ask(json!(3), limit.clone())).len(),
+                2,
+                "limit {limit}"
+            );
+        }
+        // Out of range is brought back into range, in both directions.
+        assert_eq!(parsed(&ask(json!(-4), json!(0))).len(), 1);
+        assert_eq!(parsed(&ask(json!(u64::MAX), json!(u64::MAX))).len(), 4);
+        // Anything else is refused: answering at the default depth would
+        // read as "there is nothing further".
+        for (depth, limit, key) in [
+            (json!(2.5), json!(10), "depth"),
+            (json!("three"), json!(10), "depth"),
+            (json!(true), json!(10), "depth"),
+            (json!(1), json!(1.5), "limit"),
+            (json!(1), json!([2]), "limit"),
+        ] {
+            let result = ask(depth.clone(), limit.clone());
+            assert!(result.is_error, "depth {depth} limit {limit}");
+            assert!(result.content[0].text.contains(&format!("invalid {key}")));
+        }
     }
 
     #[test]

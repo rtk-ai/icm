@@ -81,7 +81,7 @@ pub(crate) fn summary_hash(topic: &str, summary: &str) -> String {
     h.update(topic_n.as_bytes());
     h.update(b"\0");
     h.update(summary_n.as_bytes());
-    format!("{:x}", h.finalize())
+    icm_core::to_hex(&h.finalize())
 }
 
 /// Validate and normalize a memory before storing (mirror of the other
@@ -95,7 +95,7 @@ pub(crate) fn validate_and_normalize(mut memory: Memory) -> IcmResult<Memory> {
         return Err(IcmError::InvalidInput("summary cannot be empty".into()));
     }
     if memory.id.trim().is_empty() {
-        memory.id = ulid::Ulid::new().to_string();
+        memory.id = ulid::Ulid::generate().to_string();
     }
     memory.topic = memory.topic.trim().to_string();
     Ok(memory)

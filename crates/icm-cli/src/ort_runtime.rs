@@ -159,7 +159,7 @@ fn download_bytes(url: &str) -> Result<Vec<u8>> {
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    icm_core::to_hex(&hasher.finalize())
 }
 
 fn verify_sha(bytes: &[u8], expected: &str, what: &str) -> Result<()> {

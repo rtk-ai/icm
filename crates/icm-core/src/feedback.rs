@@ -31,7 +31,7 @@ impl Feedback {
         source: String,
     ) -> Self {
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             topic,
             context,
             predicted,

@@ -20,7 +20,7 @@ impl Memoir {
     pub fn new(name: String, description: String) -> Self {
         let now = Utc::now();
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             name,
             description,
             created_at: now,
@@ -122,7 +122,7 @@ impl Concept {
     pub fn new(memoir_id: String, name: String, definition: String) -> Self {
         let now = Utc::now();
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             memoir_id,
             name,
             definition,
@@ -206,7 +206,7 @@ pub struct ConceptLink {
 impl ConceptLink {
     pub fn new(source_id: String, target_id: String, relation: Relation) -> Self {
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             source_id,
             target_id,
             relation,

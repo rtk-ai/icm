@@ -72,7 +72,7 @@ impl SqliteStore {
         tool_name: &str,
         raw_output: &str,
     ) -> IcmResult<String> {
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn
             .execute(
@@ -148,7 +148,7 @@ impl SqliteStore {
     /// past the threshold used to add a job, and each job after the first
     /// sent the lone summary back to the provider to be rewritten.
     pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         let inserted = self
             .conn

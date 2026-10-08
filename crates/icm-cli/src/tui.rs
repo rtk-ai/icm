@@ -2459,7 +2459,7 @@ mod tests {
                 .unwrap();
         }
         let var = "ICM_TEST_TUI_CONSOLIDATE_401_KEY";
-        std::env::set_var(var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(var, "placeholder-not-a-real-key") };
         let mut app = App::new(&store, None, None).unwrap();
         app.summarizer_cfg = crate::config::SummarizerConfig {
             provider: "openai".into(),
@@ -2472,7 +2472,7 @@ mod tests {
             topic: "solo".into(),
         };
         execute_confirm(&mut app, &store, None);
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
 
         called_rx
             .recv_timeout(Duration::from_secs(5))

@@ -24,7 +24,7 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # default-features off so each member selects its own ort backend
 # (ort-download-binaries for the static default build, ort-load-dynamic for the
 # homebrew-core-buildable variant — issue #345). hf-hub is re-added per-feature.
-fastembed = { version = "6", default-features = false }
+fastembed = { version = "7", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use directories::ProjectDirs;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use crate::embedder::Embedder;
 use crate::error::{IcmError, IcmResult};
@@ -210,7 +210,7 @@ impl FastEmbedder {
                 ));
             }
             let model = TextEmbedding::try_new(
-                InitOptions::new(emb_model)
+                TextInitOptions::new(emb_model)
                     .with_show_download_progress(true)
                     .with_cache_dir(cache),
             )

@@ -59,7 +59,7 @@ impl SqliteStore {
         // page was dirtied during backup" retry loop internally, so a
         // concurrent writer does not corrupt the destination.
         self.conn
-            .backup(rusqlite::DatabaseName::Main, dst, None)
+            .backup(rusqlite::MAIN_DB, dst, None)
             .map_err(|e| IcmError::Database(format!("sqlite online backup failed: {e}")))?;
 
         // POW-1: Restrict permissions on the backup file. A backup contains

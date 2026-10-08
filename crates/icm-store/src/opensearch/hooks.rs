@@ -35,7 +35,7 @@ impl OpenSearchStore {
         tool_name: &str,
         raw_output: &str,
     ) -> IcmResult<String> {
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         self.request(
             "PUT",
             &format!("{IDX_PENDING}/_doc/{id}?{}", self.refresh_param()),
@@ -109,7 +109,7 @@ impl OpenSearchStore {
         {
             return Ok(waiting.id);
         }
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         self.request(
             "PUT",
             &format!(
@@ -397,7 +397,7 @@ impl OpenSearchStore {
     pub fn record_hook_event(&self, ev: &HookEventInsert) -> IcmResult<i64> {
         let now = Utc::now();
         let id = now.timestamp_millis();
-        let doc_id = ulid::Ulid::new().to_string();
+        let doc_id = ulid::Ulid::generate().to_string();
         self.request(
             "PUT",
             &format!("{IDX_HOOKS}/_doc/{doc_id}"),

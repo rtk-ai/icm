@@ -38,7 +38,7 @@ impl Memory {
     pub fn new(topic: String, summary: String, importance: Importance) -> Self {
         let now = Utc::now();
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             created_at: now,
             updated_at: now,
             last_accessed: now,

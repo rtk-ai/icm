@@ -41,7 +41,7 @@ impl PostgresStore {
         tool_name: &str,
         raw_output: &str,
     ) -> IcmResult<String> {
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let mut c = self.conn()?;
         c.execute(
             "INSERT INTO pending_extractions (id, project, tool_name, raw_output, captured_at)
@@ -110,7 +110,7 @@ impl PostgresStore {
     pub fn enqueue_pending_consolidation(&self, topic: &str, project: &str) -> IcmResult<String> {
         // One `pending` job per topic, as on SQLite: a topic already
         // waiting is not queued again.
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let mut c = self.conn()?;
         let inserted = c
             .execute(

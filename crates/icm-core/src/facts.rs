@@ -51,7 +51,7 @@ impl Fact {
     #[must_use]
     pub fn new(entity: String, key: String, value: String, source: String) -> Self {
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             entity,
             key,
             value,

@@ -289,7 +289,7 @@ fn scan_scripts(store: &dyn MemoirStore, memoir_id: &str, dir: &Path) -> IcmResu
 fn read_cargo_toml(dir: &Path) -> Option<String> {
     let path = dir.join("Cargo.toml");
     let content = read_manifest_capped(&path)?;
-    let parsed: toml::Value = content.parse().ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
 
     let pkg = parsed.get("package");
     let name = pkg
@@ -351,7 +351,7 @@ fn read_package_json(dir: &Path) -> Option<String> {
 fn read_pyproject_toml(dir: &Path) -> Option<String> {
     let path = dir.join("pyproject.toml");
     let content = read_manifest_capped(&path)?;
-    let parsed: toml::Value = content.parse().ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
 
     let project = parsed
         .get("project")
@@ -419,7 +419,7 @@ fn dedup_by_name(deps: Vec<(String, String)>) -> Vec<(String, String)> {
 fn collect_cargo_deps(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("Cargo.toml");
     let content = read_manifest_capped(&path)?;
-    let parsed: toml::Value = content.parse().ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
 
     let mut deps = Vec::new();
 
@@ -474,7 +474,7 @@ fn collect_npm_deps(dir: &Path) -> Option<Vec<(String, String)>> {
 fn collect_python_deps(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("pyproject.toml");
     let content = read_manifest_capped(&path)?;
-    let parsed: toml::Value = content.parse().ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
 
     let mut deps = Vec::new();
 
@@ -579,7 +579,7 @@ fn collect_modules(dir: &Path) -> Vec<(String, String)> {
 fn collect_rust_workspace_members(dir: &Path) -> Option<Vec<(String, String)>> {
     let path = dir.join("Cargo.toml");
     let content = read_manifest_capped(&path)?;
-    let parsed: toml::Value = content.parse().ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
 
     let members = parsed
         .get("workspace")
@@ -601,7 +601,7 @@ fn collect_rust_workspace_members(dir: &Path) -> Option<Vec<(String, String)>> {
                 // Try to read the member's Cargo.toml for description
                 let member_cargo = member_path.join("Cargo.toml");
                 let desc = if let Some(mc) = read_manifest_capped(&member_cargo) {
-                    if let Ok(mp) = mc.parse::<toml::Value>() {
+                    if let Ok(mp) = toml::from_str::<toml::Value>(&mc) {
                         mp.get("package")
                             .and_then(|p| p.get("description"))
                             .and_then(|v| v.as_str())

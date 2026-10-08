@@ -57,7 +57,7 @@ pgvector = { version = "0.4", features = ["postgres"], optional = true }
 # OpenSearch REST API directly — no async runtime, matching the store's
 # synchronous trait surface. `base64` encodes optional basic-auth creds.
 ureq = { version = "2", features = ["json", "tls"], optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

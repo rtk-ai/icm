@@ -448,7 +448,7 @@ pub(crate) fn rewrite_toml(
 ) -> Result<StripResult> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let mut value: toml::Value = content.parse()?;
+    let mut value: toml::Value = toml::from_str(&content)?;
     let result = strip_toml_table(&mut value, table, entry);
     if matches!(result, StripResult::Removed { .. }) {
         let out = toml::to_string(&value)?;
@@ -605,7 +605,7 @@ hello = "world"
 command = "/x/icm"
 args = ["serve"]
 "#;
-        let mut v: toml::Value = src.parse().unwrap();
+        let mut v: toml::Value = toml::from_str(src).unwrap();
         let r = strip_toml_table(&mut v, "mcp_servers", "icm");
         assert_eq!(r, StripResult::Removed { removed: 1 });
         // mcp_servers parent had only icm -> dropped.
@@ -623,7 +623,7 @@ command = "/x/icm"
 [mcp_servers.other]
 command = "/x/o"
 "#;
-        let mut v: toml::Value = src.parse().unwrap();
+        let mut v: toml::Value = toml::from_str(src).unwrap();
         let r = strip_toml_table(&mut v, "mcp_servers", "icm");
         assert_eq!(r, StripResult::Removed { removed: 1 });
         assert!(v["mcp_servers"].get("other").is_some());

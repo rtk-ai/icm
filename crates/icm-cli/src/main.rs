@@ -1622,7 +1622,7 @@ fn resolve_db_path(cli_db: Option<PathBuf>, cfg: &config::Config) -> PathBuf {
             let project_cfg = icm_dir.join("config.toml");
             if project_cfg.exists() {
                 if let Ok(content) = std::fs::read_to_string(&project_cfg) {
-                    if let Ok(value) = content.parse::<toml::Value>() {
+                    if let Ok(value) = toml::from_str::<toml::Value>(&content) {
                         if let Some(path_str) = value
                             .get("store")
                             .and_then(|s| s.get("path"))
@@ -8376,8 +8376,7 @@ fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Res
     let mut config: toml::Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("cannot read {}", config_path.display()))?;
-        content
-            .parse::<toml::Value>()
+        toml::from_str::<toml::Value>(&content)
             .with_context(|| format!("invalid TOML in {}", config_path.display()))?
     } else {
         if let Some(parent) = config_path.parent() {
@@ -8495,7 +8494,7 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
             let project_cfg = icm_dir.join("config.toml");
             if project_cfg.exists() {
                 if let Ok(content) = std::fs::read_to_string(&project_cfg) {
-                    if let Ok(value) = content.parse::<toml::Value>() {
+                    if let Ok(value) = toml::from_str::<toml::Value>(&content) {
                         if let Some(path_str) = value
                             .get("store")
                             .and_then(|s| s.get("path"))
@@ -13027,6 +13026,74 @@ mod hook_start_tests {
         let (_base, worktree) = make_worktree();
         let json = serde_json::json!({"cwd": worktree.to_str().unwrap()});
         assert_eq!(project_from_cwd_json(&json), Some("mainproject".into()));
+    }
+}
+
+#[cfg(test)]
+mod inject_codex_mcp_server_tests {
+    use super::*;
+
+    /// An existing Codex config is a whole TOML document. Parsed as a single
+    /// value (`str::parse::<toml::Value>` reads one value since toml 1.0),
+    /// every real file was refused as invalid and `icm init` failed for
+    /// Codex users. Its other settings must also survive the edit.
+    #[test]
+    fn adds_the_server_to_an_existing_config_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "model = \"o4-mini\"\napproval_policy = \"on-request\"\n\n\
+             [mcp_servers.other]\ncommand = \"other-server\"\nargs = [\"--stdio\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            inject_codex_mcp_server(&path, "icm", "/usr/local/bin/icm").unwrap(),
+            "configured"
+        );
+        let written: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["model"].as_str(), Some("o4-mini"));
+        assert_eq!(written["approval_policy"].as_str(), Some("on-request"));
+        assert_eq!(
+            written["mcp_servers"]["other"]["command"].as_str(),
+            Some("other-server")
+        );
+        assert_eq!(
+            written["mcp_servers"]["icm"]["command"].as_str(),
+            Some("/usr/local/bin/icm")
+        );
+        assert_eq!(
+            written["mcp_servers"]["icm"]["args"],
+            toml::Value::Array(vec!["serve".into()])
+        );
+
+        // A second run finds it.
+        assert_eq!(
+            inject_codex_mcp_server(&path, "icm", "/usr/local/bin/icm").unwrap(),
+            "already configured"
+        );
+    }
+
+    #[test]
+    fn creates_the_config_when_there_is_none_and_refuses_a_broken_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codex").join("config.toml");
+        assert_eq!(
+            inject_codex_mcp_server(&path, "icm", "icm").unwrap(),
+            "configured"
+        );
+        let written: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["mcp_servers"]["icm"]["command"].as_str(),
+            Some("icm")
+        );
+
+        std::fs::write(&path, "model = \n").unwrap();
+        let err = inject_codex_mcp_server(&path, "icm", "icm").unwrap_err();
+        assert!(err.to_string().contains("invalid TOML"), "{err}");
     }
 }
 

@@ -208,7 +208,7 @@ fn lookup_dotted<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
 
 fn scan_toml(spec: &LocationSpec, table: &str, entry: &str) -> Result<Vec<LocationHit>> {
     let content = std::fs::read_to_string(&spec.path)?;
-    let parsed: toml::Value = content.parse()?;
+    let parsed: toml::Value = toml::from_str(&content)?;
     let mut hits = Vec::new();
     if let Some(t) = parsed.get(table).and_then(|v| v.as_table()) {
         if t.contains_key(entry) {

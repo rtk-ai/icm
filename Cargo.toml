@@ -30,7 +30,7 @@ fastembed = { version = "6", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_json_lenient = { version = "0.2", features = ["preserve_order"] }
-toml = "0.8"
+toml = "1"
 
 # Error handling
 thiserror = "2"
@@ -42,7 +42,7 @@ ulid = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Project detection (git remote / worktree resolution)
-gix = { version = "0.87.1", default-features = false, features = ["revision", "sha1"] }
+gix = { version = "0.88", default-features = false, features = ["revision", "sha1"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -63,7 +63,7 @@ flate2 = "1"
 tar = "0.4.45"
 # Windows onnxruntime runtime (issue #345) ships as a .zip, unlike the unix
 # .tgz; `deflate` is the only compression the Microsoft asset uses.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Platform
 libc = "0.2"
@@ -79,7 +79,7 @@ axum = "0.8"
 # `#[tokio::main]` macro, and `tokio::net` for the TCP listener.
 # Dropping `full` shaves ~3MB off the optimized binary on Linux.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
 rust-embed = "8"
 mime_guess = "2"
 getrandom = "0.2"

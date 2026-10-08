@@ -213,7 +213,7 @@ icm stats
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```
 
-ICM conserva anche **memoirs** (grafi di conoscenza permanenti di concetti e relazioni tipizzate), **feedback** (correzioni da cui imparare) e **trascrizioni letterali**, ed espone **31 strumenti MCP** (30 senza modello di embedding), una **API HTTP** che mantiene caricato il modello di embedding e una **dashboard da terminale** (`icm dashboard`). Tutto è descritto nel [riferimento](docs/reference.md).
+ICM conserva anche **memoirs** (grafi di conoscenza permanenti di concetti e relazioni tipizzate), **feedback** (correzioni da cui imparare) e **trascrizioni letterali**, ed espone **32 strumenti MCP** (31 senza modello di embedding), una **API HTTP** che mantiene caricato il modello di embedding e una **dashboard da terminale** (`icm dashboard`). Tutto è descritto nel [riferimento](docs/reference.md).
 
 <a id="how-it-works"></a>
 
@@ -242,7 +242,7 @@ Tutto sta in un unico file SQLite, senza servizi esterni:
 | [Architettura tecnica](docs/architecture.md) | Struttura dei crate, pipeline di ricerca, modello di decay, integrazione di sqlite-vec, test |
 | [Guida utente](docs/guide.md) | Installazione, organizzazione dei topic, consolidamento, estrazione, risoluzione dei problemi |
 | [Panoramica del prodotto](docs/product.md) | Casi d'uso, benchmark, confronto con le alternative |
-| [Riferimento](docs/reference.md) | Opzioni di installazione, configurazione per strumento, CLI, 31 strumenti MCP, API HTTP, dashboard, funzionamento interno |
+| [Riferimento](docs/reference.md) | Opzioni di installazione, configurazione per strumento, CLI, 32 strumenti MCP, API HTTP, dashboard, funzionamento interno |
 | [Adattatore del benchmark](bench/amb/README.md) | Come è stato eseguito il confronto qui sopra e come riprodurlo |
 | [Dimostrazioni](docs/demonstrations.md) | Micro-benchmark di archiviazione e piccole demo |
 

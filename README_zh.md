@@ -207,7 +207,7 @@ icm stats
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```
 
-ICM 还会保存 **memoirs**（由概念和带类型的关系组成的永久知识图谱）、**feedback**（可供学习的纠正）和**逐字对话记录**，并提供 **31 个 MCP 工具**（无嵌入模型时为 30 个）、一个让嵌入模型保持加载状态的 **HTTP API**，以及一个**终端仪表盘**（`icm dashboard`）。所有这些内容都在[参考文档](docs/reference.md)中。
+ICM 还会保存 **memoirs**（由概念和带类型的关系组成的永久知识图谱）、**feedback**（可供学习的纠正）和**逐字对话记录**，并提供 **32 个 MCP 工具**（无嵌入模型时为 31 个）、一个让嵌入模型保持加载状态的 **HTTP API**，以及一个**终端仪表盘**（`icm dashboard`）。所有这些内容都在[参考文档](docs/reference.md)中。
 
 <a id="how-it-works"></a>
 ## 工作原理
@@ -234,7 +234,7 @@ ICM 还会保存 **memoirs**（由概念和带类型的关系组成的永久知�
 | [技术架构](docs/architecture.md) | crate 结构、搜索流水线、衰减模型、sqlite-vec 集成、测试 |
 | [用户指南](docs/guide.md) | 安装、主题组织、整合、提取、故障排查 |
 | [产品概览](docs/product.md) | 使用场景、基准测试、与其他方案的比较 |
-| [参考文档](docs/reference.md) | 安装选项、各工具配置、CLI、31 个 MCP 工具、HTTP API、仪表盘、内部机制 |
+| [参考文档](docs/reference.md) | 安装选项、各工具配置、CLI、32 个 MCP 工具、HTTP API、仪表盘、内部机制 |
 | [基准适配器](bench/amb/README.md) | 上述对比是如何运行的，以及如何复现 |
 | [演示](docs/demonstrations.md) | 存储微基准测试和小型演示 |
 

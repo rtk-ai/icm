@@ -207,7 +207,7 @@ icm stats
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```
 
-ICM은 **memoirs**(개념과 타입이 있는 관계로 이루어진 영구 지식 그래프), **feedback**(학습에 쓰는 수정 사항), **원문 그대로의 대화 기록**도 보관하며, **31개의 MCP 도구**(임베딩 모델이 없으면 30개), 임베딩 모델을 로드된 상태로 유지하는 **HTTP API**, **터미널 대시보드**(`icm dashboard`)를 제공합니다. 모든 내용은 [레퍼런스](docs/reference.md)에 있습니다.
+ICM은 **memoirs**(개념과 타입이 있는 관계로 이루어진 영구 지식 그래프), **feedback**(학습에 쓰는 수정 사항), **원문 그대로의 대화 기록**도 보관하며, **32개의 MCP 도구**(임베딩 모델이 없으면 31개), 임베딩 모델을 로드된 상태로 유지하는 **HTTP API**, **터미널 대시보드**(`icm dashboard`)를 제공합니다. 모든 내용은 [레퍼런스](docs/reference.md)에 있습니다.
 
 <a id="how-it-works"></a>
 ## 작동 방식
@@ -234,7 +234,7 @@ ICM은 **memoirs**(개념과 타입이 있는 관계로 이루어진 영구 지�
 | [기술 아키텍처](docs/architecture.md) | 크레이트 구조, 검색 파이프라인, 감쇠 모델, sqlite-vec 통합, 테스트 |
 | [사용자 가이드](docs/guide.md) | 설치, 토픽 구성, 통합 정리(consolidation), 추출, 문제 해결 |
 | [제품 개요](docs/product.md) | 사용 사례, 벤치마크, 대안과의 비교 |
-| [레퍼런스](docs/reference.md) | 설치 옵션, 도구별 설정, CLI, 31개 MCP 도구, HTTP API, 대시보드, 내부 구조 |
+| [레퍼런스](docs/reference.md) | 설치 옵션, 도구별 설정, CLI, 32개 MCP 도구, HTTP API, 대시보드, 내부 구조 |
 | [벤치마크 어댑터](bench/amb/README.md) | 위 비교를 어떻게 실행했는지와 재현 방법 |
 | [데모](docs/demonstrations.md) | 저장소 마이크로벤치마크와 작은 데모 |
 

@@ -283,14 +283,15 @@ icm transcript forget "$SID"
 Rust + SQLite + FTS5, no external service: the whole transcript lives in the same SQLite file as your
 memories and memoirs.
 
-## MCP Tools (31)
+## MCP Tools (32)
 
 ### Memory tools
 
 | Tool | Description |
 |------|-------------|
 | `icm_memory_store` | Store, merging into a near-identical memory of the same topic (cosine above 0.95, with embeddings) |
-| `icm_memory_recall` | Search by query, filter by topic / keyword / project |
+| `icm_memory_recall` | Search by query, filter by topic / keyword / project; `format: "json"` returns records with their `id` and `related_ids` |
+| `icm_memory_related` | List the memories linked to one memory (`id`), up to `depth` links away, within the project |
 | `icm_memory_update` | Edit a memory in-place (content, importance, keywords) |
 | `icm_memory_forget` | Delete a memory by ID |
 | `icm_memory_forget_topic` | Delete all memories in a given topic |

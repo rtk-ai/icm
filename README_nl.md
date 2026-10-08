@@ -213,7 +213,7 @@ icm stats
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```
 
-ICM bewaart ook **memoirs** (permanente kennisgrafen van concepten en getypeerde relaties), **feedback** (correcties om van te leren) en **letterlijke transcripten**, en biedt **31 MCP-tools** (30 zonder embeddingmodel), een **HTTP-API** die het embeddingmodel geladen houdt en een **terminaldashboard** (`icm dashboard`). Alles staat in de [referentie](docs/reference.md).
+ICM bewaart ook **memoirs** (permanente kennisgrafen van concepten en getypeerde relaties), **feedback** (correcties om van te leren) en **letterlijke transcripten**, en biedt **32 MCP-tools** (31 zonder embeddingmodel), een **HTTP-API** die het embeddingmodel geladen houdt en een **terminaldashboard** (`icm dashboard`). Alles staat in de [referentie](docs/reference.md).
 
 <a id="how-it-works"></a>
 
@@ -242,7 +242,7 @@ Alles staat in één SQLite-bestand, zonder externe service:
 | [Technische architectuur](docs/architecture.md) | Cratestructuur, zoekpipeline, decaymodel, sqlite-vec-integratie, testen |
 | [Gebruikershandleiding](docs/guide.md) | Installatie, organisatie van topics, consolidatie, extractie, probleemoplossing |
 | [Productoverzicht](docs/product.md) | Toepassingen, benchmarks, vergelijking met alternatieven |
-| [Referentie](docs/reference.md) | Installatieopties, configuratie per tool, CLI, 31 MCP-tools, HTTP-API, dashboard, interne werking |
+| [Referentie](docs/reference.md) | Installatieopties, configuratie per tool, CLI, 32 MCP-tools, HTTP-API, dashboard, interne werking |
 | [Benchmarkadapter](bench/amb/README.md) | Hoe de vergelijking hierboven is uitgevoerd en hoe je die reproduceert |
 | [Demonstraties](docs/demonstrations.md) | Opslag-microbenchmarks en kleine demo's |
 

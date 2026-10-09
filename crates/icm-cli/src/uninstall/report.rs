@@ -67,6 +67,9 @@ fn print_section(title: &str, hits: &[super::discover::LocationHit], purge_data:
             HitDetail::TomlTable { table } => {
                 println!("  TOML table {table}");
             }
+            HitDetail::TomlArrayEntry { array, entry } => {
+                println!("  TOML array entry {array} name = \"{entry}\"");
+            }
             HitDetail::YamlBlock { start_line, lines } => {
                 println!(
                     "  YAML block at line {start_line} (~{lines} line(s)) — manual review may be needed"

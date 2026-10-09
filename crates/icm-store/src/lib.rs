@@ -50,7 +50,7 @@ pub use backend::{BackendKind, Store};
 
 // The v2 recall pipeline (rank fusion, token budget), shared by the HTTP,
 // MCP and CLI surfaces.
-pub use recall::{recall_v2, RecallEngine, RecallHit, RecallOutcome, RecallRequest};
+pub use recall::{RecallEngine, RecallHit, RecallOutcome, RecallRequest, recall_v2};
 
 // Concrete backend types, exposed for direct use / tests.
 #[cfg(feature = "opensearch")]

@@ -148,7 +148,7 @@ icm init --per-project    # database under .icm/ at the git root
 icm init --mode all       # also register the MCP server in every tool that supports it
 ```
 
-默认模式（`standard`）会写入指令、技能（skills）和钩子，不包含 MCP 服务器。`--mode all` 会添加 MCP 服务器；使用它（并对 Aider 加上 `--per-project`，因为 Aider 的约定文件是按项目区分的），即可覆盖下面的 18 个工具（[集成指南](docs/integrations.md)）：
+默认模式（`standard`）会写入指令、技能（skills）和钩子，不包含 MCP 服务器。`--mode all` 会添加 MCP 服务器；使用它（并对 Aider 加上 `--per-project`，因为 Aider 的约定文件是按项目区分的），即可覆盖下面的 19 个工具（[集成指南](docs/integrations.md)）：
 
 | 工具 | MCP 服务器 | 钩子 |
 |------|:---:|:-----:|
@@ -170,6 +170,7 @@ icm init --mode all       # also register the MCP server in every tool that supp
 | Continue.dev | 支持 | — |
 | Aider | — | — |
 | Pi | — | — |
+| Mistral Vibe | 支持 | 支持 (pre/post tool) |
 
 也可以手动注册 MCP 服务器：`claude mcp add icm -- icm serve`（任意 MCP 客户端：命令 `icm`，参数 `["serve"]`）。
 

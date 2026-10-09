@@ -23,7 +23,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 /// onnxruntime release to fetch. MUST stay ABI-compatible with the `ort`
@@ -135,11 +135,13 @@ pub fn activate_if_present() -> bool {
     if user_set_dylib() {
         return true;
     }
-    if let Some(lib) = managed_lib_path() {
-        if lib.is_file() {
-            std::env::set_var(ORT_DYLIB_ENV, &lib);
-            return true;
-        }
+    if let Some(lib) = managed_lib_path()
+        && lib.is_file()
+    {
+        // SAFETY: reached from `main` before the embedder, or any other
+        // thread, is started: nothing reads the environment concurrently.
+        unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib) };
+        return true;
     }
     false
 }
@@ -330,7 +332,9 @@ pub fn download(progress: bool) -> Result<PathBuf> {
     if let Some(marker) = declined_marker() {
         let _ = std::fs::remove_file(marker);
     }
-    std::env::set_var(ORT_DYLIB_ENV, &lib_path);
+    // SAFETY: reached from `main` before the embedder, or any other
+    // thread, is started: nothing reads the environment concurrently.
+    unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib_path) };
     if progress {
         eprintln!(
             "Installed onnxruntime {ORT_VERSION} → {}",
@@ -366,10 +370,10 @@ pub fn ensure_for_run(interactive: bool) -> bool {
         return false;
     }
     // Respect a previous decline.
-    if let Some(marker) = declined_marker() {
-        if marker.exists() {
-            return false;
-        }
+    if let Some(marker) = declined_marker()
+        && marker.exists()
+    {
+        return false;
     }
     let prompt = format!(
         "Enable semantic (vector) search? This downloads ONNX Runtime {ORT_VERSION} \
@@ -482,8 +486,8 @@ mod tests {
         // Build a tiny .tgz: a providers sibling (must be ignored) + the real
         // versioned library. No symlink entry (tar builder appends regular
         // files), which still exercises the prefix/underscore filtering.
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
 
         fn tar_entry(builder: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8]) {
             let mut header = tar::Header::new_gnu();

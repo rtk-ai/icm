@@ -42,15 +42,15 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    build_wake_up, find_similar_memory, format_local, is_preference_topic, keyword_matches,
-    project_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance,
-    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions,
-    DEDUP_SIMILARITY_THRESHOLD, MSG_NO_MEMORIES,
+    Concept, ConceptLink, DEDUP_SIMILARITY_THRESHOLD, Feedback, FeedbackStore, Importance, Label,
+    MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
+    WakeUpOptions, build_wake_up, find_similar_memory, format_local, is_preference_topic,
+    keyword_matches, project_matches, topic_matches,
 };
 use icm_store::Store;
 
@@ -556,7 +556,8 @@ enum Commands {
     ///
     /// Rows are populated automatically by the PostToolUse hook
     /// (`icm hook post`) whenever Claude Code / Codex / Gemini /
-    /// Copilot calls Edit / Write / MultiEdit / NotebookEdit on a
+    /// Copilot / Mistral Vibe calls Edit / Write / MultiEdit /
+    /// NotebookEdit (or their lowercase Vibe equivalents) on a
     /// file. Same `(project, file_path)` increments `touch_count`
     /// instead of duplicating rows. See issue #196.
     CodeAreas {
@@ -1620,24 +1621,21 @@ fn resolve_db_path(cli_db: Option<PathBuf>, cfg: &config::Config) -> PathBuf {
         if icm_dir.is_dir() {
             // 4a. .icm/config.toml with [store].path
             let project_cfg = icm_dir.join("config.toml");
-            if project_cfg.exists() {
-                if let Ok(content) = std::fs::read_to_string(&project_cfg) {
-                    if let Ok(value) = toml::from_str::<toml::Value>(&content) {
-                        if let Some(path_str) = value
-                            .get("store")
-                            .and_then(|s| s.get("path"))
-                            .and_then(|p| p.as_str())
-                        {
-                            let path = if Path::new(path_str).is_absolute() {
-                                PathBuf::from(path_str)
-                            } else {
-                                project_root.join(path_str)
-                            };
-                            if !path.as_os_str().is_empty() {
-                                return path;
-                            }
-                        }
-                    }
+            if project_cfg.exists()
+                && let Ok(content) = std::fs::read_to_string(&project_cfg)
+                && let Ok(value) = toml::from_str::<toml::Value>(&content)
+                && let Some(path_str) = value
+                    .get("store")
+                    .and_then(|s| s.get("path"))
+                    .and_then(|p| p.as_str())
+            {
+                let path = if Path::new(path_str).is_absolute() {
+                    PathBuf::from(path_str)
+                } else {
+                    project_root.join(path_str)
+                };
+                if !path.as_os_str().is_empty() {
+                    return path;
                 }
             }
 
@@ -2021,7 +2019,7 @@ fn settle_embedder<E: icm_core::Embedder>(
                     "embeddings: could not read the embedding state of the database ({e}); \
                      running keyword-only."
                 )),
-            )
+            );
         }
     };
     let plan = plan_embeddings(Some(&state), requested, requested_model, load);
@@ -2030,18 +2028,18 @@ fn settle_embedder<E: icm_core::Embedder>(
     // is not at the embedder's dimension (the state changed between the
     // peek and the open), this run does without.
     let embedder_dims = plan.embedder.as_ref().map(|e| e.dimensions());
-    if let (Some(embedder_dims), Some(index_dims)) = (embedder_dims, state.dims) {
-        if embedder_dims != index_dims {
-            return (
-                None,
-                Some(format!(
-                    "embeddings: the vector index has {index_dims} dims but the embedding model \
+    if let (Some(embedder_dims), Some(index_dims)) = (embedder_dims, state.dims)
+        && embedder_dims != index_dims
+    {
+        return (
+            None,
+            Some(format!(
+                "embeddings: the vector index has {index_dims} dims but the embedding model \
                      produces {embedder_dims}; running keyword-only and leaving the stored \
                      vectors untouched. If this persists: set `[embeddings].model` to the model \
                      that produced them, or re-embed everything with `icm embed --migrate`."
-                )),
-            );
-        }
+            )),
+        );
     }
 
     let mut warning = plan.warning;
@@ -2706,13 +2704,14 @@ fn main() -> Result<()> {
             );
             // Only here, where the flag exists: the batch commands and the
             // dashboard show the same error and have no --keep-originals.
-            if let Err(e) = &outcome {
-                if !keep_originals && e.downcast_ref::<SummarizerFailed>().is_some() {
-                    eprintln!(
-                        "hint: `icm consolidate -t {topic} --keep-originals` adds a lexical \
+            if let Err(e) = &outcome
+                && !keep_originals
+                && e.downcast_ref::<SummarizerFailed>().is_some()
+            {
+                eprintln!(
+                    "hint: `icm consolidate -t {topic} --keep-originals` adds a lexical \
                          join next to the originals instead of waiting for the provider"
-                    );
-                }
+                );
             }
             outcome.map(|_| ())
         }
@@ -3237,48 +3236,48 @@ fn cmd_store(
     }
 
     // Dedup: if a very similar memory already exists in the same topic, update it instead
-    if let Some(ref emb) = memory.embedding {
-        if let Ok(Some((existing, score))) = find_similar_memory(
+    if let Some(ref emb) = memory.embedding
+        && let Ok(Some((existing, score))) = find_similar_memory(
             store,
             &memory.embed_text(),
             emb,
             &topic,
             DEDUP_SIMILARITY_THRESHOLD,
-        ) {
-            let updated = Memory {
-                id: existing.id.clone(),
-                created_at: existing.created_at,
-                updated_at: chrono::Utc::now(),
-                last_accessed: existing.last_accessed,
-                access_count: existing.access_count,
-                weight: 1.0,
-                topic: existing.topic.clone(),
-                // Never wholesale-replace: `existing` and `memory` are only
-                // known to be semantically close (cosine similarity), not
-                // the same statement — see `merge_summaries`'s docs for a
-                // measured case (two distinct LoCoMo greeting turns scored
-                // 0.98) where that destroyed the earlier memory's content.
-                summary: icm_core::merge_summaries(&existing.summary, &memory.summary),
-                raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
-                keywords: icm_core::union_keywords(&existing.keywords, &memory.keywords),
-                embedding: memory.embedding.clone(),
-                // Never let a near-dup merge downgrade importance — a
-                // `--importance` omission defaults to Medium and would
-                // otherwise silently demote an existing Critical memory
-                // into decay/prune eligibility (audit finding).
-                importance: icm_core::max_importance(existing.importance, importance),
-                source: existing.source,
-                related_ids: existing.related_ids,
-                scope: existing.scope,
-            };
-            store.update(&updated)?;
-            println!(
-                "Updated existing memory (similarity {score:.2}): {}",
-                updated.id
-            );
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
-            return Ok(());
-        }
+        )
+    {
+        let updated = Memory {
+            id: existing.id.clone(),
+            created_at: existing.created_at,
+            updated_at: chrono::Utc::now(),
+            last_accessed: existing.last_accessed,
+            access_count: existing.access_count,
+            weight: 1.0,
+            topic: existing.topic.clone(),
+            // Never wholesale-replace: `existing` and `memory` are only
+            // known to be semantically close (cosine similarity), not
+            // the same statement — see `merge_summaries`'s docs for a
+            // measured case (two distinct LoCoMo greeting turns scored
+            // 0.98) where that destroyed the earlier memory's content.
+            summary: icm_core::merge_summaries(&existing.summary, &memory.summary),
+            raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
+            keywords: icm_core::union_keywords(&existing.keywords, &memory.keywords),
+            embedding: memory.embedding.clone(),
+            // Never let a near-dup merge downgrade importance — a
+            // `--importance` omission defaults to Medium and would
+            // otherwise silently demote an existing Critical memory
+            // into decay/prune eligibility (audit finding).
+            importance: icm_core::max_importance(existing.importance, importance),
+            source: existing.source,
+            related_ids: existing.related_ids,
+            scope: existing.scope,
+        };
+        store.update(&updated)?;
+        println!(
+            "Updated existing memory (similarity {score:.2}): {}",
+            updated.id
+        );
+        maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
+        return Ok(());
     }
 
     // Auto-link: wire the new memory into the existing graph before
@@ -3296,10 +3295,10 @@ fn cmd_store(
     let id = store.store(memory)?;
 
     // Back-refs: update each linked memory so the edges are bidirectional.
-    if !linked_ids.is_empty() {
-        if let Err(e) = icm_core::add_backrefs(store, &id, &linked_ids) {
-            eprintln!("warning: auto-link back-refs failed: {e}");
-        }
+    if !linked_ids.is_empty()
+        && let Err(e) = icm_core::add_backrefs(store, &id, &linked_ids)
+    {
+        eprintln!("warning: auto-link back-refs failed: {e}");
     }
 
     if linked_ids.is_empty() {
@@ -3437,15 +3436,15 @@ fn cmd_recall(
         if !project_filter(m) {
             return false;
         }
-        if let Some(t) = topic {
-            if !topic_matches(&m.topic, t) {
-                return false;
-            }
+        if let Some(t) = topic
+            && !topic_matches(&m.topic, t)
+        {
+            return false;
         }
-        if let Some(kw) = keyword {
-            if !keyword_matches(&m.keywords, kw) {
-                return false;
-            }
+        if let Some(kw) = keyword
+            && !keyword_matches(&m.keywords, kw)
+        {
+            return false;
         }
         true
     };
@@ -3815,10 +3814,10 @@ fn cmd_feedback_record(
     // Manual-testing finding: feedback search had no semantic fallback at
     // all — attach an embedding here so search_feedback can blend
     // semantic similarity in, mirroring cmd_store.
-    if let Some(emb) = embedder {
-        if let Ok(v) = emb.embed(&feedback.embed_text()) {
-            feedback.embedding = Some(v);
-        }
+    if let Some(emb) = embedder
+        && let Ok(v) = emb.embed(&feedback.embed_text())
+    {
+        feedback.embedding = Some(v);
     }
     let id = store.store_feedback(feedback)?;
     println!("Feedback recorded: {id}");
@@ -4114,9 +4113,10 @@ fn cmd_hook_pre() -> Result<()> {
     };
 
     // Only handle Bash/shell tool calls (name varies by tool:
-    //   Claude Code/Codex: "Bash", Gemini CLI: "run_shell_command")
+    //   Claude Code/Codex: "Bash", Gemini CLI: "run_shell_command",
+    //   Mistral Vibe: "bash")
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(tool_name, "Bash" | "run_shell_command") {
+    if !matches!(tool_name, "Bash" | "run_shell_command" | "bash") {
         return Ok(());
     }
 
@@ -4145,13 +4145,32 @@ fn cmd_hook_pre() -> Result<()> {
     // the response with "PreToolUse hook returned unsupported
     // updatedInput" (issue #237), and the Claude Code spec lists the
     // field as optional. Omitting it is forward-compatible.
-    let response = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "permissionDecisionReason": "ICM auto-allow"
-        }
-    });
+    //
+    // Mistral Vibe pre_tool payloads carry `hook_event_name: "pre_tool"`
+    // and expect a different decision shape: `{"decision": "allow"}`.
+    // Vibe tolerates unknown fields, so the Claude-specific
+    // `hookSpecificOutput` object is harmless there — we just add the
+    // top-level `decision` Vibe reads.
+    let is_vibe = json.get("hook_event_name").and_then(|v| v.as_str()) == Some("pre_tool");
+    let response = if is_vibe {
+        serde_json::json!({
+            "decision": "allow",
+            "system_message": "ICM auto-allow",
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "ICM auto-allow"
+            }
+        })
+    } else {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "ICM auto-allow"
+            }
+        })
+    };
 
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
@@ -4312,6 +4331,11 @@ fn has_shell_metacharacter(cmd: &str) -> bool {
 ///   | Write  | `tool_response.content`       |
 ///   | Edit   | `tool_response.content`       |
 ///
+///   Mistral Vibe post_tool payloads are shaped differently again: the
+///   canonical text is the top-level `tool_output_text` (what the model
+///   actually sees, possibly rewritten by earlier hooks in the chain),
+///   with `tool_output` as the serialized result object.
+///
 /// We probe in priority order so older clients keep working unchanged.
 /// `tool_response.output` stays in the list for Codex / older Gemini
 /// builds. The Read shape (`tool_response.file.content`) is checked
@@ -4328,14 +4352,29 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
         return Some(s);
     }
 
+    // 2. Mistral Vibe: `tool_output_text` is the canonical payload.
+    if let Some(s) = nonempty_str(json, "tool_output_text") {
+        return Some(s);
+    }
+
+    // 3. Mistral Vibe: `tool_output` is the serialized result *object*
+    //    (e.g. `{"output": "..."}` for the bash tool).
+    if let Some(to) = json.get("tool_output") {
+        for key in ["output", "stdout", "content"] {
+            if let Some(s) = nonempty_str(to, key) {
+                return Some(s);
+            }
+        }
+    }
+
     let tr = json.get("tool_response")?;
 
-    // 2. tool_response itself is a string (some Codex variants).
+    // 4. tool_response itself is a string (some Codex variants).
     if let Some(s) = tr.as_str().filter(|s| !s.is_empty()) {
         return Some(s);
     }
 
-    // 3-5. Probe known content fields. Order matters: `stdout` first
+    // 5-7. Probe known content fields. Order matters: `stdout` first
     // because Bash output is the most common; then `output` and
     // `content` (covers Codex `output`, Write/Edit `content`, and
     // Codex/Gemini variants we've seen).
@@ -4345,11 +4384,11 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
         }
     }
 
-    // 6. Read tool nests under `file.content`.
-    if let Some(file) = tr.get("file") {
-        if let Some(s) = nonempty_str(file, "content") {
-            return Some(s);
-        }
+    // 8. Read tool nests under `file.content`.
+    if let Some(file) = tr.get("file")
+        && let Some(s) = nonempty_str(file, "content")
+    {
+        return Some(s);
     }
 
     None
@@ -4367,26 +4406,25 @@ fn extract_tool_input_file_path(json: &Value) -> Option<String> {
     }
 
     // Claude Code 2.x: `tool_input.file_path`.
-    if let Some(s) = json.get("tool_input").and_then(|t| t.get("file_path")) {
-        if let Some(s) = nonempty(s) {
-            return Some(s);
-        }
+    if let Some(s) = json.get("tool_input").and_then(|t| t.get("file_path"))
+        && let Some(s) = nonempty(s)
+    {
+        return Some(s);
     }
     // Claude Code 1.x legacy and some Codex variants: top-level.
-    if let Some(s) = json.get("file_path") {
-        if let Some(s) = nonempty(s) {
-            return Some(s);
-        }
+    if let Some(s) = json.get("file_path")
+        && let Some(s) = nonempty(s)
+    {
+        return Some(s);
     }
     // Some MCP servers nest the input under `arguments`.
     if let Some(s) = json
         .get("tool_input")
         .and_then(|t| t.get("arguments"))
         .and_then(|a| a.get("file_path"))
+        && let Some(s) = nonempty(s)
     {
-        if let Some(s) = nonempty(s) {
-            return Some(s);
-        }
+        return Some(s);
     }
     None
 }
@@ -4453,18 +4491,21 @@ fn cmd_hook_post(
     // Independent of the extract counter: every Edit/Write tool call
     // gets one row in `code_areas` (touch_count++ on re-touch).
     // Failure is non-fatal — never block the hook on stats inserts.
-    if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
-        if let Some(file_path) = extract_tool_input_file_path(&json) {
-            let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
-            let session_id = json.get("session_id").and_then(|v| v.as_str());
-            let _ = store.upsert_code_area(
-                &project,
-                &file_path,
-                None, // description left empty in MVP; #165 will wire LLM summaries later
-                session_id,
-                Some(tool_name),
-            );
-        }
+    // Mistral Vibe names its file tools `edit` / `write_file`.
+    if matches!(
+        tool_name,
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "edit" | "write_file"
+    ) && let Some(file_path) = extract_tool_input_file_path(&json)
+    {
+        let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
+        let session_id = json.get("session_id").and_then(|v| v.as_str());
+        let _ = store.upsert_code_area(
+            &project,
+            &file_path,
+            None, // description left empty in MVP; #165 will wire LLM summaries later
+            session_id,
+            Some(tool_name),
+        );
     }
 
     // `[extraction].enabled = false` (issue #424) stops here — archive
@@ -4691,17 +4732,13 @@ fn cmd_hook_end(
     // window regardless of outcome or concurrency.
     if consolidate_cfg.summarizer.provider != "none" {
         let project = detect_project();
-        if project != "unknown" && !project.is_empty() {
-            if let Some(cache) = briefing_cache_path(&project) {
-                if briefing_cache_is_stale(&cache, BRIEFING_REFRESH_INTERVAL)
-                    && try_claim_briefing_refresh(
-                        &briefing_refresh_marker(&cache),
-                        BRIEFING_RETRY_BACKOFF,
-                    )
-                {
-                    spawn_detached_worker(&["briefing", "--project", project.as_str()], "briefing");
-                }
-            }
+        if project != "unknown"
+            && !project.is_empty()
+            && let Some(cache) = briefing_cache_path(&project)
+            && briefing_cache_is_stale(&cache, BRIEFING_REFRESH_INTERVAL)
+            && try_claim_briefing_refresh(&briefing_refresh_marker(&cache), BRIEFING_RETRY_BACKOFF)
+        {
+            spawn_detached_worker(&["briefing", "--project", project.as_str()], "briefing");
         }
     }
 
@@ -4710,53 +4747,53 @@ fn cmd_hook_end(
     // immediately so Claude Code doesn't kill us with "Hook cancelled".
     // The transcript-extract path below stays for back-compat (it's
     // still cheap when --no-embeddings is set).
-    if extraction_summarizer.provider != "none" {
-        if let Ok(self_path) = std::env::current_exe() {
-            // `nohup`-style detach: redirect std{in,out,err} to /dev/null
-            // and let the child outlive us. The child reads the same
-            // config so it picks up the same provider.
-            let mut cmd = std::process::Command::new(&self_path);
-            cmd.arg("extract-pending").arg("--limit").arg("20");
-            // Mark the worker subtree (#322) so any hook fired by an LLM
-            // CLI it spawns short-circuits instead of forking again.
-            cmd.env("ICM_WORKER", "1");
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            // On Unix, set a new session so the child survives our exit.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                unsafe {
-                    cmd.pre_exec(|| {
-                        // Detach from controlling tty / process group.
-                        libc::setsid();
-                        Ok(())
-                    });
-                }
+    if extraction_summarizer.provider != "none"
+        && let Ok(self_path) = std::env::current_exe()
+    {
+        // `nohup`-style detach: redirect std{in,out,err} to /dev/null
+        // and let the child outlive us. The child reads the same
+        // config so it picks up the same provider.
+        let mut cmd = std::process::Command::new(&self_path);
+        cmd.arg("extract-pending").arg("--limit").arg("20");
+        // Mark the worker subtree (#322) so any hook fired by an LLM
+        // CLI it spawns short-circuits instead of forking again.
+        cmd.env("ICM_WORKER", "1");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // On Unix, set a new session so the child survives our exit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    // Detach from controlling tty / process group.
+                    libc::setsid();
+                    Ok(())
+                });
             }
-            match cmd.spawn() {
-                Ok(_) => {
-                    eprintln!(
-                        "[icm] session-end: forked async LLM worker (provider={})",
-                        extraction_summarizer.provider,
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[icm] session-end: fork failed ({e}), falling back to inline transcript extract",
-                    );
-                    return extract_from_hook_transcript(
-                        store,
-                        embedder,
-                        memory_cfg,
-                        consolidate_cfg,
-                        "session-end",
-                    );
-                }
-            }
-            return Ok(());
         }
+        match cmd.spawn() {
+            Ok(_) => {
+                eprintln!(
+                    "[icm] session-end: forked async LLM worker (provider={})",
+                    extraction_summarizer.provider,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[icm] session-end: fork failed ({e}), falling back to inline transcript extract",
+                );
+                return extract_from_hook_transcript(
+                    store,
+                    embedder,
+                    memory_cfg,
+                    consolidate_cfg,
+                    "session-end",
+                );
+            }
+        }
+        return Ok(());
     }
     // Inline path (legacy): scan transcript and extract via fastembed.
     extract_from_hook_transcript(store, embedder, memory_cfg, consolidate_cfg, "session-end")
@@ -4885,11 +4922,11 @@ fn extract_from_hook_transcript(
             // Content as array of {type: "text", text: "..."}
             if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
                 for block in arr {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                            assistant_text.push_str(text);
-                            assistant_text.push('\n');
-                        }
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(text) = block.get("text").and_then(|t| t.as_str())
+                    {
+                        assistant_text.push_str(text);
+                        assistant_text.push('\n');
                     }
                 }
             }
@@ -5597,6 +5634,15 @@ pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     if cmd.contains(pattern) {
         return true;
     }
+    // A quoted program path (`"C:/.../icm.exe" hook pre`, as written for
+    // agents that run hooks through cmd.exe) puts a quote between the
+    // binary and `hook`: compare without the quotes.
+    if cmd.contains('"') {
+        let unquoted = cmd.replace('"', "");
+        if cmd_matches_icm_pattern(&unquoted, pattern) {
+            return true;
+        }
+    }
     // (a) `icm hook ...` written as `icm.exe hook ...`
     let with_exe = pattern.replacen("icm hook", "icm.exe hook", 1);
     if with_exe != pattern && cmd.contains(&with_exe) {
@@ -5624,6 +5670,8 @@ fn cmd_init(
     let gemini_dir = cli_config_dir("GEMINI_CONFIG_DIR", ".gemini", &home);
     let codex_dir = cli_config_dir("CODEX_HOME", ".codex", &home);
     let copilot_dir = cli_config_dir("COPILOT_HOME", ".copilot", &home);
+    // Mistral Vibe relocates its whole home with VIBE_HOME (default ~/.vibe).
+    let vibe_dir = cli_config_dir("VIBE_HOME", ".vibe", &home);
 
     // `standard` enables cli + skill + hook (everything *except* MCP).
     // `all` keeps the legacy meaning: cli + skill + hook + mcp.
@@ -5822,6 +5870,23 @@ fn cmd_init(
             let continue_status = inject_continue_mcp_server(&continue_path, "icm", &icm_bin_str)?;
             println!("[mcp] {:<16} {continue_status}", "Continue.dev");
         }
+
+        // Mistral Vibe uses a TOML config with an array of tables:
+        // `[[mcp_servers]]` where each entry carries its own `name`.
+        let vibe_path = vibe_dir.join("config.toml");
+        if !force && !detect_tool("Mistral Vibe", &home, &vscode_data) {
+            println!("[mcp] {:<16} skipped (not detected)", "Mistral Vibe");
+        } else {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &vibe_path,
+                "Mistral Vibe",
+                install_manifest::EntryKind::TomlMcpServer,
+            ) {
+                manifest.record(e);
+            }
+            let vibe_status = inject_vibe_mcp_server(&vibe_path, "icm", &icm_bin_str)?;
+            println!("[mcp] {:<16} {vibe_status}", "Mistral Vibe");
+        }
     }
 
     // --- CLI mode: inject instructions into each tool's file ---
@@ -5911,6 +5976,10 @@ icm topics                                # list all topics\n\
             // Pi reads AGENTS.md from ~/.pi/agent/ and parent dirs.
             // Global instruction file follows the same shape as Codex.
             ("Pi", "Pi", PathBuf::from(&home).join(".pi/agent/AGENTS.md")),
+            // Mistral Vibe loads ~/.vibe/AGENTS.md into every session's
+            // system prompt at startup — the same global-instruction
+            // surface as Claude Code's CLAUDE.md.
+            ("Mistral Vibe", "Mistral Vibe", vibe_dir.join("AGENTS.md")),
         ];
 
         // Project-only write targets (no global equivalent at the tool):
@@ -5949,12 +6018,15 @@ icm topics                                # list all topics\n\
                     "Claude Code" => Some(cwd.join("CLAUDE.md")),
                     // Codex AND Pi both read AGENTS.md by walking up
                     // from cwd to $HOME, so a single per-project
-                    // `cwd/AGENTS.md` covers both. `inject_icm_block`
+                    // `cwd/AGENTS.md` covers both. Mistral Vibe
+                    // discovers AGENTS.md from the project root up
+                    // through its trust chain, so the same shared
+                    // file covers it too. `inject_icm_block`
                     // is idempotent on the icm:start marker so if
-                    // both tools are detected the second pass turns
+                    // several tools are detected the second pass turns
                     // into "already configured" without duplicating
                     // the block.
-                    "Codex" | "Pi" => Some(cwd.join("AGENTS.md")),
+                    "Codex" | "Pi" | "Mistral Vibe" => Some(cwd.join("AGENTS.md")),
                     _ => None,
                 };
                 if let Some(p) = cwd_path {
@@ -6200,6 +6272,47 @@ Do this BEFORE responding to the user. Not optional.
             )?;
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Pi");
+        }
+
+        // Mistral Vibe: ~/.vibe/skills/<name>/SKILL.md with YAML frontmatter.
+        // Same directory-per-skill layout as OpenCode, plus Vibe's
+        // `user-invocable: true` so the skill surfaces as a /icm-* slash
+        // command (see the Vibe skills docs).
+        let vibe_skills_base = vibe_dir.join("skills");
+        if force || detect_tool("Mistral Vibe", &home, &vscode_data) {
+            let mut install = |name: &str, prompt: &str| -> Result<()> {
+                let skill_dir = vibe_skills_base.join(format!("icm-{name}"));
+                let skill_path = skill_dir.join("SKILL.md");
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &skill_path,
+                    "Mistral Vibe skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+                let content = format!(
+                    "\
+---
+name: icm-{name}
+description: ICM persistent memory — /icm-{name}
+user-invocable: true
+allowed-tools: bash
+---
+
+{prompt}"
+                );
+                install_skill(
+                    &skill_dir,
+                    "SKILL.md",
+                    &content,
+                    &format!("Mistral Vibe /icm-{name}"),
+                )
+            };
+            install("recall", icm_recall_prompt)?;
+            install("remember", icm_remember_prompt)?;
+            install("remember-session", icm_remember_session_prompt)?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "Mistral Vibe");
         }
 
         // OpenCode: https://opencode.ai/docs/skills/
@@ -6498,6 +6611,53 @@ description: ICM persistent memory — /{name}
             println!("[hook] {:<16} skipped (not detected)", "Copilot CLI");
         }
 
+        // --- Mistral Vibe hooks (TOML ~/.vibe/hooks.toml) ---
+        //
+        // Vibe's hook system only offers `pre_tool`, `post_tool` and
+        // `post_agent` lifecycle events — there is no SessionStart /
+        // SessionEnd / UserPromptSubmit / PreCompact equivalent. So the
+        // Claude-style wake-up pack and prompt-recall hooks have no Vibe
+        // counterpart; the AGENTS.md instructions from CLI mode cover
+        // recall-at-session-start instead. Here we register what Vibe
+        // does support:
+        //   pre_tool  (matcher "bash") -> `icm hook pre`  (auto-allow)
+        //   post_tool (all tools)      -> `icm hook post` (auto-extract)
+        let vibe_hooks_path = vibe_dir.join("hooks.toml");
+        if force || detect_tool("Mistral Vibe", &home, &vscode_data) {
+            if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                &vibe_hooks_path,
+                "Mistral Vibe hooks",
+                install_manifest::EntryKind::TomlHooks,
+            ) {
+                manifest.record(e);
+            }
+            let pre_status = inject_vibe_hook(
+                &vibe_hooks_path,
+                "icm-pretool",
+                "pre_tool",
+                Some("bash"),
+                &vibe_hook_command(&icm_bin_str, "pre"),
+                5.0,
+                &["icm hook pre", "icm-pretool"],
+                force,
+            )?;
+            println!("[hook] Mistral Vibe pre_tool (auto-allow): {pre_status}");
+
+            let post_status = inject_vibe_hook(
+                &vibe_hooks_path,
+                "icm-post-tool",
+                "post_tool",
+                None,
+                &vibe_hook_command(&icm_bin_str, "post"),
+                10.0,
+                &["icm hook post", "icm-post-tool", "icm hook"],
+                force,
+            )?;
+            println!("[hook] Mistral Vibe post_tool (auto-extract): {post_status}");
+        } else {
+            println!("[hook] {:<16} skipped (not detected)", "Mistral Vibe");
+        }
+
         // --- Pi (pi.dev) hooks need a TypeScript extension against the
         // `@earendil-works/pi-coding-agent` SDK, modeled on the OpenCode
         // plugin in `plugins/opencode-icm.ts`. The CLI doesn't ship one
@@ -6649,8 +6809,38 @@ struct DoctorTarget {
 
 /// Inspect a single hook command string. Returns `Some((bin_path, exists))`
 /// if the command references ICM, `None` if it should be skipped.
+/// The program a hook command runs: a leading double-quoted path
+/// (`"C:/Program Files/icm/icm.exe" hook pre`) without its quotes, or else
+/// the first word.
+fn leading_program(cmd: &str) -> &str {
+    let trimmed = cmd.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"')
+        && let Some(end) = rest.find('"')
+    {
+        return &rest[..end];
+    }
+    trimmed.split_whitespace().next().unwrap_or("")
+}
+
+/// The command Mistral Vibe runs for an ICM hook. Vibe starts hooks through
+/// the platform shell, which is cmd.exe on Windows: there an unquoted
+/// `C:/Users/.../icm.exe` is read as `C:` followed by a switch, and the hook
+/// fails. The path is quoted on Windows, and anywhere it holds a space.
+fn vibe_hook_command(icm_bin: &str, subcommand: &str) -> String {
+    vibe_hook_command_for(icm_bin, subcommand, cfg!(windows))
+}
+
+/// Pure, testable core of [`vibe_hook_command`].
+fn vibe_hook_command_for(icm_bin: &str, subcommand: &str, windows: bool) -> String {
+    if windows || icm_bin.contains(' ') {
+        format!("\"{icm_bin}\" hook {subcommand}")
+    } else {
+        format!("{icm_bin} hook {subcommand}")
+    }
+}
+
 pub(crate) fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
-    let bin_path = cmd.split_whitespace().next().unwrap_or("");
+    let bin_path = leading_program(cmd);
     // Harden against false positives (security review): require the invoked
     // *binary* to actually be an icm binary, not merely a command that mentions
     // "icm hook" somewhere (e.g. a note/arg of an unrelated tool). Otherwise
@@ -6893,6 +7083,114 @@ fn disable_opencode_plugin(home: &str, dry_run: bool) -> Result<usize> {
     Ok(1)
 }
 
+/// Vibe's hook layout: a TOML array of tables at `~/.vibe/hooks.toml` —
+/// it doesn't fit the JSON `DoctorTarget` shape, so it gets its own
+/// check/disable pair, following the OpenCode-plugin precedent.
+fn vibe_hooks_path(home: &str) -> PathBuf {
+    crate::cli_config_dir("VIBE_HOME", ".vibe", home).join("hooks.toml")
+}
+
+/// Inspect Mistral Vibe's hooks.toml for ICM hook entries (`icm doctor`).
+/// Returns `(checked, broken)` like `check_json_target`.
+fn check_vibe_hooks(home: &str) -> (usize, usize) {
+    let path = vibe_hooks_path(home);
+    if !path.exists() {
+        return (0, 0);
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[Mistral Vibe] {}: read error ({e})", path.display());
+            return (0, 0);
+        }
+    };
+    let parsed: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[Mistral Vibe] {}: parse error ({e})", path.display());
+            return (0, 1);
+        }
+    };
+    let Some(hooks) = parsed.get("hooks").and_then(|h| h.as_array()) else {
+        return (0, 0);
+    };
+
+    let mut checked = 0usize;
+    let mut broken = 0usize;
+    for entry in hooks {
+        let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        let Some((bin_path, exists)) = check_icm_hook_command(cmd) else {
+            continue;
+        };
+        let hook_name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("hook");
+        checked += 1;
+        if exists {
+            println!("[Mistral Vibe] {hook_name:<19} ✓  {bin_path}");
+        } else {
+            println!("[Mistral Vibe] {hook_name:<19} ✗  {bin_path}  (missing)");
+            broken += 1;
+        }
+    }
+    (checked, broken)
+}
+
+/// Remove ICM hook entries from Mistral Vibe's hooks.toml (#268),
+/// preserving every non-ICM hook. Returns how many were removed.
+fn disable_vibe_hooks(home: &str, dry_run: bool) -> Result<usize> {
+    let path = vibe_hooks_path(home);
+    if !path.exists() {
+        return Ok(0);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let mut config: toml::Value =
+        toml::from_str(&content).with_context(|| format!("invalid TOML in {}", path.display()))?;
+
+    let Some(root) = config.as_table_mut() else {
+        return Ok(0);
+    };
+    let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+        println!("[Mistral Vibe] no ICM hooks");
+        return Ok(0);
+    };
+
+    let before = hooks.len();
+    hooks.retain(|entry| {
+        entry
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|cmd| check_icm_hook_command(cmd).is_none())
+            .unwrap_or(true)
+    });
+    let removed = before - hooks.len();
+
+    if removed == 0 {
+        println!("[Mistral Vibe] no ICM hooks");
+        return Ok(0);
+    }
+    if dry_run {
+        println!(
+            "[Mistral Vibe] would remove {removed} ICM hook(s) from {}",
+            path.display()
+        );
+        return Ok(removed);
+    }
+    // Drop the now-empty hooks array so we don't leave `hooks = []` behind.
+    if hooks.is_empty() {
+        root.remove("hooks");
+    }
+    let backup = backup_settings_file(&path)?;
+    let output = toml::to_string_pretty(&config)?;
+    std::fs::write(&path, output).with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "[Mistral Vibe] removed {removed} ICM hook(s) (backup: {})",
+        backup.display()
+    );
+    Ok(removed)
+}
+
 /// `icm hook disable` — remove ICM's hooks from every detected AI tool while
 /// preserving the MCP server config and your memory DB (#268). Reversible via
 /// `icm init --mode hook`.
@@ -6903,6 +7201,7 @@ fn cmd_hook_disable(dry_run: bool) -> Result<()> {
         total += disable_hooks_in_target(&target, dry_run)?;
     }
     total += disable_opencode_plugin(&home, dry_run)?;
+    total += disable_vibe_hooks(&home, dry_run)?;
 
     let plural = if total == 1 { "y" } else { "ies" };
     println!();
@@ -7002,6 +7301,9 @@ fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
         broken += b;
     }
     checked += check_opencode_plugin(&home);
+    let (vc, vb) = check_vibe_hooks(&home);
+    checked += vc;
+    broken += vb;
 
     println!();
     if checked == 0 {
@@ -7403,10 +7705,10 @@ fn cmd_import_from_export(
         match record_type {
             "header" => {
                 // Validate version; warn on mismatch but continue.
-                if let Some(v) = obj.get("icm_export_version").and_then(|v| v.as_u64()) {
-                    if v != 1 {
-                        eprintln!("warning: export version {v} (expected 1) — proceeding anyway");
-                    }
+                if let Some(v) = obj.get("icm_export_version").and_then(|v| v.as_u64())
+                    && v != 1
+                {
+                    eprintln!("warning: export version {v} (expected 1) — proceeding anyway");
                 }
                 continue;
             }
@@ -8065,6 +8367,12 @@ fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
         // path the binary alone can't always reach (e.g. Volta /
         // pnpm-global env quirks). See issue #259.
         "Pi" => binary_in_path("pi") || PathBuf::from(home).join(".pi/agent").exists(),
+        // Mistral Vibe (https://docs.mistral.ai/vibe/code/overview) —
+        // check the binary, falling back to the config dir, which Vibe
+        // creates on first run (~/.vibe or $VIBE_HOME).
+        "Mistral Vibe" => {
+            binary_in_path("vibe") || crate::cli_config_dir("VIBE_HOME", ".vibe", home).exists()
+        }
         _ => true,
     }
 }
@@ -8130,12 +8438,11 @@ fn inject_mcp_server(
     };
 
     // Check if already configured with same binary
-    if let Some(existing) = mcp_servers.get(name) {
-        if existing.get("command").and_then(|v| v.as_str())
+    if let Some(existing) = mcp_servers.get(name)
+        && existing.get("command").and_then(|v| v.as_str())
             == entry.get("command").and_then(|v| v.as_str())
-        {
-            return Ok("already configured".into());
-        }
+    {
+        return Ok("already configured".into());
     }
 
     mcp_servers
@@ -8221,10 +8528,10 @@ fn inject_copilot_cli_mcp_server(
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}));
 
-    if let Some(existing) = servers.get(name) {
-        if existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
-            return Ok("already configured".into());
-        }
+    if let Some(existing) = servers.get(name)
+        && existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin)
+    {
+        return Ok("already configured".into());
     }
 
     servers
@@ -8371,6 +8678,210 @@ fn inject_copilot_hooks(copilot_dir: &std::path::Path, icm_bin: &str) -> Result<
     Ok("configured".into())
 }
 
+/// Inject ICM MCP server into Mistral Vibe's TOML config
+/// (`~/.vibe/config.toml`). Returns a status string.
+///
+/// Vibe stores MCP servers as an array of tables — `[[mcp_servers]]` —
+/// where each entry carries its own `name`, unlike Codex's
+/// `[mcp_servers.<name>]` sub-tables:
+///
+/// ```toml
+/// [[mcp_servers]]
+/// name = "icm"
+/// transport = "stdio"
+/// command = "/path/to/icm"
+/// args = ["serve"]
+/// ```
+fn inject_vibe_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Result<String> {
+    let mut config: toml::Value = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        toml::from_str::<toml::Value>(&content)
+            .with_context(|| format!("invalid TOML in {}", config_path.display()))?
+    } else {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    let root = config
+        .as_table_mut()
+        .context("config is not a TOML table")?;
+
+    let servers = root
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let servers_arr = servers.as_array_mut().with_context(|| {
+        format!(
+            "`mcp_servers` in {} is not a TOML array",
+            config_path.display()
+        )
+    })?;
+
+    // Idempotency: an existing entry with our name and the current binary
+    // is already configured. An entry with our name but a different
+    // (stale) binary path is replaced in place — same semantics as
+    // `inject_codex_mcp_server`.
+    let mut server = toml::map::Map::new();
+    server.insert("name".into(), toml::Value::String(name.to_string()));
+    server.insert("transport".into(), toml::Value::String("stdio".into()));
+    server.insert("command".into(), toml::Value::String(icm_bin.to_string()));
+    server.insert(
+        "args".into(),
+        toml::Value::Array(vec![toml::Value::String("serve".into())]),
+    );
+    let server = toml::Value::Table(server);
+
+    let mut replaced = false;
+    for entry in servers_arr.iter_mut() {
+        if entry.get("name").and_then(|v| v.as_str()) == Some(name) {
+            if entry.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
+                return Ok("already configured".into());
+            }
+            *entry = server.clone();
+            replaced = true;
+        }
+    }
+    if !replaced {
+        servers_arr.push(server);
+    }
+
+    let output = toml::to_string_pretty(&config)?;
+    std::fs::write(config_path, output)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+
+    if replaced {
+        Ok("updated (stale entry)".into())
+    } else {
+        Ok("configured".into())
+    }
+}
+
+/// Inject one ICM hook into Mistral Vibe's `~/.vibe/hooks.toml`.
+///
+/// Vibe hooks are an array of tables:
+///
+/// ```toml
+/// [[hooks]]
+/// name = "icm-post-tool"
+/// type = "post_tool"          # pre_tool | post_tool | post_agent
+/// match = "bash"              # optional fnmatch/regex tool matcher
+/// command = "/path/to/icm hook post"
+/// timeout = 10.0
+/// ```
+///
+/// Idempotency and stale-binary handling mirror `inject_settings_hook`:
+/// an existing entry of the same hook type whose `command` matches an ICM
+/// pattern is classified as already-correct or stale; stale entries are
+/// only rewritten with `--force`. Note the TOML round-trip drops
+/// comments, symmetric with the Codex config.toml injector — Vibe keeps
+/// no canonical formatting we must preserve.
+#[allow(clippy::too_many_arguments)]
+fn inject_vibe_hook(
+    hooks_path: &Path,
+    hook_name: &str,
+    hook_type: &str,
+    matcher: Option<&str>,
+    hook_command: &str,
+    timeout_secs: f64,
+    detect_patterns: &[&str],
+    force: bool,
+) -> Result<String> {
+    let mut config: toml::Value = if hooks_path.exists() {
+        let content = std::fs::read_to_string(hooks_path)
+            .with_context(|| format!("cannot read {}", hooks_path.display()))?;
+        toml::from_str::<toml::Value>(&content)
+            .with_context(|| format!("invalid TOML in {}", hooks_path.display()))?
+    } else {
+        if let Some(parent) = hooks_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    let root = config
+        .as_table_mut()
+        .context("hooks.toml is not a TOML table")?;
+
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let hooks_arr = hooks
+        .as_array_mut()
+        .with_context(|| format!("`hooks` in {} is not a TOML array", hooks_path.display()))?;
+
+    // Walk existing entries of the same hook type: classify each ICM
+    // command as already-correct or stale (different binary path).
+    let mut updated = 0usize;
+    let mut already_correct = false;
+    let mut stale_present = false;
+
+    for entry in hooks_arr.iter_mut() {
+        if entry.get("type").and_then(|v| v.as_str()) != Some(hook_type) {
+            continue;
+        }
+        let Some(current) = entry.get("command").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        if !detect_patterns
+            .iter()
+            .any(|p| cmd_matches_icm_pattern(current, p))
+        {
+            continue;
+        }
+        if current == hook_command {
+            already_correct = true;
+        } else if force {
+            if let Some(t) = entry.as_table_mut() {
+                t.insert(
+                    "command".into(),
+                    toml::Value::String(hook_command.to_string()),
+                );
+            }
+            updated += 1;
+        } else {
+            stale_present = true;
+        }
+    }
+
+    if updated > 0 {
+        let output = toml::to_string_pretty(&config)?;
+        std::fs::write(hooks_path, output)
+            .with_context(|| format!("cannot write {}", hooks_path.display()))?;
+        let plural = if updated == 1 { "entry" } else { "entries" };
+        return Ok(format!("updated ({updated} stale {plural})"));
+    }
+
+    if already_correct {
+        return Ok("already configured".into());
+    }
+
+    if stale_present {
+        return Ok("already configured (stale path; use --force to update)".into());
+    }
+
+    // No matching entry — add a fresh one.
+    let mut entry = toml::map::Map::new();
+    entry.insert("name".into(), toml::Value::String(hook_name.to_string()));
+    entry.insert("type".into(), toml::Value::String(hook_type.to_string()));
+    if let Some(m) = matcher {
+        entry.insert("match".into(), toml::Value::String(m.to_string()));
+    }
+    entry.insert(
+        "command".into(),
+        toml::Value::String(hook_command.to_string()),
+    );
+    entry.insert("timeout".into(), toml::Value::Float(timeout_secs));
+    hooks_arr.push(toml::Value::Table(entry));
+
+    let output = toml::to_string_pretty(&config)?;
+    std::fs::write(hooks_path, output)
+        .with_context(|| format!("cannot write {}", hooks_path.display()))?;
+
+    Ok("configured".into())
+}
+
 /// Inject ICM MCP server into Codex CLI TOML config. Returns a status string.
 fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Result<String> {
     let mut config: toml::Value = if config_path.exists() {
@@ -8394,10 +8905,10 @@ fn inject_codex_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> Res
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
 
     // Check if already configured with same binary
-    if let Some(existing) = mcp_servers.get(name) {
-        if existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin) {
-            return Ok("already configured".into());
-        }
+    if let Some(existing) = mcp_servers.get(name)
+        && existing.get("command").and_then(|v| v.as_str()) == Some(icm_bin)
+    {
+        return Ok("already configured".into());
     }
 
     let mut server = toml::map::Map::new();
@@ -8441,12 +8952,11 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
         .entry("mcp")
         .or_insert_with(|| serde_json::json!({}));
 
-    if let Some(existing) = mcp.get(name) {
-        if let Some(cmd) = existing.get("command").and_then(|v| v.as_array()) {
-            if cmd.first().and_then(|v| v.as_str()) == Some(icm_bin) {
-                return Ok("already configured".into());
-            }
-        }
+    if let Some(existing) = mcp.get(name)
+        && let Some(cmd) = existing.get("command").and_then(|v| v.as_array())
+        && cmd.first().and_then(|v| v.as_str()) == Some(icm_bin)
+    {
+        return Ok("already configured".into());
     }
 
     mcp.as_object_mut()
@@ -8492,18 +9002,15 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
         if icm_dir.is_dir() {
             println!("  .icm/ exists");
             let project_cfg = icm_dir.join("config.toml");
-            if project_cfg.exists() {
-                if let Ok(content) = std::fs::read_to_string(&project_cfg) {
-                    if let Ok(value) = toml::from_str::<toml::Value>(&content) {
-                        if let Some(path_str) = value
-                            .get("store")
-                            .and_then(|s| s.get("path"))
-                            .and_then(|p| p.as_str())
-                        {
-                            println!("  .icm/config.toml [store].path = {path_str}");
-                        }
-                    }
-                }
+            if project_cfg.exists()
+                && let Ok(content) = std::fs::read_to_string(&project_cfg)
+                && let Ok(value) = toml::from_str::<toml::Value>(&content)
+                && let Some(path_str) = value
+                    .get("store")
+                    .and_then(|s| s.get("path"))
+                    .and_then(|p| p.as_str())
+            {
+                println!("  .icm/config.toml [store].path = {path_str}");
             }
             let project_db = icm_dir.join("memories.db");
             if project_db.exists() {
@@ -8756,6 +9263,79 @@ fn build_extract_prompt(rows: &[&icm_store::PendingRow]) -> String {
     )
 }
 
+/// One line of the provider's reply.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyLine<'a> {
+    /// A list item holding a fact.
+    Fact(&'a str),
+    /// A list item saying there is nothing to keep (`- (none)`,
+    /// `- No durable facts.`).
+    Nothing,
+    /// Not a list item: a header, prose, a blank line.
+    Other,
+}
+
+/// Bullets a model uses for a list item.
+const BULLETS: &[&str] = &["- ", "* ", "\u{2022} ", "+ ", "\u{2013} ", "-\t", "*\t"];
+
+/// Item openings that say nothing was found, after markdown is stripped.
+const NOTHING_OPENINGS: &[&str] = &[
+    "no durable",
+    "nothing durable",
+    "no facts",
+    "no new facts",
+    "nothing to extract",
+    "nothing worth",
+    "i don't see",
+    "i do not see",
+];
+
+/// Classify one line of the provider's reply.
+///
+/// Only list items can be facts: the prompt asks for one bullet per fact.
+/// Anything else is the model talking about its input — "I don't see the
+/// actual tool output…", "Looking at these outputs, here are the durable
+/// facts:" — and was stored as a memory when every line was kept (249 such
+/// memories found in one user's store, 2026-10-09). A list item that only
+/// says there is nothing to keep is not a fact either.
+fn reply_line(line: &str) -> ReplyLine<'_> {
+    let line = line.trim();
+    let numbered = || {
+        let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+        // `2026. That year…` is prose, not item 2026.
+        (1..=3)
+            .contains(&digits)
+            .then(|| &line[digits..])
+            .and_then(|rest| rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")))
+    };
+    let Some(item) = BULLETS
+        .iter()
+        .find_map(|b| line.strip_prefix(b))
+        .or_else(numbered)
+        .map(str::trim)
+    else {
+        return ReplyLine::Other;
+    };
+    let plain = item
+        .trim_matches(|c: char| matches!(c, '*' | '`' | '_' | '(' | ')' | '.' | ' '))
+        .to_lowercase();
+    let plain = plain.replace(['*', '`', '_'], "");
+    let says_none = plain.is_empty()
+        || plain == "n/a"
+        || plain == "none"
+        || plain.starts_with("none ")
+        || plain.starts_with("none)")
+        || plain.starts_with("none—")
+        || plain.starts_with("none -")
+        || plain.starts_with("none found")
+        || NOTHING_OPENINGS.iter().any(|o| plain.starts_with(o));
+    if item.is_empty() || says_none {
+        ReplyLine::Nothing
+    } else {
+        ReplyLine::Fact(item)
+    }
+}
+
 /// Counters for one `extract-pending` drain. They live outside the group loop
 /// so an error that propagates mid-drain can still report what was committed
 /// before it.
@@ -8769,6 +9349,9 @@ struct DrainTally {
     fallback_rows: usize,
     /// Rows dropped because the provider returned nothing for their group.
     discarded_rows: usize,
+    /// Rows dropped because the provider's reply held no list item at all
+    /// (it ignored the format): nothing was stored from them.
+    unformatted_rows: usize,
 }
 
 impl DrainTally {
@@ -8778,6 +9361,12 @@ impl DrainTally {
         let mut notes: Vec<String> = Vec::new();
         if self.fallback_rows > 0 {
             notes.push(format!("{} via fastembed fallback", self.fallback_rows));
+        }
+        if self.unformatted_rows > 0 {
+            notes.push(format!(
+                "{} dropped after a reply with no list items",
+                self.unformatted_rows
+            ));
         }
         if self.discarded_rows > 0 {
             notes.push(format!(
@@ -8880,27 +9469,38 @@ fn drain_pending_groups(
         // Parse bullet output into individual facts, each filed under the
         // project whose rows produced it.
         let topic = format!("context-{project}");
+        let mut items = 0usize;
         for line in response.lines() {
-            let line = line.trim();
-            let fact = line
-                .strip_prefix("- ")
-                .or_else(|| line.strip_prefix("* "))
-                .unwrap_or(line)
-                .trim();
-            if fact.is_empty() || fact == "(none)" || fact.eq_ignore_ascii_case("none") {
-                continue;
-            }
+            let fact = match reply_line(line) {
+                ReplyLine::Fact(fact) => fact,
+                ReplyLine::Nothing => {
+                    items += 1;
+                    continue;
+                }
+                ReplyLine::Other => continue,
+            };
+            items += 1;
             let mut mem = Memory::new(topic.clone(), fact.to_string(), Importance::Medium);
             // Same bug class as #394: this LLM-backed extraction path is a
             // sibling of extract_and_store_with_embedder and had the same gap
             // — the embedder was available but never attached to the Memory.
-            if let Some(emb) = embedder {
-                if let Ok(vec) = emb.embed(&mem.embed_text()) {
-                    mem.embedding = Some(vec);
-                }
+            if let Some(emb) = embedder
+                && let Ok(vec) = emb.embed(&mem.embed_text())
+            {
+                mem.embedding = Some(vec);
             }
             store.store(mem)?;
             tally.stored += 1;
+        }
+        if items == 0 {
+            // Retrying would cost the same call for the same answer; the rows
+            // go, but visibly.
+            eprintln!(
+                "[extract-pending] project={project}: provider reply had no list items; \
+                 dropping {} rows",
+                rows.len()
+            );
+            tally.unformatted_rows += rows.len();
         }
         tally.deleted += store.delete_pending_extractions(&ids)?;
     }
@@ -9443,10 +10043,10 @@ fn cmd_consolidate(
         // Same bug class as #394/#395: cmd_consolidate had no embedder param at
         // all, so the merged memory was always born with embedding: None — a
         // real gap found via manual testing against a real Postgres backend.
-        if let Some(emb) = embedder {
-            if let Ok(vec) = emb.embed(&consolidated.embed_text()) {
-                consolidated.embedding = Some(vec);
-            }
+        if let Some(emb) = embedder
+            && let Ok(vec) = emb.embed(&consolidated.embed_text())
+        {
+            consolidated.embedding = Some(vec);
         }
         consolidated
     };
@@ -9768,7 +10368,9 @@ fn cmd_consolidate_pending(
     if failed == 0 {
         println!("Processed {done} job(s).");
     } else {
-        println!("Processed {done} job(s); {failed} failed (see errors above, retry with `icm consolidate-jobs --retry <id>`).");
+        println!(
+            "Processed {done} job(s); {failed} failed (see errors above, retry with `icm consolidate-jobs --retry <id>`)."
+        );
     }
     Ok(())
 }
@@ -11217,11 +11819,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
 
 #[cfg(feature = "bench")]
 fn pct_delta(a: f64, b: f64) -> f64 {
-    if a == 0.0 {
-        0.0
-    } else {
-        ((b - a) / a) * 100.0
-    }
+    if a == 0.0 { 0.0 } else { ((b - a) / a) * 100.0 }
 }
 
 #[cfg(feature = "bench")]
@@ -12420,8 +13018,8 @@ mod hook_start_tests {
                 .unwrap();
         }
         let cfg = config::SummarizerConfig::default(); // provider defaults to "none"
-                                                       // Bare run (no explicit provider) resolves to none → refuse (a batch
-                                                       // lexical join + delete of originals across the whole store).
+        // Bare run (no explicit provider) resolves to none → refuse (a batch
+        // lexical join + delete of originals across the whole store).
         assert!(cmd_consolidate_all(&store, 3, &cfg, None, None, None, false, None).is_err());
         // threshold 0 → refuse.
         assert!(
@@ -12741,10 +13339,12 @@ mod hook_start_tests {
         // The non-ICM hook survives.
         let post = after["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(post.len(), 1);
-        assert!(post[0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("othertool"));
+        assert!(
+            post[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("othertool")
+        );
         // The ICM-only event is dropped entirely.
         assert!(after["hooks"].get("SessionEnd").is_none());
         // MCP config and unrelated settings are untouched.
@@ -13315,6 +13915,280 @@ mod inject_settings_hook_tests {
 }
 
 #[cfg(test)]
+mod inject_vibe_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn read_toml(path: &Path) -> toml::Value {
+        let raw = std::fs::read_to_string(path).unwrap();
+        toml::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn vibe_mcp_creates_entry_when_config_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let status = inject_vibe_mcp_server(&path, "icm", "/opt/homebrew/bin/icm").unwrap();
+
+        assert_eq!(status, "configured");
+        let cfg = read_toml(&path);
+        let entries = cfg["mcp_servers"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"].as_str().unwrap(), "icm");
+        assert_eq!(entries[0]["transport"].as_str().unwrap(), "stdio");
+        assert_eq!(
+            entries[0]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm"
+        );
+        assert_eq!(
+            entries[0]["args"].as_array().unwrap()[0].as_str().unwrap(),
+            "serve"
+        );
+    }
+
+    #[test]
+    fn vibe_mcp_is_idempotent_and_preserves_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "active_model = \"mistral-medium-3.5\"\n\n\
+             [[mcp_servers]]\nname = \"other\"\ncommand = \"/x/other\"\n",
+        )
+        .unwrap();
+
+        let first = inject_vibe_mcp_server(&path, "icm", "/opt/homebrew/bin/icm").unwrap();
+        let second = inject_vibe_mcp_server(&path, "icm", "/opt/homebrew/bin/icm").unwrap();
+
+        assert_eq!(first, "configured");
+        assert_eq!(second, "already configured");
+        let cfg = read_toml(&path);
+        let entries = cfg["mcp_servers"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(cfg["active_model"].as_str().unwrap(), "mistral-medium-3.5");
+    }
+
+    #[test]
+    fn vibe_mcp_replaces_stale_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        inject_vibe_mcp_server(&path, "icm", "/Users/x/dev/icm/target/release/icm").unwrap();
+
+        let status = inject_vibe_mcp_server(&path, "icm", "/opt/homebrew/bin/icm").unwrap();
+
+        assert_eq!(status, "updated (stale entry)");
+        let cfg = read_toml(&path);
+        let entries = cfg["mcp_servers"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm"
+        );
+    }
+
+    #[test]
+    fn vibe_hook_appends_to_existing_non_icm_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.toml");
+        std::fs::write(
+            &path,
+            "[[hooks]]\nname = \"rtk-rewrite\"\ntype = \"pre_tool\"\nmatch = \"bash\"\n\
+             command = \"rtk hook vibe\"\ntimeout = 10.0\n",
+        )
+        .unwrap();
+
+        let status = inject_vibe_hook(
+            &path,
+            "icm-pretool",
+            "pre_tool",
+            Some("bash"),
+            "/opt/homebrew/bin/icm hook pre",
+            5.0,
+            &["icm hook pre", "icm-pretool"],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(status, "configured");
+        let cfg = read_toml(&path);
+        let hooks = cfg["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0]["name"].as_str().unwrap(), "rtk-rewrite");
+        assert_eq!(hooks[1]["name"].as_str().unwrap(), "icm-pretool");
+        assert_eq!(hooks[1]["type"].as_str().unwrap(), "pre_tool");
+        assert_eq!(hooks[1]["match"].as_str().unwrap(), "bash");
+        assert_eq!(
+            hooks[1]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm hook pre"
+        );
+        assert_eq!(hooks[1]["timeout"].as_float().unwrap(), 5.0);
+    }
+
+    #[test]
+    fn vibe_hook_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.toml");
+
+        inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+        let status = inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(status, "already configured");
+        let cfg = read_toml(&path);
+        assert_eq!(cfg["hooks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn vibe_hook_reports_stale_without_force_and_updates_with_force() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.toml");
+
+        inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/Users/x/dev/icm/target/release/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        let stale = inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            stale,
+            "already configured (stale path; use --force to update)"
+        );
+
+        let forced = inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            true,
+        )
+        .unwrap();
+        assert_eq!(forced, "updated (1 stale entry)");
+        let cfg = read_toml(&path);
+        let hooks = cfg["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(
+            hooks[0]["command"].as_str().unwrap(),
+            "/opt/homebrew/bin/icm hook post"
+        );
+    }
+
+    #[test]
+    fn vibe_hook_ignores_icm_entry_of_different_type() {
+        // A pre_tool ICM entry must not satisfy a post_tool inject —
+        // the two hooks are separate lifecycle events.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.toml");
+
+        inject_vibe_hook(
+            &path,
+            "icm-pretool",
+            "pre_tool",
+            Some("bash"),
+            "/opt/homebrew/bin/icm hook pre",
+            5.0,
+            &["icm hook pre", "icm-pretool"],
+            false,
+        )
+        .unwrap();
+        let status = inject_vibe_hook(
+            &path,
+            "icm-post-tool",
+            "post_tool",
+            None,
+            "/opt/homebrew/bin/icm hook post",
+            10.0,
+            &["icm hook post", "icm-post-tool", "icm hook"],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(status, "configured");
+        let cfg = read_toml(&path);
+        assert_eq!(cfg["hooks"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn extract_tool_output_understands_vibe_payload() {
+        let vibe_bash = serde_json::json!({
+            "hook_event_name": "post_tool",
+            "tool_name": "bash",
+            "tool_status": "success",
+            "tool_input": {"command": "ls"},
+            "tool_output": {"output": "file-a\nfile-b"},
+            "tool_output_text": "file-a\nfile-b"
+        });
+        assert_eq!(
+            extract_tool_output(&vibe_bash),
+            Some("file-a\nfile-b"),
+            "tool_output_text must win for Vibe payloads"
+        );
+
+        let vibe_no_text = serde_json::json!({
+            "hook_event_name": "post_tool",
+            "tool_name": "bash",
+            "tool_output": {"output": "fallback content"},
+        });
+        assert_eq!(extract_tool_output(&vibe_no_text), Some("fallback content"));
+    }
+
+    #[test]
+    fn hook_pre_auto_allows_vibe_bash_tool() {
+        // Mirrors the Claude "Bash" case from is_icm_command, but with
+        // Vibe's lowercase tool name in the payload.
+        let payload = serde_json::json!({
+            "hook_event_name": "pre_tool",
+            "tool_name": "bash",
+            "tool_input": {"command": "icm topics"}
+        });
+        let cmd = payload
+            .pointer("/tool_input/command")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(is_icm_command(cmd));
+    }
+}
+
+#[cfg(test)]
 mod read_only_requested_tests {
     use super::read_only_requested;
 
@@ -13326,13 +14200,13 @@ mod read_only_requested_tests {
         let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("ICM_READONLY").ok();
         match value {
-            Some(v) => std::env::set_var("ICM_READONLY", v),
-            None => std::env::remove_var("ICM_READONLY"),
+            Some(v) => unsafe { std::env::set_var("ICM_READONLY", v) },
+            None => unsafe { std::env::remove_var("ICM_READONLY") },
         }
         body();
         match prev {
-            Some(v) => std::env::set_var("ICM_READONLY", v),
-            None => std::env::remove_var("ICM_READONLY"),
+            Some(v) => unsafe { std::env::set_var("ICM_READONLY", v) },
+            None => unsafe { std::env::remove_var("ICM_READONLY") },
         }
     }
 
@@ -13385,7 +14259,7 @@ mod resolve_db_path_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_cwd = std::env::current_dir().unwrap();
         let prev_icm_db = std::env::var("ICM_DB").ok();
-        std::env::remove_var("ICM_DB");
+        unsafe { std::env::remove_var("ICM_DB") };
 
         let dir = tempfile::tempdir().unwrap();
         // macOS: /tmp (and TMPDIR) is a symlink into /private/tmp — the
@@ -13400,15 +14274,15 @@ mod resolve_db_path_tests {
 
         std::env::set_current_dir(prev_cwd).unwrap();
         match prev_icm_db {
-            Some(v) => std::env::set_var("ICM_DB", v),
-            None => std::env::remove_var("ICM_DB"),
+            Some(v) => unsafe { std::env::set_var("ICM_DB", v) },
+            None => unsafe { std::env::remove_var("ICM_DB") },
         }
     }
 
     #[test]
     fn cli_flag_wins_over_everything() {
         with_isolated_cwd(|_| {
-            std::env::set_var("ICM_DB", "/should/not/win");
+            unsafe { std::env::set_var("ICM_DB", "/should/not/win") };
             let cfg = config::Config::default();
             let resolved = resolve_db_path(Some(PathBuf::from("/explicit/flag.db")), &cfg);
             assert_eq!(resolved, PathBuf::from("/explicit/flag.db"));
@@ -13418,7 +14292,7 @@ mod resolve_db_path_tests {
     #[test]
     fn env_var_wins_when_no_flag() {
         with_isolated_cwd(|_| {
-            std::env::set_var("ICM_DB", "/from/env.db");
+            unsafe { std::env::set_var("ICM_DB", "/from/env.db") };
             let cfg = config::Config::default();
             let resolved = resolve_db_path(None, &cfg);
             assert_eq!(resolved, PathBuf::from("/from/env.db"));
@@ -13537,7 +14411,7 @@ mod cli_config_dir_tests {
     fn falls_back_to_home_when_env_unset() {
         // Use a uniquely-named env var so we don't race with a real one.
         let var = "ICM_TEST_FAKE_ENV_VAR_THAT_DOES_NOT_EXIST";
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
         assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
     }
@@ -13545,9 +14419,9 @@ mod cli_config_dir_tests {
     #[test]
     fn uses_env_var_when_set() {
         let var = "ICM_TEST_CLI_CONFIG_DIR_OVERRIDE";
-        std::env::set_var(var, "/tmp/custom-cli-home");
+        unsafe { std::env::set_var(var, "/tmp/custom-cli-home") };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(dir, PathBuf::from("/tmp/custom-cli-home"));
     }
 
@@ -13555,9 +14429,9 @@ mod cli_config_dir_tests {
     fn empty_env_var_falls_back_to_home() {
         // An accidentally-empty `export FOO=` should not produce a useless empty path.
         let var = "ICM_TEST_CLI_CONFIG_DIR_EMPTY";
-        std::env::set_var(var, "");
+        unsafe { std::env::set_var(var, "") };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
     }
 }
@@ -14280,7 +15154,13 @@ mod cli_contracts_tests {
             fn summarize(&self, req: &summarizer::SummarizeRequest<'_>) -> Result<String> {
                 self.calls.set(self.calls.get() + 1);
                 if req.prompt.contains("project=alpha") {
-                    Ok("- alpha stores its ledger in PostgreSQL.\n- (none)\n".to_string())
+                    // Prose around the bullets is the model talking, not a fact.
+                    Ok(
+                        "Looking at these tool outputs, here are the durable facts:\n\n\
+                        - alpha stores its ledger in PostgreSQL.\n- (none)\n\
+                        I don't see anything else worth remembering.\n"
+                            .to_string(),
+                    )
                 } else if req.prompt.contains("project=beta") {
                     Ok("   \n".to_string())
                 } else {
@@ -14328,7 +15208,8 @@ mod cli_contracts_tests {
         )
         .unwrap();
 
-        // alpha: the real bullet is filed under alpha, `(none)` is skipped.
+        // alpha: the real bullet is filed under alpha; `(none)` and the
+        // prose around it are skipped.
         let alpha = store.get_by_topic("context-alpha").unwrap();
         assert_eq!(alpha.len(), 1);
         assert!(alpha[0].summary.contains("PostgreSQL"));
@@ -14373,6 +15254,7 @@ mod cli_contracts_tests {
             deleted: 25,
             fallback_rows: 3,
             discarded_rows: 4,
+            unformatted_rows: 0,
         };
         let line = degraded.summary_line(25);
         assert!(
@@ -14515,10 +15397,12 @@ mod cli_contracts_tests {
         assert_eq!(jobs[0].id, job_id);
         assert_eq!(jobs[0].status, "done");
         assert!(jobs[0].completed_at.is_some());
-        assert!(store
-            .list_pending_consolidation_jobs(10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_pending_consolidation_jobs(10)
+                .unwrap()
+                .is_empty()
+        );
 
         // The topic itself must actually be consolidated (4 memories -> 1).
         let remaining = store.get_by_topic("t").unwrap();
@@ -14649,9 +15533,10 @@ mod cli_contracts_tests {
             cmd_consolidate(&store, "t", true, &cfg, None, None, None, None).unwrap();
             let all = store.get_by_topic("t").unwrap();
             assert_eq!(all.len(), 3, "{provider}: originals kept, join added");
-            assert!(all
-                .iter()
-                .any(|m| m.summary.contains("fact one") && m.summary.contains("fact two")));
+            assert!(
+                all.iter()
+                    .any(|m| m.summary.contains("fact one") && m.summary.contains("fact two"))
+            );
         }
     }
 
@@ -14732,7 +15617,7 @@ mod cli_contracts_tests {
     /// An API-key summarizer config pointed at a loopback stub, with its key
     /// in a variable unique to the calling test.
     fn stub_summarizer(base_url: &str, key_var: &str) -> config::SummarizerConfig {
-        std::env::set_var(key_var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(key_var, "placeholder-not-a-real-key") };
         config::SummarizerConfig {
             provider: "openai".into(),
             model: "test-model".into(),
@@ -14774,7 +15659,7 @@ mod cli_contracts_tests {
             .unwrap();
 
         let result = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_EXACT_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_EXACT_KEY") };
         result.unwrap();
 
         assert_eq!(seen.try_iter().count(), 1);
@@ -14812,7 +15697,7 @@ mod cli_contracts_tests {
         }
 
         let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_CAP_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_CAP_KEY") };
         result.unwrap();
 
         let prompts: Vec<String> = seen.try_iter().collect();
@@ -14855,7 +15740,7 @@ mod cli_contracts_tests {
         }
 
         let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_PASS2_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_PASS2_KEY") };
         let err = result.expect_err("the second pass failed");
         assert!(err.downcast_ref::<SummarizerFailed>().is_some(), "{err}");
 
@@ -14902,7 +15787,7 @@ mod cli_contracts_tests {
         let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_RACE_KEY");
 
         let result = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_RACE_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_RACE_KEY") };
         result.unwrap();
 
         let prompt = seen.try_iter().next().expect("provider called");
@@ -15010,7 +15895,7 @@ mod cli_contracts_tests {
         let again = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None).unwrap();
         assert_eq!(again.passes, 0);
         cmd_consolidate_all(&store, 1, &cfg, None, None, None, false, None).unwrap();
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_CRITICAL_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_CRITICAL_KEY") };
         assert_eq!(seen.try_iter().count(), 0, "the provider was called again");
         assert_eq!(store.count_by_topic("t").unwrap(), 2);
     }
@@ -15034,7 +15919,7 @@ mod cli_contracts_tests {
         let store = Store::in_memory().unwrap();
         seed(&store);
         let run = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None).unwrap();
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY") };
         assert_eq!((run.replaced, run.too_large, run.unfolded), (4, 1, 1));
         let prompt = seen.try_iter().next().expect("the small ones were sent");
         assert!(
@@ -15060,7 +15945,7 @@ mod cli_contracts_tests {
         seed(&store);
         store.enqueue_pending_consolidation("t", "").unwrap();
         cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path).unwrap();
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY_P");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_HUGE_KEY_P") };
         let jobs = store.list_consolidation_jobs(None, 10).unwrap();
         assert_eq!(jobs[0].status, "failed");
         assert!(
@@ -15107,17 +15992,19 @@ mod cli_contracts_tests {
         store.enqueue_pending_consolidation("busy", "").unwrap();
         cmd_consolidate_pending(&store, None, &cfg, 20, None, None, false, &db_path).unwrap();
         let direct = cmd_consolidate(&store, "busy", false, &cfg, None, None, None, None).unwrap();
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_QUEUE_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_QUEUE_KEY") };
         assert_eq!(direct.passes, 0);
         assert_eq!(seen.try_iter().count(), 0, "the lone summary was sent back");
         let left = store.get_by_topic("busy").unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].summary, "SUMMARY");
-        assert!(store
-            .list_consolidation_jobs(None, 10)
-            .unwrap()
-            .iter()
-            .all(|j| j.status == "done"));
+        assert!(
+            store
+                .list_consolidation_jobs(None, 10)
+                .unwrap()
+                .iter()
+                .all(|j| j.status == "done")
+        );
     }
 
     /// `consolidate-all` takes the biggest topic first — the one most
@@ -15141,7 +16028,7 @@ mod cli_contracts_tests {
         seed_topic(&store, "c", &facts("c", 3));
 
         let result = cmd_consolidate_all(&store, 2, &cfg, None, None, None, false, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_ALL_GOES_ON_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_ALL_GOES_ON_KEY") };
         let msg = result.expect_err("one topic failed").to_string();
         assert!(
             msg.contains("2 topic(s) consolidated, 1 failed, 0 not attempted"),
@@ -15200,7 +16087,7 @@ mod cli_contracts_tests {
         let cfg = stub_summarizer(&base_url, "ICM_TEST_CONSOLIDATE_STALE_KEY");
 
         let run = cmd_consolidate(&store, "t", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_STALE_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_STALE_KEY") };
         let run = run.unwrap();
         assert_eq!(run.passes, 1);
 
@@ -15286,7 +16173,7 @@ mod cli_contracts_tests {
             .collect();
         seed_topic(&store, "big", &texts);
         let result = cmd_consolidate(&store, "big", false, &cfg, None, None, None, None);
-        std::env::remove_var("ICM_TEST_CONSOLIDATE_PARTIAL_MSG_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_CONSOLIDATE_PARTIAL_MSG_KEY") };
         let msg = result.expect_err("the second pass failed").to_string();
         assert!(
             msg.contains("memories of the topic were already folded into a partial summary"),
@@ -15301,7 +16188,7 @@ mod cli_contracts_tests {
     fn cmd_consolidate_replaces_originals_with_the_api_key_providers_summary() {
         let (base_url, seen) = http_stub(vec![(200, openai_reply("merged by the model"))]);
         let var = "ICM_TEST_CONSOLIDATE_API_KEY";
-        std::env::set_var(var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(var, "placeholder-not-a-real-key") };
         let cfg = config::SummarizerConfig {
             provider: "openai".into(),
             model: "test-model".into(),
@@ -15327,7 +16214,7 @@ mod cli_contracts_tests {
             None,
             None,
         );
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         result.unwrap();
 
         let request = seen
@@ -15374,6 +16261,104 @@ mod cli_contracts_tests {
         );
     }
 
+    #[test]
+    fn only_list_items_of_the_reply_become_facts() {
+        use ReplyLine::{Fact, Nothing, Other};
+        for (line, fact) in [
+            (
+                "- The API uses gRPC between services.",
+                "The API uses gRPC between services.",
+            ),
+            ("  * Uses rustls.  ", "Uses rustls."),
+            ("\u{2022} Uses PostgreSQL.", "Uses PostgreSQL."),
+            ("+ Uses PostgreSQL.", "Uses PostgreSQL."),
+            ("\u{2013} Uses PostgreSQL.", "Uses PostgreSQL."),
+            ("-\tUses PostgreSQL.", "Uses PostgreSQL."),
+            ("2. Shards by tenant.", "Shards by tenant."),
+            ("3) Shards by tenant.", "Shards by tenant."),
+            ("- **Database:** PostgreSQL", "**Database:** PostgreSQL"),
+            (
+                "- Nonexistent paths fail fast.",
+                "Nonexistent paths fail fast.",
+            ),
+        ] {
+            assert_eq!(reply_line(line), Fact(fact), "{line:?}");
+        }
+        for line in [
+            "- (none)",
+            "- none",
+            "- None.",
+            "- `(none)`",
+            "- *(none)*",
+            "- (none) \u{2014} only git status output.",
+            "- None found.",
+            "- N/A",
+            "- No durable facts.",
+            "- I don't see any tool output to analyze.",
+        ] {
+            assert_eq!(reply_line(line), Nothing, "{line:?}");
+        }
+        for line in [
+            "",
+            "I don't see the actual tool output content to analyze.",
+            "The provided output contains only a storage reference ID.",
+            "Looking at these tool outputs, here are the durable facts:",
+            "### Facts",
+            "2026. That year we migrated.",
+            "-not a bullet",
+            "-",
+        ] {
+            assert_eq!(reply_line(line), Other, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_reply_without_list_items_drops_its_rows_visibly() {
+        struct Prose;
+        impl summarizer::Summarizer for Prose {
+            fn name(&self) -> &'static str {
+                "prose"
+            }
+            fn summarize(&self, req: &summarizer::SummarizeRequest<'_>) -> Result<String> {
+                Ok(if req.prompt.contains("project=alpha") {
+                    "Uses PostgreSQL for the ledger.\nDeploys via ArgoCD.\n".to_string()
+                } else {
+                    "- (none)\n".to_string()
+                })
+            }
+        }
+        let store = Store::in_memory().unwrap();
+        for project in ["alpha", "beta"] {
+            store
+                .enqueue_pending_extraction(project, "Bash", "output")
+                .unwrap();
+        }
+        let pending = store.list_pending_extractions(10).unwrap();
+        let groups = group_pending_by_project(&pending);
+        let mut tally = DrainTally::default();
+        drain_pending_groups(
+            &store,
+            None,
+            &Prose,
+            None,
+            256,
+            std::time::Duration::from_secs(5),
+            &groups,
+            &mut tally,
+        )
+        .unwrap();
+        assert_eq!(tally.stored, 0);
+        // alpha ignored the format: counted. beta said `(none)`: a normal
+        // empty answer, not counted.
+        assert_eq!(tally.unformatted_rows, 1);
+        assert_eq!(tally.deleted, 2);
+        assert!(
+            tally
+                .summary_line(2)
+                .contains("1 dropped after a reply with no list items")
+        );
+    }
+
     /// End-to-end wiring for an API-key provider through `extract-pending`:
     /// it is not downgraded by the "CLI not on PATH" check (it has no CLI),
     /// the `[extraction.summarizer]` fields reach the request, and the
@@ -15393,7 +16378,7 @@ mod cli_contracts_tests {
             .enqueue_pending_extraction("proj", "Bash", "some tool output")
             .unwrap();
         let var = "ICM_TEST_EXTRACT_PENDING_API_KEY";
-        std::env::set_var(var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(var, "placeholder-not-a-real-key") };
         let cfg = config::SummarizerConfig {
             provider: "openai".into(),
             model: "test-model".into(),
@@ -15402,7 +16387,7 @@ mod cli_contracts_tests {
             ..config::SummarizerConfig::default()
         };
         let result = cmd_extract_pending(&store, None, &cfg, 10, None, None, false, &db_path);
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         result.unwrap();
 
         let request = seen
@@ -15445,7 +16430,7 @@ mod cli_contracts_tests {
             .enqueue_pending_extraction("proj", "Bash", "some tool output")
             .unwrap();
         let var = "ICM_TEST_EXTRACT_PENDING_THINK_KEY";
-        std::env::set_var(var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(var, "placeholder-not-a-real-key") };
         let cfg = config::SummarizerConfig {
             provider: "openai".into(),
             model: "qwen3".into(),
@@ -15454,7 +16439,7 @@ mod cli_contracts_tests {
             ..config::SummarizerConfig::default()
         };
         let result = cmd_extract_pending(&store, None, &cfg, 10, None, None, false, &db_path);
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         result.unwrap();
 
         let facts: Vec<String> = store
@@ -15565,7 +16550,7 @@ mod cli_contracts_tests {
             false,
             &db_path,
         );
-        std::env::remove_var("ICM_TEST_EXTRACT_PENDING_401_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_EXTRACT_PENDING_401_KEY") };
         result.unwrap();
 
         assert_eq!(seen.try_iter().count(), 1, "one call, then the fallback");
@@ -15627,7 +16612,7 @@ mod cli_contracts_tests {
         let store = Store::in_memory().unwrap();
         seed(&store);
         let result = cmd_consolidate_all(&store, 2, &cfg, None, None, None, false, None);
-        std::env::remove_var("ICM_TEST_BATCH_401_KEY_A");
+        unsafe { std::env::remove_var("ICM_TEST_BATCH_401_KEY_A") };
         let msg = result
             .expect_err("exit status must show the failure")
             .to_string();
@@ -15646,7 +16631,7 @@ mod cli_contracts_tests {
             store.enqueue_pending_consolidation(topic, "").unwrap();
         }
         let result = cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path);
-        std::env::remove_var("ICM_TEST_BATCH_401_KEY_P");
+        unsafe { std::env::remove_var("ICM_TEST_BATCH_401_KEY_P") };
         result.unwrap();
         assert_eq!(
             seen.try_iter().count(),
@@ -15680,7 +16665,7 @@ mod cli_contracts_tests {
                 .unwrap();
         }
         let result = cmd_consolidate(&store, "t", false, &cfg, Some("ollama"), None, None, None);
-        std::env::remove_var("ICM_TEST_FLAG_OTHER_PROVIDER_KEY");
+        unsafe { std::env::remove_var("ICM_TEST_FLAG_OTHER_PROVIDER_KEY") };
         let err = result
             .expect_err("ollama has no model of its own")
             .to_string();
@@ -15734,7 +16719,7 @@ mod cli_contracts_tests {
 
         let key = "sk-log-NotARealKey-0123456789";
         let var = "ICM_TEST_LOG_REDACTION_KEY";
-        std::env::set_var(var, key);
+        unsafe { std::env::set_var(var, key) };
         let mut headers_seen = Vec::new();
         for (kind, reply) in [
             (
@@ -15776,7 +16761,7 @@ mod cli_contracts_tests {
                     .unwrap(),
             );
         }
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         tracing::warn!("log-pipeline-marker");
 
         // The key did travel in the non-masked headers…
@@ -16085,7 +17070,8 @@ mod doctor_tests {
 
 #[cfg(test)]
 mod windows_path_tests {
-    //! Regression tests for issue #180.
+    //! Regression tests for issue #180, and for the Mistral Vibe hook
+    //! commands (quoted for cmd.exe).
     //!
     //! Two failure modes on Windows:
     //!
@@ -16099,6 +17085,43 @@ mod windows_path_tests {
     //!    substring never matches. Init re-adds the hook on every run,
     //!    and `doctor` reports zero hooks even when they're configured.
     use super::*;
+
+    #[test]
+    fn vibe_hooks_quote_the_binary_for_cmd_exe() {
+        use super::vibe_hook_command_for;
+        assert_eq!(
+            vibe_hook_command_for("C:/Users/p/.local/bin/icm.exe", "pre", true),
+            "\"C:/Users/p/.local/bin/icm.exe\" hook pre"
+        );
+        assert_eq!(
+            vibe_hook_command_for("/home/p/.local/bin/icm", "post", false),
+            "/home/p/.local/bin/icm hook post"
+        );
+        // A space needs the quotes on any platform.
+        assert_eq!(
+            vibe_hook_command_for("/Users/p/My Tools/icm", "pre", false),
+            "\"/Users/p/My Tools/icm\" hook pre"
+        );
+    }
+
+    #[test]
+    fn quoted_hook_commands_are_still_recognised_as_icm() {
+        use super::{check_icm_hook_command, cmd_matches_icm_pattern};
+        let quoted = "\"C:/Program Files/icm/icm.exe\" hook pre";
+        assert!(cmd_matches_icm_pattern(quoted, "icm hook pre"));
+        assert!(cmd_matches_icm_pattern(quoted, "icm hook"));
+        assert_eq!(
+            check_icm_hook_command(quoted).map(|(bin, _)| bin),
+            Some("C:/Program Files/icm/icm.exe")
+        );
+        assert_eq!(
+            check_icm_hook_command("\"/usr/local/bin/icm\" hook post").map(|(bin, _)| bin),
+            Some("/usr/local/bin/icm")
+        );
+        // Quotes do not make another program an ICM hook.
+        assert!(check_icm_hook_command("\"C:/tools/other.exe\" icm hook pre").is_none());
+        assert!(check_icm_hook_command("mytool --note \"run icm hook later\"").is_none());
+    }
     use std::path::PathBuf;
 
     #[test]
@@ -16435,9 +17458,11 @@ mod cmd_remember_tests {
         let memories = store.get_by_topic("icm").unwrap();
         assert_eq!(memories.len(), 2, "remember appends, never overwrites");
         assert!(memories.iter().any(|m| m.summary.contains("TODO")));
-        assert!(memories
-            .iter()
-            .any(|m| m.summary.contains("closes the recall gap")));
+        assert!(
+            memories
+                .iter()
+                .any(|m| m.summary.contains("closes the recall gap"))
+        );
     }
 }
 

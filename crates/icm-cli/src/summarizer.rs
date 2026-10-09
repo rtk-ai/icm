@@ -15,13 +15,13 @@
 
 mod api;
 
-pub use api::{describe_config, ApiOptions};
+pub use api::{ApiOptions, describe_config};
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 /// Concrete provider kinds. `Auto` is resolved to one of the others at call
@@ -109,12 +109,12 @@ impl ProviderKind {
 /// set by whatever launched us — so those providers are skipped here and
 /// only run when the config or a CLI flag names them.
 pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
-    if let Ok(forced) = std::env::var("ICM_INVOKER") {
-        if let Ok(p) = ProviderKind::parse(&forced) {
-            if p != ProviderKind::Auto && !p.is_api_key() {
-                return p;
-            }
-        }
+    if let Ok(forced) = std::env::var("ICM_INVOKER")
+        && let Ok(p) = ProviderKind::parse(&forced)
+        && p != ProviderKind::Auto
+        && !p.is_api_key()
+    {
+        return p;
     }
     if std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CLI").is_ok() {
         return ProviderKind::Claude;
@@ -900,7 +900,7 @@ mod tests {
         ];
         let snapshot: Vec<_> = hints.iter().map(|k| (*k, std::env::var(k).ok())).collect();
         for k in hints {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
         // Only presence matters here. A key variable the host already
         // exports is left alone — never read, never overwritten — and only
@@ -910,7 +910,7 @@ mod tests {
             .filter(|k| std::env::var_os(k).is_none())
             .collect();
         for k in &added {
-            std::env::set_var(k, "placeholder-not-a-real-key");
+            unsafe { std::env::set_var(k, "placeholder-not-a-real-key") };
         }
 
         let mut results = vec![
@@ -919,19 +919,19 @@ mod tests {
             detect_provider(ProviderKind::Anthropic),
         ];
         for invoker in ["anthropic", "openai", "google", "gemini-api"] {
-            std::env::set_var("ICM_INVOKER", invoker);
+            unsafe { std::env::set_var("ICM_INVOKER", invoker) };
             results.push(detect_provider(ProviderKind::Auto));
         }
 
         // Restore env before asserting so failures don't poison later tests.
         for (k, v) in snapshot {
             match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
+                Some(val) => unsafe { std::env::set_var(k, val) },
+                None => unsafe { std::env::remove_var(k) },
             }
         }
         for k in added {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
 
         for got in results {
@@ -1030,7 +1030,7 @@ mod tests {
         // `auto` on the flag side that lands on the configured provider is
         // the configured provider.
         let prior = std::env::var("ICM_INVOKER").ok();
-        std::env::set_var("ICM_INVOKER", "ollama");
+        unsafe { std::env::set_var("ICM_INVOKER", "ollama") };
         let r = resolve(
             "ollama",
             "qwen3:8b",
@@ -1039,8 +1039,8 @@ mod tests {
             None,
         );
         match prior {
-            Some(v) => std::env::set_var("ICM_INVOKER", v),
-            None => std::env::remove_var("ICM_INVOKER"),
+            Some(v) => unsafe { std::env::set_var("ICM_INVOKER", v) },
+            None => unsafe { std::env::remove_var("ICM_INVOKER") },
         }
         let r = r.unwrap();
         assert_eq!(
@@ -1255,7 +1255,7 @@ mod tests {
         .map(|k| (*k, std::env::var(k).ok()))
         .collect();
         for (k, _) in &snapshot {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
 
         let result = detect_provider(ProviderKind::Auto);
@@ -1263,7 +1263,7 @@ mod tests {
         // Restore env before asserting so failures don't poison later tests.
         for (k, v) in snapshot {
             if let Some(val) = v {
-                std::env::set_var(k, val);
+                unsafe { std::env::set_var(k, val) };
             }
         }
 
@@ -1360,12 +1360,12 @@ mod tests {
         let _env = env_lock();
         // Save then override.
         let prior = std::env::var("ICM_INVOKER").ok();
-        std::env::set_var("ICM_INVOKER", "ollama");
+        unsafe { std::env::set_var("ICM_INVOKER", "ollama") };
         let got = detect_provider(ProviderKind::Claude);
         if let Some(v) = prior {
-            std::env::set_var("ICM_INVOKER", v);
+            unsafe { std::env::set_var("ICM_INVOKER", v) };
         } else {
-            std::env::remove_var("ICM_INVOKER");
+            unsafe { std::env::remove_var("ICM_INVOKER") };
         }
         assert_eq!(got, ProviderKind::Ollama);
     }

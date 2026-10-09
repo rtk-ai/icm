@@ -25,10 +25,10 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, anyhow, bail};
+use serde_json::{Value, json};
 
-use super::{trim_response, ProviderKind, SummarizeRequest, Summarizer};
+use super::{ProviderKind, SummarizeRequest, Summarizer, trim_response};
 
 /// Anthropic API version header. Dated, but it is the current (and only)
 /// stable value; newer behavior is opted into per feature, not by bumping it.
@@ -982,7 +982,9 @@ impl ApiSummarizer {
                         sent.ceiling, sent.budget,
                     )
                 };
-                anyhow!("{name} rejected the request (HTTP {code}, model={model}): {detail} — {advice}{hint}")
+                anyhow!(
+                    "{name} rejected the request (HTTP {code}, model={model}): {detail} — {advice}{hint}"
+                )
             }
             404 if self.workspace_id.is_some()
                 && detail.to_ascii_lowercase().contains("workspace") =>
@@ -1433,10 +1435,10 @@ fn host_of(authority: &str) -> Option<String> {
     if authority.starts_with('[') && port.is_none() && !authority.ends_with(']') {
         return None;
     }
-    if let Some(port) = port {
-        if port.parse::<u16>().is_err() {
-            return None;
-        }
+    if let Some(port) = port
+        && port.parse::<u16>().is_err()
+    {
+        return None;
     }
     Some(host.to_ascii_lowercase())
 }
@@ -1522,13 +1524,13 @@ fn warn_cleartext_once(name: &str, base_url: &str) {
 fn is_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(err);
     while let Some(e) = current {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if matches!(
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && matches!(
                 io.kind(),
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ) {
-                return true;
-            }
+            )
+        {
+            return true;
         }
         current = e.source();
     }
@@ -2263,7 +2265,7 @@ mod tests {
     fn key_is_read_from_the_configured_variable() {
         // A name unique to this test, so no other test races on it.
         let var = "ICM_TEST_SUMMARIZER_KEY_READ";
-        std::env::set_var(var, format!("  {KEY}\n"));
+        unsafe { std::env::set_var(var, format!("  {KEY}\n")) };
         let (server, handle) = ok(success_body(ProviderKind::Anthropic, "ok"));
         let p = ApiSummarizer::new(
             ProviderKind::Anthropic,
@@ -2275,7 +2277,7 @@ mod tests {
         )
         .unwrap();
         let out = p.summarize(&request(None));
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(out.unwrap(), "ok");
         // Surrounding whitespace from a sloppy `export` is trimmed.
         assert_eq!(handle.join().unwrap().header("x-api-key"), Some(KEY));
@@ -2554,7 +2556,7 @@ mod tests {
     #[test]
     fn unsendable_key_is_rejected_without_being_printed() {
         let var = "ICM_TEST_SUMMARIZER_KEY_UNSENDABLE";
-        std::env::set_var(var, format!("{KEY} trailing words"));
+        unsafe { std::env::set_var(var, format!("{KEY} trailing words")) };
         let p = ApiSummarizer::new(
             ProviderKind::OpenAi,
             &ApiOptions {
@@ -2565,7 +2567,7 @@ mod tests {
         )
         .unwrap();
         let err = p.summarize(&request(Some("m"))).unwrap_err().to_string();
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert!(err.contains(var), "{err}");
         assert!(err.contains("re-export"), "{err}");
         assert_no_key("unsendable key", &err);
@@ -2693,11 +2695,11 @@ mod tests {
             base_url: String::new(),
             workspace_id: String::new(),
         };
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         let unset = describe_config("anthropic", "", &opts).join("\n");
-        std::env::set_var(var, KEY);
+        unsafe { std::env::set_var(var, KEY) };
         let set = describe_config("anthropic", "", &opts).join("\n");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
 
         assert!(
             unset.contains(&format!("api_key_env = {var} (NOT set")),
@@ -2794,11 +2796,12 @@ mod tests {
         provider(ProviderKind::Anthropic, &server)
             .summarize_with_key(KEY, &request(None))
             .unwrap();
-        assert!(seen
-            .join()
-            .unwrap()
-            .header("anthropic-workspace-id")
-            .is_none());
+        assert!(
+            seen.join()
+                .unwrap()
+                .header("anthropic-workspace-id")
+                .is_none()
+        );
 
         // It is an Anthropic header: the other providers never send it.
         for kind in [ProviderKind::OpenAi, ProviderKind::Google] {
@@ -2808,11 +2811,12 @@ mod tests {
             build(kind, &opts)
                 .summarize_with_key(KEY, &request(Some("m")))
                 .unwrap();
-            assert!(seen
-                .join()
-                .unwrap()
-                .header("anthropic-workspace-id")
-                .is_none());
+            assert!(
+                seen.join()
+                    .unwrap()
+                    .header("anthropic-workspace-id")
+                    .is_none()
+            );
             let lines = describe_config(kind.as_str(), "m", &opts).join("\n");
             assert!(lines.contains("workspace_id = (ignored"), "{lines}");
         }
@@ -3288,10 +3292,12 @@ mod tests {
             let err = call(partial(Some(reason))).unwrap_err().to_string();
             assert!(err.contains("declined to answer"), "{reason}: {err}");
         }
-        assert!(call(partial(Some("MAX_TOKENS")))
-            .unwrap_err()
-            .to_string()
-            .contains("output ceiling"));
+        assert!(
+            call(partial(Some("MAX_TOKENS")))
+                .unwrap_err()
+                .to_string()
+                .contains("output ceiling")
+        );
         assert_eq!(
             call(partial(Some("STOP"))).unwrap(),
             "The retriever combines BM25 with"
@@ -3360,9 +3366,11 @@ mod tests {
             base_url: "http://127.0.0.1:8000/v1".into(),
             ..ApiOptions::default()
         };
-        assert!(!describe_config("openai", "m", &local)
-            .join("\n")
-            .contains("WARNING"));
+        assert!(
+            !describe_config("openai", "m", &local)
+                .join("\n")
+                .contains("WARNING")
+        );
     }
 
     #[test]
@@ -3605,23 +3613,31 @@ mod tests {
             assert!(!err.contains("fact 000"), "{reason}: partial text quoted");
         }
         // Missing altogether, and the upper-case spellings some gateways use.
-        assert!(call(partial(Value::Null))
-            .unwrap_err()
-            .to_string()
-            .contains("no finish_reason"));
-        assert!(call(partial(json!("MAX_TOKENS")))
-            .unwrap_err()
-            .to_string()
-            .contains("output ceiling"));
-        assert!(call(partial(json!("LENGTH")))
-            .unwrap_err()
-            .to_string()
-            .contains("output ceiling"));
+        assert!(
+            call(partial(Value::Null))
+                .unwrap_err()
+                .to_string()
+                .contains("no finish_reason")
+        );
+        assert!(
+            call(partial(json!("MAX_TOKENS")))
+                .unwrap_err()
+                .to_string()
+                .contains("output ceiling")
+        );
+        assert!(
+            call(partial(json!("LENGTH")))
+                .unwrap_err()
+                .to_string()
+                .contains("output ceiling")
+        );
         assert!(call(partial(json!("ERROR"))).is_err());
-        assert!(call(partial(json!("model_length")))
-            .unwrap_err()
-            .to_string()
-            .contains("context window"));
+        assert!(
+            call(partial(json!("model_length")))
+                .unwrap_err()
+                .to_string()
+                .contains("context window")
+        );
 
         for reason in [
             "stop",
@@ -4145,9 +4161,11 @@ mod tests {
             ProviderKind::OpenAi,
             "<think> blocks eat the budget; the answer follows </think>. Use think=false.",
         ));
-        assert!(provider(ProviderKind::OpenAi, &server)
-            .summarize_with_key(KEY, &req)
-            .is_err());
+        assert!(
+            provider(ProviderKind::OpenAi, &server)
+                .summarize_with_key(KEY, &req)
+                .is_err()
+        );
     }
 
     #[test]

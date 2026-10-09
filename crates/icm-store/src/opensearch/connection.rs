@@ -298,14 +298,14 @@ impl OpenSearchStore {
     }
 
     pub(crate) fn check_dims(&self, memory: &Memory) -> IcmResult<()> {
-        if let Some(emb) = memory.embedding.as_ref() {
-            if emb.len() != self.embedding_dims {
-                return Err(IcmError::InvalidInput(format!(
-                    "embedding has {} dimensions, but this store uses {}",
-                    emb.len(),
-                    self.embedding_dims
-                )));
-            }
+        if let Some(emb) = memory.embedding.as_ref()
+            && emb.len() != self.embedding_dims
+        {
+            return Err(IcmError::InvalidInput(format!(
+                "embedding has {} dimensions, but this store uses {}",
+                emb.len(),
+                self.embedding_dims
+            )));
         }
         Ok(())
     }

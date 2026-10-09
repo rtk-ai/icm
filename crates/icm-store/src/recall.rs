@@ -21,9 +21,9 @@ use chrono::{DateTime, Local, Utc};
 
 use icm_core::temporal::parse_query_window_at;
 use icm_core::{
-    estimate_tokens, is_preference_topic, keyword_matches, parse_query_window, project_matches,
-    select_within_budget, topic_matches, Embedder, IcmError, IcmResult, Memory, MemoryStore,
-    RankedHit, RankedQuery, TimeWindow, ITEM_OVERHEAD_TOKENS,
+    Embedder, ITEM_OVERHEAD_TOKENS, IcmError, IcmResult, Memory, MemoryStore, RankedHit,
+    RankedQuery, TimeWindow, estimate_tokens, is_preference_topic, keyword_matches,
+    parse_query_window, project_matches, select_within_budget, topic_matches,
 };
 
 use crate::backend::Store;
@@ -271,10 +271,8 @@ fn recall_with_depth(
     if req.query.trim().is_empty() {
         return Err(IcmError::InvalidInput("query must not be empty".into()));
     }
-    if bookkeeping {
-        if let Err(e) = store.maybe_auto_decay() {
-            tracing::warn!(error = %e, "auto-decay failed during recall");
-        }
+    if bookkeeping && let Err(e) = store.maybe_auto_decay() {
+        tracing::warn!(error = %e, "auto-decay failed during recall");
     }
 
     let limit = req.limit.clamp(1, MAX_LIMIT);

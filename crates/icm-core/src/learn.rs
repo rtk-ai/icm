@@ -798,15 +798,15 @@ fn collect_configs(dir: &Path) -> Vec<(PathBuf, String)> {
 
     // GitHub workflows
     let workflows = dir.join(".github").join("workflows");
-    if workflows.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&workflows) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.ends_with(".yml") || name_str.ends_with(".yaml") {
-                    let rel = PathBuf::from(".github/workflows").join(&name);
-                    result.push((rel, format!("GitHub Actions workflow: {name_str}")));
-                }
+    if workflows.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&workflows)
+    {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".yml") || name_str.ends_with(".yaml") {
+                let rel = PathBuf::from(".github/workflows").join(&name);
+                result.push((rel, format!("GitHub Actions workflow: {name_str}")));
             }
         }
     }
@@ -878,19 +878,19 @@ fn collect_scripts(dir: &Path) -> Vec<(PathBuf, String)> {
 
     // scripts/ directory
     let scripts_dir = dir.join("scripts");
-    if scripts_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_string();
-                if name_str.ends_with(".sh")
-                    || name_str.ends_with(".py")
-                    || name_str.ends_with(".ts")
-                    || name_str.ends_with(".js")
-                {
-                    let rel = PathBuf::from("scripts").join(&name);
-                    result.push((rel, format!("Script: {name_str}")));
-                }
+    if scripts_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&scripts_dir)
+    {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().to_string();
+            if name_str.ends_with(".sh")
+                || name_str.ends_with(".py")
+                || name_str.ends_with(".ts")
+                || name_str.ends_with(".js")
+            {
+                let rel = PathBuf::from("scripts").join(&name);
+                result.push((rel, format!("Script: {name_str}")));
             }
         }
     }

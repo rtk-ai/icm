@@ -550,10 +550,10 @@ fn named_month(words: &Words<'_>, cal: &Calendar) -> Option<TimeWindow> {
             // The whole month. "Mars 2020 rover" and "what may 2024
             // customers expect" are why an everyday word needs its
             // preposition even with a year.
-            if introduced || !ambiguous_month(tok) {
-                if let Some(w) = cal.month(y, month) {
-                    return Some(w);
-                }
+            if (introduced || !ambiguous_month(tok))
+                && let Some(w) = cal.month(y, month)
+            {
+                return Some(w);
             }
             continue;
         }
@@ -575,22 +575,22 @@ fn named_month(words: &Words<'_>, cal: &Calendar) -> Option<TimeWindow> {
 fn units_ago(toks: &[&str], cal: &Calendar) -> Option<TimeWindow> {
     // English: "<N> <unit> ago".
     for w in toks.windows(3) {
-        if w[2] == "ago" {
-            if let Some((n, unit)) = number_en(w[0]).zip(unit_en(w[1])) {
-                if let Some(window) = cal.ago(n, unit) {
-                    return Some(window);
-                }
-            }
+        if w[2] == "ago"
+            && let Some((n, unit)) = number_en(w[0]).zip(unit_en(w[1]))
+            && let Some(window) = cal.ago(n, unit)
+        {
+            return Some(window);
         }
     }
     // French: "il y a <N> <unité>".
     for w in toks.windows(5) {
-        if w[0] == "il" && w[1] == "y" && w[2] == "a" {
-            if let Some((n, unit)) = number_fr(w[3]).zip(unit_fr(w[4])) {
-                if let Some(window) = cal.ago(n, unit) {
-                    return Some(window);
-                }
-            }
+        if w[0] == "il"
+            && w[1] == "y"
+            && w[2] == "a"
+            && let Some((n, unit)) = number_fr(w[3]).zip(unit_fr(w[4]))
+            && let Some(window) = cal.ago(n, unit)
+        {
+            return Some(window);
         }
     }
     None

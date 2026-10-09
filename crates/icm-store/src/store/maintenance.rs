@@ -48,11 +48,11 @@ impl SqliteStore {
     pub fn backup_to(&self, dst: &Path) -> IcmResult<()> {
         // Ensure the destination directory exists (parallel to how with_dims
         // creates the parent dir for the main DB).
-        if let Some(parent) = dst.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| IcmError::Database(format!("creating backup dir: {e}")))?;
-            }
+        if let Some(parent) = dst.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| IcmError::Database(format!("creating backup dir: {e}")))?;
         }
         // `Connection::backup` is gated behind the `backup` rusqlite feature.
         // It calls sqlite3_backup_init/step/finish and handles the "source

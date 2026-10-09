@@ -788,9 +788,11 @@ mod tests {
             other.update(&m).unwrap();
         }
 
-        assert!(embedding_process
-            .set_embedding(&id, &[0.5_f32; 64])
-            .unwrap());
+        assert!(
+            embedding_process
+                .set_embedding(&id, &[0.5_f32; 64])
+                .unwrap()
+        );
 
         let after = SqliteStore::with_dims(&path, 64)
             .unwrap()
@@ -808,10 +810,12 @@ mod tests {
             embedding_process.search_fts("corrected", 5).unwrap().len(),
             1
         );
-        assert!(embedding_process
-            .search_fts("original", 5)
-            .unwrap()
-            .is_empty());
+        assert!(
+            embedding_process
+                .search_fts("original", 5)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

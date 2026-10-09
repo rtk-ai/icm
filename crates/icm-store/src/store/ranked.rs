@@ -15,7 +15,7 @@
 
 use super::*;
 
-use icm_core::fusion::{rrf_fuse, RankedHit, RankedList, RankedQuery, RRF_K};
+use icm_core::fusion::{RRF_K, RankedHit, RankedList, RankedQuery, rrf_fuse};
 
 /// Floor on candidates per arm: the legacy pool size, so v2 never looks
 /// at fewer candidates than `search_hybrid` does.
@@ -194,8 +194,7 @@ impl SqliteStore {
         // column order, except NULL instead of `m.embedding`: at depth
         // 2000 that would read 2000 blobs of several KB to rank ids.
         // `hydrate_embeddings` loads them for the final hits only.
-        let sql =
-            "SELECT m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
+        let sql = "SELECT m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
                     m.topic, m.summary, m.raw_excerpt, m.keywords, \
                     m.importance, m.source_type, m.source_data, m.related_ids, NULL, \
                     fts.rank \

@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::{
+    Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, Method, Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post},
-    Router,
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
@@ -51,10 +51,10 @@ pub struct AppState {
 /// Priority: ICM_WEB_PASSWORD env > config.toml [web].password > auto-generate.
 pub fn resolve_password(cfg: &WebConfig) -> Result<String> {
     // 1. Environment variable
-    if let Ok(p) = std::env::var("ICM_WEB_PASSWORD") {
-        if !p.is_empty() {
-            return Ok(p);
-        }
+    if let Ok(p) = std::env::var("ICM_WEB_PASSWORD")
+        && !p.is_empty()
+    {
+        return Ok(p);
     }
 
     // 2. Config file
@@ -64,16 +64,15 @@ pub fn resolve_password(cfg: &WebConfig) -> Result<String> {
 
     // 3. Credentials file
     let cred_path = credentials_path();
-    if let Some(ref path) = cred_path {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                for line in content.lines() {
-                    if let Some(val) = line.strip_prefix("ICM_WEB_PASSWORD=") {
-                        if !val.is_empty() {
-                            return Ok(val.to_string());
-                        }
-                    }
-                }
+    if let Some(ref path) = cred_path
+        && path.exists()
+        && let Ok(content) = std::fs::read_to_string(path)
+    {
+        for line in content.lines() {
+            if let Some(val) = line.strip_prefix("ICM_WEB_PASSWORD=")
+                && !val.is_empty()
+            {
+                return Ok(val.to_string());
             }
         }
     }
@@ -1160,9 +1159,11 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let nodes = json["nodes"].as_array().unwrap();
             assert_eq!(nodes.len(), expected_nodes, "{path}");
-            assert!(nodes
-                .iter()
-                .all(|n| n["x"].is_f64() && n["y"].is_f64() && n["z"].is_f64()));
+            assert!(
+                nodes
+                    .iter()
+                    .all(|n| n["x"].is_f64() && n["y"].is_f64() && n["z"].is_f64())
+            );
         }
         assert!(
             state.store.try_lock().is_ok(),
@@ -1190,14 +1191,18 @@ mod tests {
         let graph = build_graph_response(&memories);
 
         assert_eq!(graph.nodes.len(), 3);
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|n| n.id == a.id && n.importance == "high"));
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|n| n.id == c.id && n.importance == "low"));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.id == a.id && n.importance == "high")
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.id == c.id && n.importance == "low")
+        );
 
         // Exactly one edge for the a<->b pair, not two.
         assert_eq!(graph.edges.len(), 1);

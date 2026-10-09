@@ -12,26 +12,26 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::CrosstermBackend,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        canvas::{Canvas, Line as CanvasLine, Points},
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
         Tabs, Wrap,
+        canvas::{Canvas, Line as CanvasLine, Points},
     },
-    Frame, Terminal,
 };
 
 use crate::graph_layout::compute_force_layout;
 
 use icm_core::{
-    format_local, Embedder, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore,
-    StoreStats, TopicHealth,
+    Embedder, FeedbackStore, Importance, MemoirStore, Memory, MemoryStore, StoreStats, TopicHealth,
+    format_local,
 };
 use icm_store::Store;
 
@@ -2459,7 +2459,7 @@ mod tests {
                 .unwrap();
         }
         let var = "ICM_TEST_TUI_CONSOLIDATE_401_KEY";
-        std::env::set_var(var, "placeholder-not-a-real-key");
+        unsafe { std::env::set_var(var, "placeholder-not-a-real-key") };
         let mut app = App::new(&store, None, None).unwrap();
         app.summarizer_cfg = crate::config::SummarizerConfig {
             provider: "openai".into(),
@@ -2472,7 +2472,7 @@ mod tests {
             topic: "solo".into(),
         };
         execute_confirm(&mut app, &store, None);
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
 
         called_rx
             .recv_timeout(Duration::from_secs(5))

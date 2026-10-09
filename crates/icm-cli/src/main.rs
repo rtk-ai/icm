@@ -9263,6 +9263,79 @@ fn build_extract_prompt(rows: &[&icm_store::PendingRow]) -> String {
     )
 }
 
+/// One line of the provider's reply.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyLine<'a> {
+    /// A list item holding a fact.
+    Fact(&'a str),
+    /// A list item saying there is nothing to keep (`- (none)`,
+    /// `- No durable facts.`).
+    Nothing,
+    /// Not a list item: a header, prose, a blank line.
+    Other,
+}
+
+/// Bullets a model uses for a list item.
+const BULLETS: &[&str] = &["- ", "* ", "\u{2022} ", "+ ", "\u{2013} ", "-\t", "*\t"];
+
+/// Item openings that say nothing was found, after markdown is stripped.
+const NOTHING_OPENINGS: &[&str] = &[
+    "no durable",
+    "nothing durable",
+    "no facts",
+    "no new facts",
+    "nothing to extract",
+    "nothing worth",
+    "i don't see",
+    "i do not see",
+];
+
+/// Classify one line of the provider's reply.
+///
+/// Only list items can be facts: the prompt asks for one bullet per fact.
+/// Anything else is the model talking about its input — "I don't see the
+/// actual tool output…", "Looking at these outputs, here are the durable
+/// facts:" — and was stored as a memory when every line was kept (249 such
+/// memories found in one user's store, 2026-10-09). A list item that only
+/// says there is nothing to keep is not a fact either.
+fn reply_line(line: &str) -> ReplyLine<'_> {
+    let line = line.trim();
+    let numbered = || {
+        let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+        // `2026. That year…` is prose, not item 2026.
+        (1..=3)
+            .contains(&digits)
+            .then(|| &line[digits..])
+            .and_then(|rest| rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")))
+    };
+    let Some(item) = BULLETS
+        .iter()
+        .find_map(|b| line.strip_prefix(b))
+        .or_else(numbered)
+        .map(str::trim)
+    else {
+        return ReplyLine::Other;
+    };
+    let plain = item
+        .trim_matches(|c: char| matches!(c, '*' | '`' | '_' | '(' | ')' | '.' | ' '))
+        .to_lowercase();
+    let plain = plain.replace(['*', '`', '_'], "");
+    let says_none = plain.is_empty()
+        || plain == "n/a"
+        || plain == "none"
+        || plain.starts_with("none ")
+        || plain.starts_with("none)")
+        || plain.starts_with("none—")
+        || plain.starts_with("none -")
+        || plain.starts_with("none found")
+        || NOTHING_OPENINGS.iter().any(|o| plain.starts_with(o));
+    if item.is_empty() || says_none {
+        ReplyLine::Nothing
+    } else {
+        ReplyLine::Fact(item)
+    }
+}
+
 /// Counters for one `extract-pending` drain. They live outside the group loop
 /// so an error that propagates mid-drain can still report what was committed
 /// before it.
@@ -9276,6 +9349,9 @@ struct DrainTally {
     fallback_rows: usize,
     /// Rows dropped because the provider returned nothing for their group.
     discarded_rows: usize,
+    /// Rows dropped because the provider's reply held no list item at all
+    /// (it ignored the format): nothing was stored from them.
+    unformatted_rows: usize,
 }
 
 impl DrainTally {
@@ -9285,6 +9361,12 @@ impl DrainTally {
         let mut notes: Vec<String> = Vec::new();
         if self.fallback_rows > 0 {
             notes.push(format!("{} via fastembed fallback", self.fallback_rows));
+        }
+        if self.unformatted_rows > 0 {
+            notes.push(format!(
+                "{} dropped after a reply with no list items",
+                self.unformatted_rows
+            ));
         }
         if self.discarded_rows > 0 {
             notes.push(format!(
@@ -9387,16 +9469,17 @@ fn drain_pending_groups(
         // Parse bullet output into individual facts, each filed under the
         // project whose rows produced it.
         let topic = format!("context-{project}");
+        let mut items = 0usize;
         for line in response.lines() {
-            let line = line.trim();
-            let fact = line
-                .strip_prefix("- ")
-                .or_else(|| line.strip_prefix("* "))
-                .unwrap_or(line)
-                .trim();
-            if fact.is_empty() || fact == "(none)" || fact.eq_ignore_ascii_case("none") {
-                continue;
-            }
+            let fact = match reply_line(line) {
+                ReplyLine::Fact(fact) => fact,
+                ReplyLine::Nothing => {
+                    items += 1;
+                    continue;
+                }
+                ReplyLine::Other => continue,
+            };
+            items += 1;
             let mut mem = Memory::new(topic.clone(), fact.to_string(), Importance::Medium);
             // Same bug class as #394: this LLM-backed extraction path is a
             // sibling of extract_and_store_with_embedder and had the same gap
@@ -9408,6 +9491,16 @@ fn drain_pending_groups(
             }
             store.store(mem)?;
             tally.stored += 1;
+        }
+        if items == 0 {
+            // Retrying would cost the same call for the same answer; the rows
+            // go, but visibly.
+            eprintln!(
+                "[extract-pending] project={project}: provider reply had no list items; \
+                 dropping {} rows",
+                rows.len()
+            );
+            tally.unformatted_rows += rows.len();
         }
         tally.deleted += store.delete_pending_extractions(&ids)?;
     }
@@ -15061,7 +15154,13 @@ mod cli_contracts_tests {
             fn summarize(&self, req: &summarizer::SummarizeRequest<'_>) -> Result<String> {
                 self.calls.set(self.calls.get() + 1);
                 if req.prompt.contains("project=alpha") {
-                    Ok("- alpha stores its ledger in PostgreSQL.\n- (none)\n".to_string())
+                    // Prose around the bullets is the model talking, not a fact.
+                    Ok(
+                        "Looking at these tool outputs, here are the durable facts:\n\n\
+                        - alpha stores its ledger in PostgreSQL.\n- (none)\n\
+                        I don't see anything else worth remembering.\n"
+                            .to_string(),
+                    )
                 } else if req.prompt.contains("project=beta") {
                     Ok("   \n".to_string())
                 } else {
@@ -15109,7 +15208,8 @@ mod cli_contracts_tests {
         )
         .unwrap();
 
-        // alpha: the real bullet is filed under alpha, `(none)` is skipped.
+        // alpha: the real bullet is filed under alpha; `(none)` and the
+        // prose around it are skipped.
         let alpha = store.get_by_topic("context-alpha").unwrap();
         assert_eq!(alpha.len(), 1);
         assert!(alpha[0].summary.contains("PostgreSQL"));
@@ -15154,6 +15254,7 @@ mod cli_contracts_tests {
             deleted: 25,
             fallback_rows: 3,
             discarded_rows: 4,
+            unformatted_rows: 0,
         };
         let line = degraded.summary_line(25);
         assert!(
@@ -16157,6 +16258,104 @@ mod cli_contracts_tests {
         assert_eq!(
             resolve_consolidate_provider(&cfg, Some("google")).unwrap(),
             summarizer::ProviderKind::Google
+        );
+    }
+
+    #[test]
+    fn only_list_items_of_the_reply_become_facts() {
+        use ReplyLine::{Fact, Nothing, Other};
+        for (line, fact) in [
+            (
+                "- The API uses gRPC between services.",
+                "The API uses gRPC between services.",
+            ),
+            ("  * Uses rustls.  ", "Uses rustls."),
+            ("\u{2022} Uses PostgreSQL.", "Uses PostgreSQL."),
+            ("+ Uses PostgreSQL.", "Uses PostgreSQL."),
+            ("\u{2013} Uses PostgreSQL.", "Uses PostgreSQL."),
+            ("-\tUses PostgreSQL.", "Uses PostgreSQL."),
+            ("2. Shards by tenant.", "Shards by tenant."),
+            ("3) Shards by tenant.", "Shards by tenant."),
+            ("- **Database:** PostgreSQL", "**Database:** PostgreSQL"),
+            (
+                "- Nonexistent paths fail fast.",
+                "Nonexistent paths fail fast.",
+            ),
+        ] {
+            assert_eq!(reply_line(line), Fact(fact), "{line:?}");
+        }
+        for line in [
+            "- (none)",
+            "- none",
+            "- None.",
+            "- `(none)`",
+            "- *(none)*",
+            "- (none) \u{2014} only git status output.",
+            "- None found.",
+            "- N/A",
+            "- No durable facts.",
+            "- I don't see any tool output to analyze.",
+        ] {
+            assert_eq!(reply_line(line), Nothing, "{line:?}");
+        }
+        for line in [
+            "",
+            "I don't see the actual tool output content to analyze.",
+            "The provided output contains only a storage reference ID.",
+            "Looking at these tool outputs, here are the durable facts:",
+            "### Facts",
+            "2026. That year we migrated.",
+            "-not a bullet",
+            "-",
+        ] {
+            assert_eq!(reply_line(line), Other, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_reply_without_list_items_drops_its_rows_visibly() {
+        struct Prose;
+        impl summarizer::Summarizer for Prose {
+            fn name(&self) -> &'static str {
+                "prose"
+            }
+            fn summarize(&self, req: &summarizer::SummarizeRequest<'_>) -> Result<String> {
+                Ok(if req.prompt.contains("project=alpha") {
+                    "Uses PostgreSQL for the ledger.\nDeploys via ArgoCD.\n".to_string()
+                } else {
+                    "- (none)\n".to_string()
+                })
+            }
+        }
+        let store = Store::in_memory().unwrap();
+        for project in ["alpha", "beta"] {
+            store
+                .enqueue_pending_extraction(project, "Bash", "output")
+                .unwrap();
+        }
+        let pending = store.list_pending_extractions(10).unwrap();
+        let groups = group_pending_by_project(&pending);
+        let mut tally = DrainTally::default();
+        drain_pending_groups(
+            &store,
+            None,
+            &Prose,
+            None,
+            256,
+            std::time::Duration::from_secs(5),
+            &groups,
+            &mut tally,
+        )
+        .unwrap();
+        assert_eq!(tally.stored, 0);
+        // alpha ignored the format: counted. beta said `(none)`: a normal
+        // empty answer, not counted.
+        assert_eq!(tally.unformatted_rows, 1);
+        assert_eq!(tally.deleted, 2);
+        assert!(
+            tally
+                .summary_line(2)
+                .contains("1 dropped after a reply with no list items")
         );
     }
 

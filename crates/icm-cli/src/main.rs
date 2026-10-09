@@ -9263,6 +9263,32 @@ fn build_extract_prompt(rows: &[&icm_store::PendingRow]) -> String {
     )
 }
 
+/// The fact on one line of the provider's reply, or `None`.
+///
+/// Only list items count (`- `, `* `, `1. `): the prompt asks for one bullet
+/// per fact. Anything else is the model talking about its input — "I don't
+/// see the actual tool output…", "Looking at these outputs, here are the
+/// durable facts:" — and was stored as a memory when every line was kept
+/// (249 such memories found in one user's store, 2026-10-09).
+fn extracted_fact(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let item = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| {
+            let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+            (digits > 0)
+                .then(|| &line[digits..])
+                .and_then(|rest| rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")))
+        })?
+        .trim();
+    let none = item.trim_matches(|c: char| c == '(' || c == ')' || c == '.');
+    if item.is_empty() || none.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(item)
+}
+
 /// Counters for one `extract-pending` drain. They live outside the group loop
 /// so an error that propagates mid-drain can still report what was committed
 /// before it.
@@ -9388,15 +9414,9 @@ fn drain_pending_groups(
         // project whose rows produced it.
         let topic = format!("context-{project}");
         for line in response.lines() {
-            let line = line.trim();
-            let fact = line
-                .strip_prefix("- ")
-                .or_else(|| line.strip_prefix("* "))
-                .unwrap_or(line)
-                .trim();
-            if fact.is_empty() || fact == "(none)" || fact.eq_ignore_ascii_case("none") {
+            let Some(fact) = extracted_fact(line) else {
                 continue;
-            }
+            };
             let mut mem = Memory::new(topic.clone(), fact.to_string(), Importance::Medium);
             // Same bug class as #394: this LLM-backed extraction path is a
             // sibling of extract_and_store_with_embedder and had the same gap
@@ -15061,7 +15081,13 @@ mod cli_contracts_tests {
             fn summarize(&self, req: &summarizer::SummarizeRequest<'_>) -> Result<String> {
                 self.calls.set(self.calls.get() + 1);
                 if req.prompt.contains("project=alpha") {
-                    Ok("- alpha stores its ledger in PostgreSQL.\n- (none)\n".to_string())
+                    // Prose around the bullets is the model talking, not a fact.
+                    Ok(
+                        "Looking at these tool outputs, here are the durable facts:\n\n\
+                        - alpha stores its ledger in PostgreSQL.\n- (none)\n\
+                        I don't see anything else worth remembering.\n"
+                            .to_string(),
+                    )
                 } else if req.prompt.contains("project=beta") {
                     Ok("   \n".to_string())
                 } else {
@@ -15109,7 +15135,8 @@ mod cli_contracts_tests {
         )
         .unwrap();
 
-        // alpha: the real bullet is filed under alpha, `(none)` is skipped.
+        // alpha: the real bullet is filed under alpha; `(none)` and the
+        // prose around it are skipped.
         let alpha = store.get_by_topic("context-alpha").unwrap();
         assert_eq!(alpha.len(), 1);
         assert!(alpha[0].summary.contains("PostgreSQL"));
@@ -16158,6 +16185,37 @@ mod cli_contracts_tests {
             resolve_consolidate_provider(&cfg, Some("google")).unwrap(),
             summarizer::ProviderKind::Google
         );
+    }
+
+    #[test]
+    fn only_list_items_of_the_reply_become_facts() {
+        assert_eq!(
+            extracted_fact("- The API uses gRPC between services."),
+            Some("The API uses gRPC between services.")
+        );
+        assert_eq!(extracted_fact("  * Uses rustls.  "), Some("Uses rustls."));
+        assert_eq!(
+            extracted_fact("2. Shards by tenant."),
+            Some("Shards by tenant.")
+        );
+        assert_eq!(
+            extracted_fact("3) Shards by tenant."),
+            Some("Shards by tenant.")
+        );
+        for skipped in [
+            "- (none)",
+            "- none",
+            "- None.",
+            "-",
+            "",
+            "I don't see the actual tool output content to analyze.",
+            "The provided output contains only a storage reference ID.",
+            "Looking at these tool outputs, here are the durable facts:",
+            "2026-10-09 release notes",
+            "-not a bullet",
+        ] {
+            assert_eq!(extracted_fact(skipped), None, "{skipped:?}");
+        }
     }
 
     /// End-to-end wiring for an API-key provider through `extract-pending`:

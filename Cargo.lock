@@ -2209,6 +2209,7 @@ dependencies = [
  "directories",
  "fastembed",
  "gix",
+ "hf-hub",
  "libc",
  "serde",
  "serde_json",

@@ -554,6 +554,15 @@ impl Api {
         .map_err(|_| ApiError::InvalidHeader("commit_hash"))?
         .to_string();
 
+        // ICM patch (issue #507): the Hub states the size of an LFS / Xet file
+        // in `X-Linked-Size`. Kept as the fallback for a CDN that answers the
+        // ranged request below with a plain `200` and no `Content-Range`.
+        let linked_size: Option<usize> = response
+            .headers()
+            .get("x-linked-size")
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            .and_then(|v| v.trim().parse().ok());
+
         // The response was redirected to S3 most likely which will
         // know about the size of the file
         let status = response.status();
@@ -573,18 +582,20 @@ impl Api {
         } else {
             response
         };
-        let content_range = response
-            .headers()
-            .get(CONTENT_RANGE)
-            .ok_or(ApiError::MissingHeader(CONTENT_RANGE))?;
-        let content_range = std::str::from_utf8(content_range.as_bytes())
-            .map_err(|_| ApiError::InvalidHeader(CONTENT_RANGE))?;
-
-        let size = content_range
-            .split('/')
-            .next_back()
-            .ok_or(ApiError::InvalidHeader(CONTENT_RANGE))?
-            .parse()?;
+        let size = match response.headers().get(CONTENT_RANGE) {
+            Some(content_range) => {
+                let content_range = std::str::from_utf8(content_range.as_bytes())
+                    .map_err(|_| ApiError::InvalidHeader(CONTENT_RANGE))?;
+                content_range
+                    .split('/')
+                    .next_back()
+                    .ok_or(ApiError::InvalidHeader(CONTENT_RANGE))?
+                    .parse()?
+            }
+            // ICM patch (issue #507): no `Content-Range` (a Xet CDN answering
+            // `200` to `Range: bytes=0-0`) — use the size the Hub announced.
+            None => linked_size.ok_or(ApiError::MissingHeader(CONTENT_RANGE))?,
+        };
         Ok(Metadata {
             commit_hash,
             etag,
@@ -654,6 +665,16 @@ impl Api {
             .header(RANGE, &range)
             .call()
             .map_err(Box::new)?;
+        // ICM patch (issue #507): a server that ignores `Range` answers `200`
+        // with the whole file. Appended after the bytes already on disk, that
+        // would corrupt a resumed download: start the file over instead.
+        let current = if current > 0 && response.status() == StatusCode::OK {
+            file.set_len(0)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            0
+        } else {
+            current
+        };
         let (_, body) = response.into_parts();
         let reader = body.into_reader();
         progress.init(size, filename);

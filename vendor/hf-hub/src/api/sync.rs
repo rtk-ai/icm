@@ -627,7 +627,15 @@ impl Api {
             return Err(ApiError::InvalidResume);
         }
 
-        let mut res = self.download_from(url, start, size, &mut file, filename, &mut progress);
+        let mut res = self.download_from(
+            url,
+            start,
+            size,
+            &mut file,
+            &filepath,
+            filename,
+            &mut progress,
+        );
         if self.max_retries > 0 {
             let mut i = 0;
             while let Err(dlerr) = res {
@@ -635,7 +643,15 @@ impl Api {
                 std::thread::sleep(std::time::Duration::from_millis(wait_time as u64));
 
                 let current = file.stream_position()?;
-                res = self.download_from(url, current, size, &mut file, filename, &mut progress);
+                res = self.download_from(
+                    url,
+                    current,
+                    size,
+                    &mut file,
+                    &filepath,
+                    filename,
+                    &mut progress,
+                );
                 i += 1;
                 if i > self.max_retries {
                     return Err(ApiError::TooManyRetries(dlerr.into()));
@@ -652,6 +668,7 @@ impl Api {
         current: u64,
         size: usize,
         file: &mut std::fs::File,
+        path: &Path,
         filename: &str,
         progress: &mut P,
     ) -> Result<(), ApiError>
@@ -668,9 +685,13 @@ impl Api {
         // ICM patch (issue #507): a server that ignores `Range` answers `200`
         // with the whole file. Appended after the bytes already on disk, that
         // would corrupt a resumed download: start the file over instead.
+        // The partial file was opened for appending, which Windows does not
+        // let truncate: reopen it truncated instead.
         let current = if current > 0 && response.status() == StatusCode::OK {
-            file.set_len(0)?;
-            file.seek(std::io::SeekFrom::Start(0))?;
+            *file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)?;
             0
         } else {
             current

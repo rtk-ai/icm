@@ -1994,8 +1994,6 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hf-hub"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef3982638978efa195ff11b305f51f1f22f4f0a6cabee7af79b383ebee6a213"
 dependencies = [
  "dirs",
  "http",
@@ -2211,6 +2209,7 @@ dependencies = [
  "directories",
  "fastembed",
  "gix",
+ "hf-hub",
  "libc",
  "serde",
  "serde_json",

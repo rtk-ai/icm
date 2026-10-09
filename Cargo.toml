@@ -83,3 +83,10 @@ tower-http = { version = "0.7", features = ["trace", "cors"] }
 rust-embed = "8"
 mime_guess = "2"
 getrandom = "0.4"
+
+# hf-hub 0.5.0 (pulled in by fastembed 7) with one fix: take the file size from
+# `X-Linked-Size` when the Xet CDN answers a ranged request without
+# `Content-Range` (issue #507). Drop this once fastembed moves to hf-hub 1.x,
+# which handles it. See vendor/hf-hub/ICM-PATCH.md.
+[patch.crates-io]
+hf-hub = { path = "vendor/hf-hub" }

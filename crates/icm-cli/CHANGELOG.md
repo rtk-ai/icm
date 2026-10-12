@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.11.5](https://github.com/rtk-ai/icm/compare/icm-v0.11.4...icm-v0.11.5) (2026-10-12)
+
+
+### Features
+
+* **cli:** add Mistral Vibe init integration ([4f99066](https://github.com/rtk-ai/icm/commit/4f990660371d2c0c307ef0553ad54bba151da363))
+
+
+### Bug Fixes
+
+* **cli:** quote the icm path in Mistral Vibe hooks for cmd.exe ([fa12c14](https://github.com/rtk-ai/icm/commit/fa12c144de55e954c4374ed27ae23b2fe2835b8a))
+* **cli:** read Mistral Vibe's TOML files as documents ([8a44286](https://github.com/rtk-ai/icm/commit/8a44286be836dea9792053ba6825a514dbfb51c6))
+* **embeddings:** download models from a Xet CDN without Content-Range ([#507](https://github.com/rtk-ai/icm/issues/507)) ([c50fae2](https://github.com/rtk-ai/icm/commit/c50fae2e4296cb3de66e40c972081aa4224aaed5))
+* **embeddings:** restart a resumed download by reopening the file ([083854b](https://github.com/rtk-ai/icm/commit/083854b3fe57ed5807ad4abca064a6d09da357c2))
+* **extract:** store only list items from the extraction reply ([#509](https://github.com/rtk-ai/icm/issues/509)) ([bac5ea1](https://github.com/rtk-ai/icm/commit/bac5ea1cfefbeb6f12994d83cc67a5359d1ecf7b))
+* **install:** fall back to musl when the gnu archive is not published ([#477](https://github.com/rtk-ai/icm/issues/477)) ([dfe22a8](https://github.com/rtk-ai/icm/commit/dfe22a8009a35d87f7f437d38c1a367e5c66480e))
+
 ## [0.11.4](https://github.com/rtk-ai/icm/compare/icm-v0.11.3...icm-v0.11.4) (2026-10-08)
 
 

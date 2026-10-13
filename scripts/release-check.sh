@@ -245,6 +245,17 @@ cmd_smoke() {
     bin=$(unpack "$artifact" "$work/x")
     [ -f "$bin" ] || die "$name does not contain ${bin#"$work"/x/}"
 
+    # 0. It carries icm's license and the third-party licenses (issue #514),
+    #    where scripts/third-party-licenses.sh and the packaging put them.
+    case "$artifact" in
+        *.deb) where=/usr/share/doc/icm-cli ;;
+        *.rpm) where=/usr/share/licenses/icm-cli ;;
+        *) where= ;;
+    esac
+    for f in LICENSE THIRD-PARTY-LICENSES.md; do
+        [ -s "$work/x$where/$f" ] || die "$name does not carry ${where:+$where/}$f"
+    done
+
     # 1. The binary starts.
     out=$(run_icm "$bin" --version) || die "$name: 'icm --version' did not run on $(uname -sm)"
     case "$out" in

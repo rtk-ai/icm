@@ -8,3 +8,4 @@ result
 
 # Python bytecode (bench tooling)
 __pycache__/
+/THIRD-PARTY-LICENSES.md

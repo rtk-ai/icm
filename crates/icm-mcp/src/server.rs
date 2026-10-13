@@ -29,6 +29,45 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28", "2025-11-25"];
 /// version outside its own advertised list.
 const DEFAULT_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
 
+/// First revision whose results carry the envelope fields (`resultType`,
+/// `cacheScope`, `ttlMs`, `_meta` server identity). A client on an older
+/// revision must not receive them (issue #432). Revision ids are ISO dates,
+/// so string order is chronological order.
+const RESULT_ENVELOPE_SINCE: &str = "2026-07-28";
+
+/// Where a 2026-07-28 request declares its version: `params._meta`.
+const PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// The supported revision equal to `version`, if icm speaks it.
+pub fn supported_protocol_version(version: &str) -> Option<&'static str> {
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|v| *v == version)
+}
+
+/// The version a request declares for itself in `params._meta` (spec
+/// 2026-07-28: the version is declared per request, not only once at
+/// `initialize`).
+pub fn declared_protocol_version(params: &Option<Value>) -> Option<&str> {
+    params
+        .as_ref()?
+        .get("_meta")?
+        .get(PROTOCOL_VERSION_META_KEY)?
+        .as_str()
+}
+
+/// The version `initialize` settles on: the client's if icm speaks it,
+/// icm's default otherwise.
+fn negotiated_protocol_version(params: &Option<Value>) -> &'static str {
+    params
+        .as_ref()
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .and_then(supported_protocol_version)
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION)
+}
+
 /// Cache-freshness hint (`ttlMs`, HTTP `max-age` analogue) shared by every
 /// `CacheableResult`-envelope response icm sends (`server/discover`,
 /// `tools/list`). All of them describe build-time-fixed data — icm's
@@ -104,6 +143,7 @@ pub fn run_server(
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
     let mut calls_since_store: u32 = 0;
+    let mut session_version: Option<&'static str> = None;
     let mut buf: Vec<u8> = Vec::new();
 
     loop {
@@ -151,6 +191,7 @@ pub fn run_server(
             compact,
             auto_consolidate,
             &mut calls_since_store,
+            &mut session_version,
             extra_instructions,
         ) {
             write_response(&mut stdout, &response)?;
@@ -160,6 +201,10 @@ pub fn run_server(
     Ok(())
 }
 
+/// `session_version` is the version `initialize` settled on for this
+/// connection, `None` before any `initialize`. A request that declares its
+/// own version in `_meta` is answered on that one instead; a request that
+/// declares nothing, on the session's, else on icm's default.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_json_rpc_message(
     msg: JsonRpcMessage,
@@ -168,6 +213,7 @@ pub fn handle_json_rpc_message(
     compact: bool,
     auto_consolidate: AutoConsolidate,
     calls_since_store: &mut u32,
+    session_version: &mut Option<&'static str>,
     extra_instructions: Option<&str>,
 ) -> Option<JsonRpcResponse> {
     let method = msg.method.as_deref().unwrap_or("");
@@ -175,11 +221,29 @@ pub fn handle_json_rpc_message(
 
     let id = msg.id?;
 
+    let version = match declared_protocol_version(&msg.params) {
+        Some(requested) => match supported_protocol_version(requested) {
+            Some(v) => v,
+            None => {
+                return Some(JsonRpcResponse::unsupported_protocol_version(
+                    id,
+                    requested,
+                    SUPPORTED_PROTOCOL_VERSIONS,
+                ));
+            }
+        },
+        None => session_version.unwrap_or(DEFAULT_PROTOCOL_VERSION),
+    };
+    let envelope = version >= RESULT_ENVELOPE_SINCE;
+
     Some(match method {
-        "initialize" => handle_initialize(id, &msg.params, extra_instructions),
+        "initialize" => {
+            *session_version = Some(negotiated_protocol_version(&msg.params));
+            handle_initialize(id, &msg.params, extra_instructions)
+        }
         "server/discover" => handle_discover(id, extra_instructions),
         "ping" => JsonRpcResponse::ok(id, json!({})),
-        "tools/list" => handle_tools_list(id, embedder.is_some()),
+        "tools/list" => handle_tools_list(id, embedder.is_some(), envelope),
         "tools/call" => handle_tools_call(
             id,
             &msg.params,
@@ -188,6 +252,7 @@ pub fn handle_json_rpc_message(
             compact,
             auto_consolidate,
             calls_since_store,
+            envelope,
         ),
         other => JsonRpcResponse::method_not_found(id, other),
     })
@@ -215,22 +280,15 @@ fn write_response(stdout: &mut io::Stdout, resp: &JsonRpcResponse) -> anyhow::Re
 /// speaks, echo it back; otherwise answer with icm's own default. Per the
 /// spec's own `InitializeResult.protocolVersion` doc, a server is free to
 /// answer with any version *it* supports — "if the client cannot support
-/// this version, it MUST disconnect." icm's request handling doesn't
-/// actually branch on protocol version anywhere, so this is honest: every
-/// version in `SUPPORTED_PROTOCOL_VERSIONS` gets identical behavior.
+/// this version, it MUST disconnect." The settled version becomes the
+/// session's: later results leave out the fields a revision older than
+/// `RESULT_ENVELOPE_SINCE` does not have.
 fn handle_initialize(
     id: Value,
     params: &Option<Value>,
     extra_instructions: Option<&str>,
 ) -> JsonRpcResponse {
-    let requested_version = params
-        .as_ref()
-        .and_then(|p| p.get("protocolVersion"))
-        .and_then(|v| v.as_str());
-    let protocol_version = match requested_version {
-        Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
-        _ => DEFAULT_PROTOCOL_VERSION,
-    };
+    let protocol_version = negotiated_protocol_version(params);
 
     let instructions = match extra_instructions {
         Some(extra) if !extra.trim().is_empty() => {
@@ -324,8 +382,13 @@ rather than adding a duplicate.";
 /// _meta") — the tool catalog is fixed for the life of the process (it only
 /// varies with `has_embedder`, a build/startup-time property, never per
 /// request), so it's exactly as static as `discover`'s own content.
-fn handle_tools_list(id: Value, has_embedder: bool) -> JsonRpcResponse {
+/// `envelope` is false for a client on an older revision, which gets the
+/// bare list.
+fn handle_tools_list(id: Value, has_embedder: bool, envelope: bool) -> JsonRpcResponse {
     let mut result = tools::tool_definitions(has_embedder);
+    if !envelope {
+        return JsonRpcResponse::ok(id, result);
+    }
     if let Some(obj) = result.as_object_mut() {
         obj.insert("resultType".into(), json!("complete"));
         obj.insert("cacheScope".into(), json!("public"));
@@ -335,6 +398,7 @@ fn handle_tools_list(id: Value, has_embedder: bool) -> JsonRpcResponse {
     JsonRpcResponse::ok(id, result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_tools_call(
     id: Value,
     params: &Option<Value>,
@@ -343,6 +407,7 @@ fn handle_tools_call(
     compact: bool,
     auto_consolidate: AutoConsolidate,
     calls_since_store: &mut u32,
+    envelope: bool,
 ) -> JsonRpcResponse {
     let params = match params {
         Some(p) => p,
@@ -397,7 +462,7 @@ fn handle_tools_call(
     // results above — a tool call's outcome isn't cacheable, it just needs
     // this one field so the client knows how to parse the result.
     let mut value = serde_json::to_value(result).unwrap_or(json!(null));
-    if let Some(obj) = value.as_object_mut() {
+    if envelope && let Some(obj) = value.as_object_mut() {
         obj.insert("resultType".into(), json!("complete"));
     }
     JsonRpcResponse::ok(id, value)
@@ -554,7 +619,7 @@ mod tests {
     /// `tools`, `ttlMs`, plus the same `_meta` server-identity block.
     #[test]
     fn tools_list_response_has_the_cacheable_envelope() {
-        let result = handle_tools_list(json!(1), false).result.unwrap();
+        let result = handle_tools_list(json!(1), false, true).result.unwrap();
 
         assert!(result["tools"].is_array(), "must still return tools");
         assert!(result["resultType"].is_string());
@@ -590,6 +655,7 @@ mod tests {
             true,
             AutoConsolidate::default(),
             &mut calls_since_store,
+            &mut None,
             None,
         )
         .expect("a response");
@@ -662,5 +728,166 @@ mod tests {
             text.contains("\n[ICM: 10 tool calls since last store."),
             "{text}"
         );
+    }
+
+    /// One request through the server, on the connection whose
+    /// `initialize` settled on `session`. `version` goes in `params._meta`
+    /// when given, the way a 2026-07-28 client declares it.
+    fn rpc(
+        session: &mut Option<&'static str>,
+        method: &str,
+        params: Value,
+        version: Option<&str>,
+    ) -> JsonRpcResponse {
+        let mut params = params;
+        if let Some(v) = version {
+            params["_meta"] = json!({
+                PROTOCOL_VERSION_META_KEY: v,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            });
+        }
+        let msg: JsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": method,
+            "params": params
+        }))
+        .unwrap();
+        let store = Store::in_memory().unwrap();
+        handle_json_rpc_message(
+            msg,
+            &store,
+            None,
+            true,
+            AutoConsolidate::default(),
+            &mut 0,
+            session,
+            None,
+        )
+        .expect("a response")
+    }
+
+    const ENVELOPE_FIELDS: [&str; 4] = ["resultType", "cacheScope", "ttlMs", "_meta"];
+
+    /// Issue #432: a version icm does not speak, declared in `_meta`, is
+    /// refused with `UnsupportedProtocolVersion` naming the versions to
+    /// retry with — the ones `server/discover` advertises. It used to be
+    /// ignored and the request served anyway.
+    #[test]
+    fn an_unsupported_declared_version_is_refused_with_the_supported_list() {
+        for method in ["tools/list", "tools/call", "server/discover", "ping"] {
+            let resp = rpc(
+                &mut None,
+                method,
+                json!({"name": "icm_memory_stats", "arguments": {}}),
+                Some("1999-01-01"),
+            );
+            assert!(resp.result.is_none(), "{method}");
+            let error = resp.error.expect("an error");
+            assert_eq!(error.code, -32022, "{method}");
+            let data = error.data.expect("error data");
+            assert_eq!(data["requested"], "1999-01-01");
+            assert_eq!(data["supported"], json!(SUPPORTED_PROTOCOL_VERSIONS));
+        }
+    }
+
+    /// Issue #432: a 2025-11-25 client must not receive the fields
+    /// 2026-07-28 added to results, whether it declares its version per
+    /// request or settled on it at `initialize`.
+    #[test]
+    fn a_client_on_the_older_revision_gets_no_envelope_fields() {
+        let mut declared = None;
+        let mut negotiated = None;
+        rpc(
+            &mut negotiated,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25"}),
+            None,
+        );
+        assert_eq!(negotiated, Some("2025-11-25"));
+
+        for (session, version) in [(&mut declared, Some("2025-11-25")), (&mut negotiated, None)] {
+            let list = rpc(session, "tools/list", json!({}), version)
+                .result
+                .unwrap();
+            assert!(list["tools"].is_array());
+            let call = rpc(
+                session,
+                "tools/call",
+                json!({"name": "icm_memory_stats", "arguments": {}}),
+                version,
+            )
+            .result
+            .unwrap();
+            assert!(call["content"].is_array());
+            for field in ENVELOPE_FIELDS {
+                assert!(
+                    list.get(field).is_none(),
+                    "tools/list leaks {field}: {list}"
+                );
+                assert!(
+                    call.get(field).is_none(),
+                    "tools/call leaks {field}: {call}"
+                );
+            }
+        }
+    }
+
+    /// The same requests on 2026-07-28 — declared, negotiated, or not
+    /// stated at all (icm's default) — keep the envelope.
+    #[test]
+    fn the_latest_revision_and_the_default_keep_the_envelope() {
+        let mut negotiated = None;
+        rpc(
+            &mut negotiated,
+            "initialize",
+            json!({"protocolVersion": "2026-07-28"}),
+            None,
+        );
+        for (mut session, version) in [(None, Some("2026-07-28")), (negotiated, None), (None, None)]
+        {
+            let list = rpc(&mut session, "tools/list", json!({}), version)
+                .result
+                .unwrap();
+            for field in ENVELOPE_FIELDS {
+                assert!(list.get(field).is_some(), "tools/list lacks {field}");
+            }
+            let call = rpc(
+                &mut session,
+                "tools/call",
+                json!({"name": "icm_memory_stats", "arguments": {}}),
+                version,
+            )
+            .result
+            .unwrap();
+            assert_eq!(call["resultType"], "complete");
+        }
+    }
+
+    /// A version declared in `_meta` applies to that request only: it
+    /// wins over the session's, and does not change it.
+    #[test]
+    fn a_declared_version_overrides_the_session_for_one_request() {
+        let mut session = Some("2025-11-25");
+        let list = rpc(&mut session, "tools/list", json!({}), Some("2026-07-28"))
+            .result
+            .unwrap();
+        assert_eq!(list["resultType"], "complete");
+        assert_eq!(session, Some("2025-11-25"));
+        let list = rpc(&mut session, "tools/list", json!({}), None)
+            .result
+            .unwrap();
+        assert!(list.get("resultType").is_none());
+    }
+
+    /// `server/discover` carries its envelope on every revision: it is
+    /// how a client learns which versions to use in the first place.
+    #[test]
+    fn discover_keeps_its_envelope_for_an_older_client() {
+        let result = rpc(&mut None, "server/discover", json!({}), Some("2025-11-25"))
+            .result
+            .unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert!(result["supportedVersions"].is_array());
     }
 }

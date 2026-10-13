@@ -340,3 +340,91 @@ fn stdio_proxy_forwards_tools_call_to_http_daemon() {
         "proxied store did not reach daemon DB: {memories}"
     );
 }
+
+/// Issue #432, over Streamable HTTP: a request declaring a protocol
+/// version icm does not speak gets `UnsupportedProtocolVersion` (-32022)
+/// with a 400, and a request on the older revision, named by the
+/// `MCP-Protocol-Version` header, gets results without the 2026-07-28
+/// envelope fields. The stdio proxy passes the -32022 answer on.
+#[test]
+fn mcp_endpoint_follows_the_requested_protocol_version() {
+    let (_dir, db) = temp_db();
+    let server = spawn_server(&db, &[]);
+    let endpoint = format!("http://{}/mcp", server.addr);
+
+    let unsupported = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "1999-01-01",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}
+    });
+    let resp = ureq::post(&endpoint)
+        .timeout(Duration::from_secs(5))
+        .set("content-type", "application/json")
+        .send_string(&unsupported.to_string());
+    let body = match resp {
+        Err(ureq::Error::Status(400, r)) => r.into_string().unwrap(),
+        other => panic!("expected 400, got {other:?}"),
+    };
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"]["code"], -32022, "{body}");
+    assert_eq!(body["error"]["data"]["requested"], "1999-01-01");
+
+    let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+    let older = ureq::post(&endpoint)
+        .timeout(Duration::from_secs(5))
+        .set("content-type", "application/json")
+        .set("mcp-protocol-version", "2025-11-25")
+        .send_string(list)
+        .expect("tools/list on 2025-11-25");
+    assert_eq!(older.header("mcp-protocol-version"), Some("2025-11-25"));
+    let older: serde_json::Value = older.into_json().unwrap();
+    assert!(older["result"]["tools"].is_array(), "{older}");
+    assert!(older["result"].get("resultType").is_none(), "{older}");
+    assert!(older["result"].get("_meta").is_none(), "{older}");
+
+    let latest = post_json(&server.addr, "/mcp", list);
+    // Version-less: answered on icm's default, without naming it.
+    assert_eq!(latest.header("mcp-protocol-version"), None);
+    let latest: serde_json::Value = latest.into_json().unwrap();
+    assert_eq!(latest["result"]["resultType"], "complete", "{latest}");
+
+    let mut mismatch = unsupported.clone();
+    mismatch["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        serde_json::json!("2026-07-28");
+    let resp = ureq::post(&endpoint)
+        .timeout(Duration::from_secs(5))
+        .set("content-type", "application/json")
+        .set("mcp-protocol-version", "2025-11-25")
+        .send_string(&mismatch.to_string());
+    match resp {
+        Err(ureq::Error::Status(400, r)) => {
+            let body: serde_json::Value = r.into_json().unwrap();
+            assert_eq!(body["error"]["code"], -32020, "{body}");
+        }
+        other => panic!("expected 400 on a header mismatch, got {other:?}"),
+    }
+
+    let mut proxy = Command::new(ICM)
+        .arg("--no-embeddings")
+        .arg("serve")
+        .arg("--http-proxy")
+        .arg(format!("http://{}", server.addr))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn icm serve --http-proxy");
+    {
+        let mut stdin = proxy.stdin.take().expect("proxy stdin");
+        writeln!(stdin, "{unsupported}").expect("write JSON-RPC request");
+    }
+    let output = proxy.wait_with_output().expect("wait for proxy");
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("proxy output is not JSON-RPC ({e}): {output:?}"));
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["error"]["code"], -32022, "{response}");
+}

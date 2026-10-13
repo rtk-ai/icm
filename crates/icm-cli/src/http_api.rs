@@ -41,7 +41,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use icm_mcp::protocol::{JsonRpcMessage, JsonRpcResponse};
+use icm_mcp::protocol::{
+    HEADER_MISMATCH, JsonRpcMessage, JsonRpcResponse, UNSUPPORTED_PROTOCOL_VERSION,
+};
 
 use icm_core::{
     Embedder, Importance, MSG_NO_MEMORIES, Memory, MemoryStore, is_preference_topic,
@@ -357,9 +359,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Streamable HTTP keeps no `initialize` state between requests: a request
+/// that declares no version in `_meta` is answered on the one its
+/// `MCP-Protocol-Version` header names, when icm speaks it. A request whose
+/// declared version icm does not speak gets its JSON-RPC error with a 400,
+/// as the spec requires on HTTP.
 async fn handle_mcp(
     State(state): State<AppState>,
     Query(q): Query<McpQuery>,
+    headers: HeaderMap,
     Json(raw): Json<Value>,
 ) -> Response {
     let msg: JsonRpcMessage = match serde_json::from_value(raw) {
@@ -369,6 +377,24 @@ async fn handle_mcp(
             return Json(response).into_response();
         }
     };
+
+    let header = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok());
+    let declared = icm_mcp::server::declared_protocol_version(&msg.params).map(str::to_owned);
+    // The header and `_meta` name the same thing on 2026-07-28: when both
+    // are there they must agree (`HeaderMismatch`, with a 400).
+    if let (Some(header), Some(declared)) = (header, declared.as_deref())
+        && header != declared
+    {
+        let response = JsonRpcResponse::err(
+            msg.id.clone().unwrap_or(Value::Null),
+            HEADER_MISMATCH,
+            format!("MCP-Protocol-Version header {header} does not match _meta version {declared}"),
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
+    let mut header_version = header.and_then(icm_mcp::server::supported_protocol_version);
 
     let store = lock_store(&state);
     let mut calls_since_store = state
@@ -383,9 +409,29 @@ async fn handle_mcp(
         q.compact,
         state.auto_consolidate,
         &mut calls_since_store,
+        &mut header_version,
         state.mcp_instructions.as_deref(),
     ) {
-        Some(response) => Json(response).into_response(),
+        Some(response) => {
+            let unsupported = response
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == UNSUPPORTED_PROTOCOL_VERSION);
+            if unsupported {
+                return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+            }
+            // Echo the version the request was answered on, when it named
+            // one (or `initialize` settled one); a version-less request
+            // gets no header rather than icm's default.
+            let version = declared
+                .as_deref()
+                .and_then(icm_mcp::server::supported_protocol_version)
+                .or(header_version);
+            match version {
+                Some(v) => ([("mcp-protocol-version", v)], Json(response)).into_response(),
+                None => Json(response).into_response(),
+            }
+        }
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }
@@ -426,6 +472,14 @@ fn post_mcp_json_rpc(endpoint: &str, token: Option<&str>, body: &str) -> Result<
         }
         Err(ureq::Error::Status(code, resp)) => {
             let text = resp.into_string().unwrap_or_default();
+            // A JSON-RPC error sent with a 4xx (an unsupported protocol
+            // version) is the answer itself: pass it on to the client.
+            let is_rpc_error = serde_json::from_str::<Value>(&text)
+                .ok()
+                .is_some_and(|v| v.get("jsonrpc").is_some() && v.get("error").is_some());
+            if is_rpc_error {
+                return Ok(Some(text));
+            }
             anyhow::bail!("HTTP {code} from ICM daemon: {}", text.trim());
         }
         Err(e) => Err(e.into()),

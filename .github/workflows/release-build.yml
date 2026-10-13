@@ -61,8 +61,37 @@ env:
   RELEASE_CHECK_SEMANTIC: ${{ inputs.semantic_check && '1' || '0' }}
 
 jobs:
+  licenses:
+    name: Third-party licenses
+    # THIRD-PARTY-LICENSES.md ships next to LICENSE in every archive and
+    # package (issue #514). Written once, with every feature on, so it
+    # covers all the builds below.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      - name: Write THIRD-PARTY-LICENSES.md
+        run: sh scripts/third-party-licenses.sh THIRD-PARTY-LICENSES.md
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-licenses
+          path: THIRD-PARTY-LICENSES.md
+          if-no-files-found: error
+
   build:
     name: Build ${{ matrix.target }}
+    needs: licenses
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -127,18 +156,25 @@ jobs:
           CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: cargo build --release --target ${{ matrix.target }} -p icm-cli ${{ matrix.flags }}
 
+      - name: Download third-party licenses
+        uses: actions/download-artifact@v4
+        with:
+          name: third-party-licenses
+
       - name: Package (Unix)
+        # The binary and the two license files, all at the top of the
+        # archive: install.sh and `icm upgrade` pick the binary by name.
         if: matrix.archive == 'tar.gz'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar -czvf ../../../icm-${{ matrix.target }}.${{ matrix.archive }} icm
-          cd ../../..
+          tar -czvf icm-${{ matrix.target }}.${{ matrix.archive }} \
+            -C target/${{ matrix.target }}/release icm \
+            -C "$GITHUB_WORKSPACE" LICENSE THIRD-PARTY-LICENSES.md
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/icm.exe" -DestinationPath "icm-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/icm.exe", "LICENSE", "THIRD-PARTY-LICENSES.md" -DestinationPath "icm-${{ matrix.target }}.zip"
 
       - name: Smoke-test the packaged binary
         # Unpacks the archive that will be published, runs `icm --version`
@@ -160,11 +196,17 @@ jobs:
 
   build-deb:
     name: Build .deb
+    needs: licenses
     # glibc 2.35 so the package installs on Debian 12 / Ubuntu 22.04 (#330).
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download third-party licenses
+        uses: actions/download-artifact@v4
+        with:
+          name: third-party-licenses
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -237,6 +279,7 @@ jobs:
 
   build-rpm:
     name: Build .rpm
+    needs: licenses
     # Static ONNX Runtime, linked against Fedora's current glibc: this
     # package targets current Fedora, not RHEL 9 and derivatives.
     runs-on: ubuntu-latest
@@ -247,6 +290,11 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download third-party licenses
+        uses: actions/download-artifact@v4
+        with:
+          name: third-party-licenses
 
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm

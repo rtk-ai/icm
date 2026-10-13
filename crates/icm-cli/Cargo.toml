@@ -111,11 +111,21 @@ libc = { workspace = true }
 
 [package.metadata.deb]
 maintainer = "Patrick Szymkowiak"
-copyright = "2024-2026 Patrick Szymkowiak"
+copyright = "2025-2026 RTK AI"
 extended-description = "Permanent memory for AI agents — MCP server with hybrid search, temporal decay, and multilingual embeddings."
 section = "utility"
 priority = "optional"
-assets = [["target/release/icm", "usr/bin/", "755"]]
+# THIRD-PARTY-LICENSES.md is written by scripts/third-party-licenses.sh
+# before packaging (issue #514).
+assets = [
+    ["target/release/icm", "usr/bin/", "755"],
+    ["../../LICENSE", "usr/share/doc/icm-cli/", "644"],
+    ["../../THIRD-PARTY-LICENSES.md", "usr/share/doc/icm-cli/", "644"],
+]
 
 [package.metadata.generate-rpm]
-assets = [{ source = "target/release/icm", dest = "/usr/bin/icm", mode = "755" }]
+assets = [
+    { source = "target/release/icm", dest = "/usr/bin/icm", mode = "755" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/icm-cli/LICENSE", mode = "644", doc = true },
+    { source = "../../THIRD-PARTY-LICENSES.md", dest = "/usr/share/licenses/icm-cli/THIRD-PARTY-LICENSES.md", mode = "644", doc = true },
+]

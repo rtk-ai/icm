@@ -5,6 +5,13 @@ use serde_json::Value;
 // JSON-RPC 2.0 message types
 // ---------------------------------------------------------------------------
 
+/// Error code of `HeaderMismatchError` (spec 2026-07-28): an HTTP header
+/// disagrees with the request body.
+pub const HEADER_MISMATCH: i64 = -32020;
+
+/// Error code of `UnsupportedProtocolVersionError` (spec 2026-07-28).
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcMessage {
     #[allow(dead_code)]
@@ -46,6 +53,8 @@ pub struct JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl JsonRpcResponse {
@@ -63,12 +72,34 @@ impl JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id,
             result: None,
-            error: Some(JsonRpcError { code, message }),
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data: None,
+            }),
         }
     }
 
     pub fn method_not_found(id: Value, method: &str) -> Self {
         Self::err(id, -32601, format!("method not found: {method}"))
+    }
+
+    /// `UnsupportedProtocolVersionError` (spec 2026-07-28): the request
+    /// declared a version the server does not speak. `data` names it and
+    /// lists the versions to retry with.
+    pub fn unsupported_protocol_version(id: Value, requested: &str, supported: &[&str]) -> Self {
+        let mut resp = Self::err(
+            id,
+            UNSUPPORTED_PROTOCOL_VERSION,
+            format!("unsupported protocol version: {requested}"),
+        );
+        if let Some(error) = resp.error.as_mut() {
+            error.data = Some(serde_json::json!({
+                "requested": requested,
+                "supported": supported,
+            }));
+        }
+        resp
     }
 }
 

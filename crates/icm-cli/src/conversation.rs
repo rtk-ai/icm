@@ -35,11 +35,12 @@ pub fn position_key(session_id: &str) -> String {
 }
 
 /// The complete lines of the file at `path` from byte `offset`, at most
-/// `cap` bytes of them, and the offset just past the last one. A last line
+/// `cap` bytes of them: `(text, start, end)`, where `start` is the offset
+/// they were read from and `end` the one just past the last of them. A last line
 /// without its newline may still be being written: it is left for the next
 /// call. An `offset` past the end of the file means another file: reading
 /// starts over at 0. A single line longer than `cap` is skipped.
-pub fn read_new_lines(path: &str, offset: u64, cap: u64) -> std::io::Result<(String, u64)> {
+pub fn read_new_lines(path: &str, offset: u64, cap: u64) -> std::io::Result<(String, u64, u64)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -49,11 +50,11 @@ pub fn read_new_lines(path: &str, offset: u64, cap: u64) -> std::io::Result<(Str
     file.take(cap).read_to_end(&mut bytes)?;
     let complete = match bytes.iter().rposition(|&b| b == b'\n') {
         Some(i) => i + 1,
-        None if bytes.len() as u64 == cap => return Ok((String::new(), start + cap)),
+        None if bytes.len() as u64 == cap => return Ok((String::new(), start, start + cap)),
         None => 0,
     };
     let text = String::from_utf8_lossy(&bytes[..complete]).into_owned();
-    Ok((text, start + complete as u64))
+    Ok((text, start, start + complete as u64))
 }
 
 /// Render transcript JSONL lines as one entry per message part:
@@ -140,28 +141,65 @@ fn push(out: &mut Vec<String>, ts: &str, role: &str, text: &str, cap: usize) {
     out.push(format!("[{ts} {role}] {head}"));
 }
 
-/// Join entries into excerpts of at most [`EXCERPT_CHARS`] characters (an
-/// entry is never split; a longer one makes an excerpt alone), keeping the
-/// last [`MAX_EXCERPTS_PER_FIRE`].
-pub fn excerpts(entries: &[String]) -> Vec<String> {
-    let mut all: Vec<String> = Vec::new();
+/// Excerpts cut from transcript lines, and the byte offset up to which
+/// they cover the transcript: where the next read starts.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Batch {
+    pub excerpts: Vec<String>,
+    pub end: u64,
+}
+
+/// Cut `text`, complete transcript lines read from byte `start`, into
+/// excerpts of at most [`EXCERPT_CHARS`] characters, at line boundaries (a
+/// line rendering to more makes an excerpt alone), keeping the last
+/// [`MAX_EXCERPTS_PER_FIRE`].
+///
+/// An excerpt is closed when the next line would overflow it. With `flush`
+/// the last, unfilled one is kept too, and `end` is the end of `text`:
+/// compaction and session end, after which that text leaves the agent's
+/// context. Without it, the unfilled excerpt is left out and `end` stops
+/// where it would have started, so the next call reads those lines again
+/// with what follows: the in-session path, which queues full excerpts only.
+pub fn batch(text: &str, start: u64, flush: bool) -> Batch {
+    let mut done: Vec<String> = Vec::new();
+    let mut done_end = start;
     let mut current = String::new();
-    for entry in entries {
-        if !current.is_empty()
-            && current.chars().count() + entry.chars().count() + 1 > EXCERPT_CHARS
-        {
-            all.push(std::mem::take(&mut current));
+    let mut current_chars = 0usize;
+    let mut offset = start;
+    for line in text.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len() as u64;
+        let entries = render_entries(&[line.trim_end_matches(['\n', '\r'])]);
+        if entries.is_empty() {
+            if current.is_empty() {
+                // Nothing pending: the line need not be read again.
+                done_end = offset;
+            }
+            continue;
         }
-        if !current.is_empty() {
+        let block = entries.join("\n");
+        let chars = block.chars().count();
+        if current_chars > 0 && current_chars + 1 + chars > EXCERPT_CHARS {
+            done.push(std::mem::take(&mut current));
+            current_chars = 0;
+            done_end = line_start;
+        }
+        if current_chars > 0 {
             current.push('\n');
+            current_chars += 1;
         }
-        current.push_str(entry);
+        current.push_str(&block);
+        current_chars += chars;
     }
-    if !current.is_empty() {
-        all.push(current);
+    if flush && !current.is_empty() {
+        done.push(current);
+        done_end = offset;
     }
-    let skip = all.len().saturating_sub(MAX_EXCERPTS_PER_FIRE);
-    all.split_off(skip)
+    let skip = done.len().saturating_sub(MAX_EXCERPTS_PER_FIRE);
+    Batch {
+        excerpts: done.split_off(skip),
+        end: done_end,
+    }
 }
 
 /// The extraction prompt for one conversation excerpt. Its wording is the
@@ -197,18 +235,21 @@ mod tests {
         let path = dir.path().join("t.jsonl");
         let p = path.to_str().unwrap();
         std::fs::write(&path, "one\ntwo\nthr").unwrap();
-        let (text, end) = read_new_lines(p, 0, 1024).unwrap();
-        assert_eq!((text.as_str(), end), ("one\ntwo\n", 8));
+        let (text, start, end) = read_new_lines(p, 0, 1024).unwrap();
+        assert_eq!((text.as_str(), start, end), ("one\ntwo\n", 0, 8));
 
         // From the recorded offset only what follows; the cap cuts at a line.
         std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
         // 12 bytes from 8 are "three\nfour\nf": the partial "f" stays.
-        let (text, end) = read_new_lines(p, 8, 12).unwrap();
-        assert_eq!((text.as_str(), end), ("three\nfour\n", 19));
+        let (text, start, end) = read_new_lines(p, 8, 12).unwrap();
+        assert_eq!((text.as_str(), start, end), ("three\nfour\n", 8, 19));
 
         // An offset past the end: another file, start over.
-        let (text, end) = read_new_lines(p, 10_000, 1024).unwrap();
-        assert_eq!((text.as_str(), end), ("one\ntwo\nthree\nfour\nfive\n", 24));
+        let (text, start, end) = read_new_lines(p, 10_000, 1024).unwrap();
+        assert_eq!(
+            (text.as_str(), start, end),
+            ("one\ntwo\nthree\nfour\nfive\n", 0, 24)
+        );
     }
 
     #[test]
@@ -217,8 +258,8 @@ mod tests {
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, format!("{}\nnext\n", "x".repeat(50))).unwrap();
         let p = path.to_str().unwrap();
-        let (text, end) = read_new_lines(p, 0, 10).unwrap();
-        assert_eq!((text.as_str(), end), ("", 10));
+        let (text, start, end) = read_new_lines(p, 0, 10).unwrap();
+        assert_eq!((text.as_str(), start, end), ("", 0, 10));
     }
 
     #[test]
@@ -227,8 +268,8 @@ mod tests {
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, "é\nàé\n").unwrap();
         // The cap lands inside "à": only the first line comes back, intact.
-        let (text, end) = read_new_lines(path.to_str().unwrap(), 0, 4).unwrap();
-        assert_eq!((text.as_str(), end), ("é\n", 3));
+        let (text, start, end) = read_new_lines(path.to_str().unwrap(), 0, 4).unwrap();
+        assert_eq!((text.as_str(), start, end), ("é\n", 0, 3));
     }
 
     #[test]
@@ -285,28 +326,82 @@ mod tests {
         );
     }
 
-    #[test]
-    fn excerpts_respect_size_and_keep_the_most_recent() {
-        let entry = "e".repeat(EXCERPT_CHARS / 2 - 10);
-        let entries: Vec<String> = (0..40).map(|i| format!("{i}:{entry}")).collect();
-        let out = excerpts(&entries);
-        assert_eq!(out.len(), MAX_EXCERPTS_PER_FIRE);
-        assert!(out.iter().all(|e| e.chars().count() <= EXCERPT_CHARS));
-        assert!(out.last().is_some_and(|e| e.contains("39:")));
-        assert!(!out.iter().any(|e| e.starts_with("0:")));
+    /// One plain user line of `n` characters, numbered, with its newline.
+    fn user_line(i: usize, n: usize) -> String {
+        let text = format!("{i}:{}", "u".repeat(n));
+        format!("{}\n", serde_json::json!({"role": "user", "content": text}))
     }
 
     #[test]
-    fn an_oversized_entry_is_an_excerpt_alone() {
-        let entries = vec![
-            "a".to_string(),
-            "b".repeat(EXCERPT_CHARS + 5),
-            "c".to_string(),
-        ];
-        let out = excerpts(&entries);
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0], "a");
-        assert_eq!(out[2], "c");
+    fn batch_respects_size_and_keeps_the_most_recent() {
+        let text: String = (0..200).map(|i| user_line(i, 3_900)).collect();
+        let b = batch(&text, 0, true);
+        assert_eq!(b.excerpts.len(), MAX_EXCERPTS_PER_FIRE);
+        assert!(
+            b.excerpts
+                .iter()
+                .all(|e| e.chars().count() <= EXCERPT_CHARS)
+        );
+        assert!(b.excerpts.last().is_some_and(|e| e.contains("199:")));
+        assert!(!b.excerpts.iter().any(|e| e.contains("[ user] 0:")));
+        assert_eq!(b.end, text.len() as u64);
+    }
+
+    #[test]
+    fn without_flush_only_full_excerpts_and_the_rest_is_read_again() {
+        let text: String = (0..20).map(|i| user_line(i, 3_900)).collect();
+        let b = batch(&text, 100, false);
+        assert_eq!(b.excerpts.len(), 1);
+        let first = &b.excerpts[0];
+        assert!(first.chars().count() <= EXCERPT_CHARS);
+        // The end is the start of the first line left out, at a line boundary.
+        let consumed = (b.end - 100) as usize;
+        let rest = &text[consumed..];
+        assert!(text[..consumed].ends_with('\n'));
+        let n_first = first.lines().count();
+        assert!(rest.starts_with(&user_line(n_first, 3_900)));
+        // Flushed, the rest is one more excerpt and nothing is left.
+        let tail = batch(rest, b.end, true);
+        assert_eq!(tail.excerpts.len(), 1);
+        assert!(tail.excerpts[0].contains("19:"));
+        assert_eq!(tail.end, 100 + text.len() as u64);
+    }
+
+    #[test]
+    fn lines_with_nothing_to_render_advance_only_when_nothing_is_pending() {
+        let meta = format!("{}\n", r#"{"type":"system","subtype":"compact_boundary"}"#);
+        let only_meta = meta.repeat(3);
+        assert_eq!(
+            batch(&only_meta, 0, false),
+            Batch {
+                excerpts: vec![],
+                end: only_meta.len() as u64
+            }
+        );
+        let pending = format!("{}{}", user_line(0, 10), meta);
+        assert_eq!(
+            batch(&pending, 0, false),
+            Batch {
+                excerpts: vec![],
+                end: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_line_rendering_past_the_size_is_an_excerpt_alone() {
+        let blocks: Vec<serde_json::Value> = (0..40)
+            .map(|_| serde_json::json!({"type": "text", "text": "b".repeat(1_990)}))
+            .collect();
+        let big = format!(
+            "{}\n",
+            serde_json::json!({"role": "assistant", "content": blocks})
+        );
+        let text = format!("{}{}{}", user_line(0, 5), big, user_line(2, 5));
+        let b = batch(&text, 0, true);
+        assert_eq!(b.excerpts.len(), 3);
+        assert!(b.excerpts[1].chars().count() > EXCERPT_CHARS);
+        assert!(b.excerpts[2].contains("2:"));
     }
 
     #[test]

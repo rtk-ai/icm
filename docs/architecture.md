@@ -165,15 +165,16 @@ sequenceDiagram
     end
 
     A->>I: PreCompact
-    I->>D: cmd_hook_compact: extract_from_hook_transcript
+    I->>D: cmd_hook_compact: enqueue_conversation,<br/>or extract by rules when the provider is "none"
+    I-)X: detached worker: extract-pending
 
     A->>I: SessionEnd
-    I->>D: cmd_hook_end: extract_from_hook_transcript
+    I->>D: cmd_hook_end: enqueue_conversation,<br/>or extract by rules when the provider is "none"
     I-)X: detached workers: extract-pending,<br/>consolidate-pending, briefing
     X-)D: facts written as memories
 ```
 
-The SessionEnd workers run only when the extraction summarizer is not `none`; they are what turns the queued tool output into memories. With an agent that has no SessionEnd hook, run `icm extract-pending` yourself.
+The workers run only when the extraction summarizer is not `none`; they are what turns the queued tool output and conversation excerpts into memories. `enqueue_conversation` reads the transcript from the byte offset it reached last time for that session (`icm_metadata`), renders what the user and the agent wrote with each tool result cut to 1,500 characters, and queues it in excerpts of up to 60,000 characters, the 12 most recent per fire; each excerpt is one provider call. An excerpt the provider fails on stays queued for the next run. With an agent that has no SessionEnd hook, run `icm extract-pending` yourself.
 
 ## icm-core
 

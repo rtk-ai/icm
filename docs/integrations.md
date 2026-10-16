@@ -37,7 +37,7 @@ icm init --mode all
 |------|-------|-------------|
 | `icm hook pre` | PreToolUse | Auto-allow `icm` commands |
 | `icm hook post` | PostToolUse | Extract facts every 15 calls |
-| `icm hook compact` | PreCompact | Extract before context compression |
+| `icm hook compact` | PreCompact | Queue the conversation for extraction before context compression |
 | `icm hook prompt` | UserPromptSubmit | Inject recalled context |
 
 **Skills:** `/recall`, `/remember` slash commands.

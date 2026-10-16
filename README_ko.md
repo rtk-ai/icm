@@ -18,7 +18,7 @@
 월요일에 Claude Code에게 프로젝트의 인증 처리 방식을 알려 주면, 화요일의 Gemini CLI 세션은 이미 그 내용을 알고 있습니다. ICM은 코딩 에이전트가 배운 것(결정, 수정, 규칙, 선호)을 사용자 머신의 SQLite 파일 하나에 보관하고, 각 세션이 시작될 때와 프롬프트를 보낼 때마다 관련된 부분을 다시 제공합니다. 최대 18개의 에이전트와 에디터가 이 메모리를 공유하므로, 세션을 열거나 도구를 바꿀 때마다 프로젝트를 다시 설명할 필요가 없습니다.
 
 - **LoCoMo(1,540문항, 세 번 실행한 평균)에서 92.9%, Hindsight(92.0%)와 같은 수준**이며, 질문당 컨텍스트는 3분의 1 적습니다. [자세한 내용과 주의 사항은 아래에](#benchmark-comparison).
-- **저장과 검색에 LLM 호출이 없습니다.** Hindsight, Mem0, Graphiti (Zep), claude-mem은 기본적으로 메모리를 저장할 때마다 LLM을 호출합니다. ICM은 그렇지 않습니다. 도구 출력에서 사실을 자동으로 추출하는 기능만, 이미 사용 중인 LLM 명령줄 도구가 설치되어 있을 때 그 도구를 거칩니다. `provider = "none"`으로 설정하면 이것도 로컬에 머뭅니다([빠른 시작](#quickstart) 참고).
+- **저장과 검색에 LLM 호출이 없습니다.** Hindsight, Mem0, Graphiti (Zep), claude-mem은 기본적으로 메모리를 저장할 때마다 LLM을 호출합니다. ICM은 그렇지 않습니다. 도구 출력과 대화에서 사실을 자동으로 추출하는 기능만, 이미 사용 중인 LLM 명령줄 도구가 설치되어 있을 때 그 도구를 거칩니다. `provider = "none"`으로 설정하면 이것도 로컬에 머뭅니다([빠른 시작](#quickstart) 참고).
 - **임베딩 모델 없이도 쓸 수 있습니다.** 키워드 검색만으로도 LoCoMo 질문의 88.6%에서 정답 세션 중 하나 이상이 상위 5개 결과 안에 들며, Linux x86-64에서 검색 1회당 중앙값은 6.8 ms입니다.
 - **LongMemEval-S에서 97.4%, LLM 없는 검색**: 500문항 중 487문항에서 정답 세션 중 하나가 상위 5개 결과 안에 들며, 같은 기준에서 MemPalace는 96.6%, agentmemory는 95.2%입니다.
 - **모든 면에서 앞서지는 않습니다.** PersonaMem(사용자의 변화하는 선호)에서는 Hindsight가 앞섭니다: 86.6% 대 ICM의 81.7%.
@@ -35,7 +35,7 @@ brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubus
 icm init                                   # instructions, skills and hooks for every agent it detects
 ```
 
-설정은 이것으로 끝입니다. Claude Code, Codex, Gemini CLI 또는 Copilot CLI에서 새 세션을 열면, 에이전트는 현재 있는 프로젝트의 가장 중요한 메모리(`myapp`이라는 저장소의 `decisions-myapp`처럼 토픽에 저장소 이름이 들어 있는 메모리와 사용자의 선호)를 모은 짧은 팩을 가지고 시작하며, 보내는 프롬프트마다 관련된 메모리를 받습니다. 에이전트가 도구 출력에서 배운 내용은 큐에 쌓이고, 이 큐는 각 Claude Code 세션이 끝날 때 메모리로 변환됩니다. 다른 도구에서는 `icm extract-pending`을 실행하세요(예를 들어 cron 작업으로).
+설정은 이것으로 끝입니다. Claude Code, Codex, Gemini CLI 또는 Copilot CLI에서 새 세션을 열면, 에이전트는 현재 있는 프로젝트의 가장 중요한 메모리(`myapp`이라는 저장소의 `decisions-myapp`처럼 토픽에 저장소 이름이 들어 있는 메모리와 사용자의 선호)를 모은 짧은 팩을 가지고 시작하며, 보내는 프롬프트마다 관련된 메모리를 받습니다. 에이전트가 도구 출력에서 배운 내용은 큐에 쌓이고, Claude Code가 대화를 압축하거나 세션이 끝날 때마다 대화 자체도 큐에 쌓입니다. 이 큐는 압축할 때마다, 그리고 각 Claude Code 세션이 끝날 때 메모리로 변환됩니다. 다른 도구에서는 `icm extract-pending`을 실행하세요(예를 들어 cron 작업으로).
 
 저장과 검색은 사용자의 머신에서 이루어집니다. 자동 추출은 이미 사용 중인 LLM 명령줄 도구(Claude Code, Codex 또는 Gemini CLI)가 설치되어 있으면 그 도구에 텍스트를 넘깁니다. 완전히 로컬로 유지하려면 `[extraction.summarizer]` 아래에 `provider = "none"`을 설정하세요.
 

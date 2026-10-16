@@ -18,7 +18,7 @@
 周一告诉 Claude Code 你的项目如何处理认证，周二的 Gemini CLI 会话就已经知道了。ICM 把编程智能体学到的内容（决策、修复、约定、偏好）保存在你本机的一个 SQLite 文件中，并在每次会话开始时以及你发送每条提示时返回其中相关的部分。最多 18 个智能体和编辑器共享这份记忆，因此你不必在每次打开会话或切换工具时重新解释你的项目。
 
 - **在 LoCoMo（1,540 个问题，三次运行的平均值）上达到 92.9%，与 Hindsight（92.0%）持平**，每个问题使用的上下文少三分之一。[详情和注意事项见下文](#benchmark-comparison)。
-- **存储和召回都不调用 LLM。** Hindsight、Mem0、Graphiti (Zep) 和 claude-mem 默认在存储每条记忆时都会调用 LLM。ICM 不会。只有从工具输出中自动提取事实这一步，会在已安装的情况下经过你已经在用的 LLM 命令行工具；设置 `provider = "none"` 可让这一步也留在本地（见[快速开始](#quickstart)）。
+- **存储和召回都不调用 LLM。** Hindsight、Mem0、Graphiti (Zep) 和 claude-mem 默认在存储每条记忆时都会调用 LLM。ICM 不会。只有从工具输出和对话中自动提取事实这一步，会在已安装的情况下经过你已经在用的 LLM 命令行工具；设置 `provider = "none"` 可让这一步也留在本地（见[快速开始](#quickstart)）。
 - **没有嵌入模型也能用。** 仅靠关键词召回，就能让 88.6% 的 LoCoMo 问题至少有一个正确会话进入前 5 条结果；在 Linux x86-64 上，每次召回的中位耗时为 6.8 ms。
 - **在 LongMemEval-S 上达到 97.4%，检索不使用 LLM**：500 个问题中有 487 个有一个正确会话进入前 5 条结果；按同一指标，MemPalace 为 96.6%，agentmemory 为 95.2%。
 - **并非处处领先。** 在 PersonaMem（用户不断变化的偏好）上，Hindsight 领先：86.6% 对 ICM 的 81.7%。
@@ -35,7 +35,7 @@ brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubus
 icm init                                   # instructions, skills and hooks for every agent it detects
 ```
 
-设置到此就完成了。在 Claude Code、Codex、Gemini CLI 或 Copilot CLI 中打开一个新会话：你的智能体现在会带着一小组它所在项目中最重要的记忆（即主题中带有仓库名称的记忆，例如名为 `myapp` 的仓库中的 `decisions-myapp`，再加上你的偏好）开始工作，并在你发送每条提示时收到与之相关的记忆。它从工具输出中学到的内容会进入队列，队列会在每个 Claude Code 会话结束时转换为记忆；对于其他工具，请运行 `icm extract-pending`（例如通过 cron 任务）。
+设置到此就完成了。在 Claude Code、Codex、Gemini CLI 或 Copilot CLI 中打开一个新会话：你的智能体现在会带着一小组它所在项目中最重要的记忆（即主题中带有仓库名称的记忆，例如名为 `myapp` 的仓库中的 `decisions-myapp`，再加上你的偏好）开始工作，并在你发送每条提示时收到与之相关的记忆。它从工具输出中学到的内容会进入队列，每当 Claude Code 压缩对话或会话结束时，对话本身也会进入队列；队列会在每次压缩时以及每个 Claude Code 会话结束时转换为记忆；对于其他工具，请运行 `icm extract-pending`（例如通过 cron 任务）。
 
 存储和召回都在你的机器上进行。自动提取会在已安装的情况下，把文本交给你已经在用的 LLM 命令行工具（Claude Code、Codex 或 Gemini CLI）；在 `[extraction.summarizer]` 下设置 `provider = "none"` 可使其完全在本地运行。
 

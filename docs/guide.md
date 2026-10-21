@@ -404,65 +404,65 @@ icm bench-agent --sessions 10 --model haiku --runs 3
 
 All benchmarks use real API calls, no mocks. Each run uses its own tempdir and fresh DB.
 
-## Les 5 premieres minutes avec ICM
+## The First 5 Minutes with ICM
 
-Guide eclair pour etre operationnel en 5 minutes.
+A quick guide to get you up and running in 5 minutes.
 
-### Minute 1 : Installer
+### Minute 1: Install
 
 ```bash
 brew tap rtk-ai/tap && brew install icm
 ```
 
-Ou, sans Homebrew :
+Or, without Homebrew:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
 ```
 
-### Minute 2 : Configurer
+### Minute 2: Configure
 
 ```bash
 icm init
 ```
 
-ICM detecte automatiquement vos outils IA (Claude Code, Cursor, VS Code, etc.) et configure le serveur MCP pour chacun. Verifiez la sortie — chaque outil affiche `configured` ou `already configured`.
+ICM automatically detects your AI tools (Claude Code, Cursor, VS Code, etc.) and configures the MCP server for each one. Check the output: each tool shows `configured` or `already configured`.
 
-### Minute 3 : Stocker un premier souvenir
+### Minute 3: Store a First Memory
 
 ```bash
-icm store -t "test" -c "Mon premier souvenir ICM" -i high
+icm store -t "test" -c "My first ICM memory" -i high
 ```
 
-Verifiez qu'il est stocke :
+Verify that it was stored:
 
 ```bash
 icm topics
 icm stats
 ```
 
-### Minute 4 : Rappeler un souvenir
+### Minute 4: Recall a Memory
 
 ```bash
-icm recall "premier souvenir"
+icm recall "first memory"
 ```
 
-Le souvenir doit apparaitre avec son ID, topic, poids et contenu.
+The memory should appear with its ID, topic, weight, and content.
 
-### Minute 5 : Tester avec votre agent
+### Minute 5: Test with Your Agent
 
-Relancez votre outil IA (Claude Code, Cursor...). Demandez-lui :
+Restart your AI tool (Claude Code, Cursor...) and ask it:
 
-> "Rappelle le contexte ICM"
+> "Recall the ICM context"
 
-L'agent devrait utiliser automatiquement `icm_memory_recall`. S'il ne le fait pas, voir la section Troubleshooting ci-dessous.
+The agent should automatically use `icm_memory_recall`. If it doesn't, see the Troubleshooting section below.
 
-### Et apres ?
+### What's Next?
 
-- Stockez vos decisions d'architecture avec `-i high`
-- Stockez les faits invariants (ports, URLs) avec `-i critical`
-- Apres chaque bug fixe, stockez la resolution avec des mots-cles
-- Pour aller plus loin : creez un **memoir** pour structurer les connaissances en graphe
+- Store architecture decisions with `-i high`
+- Store invariant facts (ports, URLs) with `-i critical`
+- After each bug fix, store the resolution with keywords
+- To go further: create a **memoir** to structure knowledge as a graph
 
 ---
 

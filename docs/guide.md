@@ -455,7 +455,7 @@ Restart your AI tool (Claude Code, Cursor...) and ask it:
 
 > "Recall the ICM context"
 
-The agent should automatically use `icm_memory_recall`. If it doesn't, see the Troubleshooting section below.
+The agent should automatically use `icm_memory_recall`. If it doesn't, see Detailed Troubleshooting below.
 
 ### What's Next?
 
@@ -466,280 +466,280 @@ The agent should automatically use `icm_memory_recall`. If it doesn't, see the T
 
 ---
 
-## Troubleshooting
+## Detailed Troubleshooting
 
-### 1. L'agent n'utilise pas les outils ICM
+### 1. The agent doesn't use the ICM tools
 
-**Symptome :** L'agent ne rappelle ni ne stocke rien, meme quand on lui demande.
+**Symptom:** The agent neither recalls nor stores anything, even when asked.
 
-**Solutions :**
-- Lancez `icm init` et verifiez la sortie pour chaque outil
-- Verifiez que le fichier de config MCP existe (ex: `~/.claude.json` pour Claude Code)
-- Testez manuellement le serveur :
+**Solutions:**
+- Run `icm init` and check the output for each tool
+- Check that the MCP config file exists (e.g. `~/.claude.json` for Claude Code)
+- Test the server manually:
   ```bash
   echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | icm serve
   ```
-  Vous devez voir une reponse JSON avec `capabilities` et `serverInfo`
-- Verifiez que `icm serve` est dans votre PATH : `which icm`
-- **Redemarrez votre outil IA** apres avoir lance `icm init`
+  You should see a JSON response with `capabilities` and `serverInfo`
+- Check that `icm serve` is in your PATH: `which icm`
+- **Restart your AI tool** after running `icm init`
 
-### 2. `icm recall` ne retourne rien
+### 2. `icm recall` returns nothing
 
-**Symptome :** La recherche retourne "No memories found."
+**Symptom:** The search returns "No memories found."
 
-**Solutions :**
-- `icm topics` — verifiez qu'il y a des souvenirs stockes
-- `icm stats` — verifiez le total
-- Essayez une requete plus large ou supprimez les filtres topic/keyword
-- `icm list --all` — listez tout pour verifier le contenu
-- Si les souvenirs existent mais ne matchent pas : backfill les embeddings avec `icm embed`
+**Solutions:**
+- `icm topics` — check that there are stored memories
+- `icm stats` — check the total
+- Try a broader query or remove the topic/keyword filters
+- `icm list --all` — list everything to check the content
+- If memories exist but don't match: backfill the embeddings with `icm embed`
 
-### 3. Les embeddings sont lents au premier lancement
+### 3. Embeddings are slow on first launch
 
-**Symptome :** ICM prend 30+ secondes au premier `store` ou `recall`.
+**Symptom:** ICM takes 30+ seconds on the first `store` or `recall`.
 
-**Explication :** Le modele d'embedding (environ 2 Go pour Qdrant/multilingual-e5-large-onnx, le modele par defaut) est telecharge a la premiere utilisation. Les executions suivantes chargent depuis le cache (~1-2s).
+**Explanation:** The embedding model (about 2 GB for Qdrant/multilingual-e5-large-onnx, the default) is downloaded on first use. Subsequent runs load from the cache (~1-2s).
 
-**Solutions :**
-- C'est normal la premiere fois — attendez le telechargement
-- Pour accelerer : utilisez un modele plus leger dans `config.toml` :
+**Solutions:**
+- This is normal the first time — wait for the download
+- To speed things up, use a lighter model in `config.toml`:
   ```toml
   [embeddings]
-  model = "Xenova/bge-small-en-v1.5"  # 384d, anglais seul, le plus rapide
+  model = "Xenova/bge-small-en-v1.5"  # 384d, English only, the fastest
   ```
-- Pour compiler sans embeddings : `cargo build --no-default-features`
+- To build without embeddings: `cargo build --no-default-features`
 
-### 4. Des souvenirs en double apparaissent
+### 4. Duplicate memories appear
 
-**Symptome :** Plusieurs souvenirs quasi-identiques dans le meme topic.
+**Symptom:** Several nearly identical memories in the same topic.
 
-**Explication :** L'auto-dedup fonctionne uniquement via MCP (serveur avec embedder). Le CLI `icm store` n'a pas d'auto-dedup par defaut.
+**Explanation:** Auto-dedup only works through MCP (the server with an embedder). The CLI `icm store` has no auto-dedup by default.
 
-**Solutions :**
-- Backfill les embeddings : `icm embed`
-- Supprimez les doublons manuellement : `icm forget <id>`
-- Consolidez le topic : `icm consolidate -t <topic>`
+**Solutions:**
+- Backfill the embeddings: `icm embed`
+- Delete duplicates manually: `icm forget <id>`
+- Consolidate the topic: `icm consolidate -t <topic>`
 
-### 5. Erreur "embeddings feature not enabled"
+### 5. "embeddings feature not enabled" error
 
-**Symptome :** `icm embed` echoue avec un message sur le feature.
+**Symptom:** `icm embed` fails with a message about the feature.
 
-**Solution :** Recompilez avec le feature embeddings :
+**Solution:** Rebuild with the embeddings feature:
 ```bash
-cargo build --release  # Le feature "embeddings" est actif par defaut
+cargo build --release  # The "embeddings" feature is on by default
 ```
 
-Si vous utilisez le binaire pre-compile depuis les releases GitHub, les embeddings sont toujours inclus.
+If you use the precompiled binary from the GitHub releases, embeddings are always included.
 
-### 6. Corruption de la base de donnees
+### 6. Database corruption
 
-**Symptome :** `icm stats` ou `icm recall` echoue avec une erreur SQLite.
+**Symptom:** `icm stats` or `icm recall` fails with a SQLite error.
 
-**Solutions :**
-- Localisez la base :
-  - macOS : `~/Library/Application Support/dev.icm.icm/memories.db`
-  - Linux : `~/.local/share/icm/memories.db`
-- Sauvegardez le fichier `.db` et ses fichiers WAL (`.db-wal`, `.db-shm`)
-- Supprimez et reconstruisez si necessaire — la migration est automatique
-- Pour tester avec une base propre : `icm --db /tmp/test.db stats`
+**Solutions:**
+- Locate the database:
+  - macOS: `~/Library/Application Support/dev.icm.icm/memories.db`
+  - Linux: `~/.local/share/icm/memories.db`
+- Back up the `.db` file and its WAL files (`.db-wal`, `.db-shm`)
+- Delete and rebuild if needed — the migration is automatic
+- To test with a clean database: `icm --db /tmp/test.db stats`
 
-### 7. `icm init` ne detecte pas mon outil
+### 7. `icm init` doesn't detect my tool
 
-**Symptome :** L'outil n'apparait pas dans la sortie de `icm init`.
+**Symptom:** The tool doesn't appear in the `icm init` output.
 
-**Solutions :**
-- Verifiez que l'outil est installe et que son fichier de config existe
-- Pour Claude Code : `~/.claude.json` doit exister (cree au premier lancement)
-- Configuration manuelle : `claude mcp add icm -- icm serve`
-- Pour les outils non supportes, ajoutez manuellement dans leur config MCP :
+**Solutions:**
+- Check that the tool is installed and that its config file exists
+- For Claude Code: `~/.claude.json` must exist (it is created on first launch)
+- Manual configuration: `claude mcp add icm -- icm serve`
+- For unsupported tools, add it manually to their MCP config:
   ```json
-  { "command": "/chemin/vers/icm", "args": ["serve"] }
+  { "command": "/path/to/icm", "args": ["serve"] }
   ```
 
-### 8. Le decay est trop agressif / pas assez
+### 8. Decay is too aggressive or not aggressive enough
 
-**Symptome :** Les souvenirs disparaissent trop vite, ou s'accumulent sans etre nettoyes.
+**Symptom:** Memories disappear too quickly, or pile up without being cleaned up.
 
-**Solutions :**
-- Ajustez dans `~/.config/icm/config.toml` :
+**Solutions:**
+- Adjust in `~/.config/icm/config.toml`:
   ```toml
   [memory]
-  decay_rate = 0.98      # Plus lent (defaut: 0.95)
-  prune_threshold = 0.05 # Seuil plus bas (defaut: 0.1)
+  decay_rate = 0.98      # Slower (default: 0.95)
+  prune_threshold = 0.05 # Lower threshold (default: 0.1)
   ```
-- Utilisez `icm prune --dry-run --threshold 0.2` pour previsualiser
-- Marquez les souvenirs importants en `high` ou `critical` pour les proteger
+- Use `icm prune --dry-run --threshold 0.2` to preview
+- Mark important memories as `high` or `critical` to protect them
 
-### 9. Le mode compact ne s'active pas
+### 9. Compact mode doesn't turn on
 
-**Symptome :** Les reponses MCP restent longues malgre la configuration.
+**Symptom:** MCP responses stay long despite the configuration.
 
-**Solutions :**
-- Verifiez `config.toml` :
+**Solutions:**
+- Check `config.toml`:
   ```toml
   [mcp]
   compact = true
   ```
-- Ou forcez via le flag : changez `icm serve` en `icm serve --compact` dans la config MCP
-- Redemarrez votre outil IA apres la modification
+- Or force it with the flag: change `icm serve` to `icm serve --compact` in the MCP config
+- Restart your AI tool after the change
 
-### 10. Erreur "memoir not found" malgre sa creation
+### 10. "memoir not found" error even after creating it
 
-**Symptome :** `icm memoir show <nom>` echoue juste apres `icm memoir create`.
+**Symptom:** `icm memoir show <name>` fails right after `icm memoir create`.
 
-**Solutions :**
-- Verifiez le nom exact : `icm memoir list`
-- Les noms sont sensibles a la casse : `Archi` != `archi`
-- Verifiez que vous n'utilisez pas `--db` avec un chemin different
+**Solutions:**
+- Check the exact name: `icm memoir list`
+- Names are case-sensitive: `Archi` != `archi`
+- Check that you're not using `--db` with a different path
 
-### 11. Performance degradee avec beaucoup de souvenirs
+### 11. Performance drops with many memories
 
-**Symptome :** `recall` devient lent avec >1000 souvenirs.
+**Symptom:** `recall` gets slow with more than 1000 memories.
 
-**Solutions :**
-- La recherche hybride prend ~1ms par requete pour 1000 souvenirs — c'est normal
-- Consolidez les topics volumineux : `icm consolidate -t <topic>`
-- Prunez les souvenirs perimees : `icm prune`
-- Reduisez le `limit` dans les recherches
+**Solutions:**
+- Hybrid search takes ~1ms per query for 1000 memories — this is normal
+- Consolidate large topics: `icm consolidate -t <topic>`
+- Prune outdated memories: `icm prune`
+- Reduce the `limit` in your searches
 
-### 12. L'extraction ne detecte rien
+### 12. Extraction finds nothing
 
-**Symptome :** `icm extract` retourne "No facts extracted."
+**Symptom:** `icm extract` returns "No facts extracted."
 
-**Solutions :**
-- Le texte doit contenir des signaux reconnus (mots-cles d'architecture, erreurs, decisions)
-- Testez avec un texte explicite :
+**Solutions:**
+- The text must contain recognized signals (architecture, error, and decision keywords)
+- Test with an explicit text:
   ```bash
   echo "We decided to use PostgreSQL instead of MySQL" | icm extract --dry-run
   ```
-- Ajustez le seuil dans `config.toml` :
+- Adjust the threshold in `config.toml`:
   ```toml
   [extraction]
-  min_score = 2.0  # Plus bas = plus de faits extraits (defaut: 3.0)
+  min_score = 2.0  # Lower = more facts extracted (default: 3.0)
   ```
 
 ---
 
-## Guides d'integration par outil
+## Integration Guides by Tool
 
 ### Claude Code
 
-**Setup :**
+**Setup:**
 ```bash
-icm init  # Configure automatiquement ~/.claude.json
+icm init  # Configures ~/.claude.json automatically
 ```
 
-**Configuration manuelle :**
+**Manual configuration:**
 ```bash
 claude mcp add icm -- icm serve
 ```
 
-**Fichier de config :** `~/.claude.json`
+**Config file:** `~/.claude.json`
 ```json
 {
   "mcpServers": {
     "icm": {
-      "command": "/chemin/vers/icm",
+      "command": "/path/to/icm",
       "args": ["serve"]
     }
   }
 }
 ```
 
-**Slash commands (optionnel) :**
+**Slash commands (optional):**
 ```bash
 icm init --mode skill
 ```
-Installe `/recall` et `/remember` dans `~/.claude/commands/`.
+Installs `/recall` and `/remember` into `~/.claude/commands/`.
 
-**Hook PostToolUse (optionnel) :**
+**PostToolUse hook (optional):**
 ```bash
 icm init --mode hook
 ```
-Installe un hook qui extrait automatiquement le contexte apres chaque appel d'outil (git commit, edit, etc.).
+Installs a hook that automatically extracts context after each tool call (git commit, edit, etc.).
 
-**Mode compact recommande :** Claude Code beneficie du mode compact pour economiser des tokens. Activez dans `~/.config/icm/config.toml` :
+**Compact mode recommended:** Claude Code benefits from compact mode to save tokens. Enable it in `~/.config/icm/config.toml`:
 ```toml
 [mcp]
 compact = true
 ```
 
-**Instructions CLAUDE.md (optionnel) :**
+**CLAUDE.md instructions (optional):**
 ```bash
 icm init --mode cli
 ```
-Ajoute les instructions ICM au `CLAUDE.md` du projet courant.
+Adds the ICM instructions to the `CLAUDE.md` of the current project.
 
 ---
 
 ### Cursor
 
-**Setup :**
+**Setup:**
 ```bash
-icm init  # Configure automatiquement ~/.cursor/mcp.json
+icm init  # Configures ~/.cursor/mcp.json automatically
 ```
 
-**Fichier de config :** `~/.cursor/mcp.json`
+**Config file:** `~/.cursor/mcp.json`
 ```json
 {
   "mcpServers": {
     "icm": {
-      "command": "/chemin/vers/icm",
+      "command": "/path/to/icm",
       "args": ["serve"]
     }
   }
 }
 ```
 
-**Regle Cursor (optionnel) :**
+**Cursor rule (optional):**
 ```bash
 icm init --mode skill
 ```
-Cree `~/.cursor/rules/icm.mdc` avec une regle `alwaysApply: true` qui rappelle a l'agent d'utiliser ICM.
+Creates `~/.cursor/rules/icm.mdc` with an `alwaysApply: true` rule that reminds the agent to use ICM.
 
-**Apres configuration :** Redemarrez Cursor. Les outils ICM apparaissent dans la palette MCP.
+**After setup:** Restart Cursor. The ICM tools appear in the MCP palette.
 
 ---
 
 ### VS Code / GitHub Copilot
 
-**Setup :**
+**Setup:**
 ```bash
-icm init  # Configure automatiquement ~/Library/.../Code/User/mcp.json
+icm init  # Configures ~/Library/.../Code/User/mcp.json automatically
 ```
 
-**Fichier de config :**
-- macOS : `~/Library/Application Support/Code/User/mcp.json`
-- Linux : `~/.config/Code/User/mcp.json`
+**Config file:**
+- macOS: `~/Library/Application Support/Code/User/mcp.json`
+- Linux: `~/.config/Code/User/mcp.json`
 
 ```json
 {
   "servers": {
     "icm": {
-      "command": "/chemin/vers/icm",
+      "command": "/path/to/icm",
       "args": ["serve"]
     }
   }
 }
 ```
 
-**Note :** VS Code utilise `"servers"` au lieu de `"mcpServers"`. `icm init` gere cette difference automatiquement.
+**Note:** VS Code uses `"servers"` instead of `"mcpServers"`. `icm init` handles this difference automatically.
 
 ---
 
 ### Windsurf
 
-**Setup :**
+**Setup:**
 ```bash
-icm init  # Configure automatiquement ~/.codeium/windsurf/mcp_config.json
+icm init  # Configures ~/.codeium/windsurf/mcp_config.json automatically
 ```
 
-**Fichier de config :** `~/.codeium/windsurf/mcp_config.json`
+**Config file:** `~/.codeium/windsurf/mcp_config.json`
 ```json
 {
   "mcpServers": {
     "icm": {
-      "command": "/chemin/vers/icm",
+      "command": "/path/to/icm",
       "args": ["serve"]
     }
   }
@@ -750,18 +750,18 @@ icm init  # Configure automatiquement ~/.codeium/windsurf/mcp_config.json
 
 ### Zed
 
-**Setup :**
+**Setup:**
 ```bash
-icm init  # Configure automatiquement ~/.zed/settings.json
+icm init  # Configures ~/.zed/settings.json automatically
 ```
 
-Zed utilise un format different avec `context_servers` :
+Zed uses a different format with `context_servers`:
 ```json
 {
   "context_servers": {
     "icm": {
       "command": {
-        "path": "/chemin/vers/icm",
+        "path": "/path/to/icm",
         "args": ["serve"]
       },
       "settings": {}
@@ -774,30 +774,30 @@ Zed utilise un format different avec `context_servers` :
 
 ### Amp
 
-**Setup :**
+**Setup:**
 ```bash
-icm init  # Configure automatiquement ~/.config/amp/settings.json
+icm init  # Configures ~/.config/amp/settings.json automatically
 ```
 
-**Slash commands (optionnel) :**
+**Slash commands (optional):**
 ```bash
 icm init --mode skill
 ```
-Installe `/icm-recall` et `/icm-remember` dans `~/.config/amp/skills/`.
+Installs `/icm-recall` and `/icm-remember` into `~/.config/amp/skills/`.
 
 ---
 
 ### OpenAI Codex CLI
 
-**Setup :**
+**Setup:**
 ```bash
-icm init  # Configure automatiquement ~/.codex/config.toml
+icm init  # Configures ~/.codex/config.toml automatically
 ```
 
-**Fichier de config (TOML) :** `~/.codex/config.toml`
+**Config file (TOML):** `~/.codex/config.toml`
 ```toml
 [mcp_servers.icm]
-command = "/chemin/vers/icm"
+command = "/path/to/icm"
 args = ["serve"]
 ```
 
@@ -805,17 +805,17 @@ args = ["serve"]
 
 ### Claude Desktop
 
-**Setup :**
+**Setup:**
 ```bash
-icm init  # Configure automatiquement
+icm init  # Configures automatically
 ```
 
-**Fichier de config :** `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Config file:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 ```json
 {
   "mcpServers": {
     "icm": {
-      "command": "/chemin/vers/icm",
+      "command": "/path/to/icm",
       "args": ["serve"]
     }
   }
@@ -824,59 +824,59 @@ icm init  # Configure automatiquement
 
 ---
 
-### Autres outils (Gemini, Amazon Q, Cline, Roo Code, Kilo Code, OpenCode)
+### Other tools (Gemini, Amazon Q, Cline, Roo Code, Kilo Code, OpenCode)
 
-Tous sont configures automatiquement par `icm init`. Le format est toujours le meme :
+All of these are configured automatically by `icm init`. The format is always the same:
 
 ```json
 {
-  "command": "/chemin/vers/icm",
+  "command": "/path/to/icm",
   "args": ["serve"]
 }
 ```
 
-La seule difference est le fichier de config et la cle JSON. `icm init` gere toutes ces variations.
+The only difference is the config file and the JSON key. `icm init` handles all of these variations.
 
 ---
 
 ## FAQ
 
-### Q1 : ICM envoie-t-il des donnees sur internet ?
+### Q1: Does ICM send data over the internet?
 
-**Pas pour stocker ni rappeler.** ICM stocke tout localement dans un fichier SQLite, et le modele d'embedding tourne localement (via fastembed/ONNX Runtime). Deux exceptions : le telechargement initial du modele d'embedding (environ 2 Go pour le modele par defaut, une seule fois), et l'extraction automatique, qui confie le texte capture a l'outil LLM en ligne de commande deja installe (Claude Code, Codex ou Gemini CLI) tant que `[extraction.summarizer] provider` vaut `"auto"` (le defaut). Avec `provider = "none"`, rien ne quitte la machine apres le telechargement du modele. Un fournisseur par cle API (`anthropic`, `openai`, `google`) envoie le texte resume a ce fournisseur, selon ses conditions.
+**Not for storing or recalling.** ICM stores everything locally in a SQLite file, and the embedding model runs locally (via fastembed/ONNX Runtime). There are two exceptions: the initial download of the embedding model (about 2 GB for the default model, one time only), and automatic extraction, which hands the captured text to the command-line LLM tool you already have installed (Claude Code, Codex, or Gemini CLI) as long as `[extraction.summarizer] provider` is `"auto"` (the default). With `provider = "none"`, nothing leaves the machine after the model download. A provider that uses an API key (`anthropic`, `openai`, `google`) sends the summarized text to that provider, under its terms.
 
-### Q2 : Puis-je utiliser ICM avec plusieurs projets ?
+### Q2: Can I use ICM with several projects?
 
-**Oui.** Tous les projets partagent la meme base SQLite. Utilisez des topics prefixes par projet (ex: `decisions-api`, `decisions-frontend`) pour les separer. Vous pouvez aussi utiliser `--db <chemin>` pour isoler completement les bases.
+**Yes.** All projects share the same SQLite database. Use project-prefixed topics (e.g. `decisions-api`, `decisions-frontend`) to separate them. You can also use `--db <path>` to fully isolate the databases.
 
-### Q3 : Comment sauvegarder/restaurer ma memoire ?
+### Q3: How do I back up and restore my memory?
 
-Sauvegardez le fichier SQLite :
+Back up the SQLite file:
 ```bash
 # macOS
 cp ~/Library/Application\ Support/dev.icm.icm/memories.db ~/backup-icm.db
 
-# Restaurer
+# Restore
 cp ~/backup-icm.db ~/Library/Application\ Support/dev.icm.icm/memories.db
 ```
 
-### Q4 : ICM fonctionne-t-il avec des modeles locaux (ollama) ?
+### Q4: Does ICM work with local models (ollama)?
 
-**Oui.** ICM est un serveur MCP standard. Il fonctionne avec tout client MCP, y compris ceux utilisant des modeles locaux. Les benchmarks montrent jusqu'a +93% de rappel avec qwen2.5:14b via ollama.
+**Yes.** ICM is a standard MCP server. It works with any MCP client, including those that use local models. Benchmarks show up to +93% recall with qwen2.5:14b via ollama.
 
-### Q5 : Quelle est la difference entre `icm consolidate` (CLI) et `icm_memory_consolidate` (MCP) ?
+### Q5: What's the difference between `icm consolidate` (CLI) and `icm_memory_consolidate` (MCP)?
 
-Le CLI fusionne automatiquement les summaries (concatenation avec ` | `). Le MCP demande a l'agent de fournir le resume, ce qui produit un resultat plus intelligent car l'agent comprend le contenu et peut synthetiser.
+The CLI automatically merges the summaries (concatenated with ` | `). The MCP asks the agent to provide the summary, which gives a smarter result because the agent understands the content and can synthesize it.
 
-### Q6 : Puis-je changer de modele d'embedding sans perdre mes donnees ?
+### Q6: Can I change the embedding model without losing my data?
 
-**Oui.** Les souvenirs (texte) sont toujours conserves, et les vecteurs aussi tant que vous ne migrez pas : le modele qui a produit les vecteurs est enregistre dans la base et prime sur `config.toml`. Pour changer de modele, lancez `icm embed --migrate` : il ecrit une sauvegarde, recree l'index a la nouvelle dimension et recalcule tous les vecteurs.
+**Yes.** The memories (text) are always kept, and so are the vectors as long as you don't migrate: the model that produced the vectors is recorded in the database and takes precedence over `config.toml`. To change the model, run `icm embed --migrate`: it writes a backup, recreates the index at the new dimension, and recomputes all the vectors.
 
-### Q7 : Combien de souvenirs ICM peut-il gerer ?
+### Q7: How many memories can ICM handle?
 
-La base SQLite gere des millions de lignes sans probleme. Les benchmarks montrent ~34us par store et ~951us par recherche hybride pour 1000 souvenirs. La performance se degrade lineairement, pas exponentiellement.
+The SQLite database handles millions of rows without trouble. Benchmarks show ~34us per store and ~951us per hybrid search for 1000 memories. Performance degrades linearly, not exponentially.
 
-### Q8 : Comment supprimer toute ma memoire ?
+### Q8: How do I delete all my memory?
 
 ```bash
 # macOS
@@ -886,29 +886,29 @@ rm ~/Library/Application\ Support/dev.icm.icm/memories.db*
 rm ~/.local/share/icm/memories.db*
 ```
 
-La base est recreee automatiquement au prochain lancement.
+The database is recreated automatically on the next launch.
 
-### Q9 : ICM consomme-t-il des tokens LLM ?
+### Q9: Does ICM consume LLM tokens?
 
-**Non pour le stockage et le rappel.** ICM n'appelle aucune API LLM. Les seuls tokens consommes sont ceux de l'agent qui appelle les outils MCP -- exactement comme tout autre outil MCP. Le mode compact (`--compact`) reduit ces tokens de ~40%.
+**No, for storing and recalling.** ICM doesn't call any LLM API. The only tokens consumed are those of the agent calling the MCP tools, just like any other MCP tool. Compact mode (`--compact`) reduces these tokens by ~40%.
 
-L'extraction (Layer 0) est purement regles -- zero cout LLM. Le Layer 1 (PreCompact, planifie) utilisera ~500 tokens par session.
+Extraction (Layer 0) is purely rule-based, with zero LLM cost. Layer 1 (PreCompact, planned) will use ~500 tokens per session.
 
-### Q10 : Puis-je partager ma memoire avec mon equipe ?
+### Q10: Can I share my memory with my team?
 
-Pas directement (c'est un fichier SQLite local). Cependant, les **memoirs** sont conçus pour capturer des connaissances structurees qui peuvent etre exportees et partagees. Une fonctionnalite d'import/export est prevue.
+Not directly, since it's a local SQLite file. However, **memoirs** are designed to capture structured knowledge that can be exported and shared. An import/export feature is planned.
 
-### Q11 : L'auto-dedup est-il fiable ?
+### Q11: Is auto-dedup reliable?
 
-L'auto-dedup utilise la similarite hybride (BM25 + cosine) avec un seuil de 85%. Il fonctionne bien pour les doublons proches mais laisse passer les reformulations tres differentes du meme fait. C'est volontaire : mieux vaut un doublon qu'une perte de donnees.
+Auto-dedup uses hybrid similarity (BM25 + cosine) with an 85% threshold. It works well for near-duplicates, but it lets through very different rewordings of the same fact. This is deliberate: a duplicate is better than data loss.
 
-### Q12 : Comment fonctionne le "store nudge" du serveur MCP ?
+### Q12: How does the MCP server's "store nudge" work?
 
-Le serveur compte les appels d'outils consecutifs sans `icm_memory_store`. Apres 10 appels, il ajoute un hint a la reponse :
+The server counts consecutive tool calls without `icm_memory_store`. After 10 calls, it adds a hint to the response:
 ```
 [ICM: 12 tool calls since last store. Consider saving important context.]
 ```
-Le compteur se reinitialise a chaque `icm_memory_store`. C'est un rappel discret pour que l'agent n'oublie pas de stocker.
+The counter resets on every `icm_memory_store`. It's a discreet reminder so the agent doesn't forget to store.
 
 ## Troubleshooting
 

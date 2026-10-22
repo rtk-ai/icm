@@ -96,6 +96,15 @@ extract_every = 3
 # net; set to `false` if you only want signal-rich extractions.
 store_raw = true
 
+# On each prompt, run the keyword pass above (no LLM) over what the agent
+# wrote since your previous prompt, in a background process, so what was
+# said early in a session can be recalled before any compaction. Off by
+# default: it loads the embedding model once per prompt and stores more
+# memories. `each_prompt_chars` bounds the text examined (the most recent
+# characters are kept).
+each_prompt = false
+each_prompt_chars = 65536
+
 # LLM summarizer used by the async extraction queue (`icm extract-pending`).
 # Same keys as [consolidate.summarizer] below. Default provider: "auto".
 # [extraction.summarizer]

@@ -161,6 +161,13 @@ pub struct ExtractionConfig {
     pub extract_every: usize,
     /// Store raw text as fallback when no facts are extracted.
     pub store_raw: bool,
+    /// On each prompt, run the keyword pass (no LLM) over what the agent
+    /// wrote since the previous prompt, in a detached process. Off by
+    /// default: it loads the embedding model once per prompt, in the
+    /// background, and stores more memories.
+    pub each_prompt: bool,
+    /// Characters of that text examined, the most recent kept.
+    pub each_prompt_chars: usize,
     /// LLM extraction from the conversation itself (`[extraction.conversation]`).
     pub conversation: ConversationExtractionConfig,
     /// LLM-backed extraction provider. When set to anything other than
@@ -452,6 +459,8 @@ impl Default for ExtractionConfig {
             max_facts: 20,
             extract_every: 3,
             store_raw: true,
+            each_prompt: false,
+            each_prompt_chars: 65_536,
             conversation: ConversationExtractionConfig::default(),
             // Default = auto: detect an installed LLM CLI and route
             // extraction through the #219 async queue (~50ms hooks, no
@@ -578,6 +587,17 @@ mod tests {
 
     /// Conversation extraction (#518, #519) is opt-in: by default the
     /// hooks behave as before it.
+    #[test]
+    fn each_prompt_extraction_is_off_by_default() {
+        let extraction = &Config::default().extraction;
+        assert!(!extraction.each_prompt);
+        assert_eq!(extraction.each_prompt_chars, 65_536);
+        let config: Config =
+            toml::from_str("[extraction]\neach_prompt = true\neach_prompt_chars = 1000\n").unwrap();
+        assert!(config.extraction.each_prompt);
+        assert_eq!(config.extraction.each_prompt_chars, 1000);
+    }
+
     #[test]
     fn conversation_extraction_is_off_by_default() {
         let conv = &Config::default().extraction.conversation;

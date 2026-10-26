@@ -2,7 +2,7 @@
 
 Esta es una traducción de README.md (inglés), que es la referencia; si difieren, la versión en inglés es la correcta.
 
-<h1 align="center">ICM</h1>
+<h1 align="center">ICM — Infinite Context Memory</h1>
 
 <p align="center">
   <b>Memoria a largo plazo para agentes de programación con IA, compartida entre tus herramientas.</b><br>

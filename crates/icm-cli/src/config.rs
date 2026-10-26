@@ -11,7 +11,7 @@
 //! (`icm config` prints the active path — the old header claimed
 //! `~/.config/icm/` everywhere, which is wrong on macOS/Windows.)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Write `content` to `path` with owner-only (0600) permissions from creation,
 /// not as a follow-up `set_permissions` call — that ordering would leave a
@@ -161,6 +161,13 @@ pub struct ExtractionConfig {
     pub extract_every: usize,
     /// Store raw text as fallback when no facts are extracted.
     pub store_raw: bool,
+    /// On each prompt, run the keyword pass (no LLM) over what the agent
+    /// wrote since the previous prompt, in a detached process. Off by
+    /// default: it loads the embedding model once per prompt, in the
+    /// background, and stores more memories.
+    pub each_prompt: bool,
+    /// Characters of that text examined, the most recent kept.
+    pub each_prompt_chars: usize,
     /// LLM extraction from the conversation itself (`[extraction.conversation]`).
     pub conversation: ConversationExtractionConfig,
     /// LLM-backed extraction provider. When set to anything other than
@@ -170,9 +177,10 @@ pub struct ExtractionConfig {
     /// the configured LLM CLI. See `icm extract-pending` and the
     /// SessionEnd async trigger.
     ///
-    /// Defaults to `auto`: ICM detects an installed LLM CLI and uses the
-    /// async queue path. With no CLI installed, `extract-pending` drains
-    /// via a batched fastembed pass. Set `provider = "none"` explicitly
+    /// Defaults to `auto`: hooks use the async queue path, and the drain
+    /// hands it to the CLI of the agent that fired the hook (Claude Code,
+    /// Codex, Gemini). Under any other agent, or with that CLI missing,
+    /// `extract-pending` drains via a batched fastembed pass. Set `provider = "none"` explicitly
     /// to force the legacy per-fire inline fastembed behavior.
     pub summarizer: SummarizerConfig,
 }
@@ -452,6 +460,8 @@ impl Default for ExtractionConfig {
             max_facts: 20,
             extract_every: 3,
             store_raw: true,
+            each_prompt: false,
+            each_prompt_chars: 65_536,
             conversation: ConversationExtractionConfig::default(),
             // Default = auto: detect an installed LLM CLI and route
             // extraction through the #219 async queue (~50ms hooks, no
@@ -563,6 +573,80 @@ fn config_path() -> Option<PathBuf> {
     resolved_config_path().map(|(p, _)| p)
 }
 
+/// Persist `icm init --db X` / `--no-embeddings` into the config file, so
+/// the hooks and the MCP server `init` registers (which run without those
+/// flags) use them too. Without this, both were silently ignored after init.
+/// Returns what was done, for `init` to print.
+pub fn persist_init_overrides(db: Option<&Path>, no_embeddings: bool) -> Result<Vec<String>> {
+    let Some(path) = config_path() else {
+        return Ok(vec![
+            "no config path resolved: --db / --no-embeddings not persisted".into(),
+        ]);
+    };
+    persist_init_overrides_at(&path, db, no_embeddings)
+}
+
+fn persist_init_overrides_at(
+    path: &Path,
+    db: Option<&Path>,
+    no_embeddings: bool,
+) -> Result<Vec<String>> {
+    let content = if path.exists() {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let current: toml::Table =
+        toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+
+    let mut wanted: Vec<(&str, &str, toml::Value)> = Vec::new();
+    if let Some(db) = db {
+        wanted.push((
+            "store",
+            "path",
+            toml::Value::String(db.display().to_string()),
+        ));
+    }
+    if no_embeddings {
+        wanted.push(("embeddings", "enabled", toml::Value::Boolean(false)));
+    }
+
+    // Rewriting the file through `toml` would drop the user's comments, so
+    // only whole missing sections are appended; a key to change inside an
+    // existing section is left to the user, with the exact line to set.
+    let mut appended = String::new();
+    let mut notes = Vec::new();
+    for (section, key, value) in wanted {
+        match current.get(section).and_then(|s| s.as_table()) {
+            Some(table) if table.get(key) == Some(&value) => {}
+            Some(_) => notes.push(format!(
+                "set `{key} = {value}` under [{section}] in {} (not changed automatically)",
+                path.display()
+            )),
+            None => {
+                appended.push_str(&format!("\n[{section}]\n{key} = {value}\n"));
+                notes.push(format!(
+                    "[{section}] {key} = {value} written to {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if !appended.is_empty() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let mut new_content = content;
+        if !new_content.is_empty() && !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        new_content.push_str(&appended);
+        std::fs::write(path, new_content).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(notes)
+}
+
 /// Show the active config path (for `icm config show`).
 pub fn show_config_path() -> String {
     match config_path() {
@@ -576,8 +660,53 @@ pub fn show_config_path() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn init_overrides_create_missing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/config.toml");
+        let notes = persist_init_overrides_at(&path, Some(Path::new("/tmp/x.db")), true).unwrap();
+        assert_eq!(notes.len(), 2);
+        let (cfg, _) = load_config_from(Some((path, true))).unwrap();
+        assert_eq!(cfg.store.path.as_deref(), Some("/tmp/x.db"));
+        assert!(!cfg.embeddings.enabled);
+    }
+
+    #[test]
+    fn init_overrides_keep_existing_sections_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# mine\n[store]\npath = \"/old.db\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let notes = persist_init_overrides_at(&path, Some(Path::new("/new.db")), true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with(original), "rewrote the file: {content}");
+        assert!(content.contains("[embeddings]\nenabled = false"));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("not changed automatically"))
+        );
+
+        // Same values again: nothing to do, nothing appended.
+        let again = persist_init_overrides_at(&path, None, true).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
     /// Conversation extraction (#518, #519) is opt-in: by default the
     /// hooks behave as before it.
+    #[test]
+    fn each_prompt_extraction_is_off_by_default() {
+        let extraction = &Config::default().extraction;
+        assert!(!extraction.each_prompt);
+        assert_eq!(extraction.each_prompt_chars, 65_536);
+        let config: Config =
+            toml::from_str("[extraction]\neach_prompt = true\neach_prompt_chars = 1000\n").unwrap();
+        assert!(config.extraction.each_prompt);
+        assert_eq!(config.extraction.each_prompt_chars, 1000);
+    }
+
     #[test]
     fn conversation_extraction_is_off_by_default() {
         let conv = &Config::default().extraction.conversation;

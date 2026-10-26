@@ -525,7 +525,7 @@ A first-class `role` field (with native filtering in wake-up and recall) is on t
 
 ## Auto-extraction
 
-ICM captures and reinjects memories through three hooks. Capture is rule-based; when an LLM command-line tool is installed (Claude Code, Codex or Gemini CLI), the default `[extraction.summarizer] provider = "auto"` also hands the captured text to it to write the facts (`provider = "none"` keeps everything local):
+ICM captures and reinjects memories through three hooks. Capture is rule-based; when the hook is fired by Claude Code, Codex or Gemini CLI and that tool is installed, the default `[extraction.summarizer] provider = "auto"` also hands the captured text to it to write the facts (`provider = "none"` keeps everything local):
 
 ```
   Layer 0: Pattern hooks              Layer 1: PreCompact           Layer 2: UserPromptSubmit
@@ -547,9 +547,19 @@ ICM captures and reinjects memories through three hooks. Capture is rule-based; 
 
 | Layer | Status | LLM call | Hook command | Description |
 |-------|--------|----------|-------------|-------------|
-| Layer 0 | Implemented | only with `provider = "auto"` and an LLM CLI installed | `icm hook post` | Rule-based extraction from tool output |
+| Layer 0 | Implemented | only with `provider = "auto"` under Claude Code, Codex or Gemini CLI | `icm hook post` | Rule-based extraction from tool output |
 | Layer 1 | Implemented | none; with `[extraction.conversation] enabled` and an LLM provider, one call per excerpt | `icm hook compact` | Extract from transcript before context compression; or, with `[extraction.conversation] enabled`, queue the conversation since the last fire for LLM extraction |
-| Layer 2 | Implemented | none; with `[extraction.conversation] in_session` and an LLM provider, one call per excerpt | `icm hook prompt` | Inject recalled memories on each user prompt; with `[extraction.conversation] in_session`, queue each full conversation excerpt for LLM extraction |
+| Layer 2 | Implemented | none; with `[extraction.conversation] in_session` and an LLM provider, one call per excerpt | `icm hook prompt` | Inject recalled memories on each user prompt; with `[extraction] each_prompt`, run the keyword pass (no LLM) over the agent's last turn in a background process; with `[extraction.conversation] in_session`, queue each full conversation excerpt for LLM extraction |
 
 All 3 layers are installed automatically by `icm init --mode hook`.
 
+
+## What leaves your machine
+
+With the default configuration:
+
+- Storage, search and recall are local: one SQLite file, no network call.
+- The first command that needs embeddings downloads the model from Hugging Face once (`--no-embeddings` or `[embeddings] enabled = false` skips it).
+- `[extraction.summarizer] provider = "auto"`: when the hook is fired by Claude Code, Codex or Gemini CLI and that tool is installed, captured tool output is handed to it (`claude -p`, `codex exec`, `gemini -p`), so it goes to the vendor that agent already talks to. Under any other agent, or from a terminal, `auto` stays local and extracts with the embedding model. `provider = "none"` keeps every agent local.
+
+Off unless you turn them on: `[extraction.conversation]` (sends conversation excerpts to the extraction provider), `[consolidate.summarizer]` (default `none`), the API-key providers `anthropic` / `openai` / `google` (only when named in the config or a flag, never picked by `auto`), and `[cloud]` sync.

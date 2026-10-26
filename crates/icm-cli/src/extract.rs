@@ -7,6 +7,7 @@
 //! Layer 2: Recall and format context for prompt injection.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use icm_core::{Embedder, Importance, Memory, MemoryStore, is_preference_topic, project_matches};
@@ -18,6 +19,21 @@ use crate::extract_semantic::{AnchorKind, SemanticScorer};
 /// the unified scoring pipeline. Kind is `None` for facts produced by
 /// the keyword scorer (legacy English path).
 type ScoredFact = (String, String, Importance, Option<AnchorKind>);
+
+/// `[extraction] min_score` / `max_facts`, set once from the config at
+/// startup. Unset (tests, bench) = the built-in defaults. `max_facts` also
+/// caps the semantic path: uncapped, one large tool output once flooded
+/// the store with hundreds of low-quality rows in a single hook fire.
+static LIMITS: OnceLock<(f32, usize)> = OnceLock::new();
+
+/// Apply the configured extraction limits. First call wins.
+pub fn set_limits(min_score: f32, max_facts: usize) {
+    let _ = LIMITS.set((min_score, max_facts.max(1)));
+}
+
+fn limits() -> (f32, usize) {
+    LIMITS.get().copied().unwrap_or((2.0, 20))
+}
 
 /// Extract key facts from text and store them in ICM.
 /// Returns the number of facts stored.
@@ -134,14 +150,6 @@ fn extract_facts_with_kind(text: &str, project: &str) -> Vec<ScoredFact> {
         .collect()
 }
 
-/// Matches the keyword path's default `max_facts` (see `extract_facts`).
-/// Audit finding: unlike the keyword path, this had no cap at all — the
-/// caller (`extract_and_store_with_embedder`) stores every returned fact
-/// unconditionally, and it's reached from the default (uncapped)
-/// PostToolUse hook path, so a large ordinary tool output could flood the
-/// store with hundreds of low-quality rows in one hook fire.
-const MAX_SEMANTIC_FACTS: usize = 20;
-
 /// Score candidate sentences semantically and return the surviving
 /// ones tagged with their matched anchor kind. Falls back to
 /// `extract_facts_with_kind` if the embedder can't embed a batch.
@@ -166,23 +174,31 @@ fn extract_facts_semantic(
 
     let scored = scorer.score_batch(embedder, &candidates)?;
 
+    // Keep the best-scoring sentences, not the first ones: the cap used
+    // to fill up on the head of a long output and drop its conclusion.
+    let mut accepted: Vec<(&str, AnchorKind, f32)> = candidates
+        .iter()
+        .zip(scored)
+        .filter_map(|(s, r)| r.map(|(kind, margin)| (*s, kind, margin)))
+        .collect();
+    accepted.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let max_facts = limits().1;
     let mut facts: Vec<ScoredFact> = Vec::new();
-    for (sentence, result) in candidates.iter().zip(scored) {
-        if facts.len() >= MAX_SEMANTIC_FACTS {
+    for (sentence, kind, _margin) in accepted {
+        if facts.len() >= max_facts {
             break;
         }
-        if let Some((kind, _margin)) = result {
-            let dominated = facts
-                .iter()
-                .any(|(_, existing, _, _)| jaccard_similar(existing, sentence));
-            if !dominated {
-                facts.push((
-                    format!("context-{project}"),
-                    sentence.to_string(),
-                    kind.importance(),
-                    Some(kind),
-                ));
-            }
+        let dominated = facts
+            .iter()
+            .any(|(_, existing, _, _)| jaccard_similar(existing, sentence));
+        if !dominated {
+            facts.push((
+                format!("context-{project}"),
+                sentence.to_string(),
+                kind.importance(),
+                Some(kind),
+            ));
         }
     }
 
@@ -560,7 +576,8 @@ pub fn extract_facts_public_with_embedder(
 
 /// Extract key facts from text using keyword scoring.
 fn extract_facts(text: &str, project: &str) -> Vec<(String, String, Importance)> {
-    extract_facts_with_threshold(text, project, 2.0, 20)
+    let (min_score, max_facts) = limits();
+    extract_facts_with_threshold(text, project, min_score, max_facts)
 }
 
 /// Extract key facts with configurable threshold and limit.
@@ -2902,9 +2919,54 @@ mod tests {
         let scorer = SemanticScorer::new(&embedder).expect("stub scorer build");
         let facts = extract_facts_semantic(&text, "test", &embedder, &scorer).unwrap();
         assert!(
-            facts.len() <= MAX_SEMANTIC_FACTS,
-            "expected at most {MAX_SEMANTIC_FACTS} facts, got {}",
+            facts.len() <= limits().1,
+            "expected at most {} facts, got {}",
+            limits().1,
             facts.len()
+        );
+    }
+
+    /// Over the cap, the semantic path keeps the best-scoring sentences:
+    /// it used to keep the first ones, so a long output's conclusion (its
+    /// last sentences) was the first thing dropped.
+    #[test]
+    fn extract_facts_semantic_keeps_best_scoring_over_cap() {
+        use crate::extract_semantic::SemanticScorer;
+        use icm_core::{Embedder, IcmResult};
+
+        // "decided" = on the decision axis; "maybe" tilts the vector away
+        // from it, lowering the margin.
+        struct TiltedStubEmbedder;
+        impl Embedder for TiltedStubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let lower = text.to_lowercase();
+                let hit = if lower.contains("decided") { 1.0 } else { 0.0 };
+                let tilt = if lower.contains("maybe") { 0.6 } else { 0.0 };
+                Ok(vec![hit, tilt])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                2
+            }
+        }
+
+        let cap = limits().1;
+        let mut sentences: Vec<String> = (0..cap + 5)
+            .map(|i| format!("Maybe we decided w{i}a w{i}b w{i}c w{i}d w{i}e w{i}f."))
+            .collect();
+        sentences.push("We decided strongly on zeta omega sigma kappa.".into());
+        let text = sentences.join(" ");
+
+        let embedder = TiltedStubEmbedder;
+        let scorer = SemanticScorer::new(&embedder).expect("stub scorer build");
+        let facts = extract_facts_semantic(&text, "test", &embedder, &scorer).unwrap();
+        assert_eq!(facts.len(), cap);
+        assert!(
+            facts[0].1.contains("strongly"),
+            "best-scoring last sentence should rank first: {:?}",
+            facts.first()
         );
     }
 

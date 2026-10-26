@@ -2,7 +2,7 @@
 
 本文是 README.md（英文版）的翻译，英文版为参考版本；如两者不一致，以英文版为准。
 
-<h1 align="center">ICM</h1>
+<h1 align="center">ICM — Infinite Context Memory</h1>
 
 <p align="center">
   <b>面向 AI 编程智能体的长期记忆，在你的各个工具之间共享。</b><br>

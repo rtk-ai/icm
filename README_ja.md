@@ -2,7 +2,7 @@
 
 これは README.md（英語）の翻訳です。英語版が基準であり、内容が異なる場合は英語版が正しいものとします。
 
-<h1 align="center">ICM</h1>
+<h1 align="center">ICM — Infinite Context Memory</h1>
 
 <p align="center">
   <b>AI コーディングエージェントのための長期記憶。使っている複数のツールで共有されます。</b><br>

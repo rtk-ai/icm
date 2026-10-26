@@ -101,7 +101,10 @@ impl ProviderKind {
 
 /// Resolve `Auto` into a concrete provider by inspecting environment hints
 /// left by the invoking tool. Falls back to the configured `fallback` when
-/// no hint matches.
+/// no hint matches; for `Auto` itself that is `None` (local extraction):
+/// an agent ICM does not recognise (Copilot, Vibe, OpenCode, Cursor, a
+/// manual run) must not have its tool output sent to the `claude` CLI
+/// just because it happens to be installed.
 ///
 /// Never returns an API-key provider. A key sitting in the environment
 /// (`ANTHROPIC_API_KEY` is exported on plenty of dev machines for unrelated
@@ -128,10 +131,10 @@ pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
     if std::env::var("OLLAMA_HOST").is_ok() {
         return ProviderKind::Ollama;
     }
-    if matches!(fallback, ProviderKind::Auto) || fallback.is_api_key() {
-        ProviderKind::Claude
-    } else {
-        fallback
+    match fallback {
+        ProviderKind::Auto => ProviderKind::None,
+        k if k.is_api_key() => ProviderKind::Claude,
+        k => k,
     }
 }
 
@@ -171,7 +174,7 @@ pub fn resolve(
     flag_model: Option<&str>,
 ) -> Result<Resolved> {
     let through_auto = |kind: ProviderKind| match kind {
-        ProviderKind::Auto => detect_provider(ProviderKind::Claude),
+        ProviderKind::Auto => detect_provider(ProviderKind::Auto),
         other => other,
     };
     let configured = ProviderKind::parse(cfg_provider);
@@ -936,7 +939,10 @@ mod tests {
 
         for got in results {
             assert!(!got.is_api_key(), "auto resolved to {got:?}");
-            assert_eq!(got, ProviderKind::Claude);
+            assert!(
+                matches!(got, ProviderKind::Claude | ProviderKind::None),
+                "{got:?}"
+            );
         }
     }
 
@@ -1238,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_falls_back_to_claude_when_nothing_set() {
+    fn detect_stays_local_when_no_agent_is_recognised() {
         let _env = env_lock();
         // Save and clear any env that might leak from the host.
         let snapshot: Vec<_> = [
@@ -1259,6 +1265,7 @@ mod tests {
         }
 
         let result = detect_provider(ProviderKind::Auto);
+        let named = detect_provider(ProviderKind::Claude);
 
         // Restore env before asserting so failures don't poison later tests.
         for (k, v) in snapshot {
@@ -1267,7 +1274,8 @@ mod tests {
             }
         }
 
-        assert_eq!(result, ProviderKind::Claude);
+        assert_eq!(result, ProviderKind::None);
+        assert_eq!(named, ProviderKind::Claude, "a named fallback is kept");
     }
 
     #[test]

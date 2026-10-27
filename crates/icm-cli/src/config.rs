@@ -259,6 +259,22 @@ pub struct RecallConfig {
     pub server_limit: usize,
     /// How long the hook waits for the server, in milliseconds.
     pub server_timeout_ms: u64,
+    /// Rerank `icm recall` results with a `/v1/systemone` decision model.
+    /// `"jev"` / `"jev:<model>"`: TypeSafe's hosted Jev API (needs
+    /// `TYPESAFE_API_KEY`). `"laya"` / `"laya:<model>"`: a Laya server
+    /// (`laya-serve`), local by default. The query and the candidate
+    /// memories are sent to that server. Empty (default): off. The prompt
+    /// hook never reranks.
+    pub reranker: String,
+    /// Endpoint override. Empty: api.typesafe.ai for Jev,
+    /// `http://127.0.0.1:8000/v1/systemone` for Laya.
+    pub reranker_url: String,
+    /// Name of the environment variable holding the bearer key. Empty:
+    /// `TYPESAFE_API_KEY` for Jev, `LAYA_API_KEY` for Laya (optional there).
+    pub reranker_api_key_env: String,
+    /// How long `icm recall` waits for the reranker, in milliseconds. Past
+    /// it, or on any error, results keep their local order (with a warning).
+    pub reranker_timeout_ms: u64,
 }
 
 /// Wake-up pack settings (SessionStart hook).
@@ -493,6 +509,10 @@ impl Default for RecallConfig {
             // of 10 memories answered about 6 more than keyword recall of 5.
             server_limit: 10,
             server_timeout_ms: 800,
+            reranker: String::new(),
+            reranker_url: String::new(),
+            reranker_api_key_env: String::new(),
+            reranker_timeout_ms: 10_000,
         }
     }
 }

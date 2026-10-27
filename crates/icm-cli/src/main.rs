@@ -23,6 +23,7 @@ mod graph_layout;
 mod http_api;
 mod import;
 mod install_manifest;
+mod jev;
 #[cfg(test)]
 mod learn_tests;
 // First-launch onnxruntime resolution for the load-dynamic embeddings build
@@ -2515,10 +2516,12 @@ fn main() -> Result<()> {
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            let reranker = jev::Reranker::from_config(&cfg.recall)?;
             match icm_store::RecallEngine::resolve(engine.as_deref(), max_tokens.is_some())? {
                 icm_store::RecallEngine::V2 => cmd_recall_v2(
                     &store,
                     emb_ref,
+                    reranker.as_ref(),
                     &icm_store::RecallRequest {
                         query: &query,
                         limit,
@@ -2540,6 +2543,7 @@ fn main() -> Result<()> {
                     keyword.as_deref(),
                     project.as_deref(),
                     format,
+                    reranker.as_ref(),
                 ),
             }
         }
@@ -3438,6 +3442,7 @@ fn cmd_recall(
     keyword: Option<&str>,
     project: Option<&str>,
     format: recall_format::RecallFormat,
+    reranker: Option<&jev::Reranker>,
 ) -> Result<()> {
     // Auto-decay if >24h since last decay
     if let Err(e) = store.maybe_auto_decay() {
@@ -3465,7 +3470,11 @@ fn cmd_recall(
     // only at the very end (`expand_with_neighbors`'s `max_total`).
     let project_active = matches!(project, Some(p) if !p.is_empty());
     let filters_active = project_active || topic.is_some() || keyword.is_some();
-    let query_limit = recall_query_limit(limit, filters_active);
+    let mut query_limit = recall_query_limit(limit, filters_active);
+    // Reranking needs a wider pool to reorder (memsearch fetches 3x top_k).
+    if reranker.is_some() {
+        query_limit = query_limit.max(limit.saturating_mul(3));
+    }
 
     // Try hybrid search if embedder is available; fall back to FTS / keywords.
     let scored: Option<Vec<(Memory, f32)>> = embedder
@@ -3506,6 +3515,24 @@ fn cmd_recall(
     };
 
     results.retain(&filter);
+
+    // Optional rerank: replace scores with the reranker's relevance
+    // probability and keep the top `limit` before graph expansion folds in
+    // neighbours.
+    let mut has_score = has_score;
+    if let Some(reranker) = reranker {
+        let docs: Vec<&str> = results.iter().map(|(m, _)| m.summary.as_str()).collect();
+        if let Some((order, scores)) = rerank_order(reranker, query, &docs) {
+            let mut slots: Vec<Option<(Memory, Option<f32>)>> =
+                results.drain(..).map(Some).collect();
+            results = order
+                .into_iter()
+                .filter_map(|i| slots[i].take().map(|(m, _)| (m, Some(scores[i]))))
+                .collect();
+            has_score = true;
+        }
+        results.truncate(limit);
+    }
 
     // Graph-aware expansion: follow related_ids one hop and fold
     // neighbours back in (discounted ×0.5). Audit R13b: re-apply
@@ -3559,22 +3586,66 @@ fn cmd_recall(
 fn cmd_recall_v2(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
+    reranker: Option<&jev::Reranker>,
     request: &icm_store::RecallRequest<'_>,
     format: recall_format::RecallFormat,
 ) -> Result<()> {
-    print!("{}", render_recall_v2(store, embedder, request, format)?);
+    print!(
+        "{}",
+        render_recall_v2_reranked(store, embedder, reranker, request, format)?
+    );
     Ok(())
 }
 
+#[cfg(test)]
 fn render_recall_v2(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     request: &icm_store::RecallRequest<'_>,
     format: recall_format::RecallFormat,
 ) -> Result<String> {
+    render_recall_v2_reranked(store, embedder, None, request, format)
+}
+
+/// Score `docs` with `reranker`: their indices best first (stable, so ties
+/// keep the local order) and one score per doc. `None` when the request
+/// fails: recall then keeps its local order, with a warning, so a
+/// reranker that is down never takes `icm recall` with it.
+fn rerank_order(
+    reranker: &jev::Reranker,
+    query: &str,
+    docs: &[&str],
+) -> Option<(Vec<usize>, Vec<f32>)> {
+    match reranker.score(query, docs) {
+        Ok(scores) => {
+            let mut order: Vec<usize> = (0..scores.len()).collect();
+            order.sort_by(|&a, &b| {
+                scores[b]
+                    .partial_cmp(&scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            Some((order, scores))
+        }
+        Err(e) => {
+            eprintln!("warning: {e}; showing results without reranking");
+            None
+        }
+    }
+}
+
+fn render_recall_v2_reranked(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    reranker: Option<&jev::Reranker>,
+    request: &icm_store::RecallRequest<'_>,
+    format: recall_format::RecallFormat,
+) -> Result<String> {
     // Same shape as the legacy path: a score only when an embedder took
     // part in the ranking (a keyword-only ranking has no similarity to
     // report), and a blank query finds nothing instead of failing.
+    if let Some(reranker) = reranker.filter(|_| !request.query.trim().is_empty()) {
+        return render_recall_v2_with_reranker(store, embedder, reranker, request, format);
+    }
     let with_score = embedder.is_some();
     let (results, raw): (Vec<(Memory, Option<f32>)>, Vec<icm_core::RawRelevance>) =
         if request.query.trim().is_empty() {
@@ -3597,6 +3668,68 @@ fn render_recall_v2(
         };
     // The detail renderer has no representation for "nothing": keep the
     // human banner there, like the legacy path (audit #185 H8).
+    if results.is_empty() && matches!(format, recall_format::RecallFormat::Detail) {
+        return Ok(format!("{MSG_NO_MEMORIES}\n"));
+    }
+    recall_format::render_with_raw(&results, &raw, format)
+}
+
+/// A recalled memory, its displayed score and its raw relevance.
+type RankedHit = ((Memory, Option<f32>), icm_core::RawRelevance);
+
+/// The v2 recall with a reranker: a pool of three times `limit` ranked by
+/// the engine without a budget, reordered by the reranker, cut to `limit`,
+/// then to the token budget. The budget is applied last because it depends
+/// on which memories the reranker keeps.
+fn render_recall_v2_with_reranker(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    reranker: &jev::Reranker,
+    request: &icm_store::RecallRequest<'_>,
+    format: recall_format::RecallFormat,
+) -> Result<String> {
+    let mut pool_request = *request;
+    pool_request.limit = request.limit.saturating_mul(3);
+    pool_request.max_tokens = None;
+    let outcome = pool_request.run_with_cost(store, embedder, &|_, _, _| 0)?;
+    let (mut results, mut raw): (Vec<(Memory, Option<f32>)>, Vec<icm_core::RawRelevance>) = outcome
+        .hits
+        .into_iter()
+        .map(|hit| {
+            (
+                (hit.memory, embedder.is_some().then_some(hit.score)),
+                hit.raw,
+            )
+        })
+        .unzip();
+
+    let docs: Vec<&str> = results.iter().map(|(m, _)| m.summary.as_str()).collect();
+    // A wider pool ranks slightly differently, so a failed rerank answers
+    // with the plain recall rather than the head of the pool.
+    let Some((order, scores)) = rerank_order(reranker, request.query, &docs) else {
+        return render_recall_v2_reranked(store, embedder, None, request, format);
+    };
+    let mut slots: Vec<Option<RankedHit>> = results.into_iter().zip(raw).map(Some).collect();
+    (results, raw) = order
+        .into_iter()
+        .filter_map(|i| slots[i].take().map(|((m, _), r)| ((m, Some(scores[i])), r)))
+        .unzip();
+    results.truncate(request.limit);
+    raw.truncate(request.limit);
+
+    if let Some(budget) = request.max_tokens {
+        let with_score = results.iter().any(|(_, s)| s.is_some());
+        let budget = budget.saturating_sub(recall_header_tokens(with_score, format));
+        let costs: Vec<usize> = results
+            .iter()
+            .zip(&raw)
+            .map(|((m, s), r)| rendered_recall_tokens_raw(m, *s, r, format))
+            .collect();
+        let kept = icm_core::select_within_budget(&costs, budget, request.limit).kept;
+        let mut slots: Vec<Option<RankedHit>> = results.into_iter().zip(raw).map(Some).collect();
+        (results, raw) = kept.into_iter().filter_map(|i| slots[i].take()).unzip();
+    }
+
     if results.is_empty() && matches!(format, recall_format::RecallFormat::Detail) {
         return Ok(format!("{MSG_NO_MEMORIES}\n"));
     }
@@ -19205,6 +19338,7 @@ mod embedding_guard_tests {
                 None,
                 None,
                 recall_format::RecallFormat::Toon,
+                None,
             )
             .unwrap();
             let cfg = config::Config::default();

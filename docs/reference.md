@@ -411,6 +411,20 @@ Recall fuses up to three ranked lists by reciprocal rank (RRF):
 
 Project, topic and keyword filters apply before the cut. Without an embedding model recall is keyword-only; on LoCoMo that is as good as the hybrid (see [Benchmark comparison](../README.md#benchmark-comparison)).
 
+#### Optional reranking
+
+`icm recall` can rerank its results with a decision model over the `/v1/systemone` protocol: it fetches three times `limit` candidates, asks the model whether each one answers the query, keeps the best `limit`, then applies `--max-tokens`. Off by default; the prompt hook never reranks.
+
+```toml
+[recall]
+reranker = "laya"        # a Laya server (laya-serve), http://127.0.0.1:8000 by default
+# reranker = "jev"       # TypeSafe's hosted Jev API, needs TYPESAFE_API_KEY
+# reranker_url = "http://gpu-box:8000/v1/systemone"
+# reranker_timeout_ms = 10000
+```
+
+The query and the candidate memories are sent to that server. If it fails or times out, `icm recall` prints a warning and keeps its own order.
+
 Default model: `Qdrant/multilingual-e5-large-onnx` (1024d, 100+ languages). Configurable in your [config file](#configuration):
 
 ```toml
@@ -562,4 +576,4 @@ With the default configuration:
 - The first command that needs embeddings downloads the model from Hugging Face once (`--no-embeddings` or `[embeddings] enabled = false` skips it).
 - `[extraction.summarizer] provider = "auto"`: when the hook is fired by Claude Code, Codex or Gemini CLI and that tool is installed, captured tool output is handed to it (`claude -p`, `codex exec`, `gemini -p`), so it goes to the vendor that agent already talks to. Under any other agent, or from a terminal, `auto` stays local and extracts with the embedding model. `provider = "none"` keeps every agent local.
 
-Off unless you turn them on: `[extraction.conversation]` (sends conversation excerpts to the extraction provider), `[consolidate.summarizer]` (default `none`), the API-key providers `anthropic` / `openai` / `google` (only when named in the config or a flag, never picked by `auto`), and `[cloud]` sync.
+Off unless you turn them on: `[recall] reranker` (sends the query and the candidate memories of `icm recall` to Jev or to a Laya server), `[extraction.conversation]` (sends conversation excerpts to the extraction provider), `[consolidate.summarizer]` (default `none`), the API-key providers `anthropic` / `openai` / `google` (only when named in the config or a flag, never picked by `auto`), and `[cloud]` sync.

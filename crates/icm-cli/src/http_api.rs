@@ -89,6 +89,8 @@ pub struct ServeOptions {
     pub request_timeout: std::time::Duration,
     pub header_timeout: std::time::Duration,
     pub max_concurrent: usize,
+    /// `[http] aml`: where the leaderboard databases go.
+    pub aml_dir: Option<PathBuf>,
 }
 
 /// Shortest bearer token accepted on a non-loopback bind.
@@ -346,6 +348,20 @@ pub async fn run_http_server(
     let mut app = Router::new();
     if opts.mcp {
         app = app.route("/mcp", post(handle_mcp));
+    }
+    if let Some(dir) = &opts.aml_dir {
+        let dims = state.embedder.as_ref().map_or(384, |e| e.dimensions());
+        let stores = crate::aml::AmlStores::new(dir.clone(), dims, state.embedder.clone())?;
+        eprintln!(
+            "[icm http] leaderboard API on /aml/add, /aml/search ({})",
+            dir.display()
+        );
+        app = app.merge(
+            Router::new()
+                .route("/aml/add", post(crate::aml::handle_add))
+                .route("/aml/search", post(crate::aml::handle_search))
+                .with_state(stores),
+        );
     }
     let app = app
         .route("/recall", post(handle_recall))

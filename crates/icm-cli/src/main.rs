@@ -17,6 +17,8 @@ mod extract_semantic;
 // own 2D layout, and (issue: large real stores scatter/stall when laid out
 // client-side in the browser) a 3D variant the web dashboard now computes
 // server-side in web.rs instead of running physics in the browser.
+#[cfg(feature = "http-api")]
+mod aml;
 #[cfg(any(feature = "tui", feature = "web"))]
 mod graph_layout;
 #[cfg(feature = "http-api")]
@@ -3082,6 +3084,11 @@ fn main() -> Result<()> {
                             cfg.http.header_timeout_secs.max(1),
                         ),
                         max_concurrent: cfg.http.max_concurrent,
+                        aml_dir: cfg.http.aml.then(|| match cfg.http.aml_dir.trim() {
+                            "" => directories::ProjectDirs::from("dev", "icm", "icm")
+                                .map_or_else(|| PathBuf::from("aml"), |d| d.data_dir().join("aml")),
+                            dir => PathBuf::from(dir),
+                        }),
                     },
                 );
             }

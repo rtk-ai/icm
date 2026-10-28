@@ -231,6 +231,22 @@ max_concurrent = 32         # requests at once; more get 503
 
 One token gives full read and write access to the store, `/mcp` included: serve a dedicated database (`--db`) when the callers should not see your own memories. Over a non-loopback bind, `icm_learn` (it scans a server directory) is refused. Without a token, only a local `Host` (`localhost`, `127.0.0.1`, `[::1]`) is served, so a web page cannot reach the API through DNS rebinding. `POST /store` takes a `raw` excerpt of at most 64 KB, as `content`.
 
+### Agent Memory Leaderboard API
+
+`[http] aml = true` adds the two routes the [Agent Memory Leaderboard](https://agentmemories.ai) calls; the platform does the answering and scoring.
+
+```toml
+[http]
+aml = true
+aml_dir = "/srv/icm-aml"     # one database per user_id (default: <data dir>/aml)
+request_timeout_secs = 1800  # the platform allows up to 30 minutes per request
+```
+
+- `POST /aml/add` `{request_id, messages: [{role, timestamp, content}], user_id, session_id}`: each message becomes one memory `[YYYY-MM-DD HH:MM] role: content`, dated by its timestamp (Unix milliseconds). Answers `{success, request_id, user_id, session_id}` once stored and searchable.
+- `POST /aml/search` `{query, options?, user_id, top_k}`: hybrid recall of that user's memories; multiple-choice `options` are ranked as extra queries and fused with the question. Answers `{data: [{id, content, score, created_at}]}`, at most `top_k` (100 max).
+
+`user_id` is the only isolation key: each one gets its own SQLite database in `aml_dir` (named by a hash of the id), so the server's own store is never read or written by these routes. They sit behind the same token, timeouts and limits as the rest of the API.
+
 `/recall` takes `"read_only": true` to record no access and apply no decay (what the prompt hook sends: a recall nobody asked for must not count as a use).
 
 The embedding model is loaded once instead of on every CLI call, so any scripting language can hit semantic recall with plain `curl`. The UserPromptSubmit hook uses it when `[recall] server_url` points at it: with the model warm, its recall is hybrid instead of keywords only, and it falls back to its own keyword recall when the server does not answer within `server_timeout_ms`. On 100 questions over 14 real sessions, hybrid recall of 10 memories answered about 6 more than keyword recall of 5. Requires the `http-api` feature (enabled by default). Issue [#290](https://github.com/rtk-ai/icm/issues/290).

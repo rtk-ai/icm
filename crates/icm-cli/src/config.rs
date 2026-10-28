@@ -57,6 +57,7 @@ pub struct Config {
     pub consolidate: ConsolidateConfig,
     pub mcp: McpConfig,
     pub web: WebConfig,
+    pub http: HttpConfig,
     pub cloud: CloudConfig,
     pub archive: ArchiveConfig,
 }
@@ -412,6 +413,74 @@ impl Default for WebConfig {
             port: 8420,
             username: "admin".into(),
             password: String::new(),
+        }
+    }
+}
+
+/// `icm serve --http` settings.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct HttpConfig {
+    /// File holding the bearer token (first line), when neither `--token`
+    /// nor `$ICM_HTTP_TOKEN` gives one. Keeps it out of `ps` and history.
+    pub token_file: String,
+    /// Serve `POST /mcp` (all MCP tools). Off leaves only the REST routes.
+    pub mcp: bool,
+    /// A request (body read and handler included) answers 408 after this.
+    pub request_timeout_secs: u64,
+    /// A connection that has not sent its request headers by then is closed.
+    pub header_timeout_secs: u64,
+    /// Requests handled at once; more get 503 instead of queuing.
+    pub max_concurrent: usize,
+    pub tls: TlsConfig,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            token_file: String::new(),
+            mcp: true,
+            request_timeout_secs: 60,
+            header_timeout_secs: 10,
+            max_concurrent: 32,
+            tls: TlsConfig::default(),
+        }
+    }
+}
+
+/// `[http.tls]`: serve `icm serve --http` over HTTPS (off by default).
+///
+/// The certificate comes from `cert` + `key` when both are set (a CA-issued
+/// or wildcard certificate); otherwise from `cert.pem` + `key.pem` in `dir`
+/// (default: `<data dir>/tls`), generated there self-signed for `names`
+/// the first time when `self_signed` is on.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Serve HTTPS (`icm serve --http ... --tls` does the same).
+    pub enabled: bool,
+    /// PEM certificate chain.
+    pub cert: String,
+    /// PEM private key.
+    pub key: String,
+    /// Directory holding `cert.pem` and `key.pem`. Empty: `<data dir>/tls`.
+    pub dir: String,
+    /// Generate a self-signed certificate in `dir` when it holds none.
+    pub self_signed: bool,
+    /// Extra host names and IP addresses of the generated certificate
+    /// (`localhost`, `127.0.0.1` and `::1` are always in).
+    pub names: Vec<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert: String::new(),
+            key: String::new(),
+            dir: String::new(),
+            self_signed: true,
+            names: Vec::new(),
         }
     }
 }

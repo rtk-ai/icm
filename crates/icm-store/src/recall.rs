@@ -368,7 +368,9 @@ fn recall_with_depth(
             .take(ACCESS_RECORD_MAX)
             .map(|h| h.memory.id.as_str())
             .collect();
-        let _ = store.batch_update_access(&ids);
+        if let Err(e) = store.batch_update_access(&ids) {
+            tracing::warn!(error = %e, "access-count update failed during recall");
+        }
     }
 
     Ok(outcome)

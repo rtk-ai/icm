@@ -3468,9 +3468,24 @@ fn cmd_recall(
     let query_limit = recall_query_limit(limit, filters_active);
 
     // Try hybrid search if embedder is available; fall back to FTS / keywords.
+    // Log each failure: the fallback has no scores, and without a log a
+    // broken embedder looks like a keyword-only setup.
     let scored: Option<Vec<(Memory, f32)>> = embedder
-        .and_then(|emb| emb.embed_query(query).ok())
-        .and_then(|query_emb| store.search_hybrid(query, &query_emb, query_limit).ok());
+        .and_then(|emb| {
+            emb.embed_query(query)
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "query embedding failed; recall uses keyword search")
+                })
+                .ok()
+        })
+        .and_then(|query_emb| {
+            store
+                .search_hybrid(query, &query_emb, query_limit)
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "hybrid search failed; recall uses keyword search")
+                })
+                .ok()
+        });
 
     let (mut results, has_score): (Vec<(Memory, Option<f32>)>, bool) = match scored {
         Some(scored) => {
@@ -3518,6 +3533,7 @@ fn cmd_recall(
     let max_neighbors = (limit / 3).max(1);
     let expanded = store
         .expand_with_neighbors(&scored_for_expand, max_neighbors, 0.5, limit)
+        .inspect_err(|e| tracing::warn!(error = %e, "neighbor expansion failed during recall"))
         .unwrap_or(scored_for_expand);
 
     let mut final_results: Vec<(Memory, Option<f32>)> = if has_score {
@@ -3546,7 +3562,9 @@ fn cmd_recall(
     }
 
     let ids: Vec<&str> = final_results.iter().map(|(m, _)| m.id.as_str()).collect();
-    let _ = store.batch_update_access(&ids);
+    if let Err(e) = store.batch_update_access(&ids) {
+        tracing::warn!(error = %e, "access-count update failed during recall");
+    }
 
     let rendered = recall_format::render(&final_results, format)?;
     print!("{rendered}");
@@ -3660,6 +3678,9 @@ fn recall_header_tokens(with_score: bool, format: recall_format::RecallFormat) -
         with_score.then_some(0.0),
     )];
     let header_chars = recall_format::render(&probe, format)
+        .inspect_err(
+            |e| tracing::warn!(error = %e, "recall header render failed; budget counts no header"),
+        )
         .ok()
         .and_then(|body| body.split_once('\n').map(|(h, _)| h.chars().count()))
         .unwrap_or(0);
@@ -3909,7 +3930,13 @@ fn cmd_feedback_search(
     topic: Option<&str>,
     limit: usize,
 ) -> Result<()> {
-    let query_embedding = embedder.and_then(|emb| emb.embed_query(query).ok());
+    let query_embedding = embedder.and_then(|emb| {
+        emb.embed_query(query)
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "query embedding failed; feedback search uses keyword search")
+            })
+            .ok()
+    });
     let results = store.search_feedback(query, query_embedding.as_deref(), topic, limit)?;
     if results.is_empty() {
         println!("No feedback found.");
@@ -11103,7 +11130,10 @@ fn cmd_recall_context(store: &Store, query: &str, limit: usize) -> Result<()> {
 fn detect_project() -> String {
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
-        Err(_) => return "unknown".to_string(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the cwd; project is \"unknown\"");
+            return "unknown".to_string();
+        }
     };
     let path_str = cwd.to_string_lossy();
     project_from_path(&path_str).unwrap_or_else(|| "unknown".to_string())

@@ -665,9 +665,15 @@ fn run_recall(state: &AppState, req: &RecallReq) -> Result<Vec<(Memory, Option<f
                     })
                     .map(|(m, s)| (m, Some(s)))
                     .collect(),
-                Err(_) => fts_fallback(&store, req, &project_filter, limit)?,
+                Err(e) => {
+                    tracing::warn!(error = %e, "hybrid search failed; recall uses keyword search");
+                    fts_fallback(&store, req, &project_filter, limit)?
+                }
             },
-            Err(_) => fts_fallback(&store, req, &project_filter, limit)?,
+            Err(e) => {
+                tracing::warn!(error = %e, "query embedding failed; recall uses keyword search");
+                fts_fallback(&store, req, &project_filter, limit)?
+            }
         }
     } else {
         fts_fallback(&store, req, &project_filter, limit)?
@@ -675,7 +681,9 @@ fn run_recall(state: &AppState, req: &RecallReq) -> Result<Vec<(Memory, Option<f
 
     // Best-effort access bookkeeping (matches the MCP path).
     let ids: Vec<&str> = scored.iter().map(|(m, _)| m.id.as_str()).collect();
-    let _ = store.batch_update_access(&ids);
+    if let Err(e) = store.batch_update_access(&ids) {
+        tracing::warn!(error = %e, "access-count update failed during recall");
+    }
 
     Ok(scored)
 }

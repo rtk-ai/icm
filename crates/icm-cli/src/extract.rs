@@ -294,9 +294,34 @@ pub fn recall_context_from_server(
     if let Some(token) = token {
         request = request.set("authorization", &format!("Bearer {token}"));
     }
-    let text = request.send_json(body).ok()?.into_string().ok()?;
+    // Each failure falls back to local recall; log it so a down server or a
+    // rejected token has a visible cause.
+    let response = request
+        .send_json(body)
+        .inspect_err(
+            |e| tracing::warn!(error = %e, "recall server request failed; local recall used"),
+        )
+        .ok()?;
+    let text = response
+        .into_string()
+        .inspect_err(
+            |e| tracing::warn!(error = %e, "recall server reply unreadable; local recall used"),
+        )
+        .ok()?;
     // No memory comes back as `{"message": …, "results": []}`, not an array.
-    let memories: Vec<Memory> = serde_json::from_str(&text).ok()?;
+    let memories: Vec<Memory> = match serde_json::from_str(&text) {
+        Ok(memories) => memories,
+        Err(e) => {
+            let no_results = serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| {
+                v.get("results")
+                    .is_some_and(|r| r.as_array().is_some_and(Vec::is_empty))
+            });
+            if !no_results {
+                tracing::warn!(error = %e, "recall server reply not understood; local recall used");
+            }
+            return None;
+        }
+    };
     if memories.is_empty() {
         return None;
     }

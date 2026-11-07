@@ -381,7 +381,8 @@ fn recall_with_depth(
 }
 
 /// One query's ranking: its own embedding and date window, the ranked
-/// search, the substring fallback when no arm matched.
+/// search, the substring fallback when no arm matched, or after the ranked
+/// hits for a query with Hangul.
 fn rank_one(
     store: &Store,
     embedder: Option<&dyn Embedder>,
@@ -420,6 +421,14 @@ fn rank_one(
     let mut ranked = store.search_ranked(&query, keep)?;
     if ranked.is_empty() {
         ranked = substring_matches(store, text, limit, keep);
+    } else if text.chars().any(is_hangul) {
+        // A Korean word glued to another particle is not a whole-word hit,
+        // so another query word matching elsewhere must not hide it (#539).
+        let extra: Vec<RankedHit> = substring_matches(store, text, limit, keep)
+            .into_iter()
+            .filter(|h| !ranked.iter().any(|r| r.memory.id == h.memory.id))
+            .collect();
+        ranked.extend(extra);
     }
     Ok((ranked, window))
 }
@@ -1712,6 +1721,26 @@ mod pipeline_tests {
         assert!(substring_words("사").is_empty());
         // Latin words keep the three-character floor and are never cut.
         assert_eq!(substring_words("deploy to"), vec!["deploy"]);
+    }
+
+    /// A Korean query word that is not a whole indexed word still finds its
+    /// memory when another query word matches elsewhere (#539).
+    #[test]
+    fn substring_fallback_follows_ranked_hits_for_korean() {
+        let s = store();
+        let list = add(&s, "ko-fixture", "사건 목록", None);
+        let year = add(&s, "notes", "incident report filed in 2023", None);
+        let glued = add(&s, "ko-fixture", "사건은 2023년에 발생했습니다", None);
+
+        let out = run(&s, None, &request("사건 2023")).unwrap();
+        let ids: Vec<&str> = out.hits.iter().map(|h| h.memory.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        // Ranked hits first, then the substring match, each once.
+        assert!(ids[..2].contains(&list.as_str()));
+        assert!(ids[..2].contains(&year.as_str()));
+        assert_eq!(ids[2], glued.as_str());
+        assert_eq!(out.hits[2].score, 0.0);
+        assert!(out.hits[2].fts_rank.is_none());
     }
 
     /// A whole-word match never goes through the fallback.

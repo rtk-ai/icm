@@ -78,8 +78,16 @@ axum = "0.8"
 # `full` was overkill — we need the multi-thread runtime, the
 # `#[tokio::main]` macro, and `tokio::net` for the TCP listener.
 # Dropping `full` shaves ~3MB off the optimized binary on Linux.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-tower-http = { version = "0.7", features = ["trace", "cors"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+# HTTPS for `icm serve --http` ([http.tls]). rustls with ring (already in the
+# tree through ureq), so no aws-lc / cmake build; rcgen generates the
+# self-signed certificate when none is configured.
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "timeout"] }
+# Header read timeout of `icm serve --http` (hyper timer).
+hyper-util = { version = "0.1", features = ["tokio"] }
 rust-embed = "8"
 mime_guess = "2"
 getrandom = "0.4"

@@ -190,6 +190,47 @@ curl -s -X POST '127.0.0.1:11435/recall?format=json' \
 
 Endpoints: `POST /store`, `POST /recall`, `POST /consolidate`, `GET /stats`, `GET /topics`, `GET /health`. Optional `--token <T>` enables `Authorization: Bearer <T>` on every request (health stays open as a liveness probe). Bound to whatever address you pass; `127.0.0.1:<port>` keeps the server localhost-only.
 
+### HTTPS
+
+`--tls` (or `enabled = true` in `[http.tls]`) serves the same API over HTTPS. The certificate is taken, in order, from `cert` + `key` (a CA-issued or wildcard certificate), then from `cert.pem` + `key.pem` in `dir`, and otherwise a self-signed certificate is generated in `dir` on the first start and reused afterwards.
+
+```toml
+[http.tls]
+enabled = true
+# Your own certificate (both or neither):
+# cert = "/etc/ssl/icm/fullchain.pem"
+# key  = "/etc/ssl/icm/privkey.pem"
+# Otherwise cert.pem + key.pem in this directory (default: <data dir>/tls):
+# dir = "~/.config/icm/tls"
+# Generate a self-signed pair there when it is empty (default: true):
+# self_signed = true
+# Extra names of the generated certificate (localhost, 127.0.0.1, ::1 are always in):
+# names = ["icm.example.com", "192.168.1.10"]
+```
+
+```bash
+ICM_HTTP_TOKEN="$(cat ~/.config/icm/http-token)" icm serve --http 0.0.0.0:11435 --tls
+# Generated certificate, Linux default data dir:
+curl --cacert ~/.local/share/icm/tls/cert.pem https://localhost:11435/health
+```
+
+A generated certificate (CN `icm`, valid two years) is not trusted by clients until you give them `cert.pem` (`curl --cacert`, or add it to the system store). The private key is written with mode 0600.
+
+### Exposing the server
+
+A non-loopback bind requires a token of at least 32 characters (`openssl rand -hex 32`). Give it through `$ICM_HTTP_TOKEN` or `[http] token_file` rather than `--token`, which shows in `ps`. Without TLS on such a bind, icm warns that the token travels in clear text.
+
+```toml
+[http]
+token_file = "~/.config/icm/http-token"  # first line; --token and $ICM_HTTP_TOKEN win
+mcp = true                  # false: no POST /mcp, only the REST routes
+request_timeout_secs = 60   # a request (body read included) gets 408 after this
+header_timeout_secs = 10    # a connection that has not sent its headers is closed
+max_concurrent = 32         # requests at once; more get 503
+```
+
+One token gives full read and write access to the store, `/mcp` included: serve a dedicated database (`--db`) when the callers should not see your own memories. Over a non-loopback bind, `icm_learn` (it scans a server directory) is refused. Without a token, only a local `Host` (`localhost`, `127.0.0.1`, `[::1]`) is served, so a web page cannot reach the API through DNS rebinding. `POST /store` takes a `raw` excerpt of at most 64 KB, as `content`.
+
 `/recall` takes `"read_only": true` to record no access and apply no decay (what the prompt hook sends: a recall nobody asked for must not count as a use).
 
 The embedding model is loaded once instead of on every CLI call, so any scripting language can hit semantic recall with plain `curl`. The UserPromptSubmit hook uses it when `[recall] server_url` points at it: with the model warm, its recall is hybrid instead of keywords only, and it falls back to its own keyword recall when the server does not answer within `server_timeout_ms`. On 100 questions over 14 real sessions, hybrid recall of 10 memories answered about 6 more than keyword recall of 5. Requires the `http-api` feature (enabled by default). Issue [#290](https://github.com/rtk-ai/icm/issues/290).
@@ -525,7 +566,7 @@ A first-class `role` field (with native filtering in wake-up and recall) is on t
 
 ## Auto-extraction
 
-ICM captures and reinjects memories through three hooks. Capture is rule-based; when an LLM command-line tool is installed (Claude Code, Codex or Gemini CLI), the default `[extraction.summarizer] provider = "auto"` also hands the captured text to it to write the facts (`provider = "none"` keeps everything local):
+ICM captures and reinjects memories through three hooks. Capture is rule-based; when the hook is fired by Claude Code, Codex or Gemini CLI and that tool is installed, the default `[extraction.summarizer] provider = "auto"` also hands the captured text to it to write the facts (`provider = "none"` keeps everything local):
 
 ```
   Layer 0: Pattern hooks              Layer 1: PreCompact           Layer 2: UserPromptSubmit
@@ -547,9 +588,19 @@ ICM captures and reinjects memories through three hooks. Capture is rule-based; 
 
 | Layer | Status | LLM call | Hook command | Description |
 |-------|--------|----------|-------------|-------------|
-| Layer 0 | Implemented | only with `provider = "auto"` and an LLM CLI installed | `icm hook post` | Rule-based extraction from tool output |
+| Layer 0 | Implemented | only with `provider = "auto"` under Claude Code, Codex or Gemini CLI | `icm hook post` | Rule-based extraction from tool output |
 | Layer 1 | Implemented | none; with `[extraction.conversation] enabled` and an LLM provider, one call per excerpt | `icm hook compact` | Extract from transcript before context compression; or, with `[extraction.conversation] enabled`, queue the conversation since the last fire for LLM extraction |
-| Layer 2 | Implemented | none; with `[extraction.conversation] in_session` and an LLM provider, one call per excerpt | `icm hook prompt` | Inject recalled memories on each user prompt; with `[extraction.conversation] in_session`, queue each full conversation excerpt for LLM extraction |
+| Layer 2 | Implemented | none; with `[extraction.conversation] in_session` and an LLM provider, one call per excerpt | `icm hook prompt` | Inject recalled memories on each user prompt; with `[extraction] each_prompt`, run the keyword pass (no LLM) over the agent's last turn in a background process; with `[extraction.conversation] in_session`, queue each full conversation excerpt for LLM extraction |
 
 All 3 layers are installed automatically by `icm init --mode hook`.
 
+
+## What leaves your machine
+
+With the default configuration:
+
+- Storage, search and recall are local: one SQLite file, no network call.
+- The first command that needs embeddings downloads the model from Hugging Face once (`--no-embeddings` or `[embeddings] enabled = false` skips it).
+- `[extraction.summarizer] provider = "auto"`: when the hook is fired by Claude Code, Codex or Gemini CLI and that tool is installed, captured tool output is handed to it (`claude -p`, `codex exec`, `gemini -p`), so it goes to the vendor that agent already talks to. Under any other agent, or from a terminal, `auto` stays local and extracts with the embedding model. `provider = "none"` keeps every agent local.
+
+Off unless you turn them on: `[extraction.conversation]` (sends conversation excerpts to the extraction provider), `[consolidate.summarizer]` (default `none`), the API-key providers `anthropic` / `openai` / `google` (only when named in the config or a flag, never picked by `auto`), and `[cloud]` sync.

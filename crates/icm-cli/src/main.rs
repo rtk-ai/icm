@@ -25,6 +25,8 @@ mod import;
 mod install_manifest;
 #[cfg(test)]
 mod learn_tests;
+#[cfg(feature = "http-api")]
+mod tls;
 // First-launch onnxruntime resolution for the load-dynamic embeddings build
 // (issue #345). Only the dynamic build needs a runtime downloaded at execution
 // time; the static build links onnxruntime in.
@@ -906,10 +908,19 @@ enum Commands {
         #[arg(long = "http-proxy", value_name = "URL", conflicts_with = "http")]
         http_proxy: Option<String>,
 
-        /// Bearer token used by the HTTP server or proxy.
+        /// Bearer token used by the HTTP server or proxy. Prefer
+        /// `$ICM_HTTP_TOKEN` or `[http] token_file`: a flag shows in `ps`.
+        /// A non-loopback bind needs one of at least 32 characters.
         #[cfg(feature = "http-api")]
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
+
+        /// Serve `--http` over HTTPS, as `[http.tls] enabled = true` does:
+        /// the certificate set in `[http.tls]`, else `cert.pem` + `key.pem`
+        /// in its `dir`, else a self-signed one generated there.
+        #[cfg(feature = "http-api")]
+        #[arg(long, requires = "http")]
+        tls: bool,
     },
 
     /// Hook handlers shared across Claude Code, Codex, Gemini, and
@@ -2264,6 +2275,11 @@ fn main() -> Result<()> {
         ..
     } = &cli.command
     {
+        let token = http_api::resolve_token(
+            token.as_deref(),
+            std::env::var("ICM_HTTP_TOKEN").ok(),
+            &cfg.http.token_file,
+        )?;
         return http_api::run_mcp_stdio_proxy(
             base_url,
             token.as_deref(),
@@ -3010,6 +3026,8 @@ fn main() -> Result<()> {
                 http_proxy: _,
             #[cfg(feature = "http-api")]
             token,
+            #[cfg(feature = "http-api")]
+            tls,
         } => {
             #[cfg(feature = "web")]
             if expose {
@@ -3027,6 +3045,19 @@ fn main() -> Result<()> {
             // stdio, so it's an `if let`, not an `else if expose`.
             #[cfg(feature = "http-api")]
             if let Some(addr) = http {
+                let token = http_api::resolve_token(
+                    token.as_deref(),
+                    std::env::var("ICM_HTTP_TOKEN").ok(),
+                    &cfg.http.token_file,
+                )?;
+                // Before generating any certificate for a server that
+                // would not start.
+                http_api::check_bind_requires_token(&addr, &token).map_err(anyhow::Error::msg)?;
+                let tls = if tls || cfg.http.tls.enabled {
+                    Some(tls::resolve(&cfg.http.tls, tls::default_dir())?)
+                } else {
+                    None
+                };
                 let boxed_emb: Option<Box<dyn icm_core::Embedder + Send + Sync>> =
                     embedder.map(|e| Box::new(e) as Box<dyn icm_core::Embedder + Send + Sync>);
                 let auto_consolidate = icm_mcp::AutoConsolidate {
@@ -3041,6 +3072,17 @@ fn main() -> Result<()> {
                     token,
                     auto_consolidate,
                     cfg.mcp.instructions.clone(),
+                    http_api::ServeOptions {
+                        tls,
+                        mcp: cfg.http.mcp,
+                        request_timeout: std::time::Duration::from_secs(
+                            cfg.http.request_timeout_secs.max(1),
+                        ),
+                        header_timeout: std::time::Duration::from_secs(
+                            cfg.http.header_timeout_secs.max(1),
+                        ),
+                        max_concurrent: cfg.http.max_concurrent,
+                    },
                 );
             }
             #[cfg(feature = "embeddings")]

@@ -195,6 +195,22 @@ server_token_env = ""
 server_limit = 10
 server_timeout_ms = 800
 
+# Rerank `icm recall` results with a /v1/systemone decision model (the
+# prompt hook never reranks). The query and the candidate memories are
+# sent to that server. Empty: off.
+#   "jev" | "jev:<model>"   TypeSafe's hosted Jev API, needs TYPESAFE_API_KEY
+#   "laya" | "laya:<model>" a Laya server (laya-serve), local by default;
+#                            no model = the server picks the checkpoint
+reranker = ""
+# Endpoint override. Empty: api.typesafe.ai for Jev,
+# http://127.0.0.1:8000/v1/systemone for Laya.
+reranker_url = ""
+# Variable holding the bearer key. Empty: TYPESAFE_API_KEY for Jev,
+# LAYA_API_KEY for Laya (optional: only if the server sets one).
+reranker_api_key_env = ""
+# Past this, or on any error, results keep their local order (warning).
+reranker_timeout_ms = 10000
+
 [wakeup]
 # SessionStart hook (Layer 1): wake-up pack of critical/high-importance
 # memories injected at session start.

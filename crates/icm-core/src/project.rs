@@ -166,20 +166,28 @@ mod tests {
             vec!["init"],
             vec!["config", "user.email", "test@test.com"],
             vec!["config", "user.name", "Test"],
+            // Isolate the fixture from global git config: `commit.gpgsign`
+            // with no usable key fails the commit, and a global
+            // `core.hooksPath` would run the user's hooks. The hooks path
+            // points at a directory that does not exist.
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", "no-hooks"],
             vec!["commit", "--allow-empty", "-m", "init"],
         ] {
-            std::process::Command::new("git")
+            let out = std::process::Command::new("git")
                 .args(&args)
                 .current_dir(&main_repo)
                 .output()
                 .unwrap();
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
         }
         let worktree = base.path().join("w1");
-        std::process::Command::new("git")
+        let out = std::process::Command::new("git")
             .args(["worktree", "add", "--detach", worktree.to_str().unwrap()])
             .current_dir(&main_repo)
             .output()
             .unwrap();
+        assert!(out.status.success(), "git worktree add failed: {out:?}");
         (base, worktree)
     }
 

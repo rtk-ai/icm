@@ -1069,9 +1069,35 @@ fn project_scope(args: &Value) -> Option<String> {
     match get_str(args, "project") {
         Some("") => None,
         Some(p) => Some(p.to_string()),
-        None => std::env::current_dir()
-            .ok()
-            .and_then(|p| icm_core::project::project_from_path(&p.to_string_lossy())),
+        // Both failures turn the project filter off. Log the cause one time
+        // per process: the cwd does not change, and a server launched from
+        // `/` (a GUI client) would otherwise warn on every call.
+        None => {
+            static CWD_WARNED: std::sync::Once = std::sync::Once::new();
+            match std::env::current_dir() {
+                Ok(cwd) => {
+                    let project = icm_core::project::project_from_path(&cwd.to_string_lossy());
+                    if project.is_none() {
+                        CWD_WARNED.call_once(|| {
+                            tracing::warn!(
+                                cwd = %cwd.display(),
+                                "no project found for the server cwd; project filter off"
+                            )
+                        });
+                    }
+                    project
+                }
+                Err(e) => {
+                    CWD_WARNED.call_once(|| {
+                        tracing::warn!(
+                            error = %e,
+                            "cannot read the server cwd; project filter off"
+                        )
+                    });
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -1613,10 +1639,18 @@ fn tool_recall_on(
         limit
     };
 
-    // Try hybrid search if embedder is available
+    // Try hybrid search if embedder is available. Both failures fall back to
+    // keyword search below, which has no scores; log them so a missing score
+    // has a visible cause.
     if let Some(emb) = embedder
-        && let Ok(query_emb) = emb.embed_query(query)
-        && let Ok(results) = store.search_hybrid(query, &query_emb, query_limit)
+        && let Ok(query_emb) = emb.embed_query(query).inspect_err(
+            |e| tracing::warn!(error = %e, "query embedding failed; recall uses keyword search"),
+        )
+        && let Ok(results) = store
+            .search_hybrid(query, &query_emb, query_limit)
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "hybrid search failed; recall uses keyword search"),
+            )
     {
         let mut scored_results = results;
         scored_results.retain(|(m, _)| project_filter(m));
@@ -1640,6 +1674,7 @@ fn tool_recall_on(
         let max_neighbors = (query_limit / 3).max(1);
         let mut expanded = store
             .expand_with_neighbors(&scored_results, max_neighbors, 0.5, query_limit)
+            .inspect_err(|e| tracing::warn!(error = %e, "neighbor expansion failed during recall"))
             .unwrap_or(scored_results);
         expanded.retain(|(m, _)| project_filter(m));
         if let Some(t) = topic {
@@ -1652,7 +1687,9 @@ fn tool_recall_on(
 
         // Batch update access counts (includes expanded neighbors)
         let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
-        let _ = store.batch_update_access(&ids);
+        if let Err(e) = store.batch_update_access(&ids) {
+            tracing::warn!(error = %e, "access-count update failed during recall");
+        }
 
         if expanded.is_empty() {
             return ToolResult::text(no_memories(format));
@@ -1695,6 +1732,7 @@ fn tool_recall_on(
     let max_neighbors = (limit / 3).max(1);
     let mut expanded = store
         .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
+        .inspect_err(|e| tracing::warn!(error = %e, "neighbor expansion failed during recall"))
         .unwrap_or(scored);
     expanded.retain(|(m, _)| project_filter(m));
     if let Some(t) = topic {
@@ -1706,7 +1744,9 @@ fn tool_recall_on(
 
     // Batch update access counts (includes expanded neighbors)
     let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
-    let _ = store.batch_update_access(&ids);
+    if let Err(e) = store.batch_update_access(&ids) {
+        tracing::warn!(error = %e, "access-count update failed during recall");
+    }
 
     if expanded.is_empty() {
         return ToolResult::text(no_memories(format));
@@ -1903,7 +1943,9 @@ fn tool_related(store: &Store, args: &Value, compact: bool) -> ToolResult {
 
     // Following a link is a read of the memory, as in recall.
     let found_ids: Vec<&str> = found.iter().map(|(m, _)| m.id.as_str()).collect();
-    let _ = store.batch_update_access(&found_ids);
+    if let Err(e) = store.batch_update_access(&found_ids) {
+        tracing::warn!(error = %e, "access-count update failed during related walk");
+    }
 
     ToolResult::text(match format {
         OutputFormat::Json => Value::Array(
@@ -2727,8 +2769,10 @@ fn tool_memoir_search_all(store: &Store, args: &Value) -> ToolResult {
     }
 
     // Group by memoir for readable output
+    // Without the memoir list the hits still show, with "?" as the name.
     let memoirs: std::collections::HashMap<String, String> = store
         .list_memoirs()
+        .inspect_err(|e| tracing::warn!(error = %e, "list memoirs failed; memoir names unknown"))
         .unwrap_or_default()
         .into_iter()
         .map(|m| (m.id.clone(), m.name))
@@ -3155,7 +3199,13 @@ fn tool_feedback_search(
     };
     let topic = get_str(args, "topic");
     let limit = get_i64(args, "limit", 5).clamp(1, 100) as usize;
-    let query_embedding = embedder.and_then(|emb| emb.embed_query(query).ok());
+    let query_embedding = embedder.and_then(|emb| {
+        emb.embed_query(query)
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "query embedding failed; feedback search uses keyword search")
+            })
+            .ok()
+    });
 
     match store.search_feedback(query, query_embedding.as_deref(), topic, limit) {
         Ok(results) => {
@@ -6369,5 +6419,83 @@ description = "A test project"
                 RELATED_MAX_LIMIT
             );
         }
+    }
+
+    /// A failed query embedding makes legacy recall fall back to keyword
+    /// search. The fallback must still answer, and the cause must reach the
+    /// log: before, the only sign was a missing score.
+    #[test]
+    fn legacy_recall_logs_a_failed_embedding_and_still_answers() {
+        use std::sync::{Arc, Mutex};
+
+        struct FailingEmbedder;
+        impl Embedder for FailingEmbedder {
+            fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
+                Err(icm_core::IcmError::Embedding("model unavailable".into()))
+            }
+            fn embed_batch(&self, _texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+                Err(icm_core::IcmError::Embedding("model unavailable".into()))
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = test_store();
+        store
+            .store(Memory::new(
+                "t".into(),
+                "fallback probe entry".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        let buf = Buf::default();
+        let writer = {
+            let buf = buf.clone();
+            move || buf.clone()
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let res = tracing::subscriber::with_default(subscriber, || {
+            tool_recall_on(
+                &store,
+                Some(&FailingEmbedder),
+                &json!({"query": "fallback probe entry", "project": ""}),
+                true,
+                RecallEngine::Legacy,
+                None,
+            )
+        });
+
+        assert!(!res.is_error, "{}", res.content[0].text);
+        assert!(
+            res.content[0].text.contains("fallback probe entry"),
+            "{}",
+            res.content[0].text
+        );
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("query embedding failed; recall uses keyword search")
+                && log.contains("model unavailable"),
+            "{log}"
+        );
     }
 }

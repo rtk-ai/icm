@@ -417,13 +417,21 @@ impl MemoryStore for SqliteStore {
         let mut fts_scores: HashMap<String, f32> = HashMap::with_capacity(pool_size);
         let mut all_memories: HashMap<String, Memory> = HashMap::with_capacity(pool_size);
 
+        // An FTS failure leaves a vector-only ranking; log it so the missing
+        // keyword signal has a visible cause.
         if !sanitized.is_empty()
-            && let Ok(mut stmt) = self.conn.prepare(fts_sql)
-            && let Ok(rows) = stmt.query_map(params![sanitized, pool_size as i64], |row| {
-                let memory = row_to_memory(row)?;
-                let rank: f32 = row.get(15)?;
-                Ok((memory, rank))
+            && let Ok(mut stmt) = self.conn.prepare(fts_sql).inspect_err(|e| {
+                tracing::warn!(error = %e, "hybrid search FTS prepare failed; vector ranking only")
             })
+            && let Ok(rows) = stmt
+                .query_map(params![sanitized, pool_size as i64], |row| {
+                    let memory = row_to_memory(row)?;
+                    let rank: f32 = row.get(15)?;
+                    Ok((memory, rank))
+                })
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "hybrid search FTS query failed; vector ranking only")
+                })
         {
             for row in rows.flatten() {
                 let (memory, rank) = row;

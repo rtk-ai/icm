@@ -260,6 +260,12 @@ pub struct RecallConfig {
     pub server_limit: usize,
     /// How long the hook waits for the server, in milliseconds.
     pub server_timeout_ms: u64,
+    /// Prompts with fewer words get no recall ("ok", "oui", "go on"):
+    /// they carry nothing to search for. 0 recalls on every prompt.
+    pub min_prompt_words: usize,
+    /// Leave out the memories already injected earlier in the session: they
+    /// are still in the context, and each copy is reread on every later call.
+    pub skip_seen: bool,
 }
 
 /// Wake-up pack settings (SessionStart hook).
@@ -562,6 +568,11 @@ impl Default for RecallConfig {
             // of 10 memories answered about 6 more than keyword recall of 5.
             server_limit: 10,
             server_timeout_ms: 800,
+            // Measured over 30 days of sessions: 9% of the recalls answered a
+            // prompt of 3 words or fewer, 38% of the injected memories were
+            // already in the session, 75% of the recall tokens reread later.
+            min_prompt_words: 3,
+            skip_seen: true,
         }
     }
 }

@@ -5498,7 +5498,11 @@ fn cmd_hook_prompt(
     // `[recall]` was documented but never read: the hook always injected 5
     // memories, `enabled = false` included. It turns off the injection
     // only; the extraction below still runs.
-    if recall_cfg.enabled {
+    let words = message
+        .split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .count();
+    if recall_cfg.enabled && words >= recall_cfg.min_prompt_words {
         let from_server = Some(recall_cfg.server_url.trim())
             .filter(|url| !url.is_empty())
             .and_then(|url| {
@@ -5507,7 +5511,7 @@ fn cmd_hook_prompt(
                     .and_then(|name| std::env::var(name).ok());
                 // The whole prompt, not the 200 bytes the keyword recall
                 // takes: the meaning is in the sentence.
-                extract::recall_context_from_server(
+                extract::recall_memories_from_server(
                     url,
                     token.as_deref(),
                     truncate_at_char_boundary(message, 2_000),
@@ -5516,12 +5520,26 @@ fn cmd_hook_prompt(
                     std::time::Duration::from_millis(recall_cfg.server_timeout_ms),
                 )
             });
-        let ctx = match from_server {
-            Some(ctx) => ctx,
-            None => extract::recall_context(store, query, project_filter, recall_cfg.limit)?,
+        let memories = match from_server {
+            Some(m) => m,
+            None => extract::recall_memories(store, query, project_filter, recall_cfg.limit)?,
         };
+        let seen_file = recall_cfg
+            .skip_seen
+            .then(|| seen_recall_path(&json))
+            .flatten();
+        let seen = seen_file.as_deref().map(read_seen_ids).unwrap_or_default();
+        let fresh: Vec<_> = memories
+            .into_iter()
+            .filter(|m| !seen.contains(&m.id))
+            .collect();
+        let ids: Vec<String> = fresh.iter().map(|m| m.id.clone()).collect();
+        let ctx = extract::render_recall_context(fresh);
         if !ctx.is_empty() {
             emit_hook_context(&ctx);
+            if let Some(path) = &seen_file {
+                record_seen_ids(path, &ids);
+            }
         }
     }
 
@@ -5566,6 +5584,72 @@ fn cmd_hook_prompt(
     }
 
     Ok(())
+}
+
+/// Where the hook keeps the ids of the memories it injected in a session
+/// (one per line), or `None` without a usable `session_id`.
+fn seen_recall_path(json: &Value) -> Option<PathBuf> {
+    let id = json.get("session_id")?.as_str()?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(std::env::temp_dir().join("icm-hook-recall").join(id))
+}
+
+fn read_seen_ids(path: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Appends `ids` to the session's file. Files of sessions untouched for two
+/// days are removed on the way, so the directory stays small.
+fn record_seen_ids(path: &Path, ids: &[String]) {
+    use std::io::Write as _;
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+        for e in entries.flatten() {
+            if e.metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t < old)
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(
+            ids.iter()
+                .map(|i| format!("{i}\n"))
+                .collect::<String>()
+                .as_bytes(),
+        );
+    }
+}
+
+/// A session that starts, resumes, clears or compacts no longer holds the
+/// memories injected before: forget them so they can be recalled again.
+fn forget_seen_recall(stdin_json: &str) {
+    if let Some(path) = serde_json::from_str::<Value>(stdin_json)
+        .ok()
+        .as_ref()
+        .and_then(seen_recall_path)
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Output target for hook stdout. Different agent runtimes have
@@ -5653,6 +5737,7 @@ fn format_hook_context(ctx: &str, fmt: HookOutputFormat) -> String {
 /// the hook decides to suppress output (empty store, no matching memories).
 fn cmd_hook_start(store: &Store, max_tokens: usize) -> Result<()> {
     let input = read_stdin_utf8_lossy().unwrap_or_default();
+    forget_seen_recall(&input);
 
     let pack = build_hook_start_pack(store, &input, max_tokens)?;
     if pack.is_empty() {

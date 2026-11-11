@@ -21,6 +21,8 @@ fn icm(
 ) -> std::process::Output {
     let mut cmd = Command::new(ICM);
     cmd.env("HOME", home)
+        // the hook keeps per-session state in the temp dir
+        .env("TMPDIR", home)
         .env("ICM_NO_EMBEDDINGS", "1")
         .env_remove("ICM_DB")
         .env_remove("ICM_CONFIG")
@@ -115,6 +117,72 @@ fn hook_prompt_injects_five_memories_by_default() {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded(tmp.path());
     assert_eq!(injected(tmp.path(), &db, None), 5);
+}
+
+/// Memories injected for `message` in session `session`.
+fn injected_in(
+    home: &Path,
+    db: &str,
+    config: Option<&Path>,
+    session: &str,
+    message: &str,
+) -> usize {
+    let input =
+        serde_json::json!({"user_message": message, "cwd": "/work/myproj", "session_id": session})
+            .to_string();
+    let out = icm(home, config, &["--db", db, "hook", "prompt"], Some(&input));
+    assert!(
+        out.status.success(),
+        "hook prompt failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with("- kubernetes"))
+        .count()
+}
+
+#[test]
+fn hook_prompt_skips_short_prompts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = seeded(tmp.path());
+    assert_eq!(injected_in(tmp.path(), &db, None, "s1", "kubernetes ok"), 0);
+    let config = tmp.path().join("config.toml");
+    std::fs::write(&config, "[recall]\nmin_prompt_words = 0\n").unwrap();
+    assert_eq!(
+        injected_in(tmp.path(), &db, Some(&config), "s1", "kubernetes ok"),
+        5
+    );
+}
+
+#[test]
+fn hook_prompt_does_not_inject_a_memory_twice_in_a_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = seeded(tmp.path());
+    let ask = "what do we know about kubernetes here?";
+    assert_eq!(injected_in(tmp.path(), &db, None, "s1", ask), 5);
+    assert_eq!(injected_in(tmp.path(), &db, None, "s1", ask), 0);
+    // another session gets them, and so does s1 once it starts again (compact, clear, resume)
+    assert_eq!(injected_in(tmp.path(), &db, None, "s2", ask), 5);
+    let out = icm(
+        tmp.path(),
+        None,
+        &["--db", &db, "hook", "start"],
+        Some(r#"{"session_id":"s1","cwd":"/work/myproj"}"#),
+    );
+    assert!(out.status.success());
+    assert_eq!(injected_in(tmp.path(), &db, None, "s1", ask), 5);
+}
+
+#[test]
+fn hook_prompt_repeats_memories_when_skip_seen_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = seeded(tmp.path());
+    let config = tmp.path().join("config.toml");
+    std::fs::write(&config, "[recall]\nskip_seen = false\n").unwrap();
+    let ask = "what do we know about kubernetes here?";
+    assert_eq!(injected_in(tmp.path(), &db, Some(&config), "s1", ask), 5);
+    assert_eq!(injected_in(tmp.path(), &db, Some(&config), "s1", ask), 5);
 }
 
 /// A running `icm serve --http` on a free loopback port, over `db`, killed

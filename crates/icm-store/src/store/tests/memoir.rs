@@ -405,3 +405,91 @@ fn test_search_concepts_by_label_escapes_wildcards() {
 }
 
 // === Vector search tests ===
+
+fn typed(memoir_id: &str, name: &str, ty: &str) -> Concept {
+    let mut c = Concept::new(memoir_id.into(), name.into(), format!("{name} def"));
+    c.labels.push(Label::new(icm_core::TYPE_NAMESPACE, ty));
+    c
+}
+
+fn ops_ontology() -> icm_core::Ontology {
+    icm_core::Ontology {
+        types: vec!["incident".into(), "deploy".into()],
+        require_type: true,
+        relations: vec!["incident:caused_by:deploy".parse().unwrap()],
+    }
+}
+
+#[test]
+fn ontology_round_trips_and_clears() {
+    let store = test_store();
+    let mut m = make_memoir("ops");
+    m.ontology = Some(ops_ontology());
+    let id = store.create_memoir(m).unwrap();
+    let mut got = store.get_memoir(&id).unwrap().unwrap();
+    assert_eq!(got.ontology, Some(ops_ontology()));
+
+    got.ontology = None;
+    store.update_memoir(&got).unwrap();
+    assert!(store.get_memoir(&id).unwrap().unwrap().ontology.is_none());
+}
+
+#[test]
+fn ontology_rejects_bad_concepts_and_links() {
+    let store = test_store();
+    let mut m = make_memoir("ops");
+    m.ontology = Some(ops_ontology());
+    let mid = store.create_memoir(m).unwrap();
+
+    let untyped = Concept::new(mid.clone(), "x".into(), "d".into());
+    assert!(matches!(
+        store.add_concept(untyped),
+        Err(IcmError::InvalidInput(_))
+    ));
+    assert!(store.add_concept(typed(&mid, "y", "service")).is_err());
+
+    let inc = store
+        .add_concept(typed(&mid, "outage", "incident"))
+        .unwrap();
+    let dep = store.add_concept(typed(&mid, "v42", "deploy")).unwrap();
+    store
+        .add_link(ConceptLink::new(
+            inc.clone(),
+            dep.clone(),
+            Relation::CausedBy,
+        ))
+        .unwrap();
+    // Reverse direction and undeclared relation are refused.
+    assert!(
+        store
+            .add_link(ConceptLink::new(
+                dep.clone(),
+                inc.clone(),
+                Relation::CausedBy
+            ))
+            .is_err()
+    );
+    assert!(
+        store
+            .add_link(ConceptLink::new(inc.clone(), dep.clone(), Relation::PartOf))
+            .is_err()
+    );
+
+    // Retyping an existing concept outside the ontology is refused too.
+    let mut c = store.get_concept(&inc).unwrap().unwrap();
+    c.labels = vec![Label::new(icm_core::TYPE_NAMESPACE, "nope")];
+    assert!(store.update_concept(&c).is_err());
+}
+
+#[test]
+fn memoir_without_ontology_stays_free_form() {
+    let store = test_store();
+    let mid = store.create_memoir(make_memoir("free")).unwrap();
+    let a = store
+        .add_concept(Concept::new(mid.clone(), "a".into(), "d".into()))
+        .unwrap();
+    let b = store.add_concept(typed(&mid, "b", "anything")).unwrap();
+    store
+        .add_link(ConceptLink::new(a, b, Relation::PartOf))
+        .unwrap();
+}

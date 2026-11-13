@@ -180,6 +180,11 @@ enum Commands {
         /// `$ICM_RECALL_ENGINE`.
         #[arg(long)]
         engine: Option<String>,
+
+        /// Also print the memoir concepts the query is about (up to 3),
+        /// with their typed relations. Ignored with `--format json|toml`.
+        #[arg(long)]
+        concepts: bool,
     },
 
     /// List memories
@@ -2526,38 +2531,52 @@ fn main() -> Result<()> {
             format,
             max_tokens,
             engine,
+            concepts,
         } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
-            match icm_store::RecallEngine::resolve(engine.as_deref(), max_tokens.is_some())? {
-                icm_store::RecallEngine::V2 => cmd_recall_v2(
-                    &store,
-                    emb_ref,
-                    &icm_store::RecallRequest {
-                        query: &query,
+            let show_concepts = concepts
+                && matches!(
+                    format,
+                    recall_format::RecallFormat::Toon | recall_format::RecallFormat::Detail
+                );
+            let res =
+                match icm_store::RecallEngine::resolve(engine.as_deref(), max_tokens.is_some())? {
+                    icm_store::RecallEngine::V2 => cmd_recall_v2(
+                        &store,
+                        emb_ref,
+                        &icm_store::RecallRequest {
+                            query: &query,
+                            limit,
+                            max_tokens,
+                            topic: topic.as_deref(),
+                            keyword: keyword.as_deref(),
+                            project: project.as_deref(),
+                            now: None,
+                            expand_neighbors: true,
+                        },
+                        format,
+                    ),
+                    icm_store::RecallEngine::Legacy => cmd_recall(
+                        &store,
+                        emb_ref,
+                        &query,
+                        topic.as_deref(),
                         limit,
-                        max_tokens,
-                        topic: topic.as_deref(),
-                        keyword: keyword.as_deref(),
-                        project: project.as_deref(),
-                        now: None,
-                        expand_neighbors: true,
-                    },
-                    format,
-                ),
-                icm_store::RecallEngine::Legacy => cmd_recall(
-                    &store,
-                    emb_ref,
-                    &query,
-                    topic.as_deref(),
-                    limit,
-                    keyword.as_deref(),
-                    project.as_deref(),
-                    format,
-                ),
+                        keyword.as_deref(),
+                        project.as_deref(),
+                        format,
+                    ),
+                };
+            if res.is_ok() && show_concepts {
+                // A backend without memoirs simply has nothing to add.
+                if let Ok(items) = icm_core::concept_context(&store, &query, 3) {
+                    print!("{}", icm_core::format_concept_context(&items));
+                }
             }
+            res
         }
         Commands::List {
             topic,

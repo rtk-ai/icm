@@ -14,6 +14,7 @@ compile_error!(
 
 pub mod auto_link;
 pub mod budget;
+pub mod concept_context;
 pub mod context_snapshot;
 pub mod embedder;
 pub mod embedding_policy;
@@ -41,6 +42,7 @@ pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 pub use auto_link::{AutoLinkOptions, add_backrefs, auto_link_memory};
 pub use budget::{BudgetSelection, ITEM_OVERHEAD_TOKENS, estimate_tokens, select_within_budget};
+pub use concept_context::{ConceptContext, concept_context, format_concept_context};
 pub use context_snapshot::{
     ContextSnapshot, ContextSnapshotOptions, SNAPSHOT_HEADER, SnapshotFormat, SnapshotSection,
     build_context_snapshot, build_context_snapshot_from_memories,

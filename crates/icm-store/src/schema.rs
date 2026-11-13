@@ -105,7 +105,7 @@ fn init_db(conn: &Connection) -> Result<(), IcmError> {
 /// the migrations, so a step added without a bump never reaches existing
 /// databases. `schema_fingerprint_is_paired_with_schema_version` fails
 /// when the schema objects change and this constant does not.
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 /// True when the database already carries the schema this binary would
 /// produce, so the migrations can be skipped. Reads only.
@@ -260,6 +260,8 @@ fn migrate_schema(conn: &Connection, embedding_dims: usize) -> Result<(), IcmErr
             relation TEXT NOT NULL,
             weight REAL NOT NULL DEFAULT 1.0,
             created_at TEXT NOT NULL,
+            source TEXT,          -- provenance (user, session:<id>, memory:<id>, ...)
+            invalidated_at TEXT,  -- NULL while the link holds
             UNIQUE(source_id, target_id, relation),
             CHECK(source_id != target_id)
         );
@@ -714,6 +716,13 @@ fn migrate_schema(conn: &Connection, embedding_dims: usize) -> Result<(), IcmErr
     if !has_embedding {
         add_column_if_missing(conn, "ALTER TABLE memories ADD COLUMN embedding BLOB")?;
     }
+
+    // Migration: provenance and invalidation on concept links.
+    add_column_if_missing(conn, "ALTER TABLE concept_links ADD COLUMN source TEXT")?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE concept_links ADD COLUMN invalidated_at TEXT",
+    )?;
 
     // Migration: scope FTS UPDATE trigger to indexed columns only (fixes #44).
     // The old trigger fired on ANY update (including update_access, apply_decay)
@@ -1549,8 +1558,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let expected = (
-            1,
-            "284f33e4efbe6dff1db12896084e1ce81813059ed3378449cc9f2c9d3a5b1b8c",
+            2,
+            "aa414805911ba4fe596247c48aff5e11480c870277a601161fd4aad88d47c75e",
         );
         assert_eq!(
             (SCHEMA_VERSION, schema_fingerprint(&conn).as_str()),

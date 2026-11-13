@@ -1137,6 +1137,34 @@ enum MemoirCommands {
         /// Relation type
         #[arg(short, long)]
         relation: CliRelation,
+
+        /// Where the link comes from (e.g. "user", "pr:42", "memory:<id>")
+        #[arg(short, long)]
+        source: Option<String>,
+    },
+
+    /// Mark a link as no longer true. It stays in the history (see
+    /// `inspect --history`) but is ignored by traversal and stats.
+    Unlink {
+        /// Memoir name
+        #[arg(short, long)]
+        memoir: String,
+
+        /// Source concept name
+        #[arg(long)]
+        from: String,
+
+        /// Target concept name
+        #[arg(long)]
+        to: String,
+
+        /// Relation type
+        #[arg(short, long)]
+        relation: CliRelation,
+
+        /// Delete the link instead of keeping it as history
+        #[arg(long)]
+        hard: bool,
     },
 
     /// Inspect a concept and its graph neighbors
@@ -1151,6 +1179,10 @@ enum MemoirCommands {
         /// BFS depth for neighborhood exploration
         #[arg(short = 'D', long, default_value = "1")]
         depth: usize,
+
+        /// Also list every link the concept ever had, invalidated ones included
+        #[arg(long)]
+        history: bool,
     },
 
     /// Export memoir graph as JSON or DOT (Graphviz)
@@ -2848,12 +2880,28 @@ fn main() -> Result<()> {
                 from,
                 to,
                 relation,
-            } => cmd_memoir_link(&store, &memoir, &from, &to, relation.into()),
+                source,
+            } => cmd_memoir_link(
+                &store,
+                &memoir,
+                &from,
+                &to,
+                relation.into(),
+                source.as_deref(),
+            ),
+            MemoirCommands::Unlink {
+                memoir,
+                from,
+                to,
+                relation,
+                hard,
+            } => cmd_memoir_unlink(&store, &memoir, &from, &to, relation.into(), hard),
             MemoirCommands::Inspect {
                 memoir,
                 name,
                 depth,
-            } => cmd_memoir_inspect(&store, &memoir, &name, depth),
+                history,
+            } => cmd_memoir_inspect(&store, &memoir, &name, depth, history),
             MemoirCommands::Export { memoir, format } => {
                 cmd_memoir_export(&store, &memoir, &format)
             }
@@ -13116,6 +13164,7 @@ fn cmd_memoir_link(
     from_name: &str,
     to_name: &str,
     relation: Relation,
+    source: Option<&str>,
 ) -> Result<()> {
     let memoir = resolve_memoir(store, memoir_name)?;
 
@@ -13126,9 +13175,42 @@ fn cmd_memoir_link(
         .get_concept_by_name(&memoir.id, to_name)?
         .ok_or_else(|| anyhow::anyhow!("concept not found: {to_name}"))?;
 
-    let link = ConceptLink::new(from.id, to.id, relation);
+    let mut link = ConceptLink::new(from.id, to.id, relation);
+    if let Some(src) = source {
+        link = link.with_source(src);
+    }
     let id = store.add_link(link)?;
     println!("Linked: {from_name} --{relation}--> {to_name} ({id})");
+    Ok(())
+}
+
+fn cmd_memoir_unlink(
+    store: &Store,
+    memoir_name: &str,
+    from_name: &str,
+    to_name: &str,
+    relation: Relation,
+    hard: bool,
+) -> Result<()> {
+    let memoir = resolve_memoir(store, memoir_name)?;
+    let from = store
+        .get_concept_by_name(&memoir.id, from_name)?
+        .ok_or_else(|| anyhow::anyhow!("concept not found: {from_name}"))?;
+    let to = store
+        .get_concept_by_name(&memoir.id, to_name)?
+        .ok_or_else(|| anyhow::anyhow!("concept not found: {to_name}"))?;
+    let link = store
+        .get_links_from(&from.id)?
+        .into_iter()
+        .find(|l| l.target_id == to.id && l.relation == relation)
+        .ok_or_else(|| anyhow::anyhow!("no active link {from_name} --{relation}--> {to_name}"))?;
+    if hard {
+        store.delete_link(&link.id)?;
+        println!("Deleted: {from_name} --{relation}--> {to_name}");
+    } else {
+        store.invalidate_link(&link.id)?;
+        println!("Invalidated: {from_name} --{relation}--> {to_name} (kept as history)");
+    }
     Ok(())
 }
 
@@ -13137,6 +13219,7 @@ fn cmd_memoir_inspect(
     memoir_name: &str,
     concept_name: &str,
     depth: usize,
+    history: bool,
 ) -> Result<()> {
     let memoir = resolve_memoir(store, memoir_name)?;
     let concept = store
@@ -13144,6 +13227,10 @@ fn cmd_memoir_inspect(
         .ok_or_else(|| anyhow::anyhow!("concept not found: {concept_name}"))?;
 
     print_concept(&concept);
+
+    if history {
+        print_link_history(store, &concept)?;
+    }
 
     let (neighbors, links) = store.get_neighborhood(&concept.id, depth)?;
 
@@ -13164,9 +13251,52 @@ fn cmd_memoir_inspect(
             .find(|c| c.id == link.target_id)
             .map(|c| c.name.as_str())
             .unwrap_or("?");
-        println!("    {src_name} --{}--> {tgt_name}", link.relation);
+        let src = link
+            .source
+            .as_deref()
+            .map(|s| format!("  [{s}]"))
+            .unwrap_or_default();
+        println!("    {src_name} --{}--> {tgt_name}{src}", link.relation);
     }
 
+    Ok(())
+}
+
+fn print_link_history(store: &Store, concept: &Concept) -> Result<()> {
+    let history = store.get_link_history(&concept.id)?;
+    if history.is_empty() {
+        return Ok(());
+    }
+    let name_of = |id: &str| -> String {
+        if id == concept.id {
+            return concept.name.clone();
+        }
+        store
+            .get_concept(id)
+            .ok()
+            .flatten()
+            .map(|c| c.name)
+            .unwrap_or_else(|| "?".to_string())
+    };
+    println!("  Link history:");
+    for l in &history {
+        let until = match l.invalidated_at {
+            Some(t) => format!(" until {}", format_local(&t, "%Y-%m-%d %H:%M")),
+            None => " (active)".to_string(),
+        };
+        let src = l
+            .source
+            .as_deref()
+            .map(|s| format!(" [{s}]"))
+            .unwrap_or_default();
+        println!(
+            "    {} --{}--> {}  since {}{until}{src}",
+            name_of(&l.source_id),
+            l.relation,
+            name_of(&l.target_id),
+            format_local(&l.created_at, "%Y-%m-%d %H:%M"),
+        );
+    }
     Ok(())
 }
 
@@ -18298,7 +18428,7 @@ mod cmd_memoir_tests {
         make_memoir(&s, "m");
         add_concept(&s, "m", "source", "src def");
         add_concept(&s, "m", "target", "tgt def");
-        cmd_memoir_link(&s, "m", "source", "target", Relation::DependsOn).unwrap();
+        cmd_memoir_link(&s, "m", "source", "target", Relation::DependsOn, None).unwrap();
 
         let mid = memoir_id(&s, "m");
         let src = s.get_concept_by_name(&mid, "source").unwrap().unwrap();
@@ -18322,7 +18452,8 @@ mod cmd_memoir_tests {
         let s = store();
         make_memoir(&s, "m");
         add_concept(&s, "m", "target", "def");
-        let err = cmd_memoir_link(&s, "m", "no-such", "target", Relation::RelatedTo).unwrap_err();
+        let err =
+            cmd_memoir_link(&s, "m", "no-such", "target", Relation::RelatedTo, None).unwrap_err();
         assert!(err.to_string().contains("concept not found"), "got: {err}");
     }
 
@@ -18332,7 +18463,8 @@ mod cmd_memoir_tests {
         let s = store();
         make_memoir(&s, "m");
         add_concept(&s, "m", "source", "def");
-        let err = cmd_memoir_link(&s, "m", "source", "no-such", Relation::RelatedTo).unwrap_err();
+        let err =
+            cmd_memoir_link(&s, "m", "source", "no-such", Relation::RelatedTo, None).unwrap_err();
         assert!(err.to_string().contains("concept not found"), "got: {err}");
     }
 
@@ -18585,6 +18717,7 @@ mod cmd_memoir_tests {
             from,
             to,
             relation,
+            ..
         } = command
         else {
             panic!("expected Link");

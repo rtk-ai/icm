@@ -55,10 +55,13 @@ fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<ConceptLink> {
         relation,
         weight: row.get(4)?,
         created_at: parse_dt(&row.get::<_, String>(5)?),
+        source: row.get(6)?,
+        invalidated_at: row.get::<_, Option<String>>(7)?.map(|s| parse_dt(&s)),
     })
 }
 
-const LINK_COLS: &str = "id, source_id, target_id, relation, weight, created_at";
+const LINK_COLS: &str =
+    "id, source_id, target_id, relation, weight, created_at, source, invalidated_at";
 
 // MemoirStore impl
 
@@ -401,10 +404,35 @@ impl MemoirStore for SqliteStore {
                 link.source_id, link.target_id
             )));
         }
+        // Re-asserting an invalidated edge revives it rather than tripping
+        // the UNIQUE(source_id, target_id, relation) constraint.
+        let revived: Option<String> = self
+            .conn
+            .query_row(
+                "UPDATE concept_links SET invalidated_at = NULL, weight = ?4,
+                 source = COALESCE(?5, source)
+                 WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3
+                   AND invalidated_at IS NOT NULL
+                 RETURNING id",
+                params![
+                    link.source_id,
+                    link.target_id,
+                    link.relation.to_string(),
+                    link.weight,
+                    link.source,
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        if let Some(id) = revived {
+            return Ok(id);
+        }
         self.conn
             .execute(
-                "INSERT INTO concept_links (id, source_id, target_id, relation, weight, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO concept_links (id, source_id, target_id, relation, weight, created_at,
+                 source, invalidated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
                 params![
                     link.id,
                     link.source_id,
@@ -412,6 +440,7 @@ impl MemoirStore for SqliteStore {
                     link.relation.to_string(),
                     link.weight,
                     link.created_at.to_rfc3339(),
+                    link.source,
                 ],
             )
             .map_err(db_err)?;
@@ -422,7 +451,7 @@ impl MemoirStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {LINK_COLS} FROM concept_links WHERE source_id = ?1"
+                "SELECT {LINK_COLS} FROM concept_links WHERE source_id = ?1 AND invalidated_at IS NULL"
             ))
             .map_err(db_err)?;
 
@@ -437,7 +466,7 @@ impl MemoirStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {LINK_COLS} FROM concept_links WHERE target_id = ?1"
+                "SELECT {LINK_COLS} FROM concept_links WHERE target_id = ?1 AND invalidated_at IS NULL"
             ))
             .map_err(db_err)?;
 
@@ -460,6 +489,36 @@ impl MemoirStore for SqliteStore {
         Ok(())
     }
 
+    fn invalidate_link(&self, id: &str) -> IcmResult<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE concept_links SET invalidated_at = ?2
+                 WHERE id = ?1 AND invalidated_at IS NULL",
+                params![id, Utc::now().to_rfc3339()],
+            )
+            .map_err(db_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    fn get_link_history(&self, concept_id: &str) -> IcmResult<Vec<ConceptLink>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {LINK_COLS} FROM concept_links
+                 WHERE source_id = ?1 OR target_id = ?1
+                 ORDER BY created_at"
+            ))
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![concept_id], row_to_link)
+            .map_err(db_err)?;
+        collect_rows(rows)
+    }
+
     fn get_neighbors(
         &self,
         concept_id: &str,
@@ -469,9 +528,9 @@ impl MemoirStore for SqliteStore {
 
         let base = format!(
             "SELECT {CONCEPT_COLS} FROM concepts WHERE id IN (
-                SELECT target_id FROM concept_links WHERE source_id = ?1 {{filter}}
+                SELECT target_id FROM concept_links WHERE source_id = ?1 AND invalidated_at IS NULL {{filter}}
                 UNION
-                SELECT source_id FROM concept_links WHERE target_id = ?1 {{filter}}
+                SELECT source_id FROM concept_links WHERE target_id = ?1 AND invalidated_at IS NULL {{filter}}
             )"
         );
 
@@ -567,7 +626,8 @@ impl MemoirStore for SqliteStore {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM concept_links
-                 WHERE source_id IN (SELECT id FROM concepts WHERE memoir_id = ?1)",
+                 WHERE source_id IN (SELECT id FROM concepts WHERE memoir_id = ?1)
+                   AND invalidated_at IS NULL",
                 params![memoir_id],
                 |row| row.get(0),
             )
@@ -619,6 +679,7 @@ impl MemoirStore for SqliteStore {
             .prepare(&format!(
                 "SELECT {LINK_COLS} FROM concept_links
                  WHERE source_id IN (SELECT id FROM concepts WHERE memoir_id = ?1)
+                   AND invalidated_at IS NULL
                  LIMIT 5000"
             ))
             .map_err(db_err)?;

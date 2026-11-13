@@ -48,6 +48,24 @@ pub trait MemoirStore {
     fn get_links_from(&self, concept_id: &str) -> IcmResult<Vec<ConceptLink>>;
     fn get_links_to(&self, concept_id: &str) -> IcmResult<Vec<ConceptLink>>;
     fn delete_link(&self, id: &str) -> IcmResult<()>;
+
+    /// Marks a link as no longer true without deleting it, so the graph
+    /// keeps the history ("A depended on B until <date>"). Re-adding the
+    /// same `(source, target, relation)` later revives it.
+    fn invalidate_link(&self, id: &str) -> IcmResult<()> {
+        let _ = id;
+        Err(crate::IcmError::Unsupported(
+            "memoir.invalidate_link".to_string(),
+        ))
+    }
+
+    /// Every link touching a concept, invalidated ones included, oldest first.
+    fn get_link_history(&self, concept_id: &str) -> IcmResult<Vec<ConceptLink>> {
+        let _ = concept_id;
+        Err(crate::IcmError::Unsupported(
+            "memoir.get_link_history".to_string(),
+        ))
+    }
     fn get_neighbors(
         &self,
         concept_id: &str,

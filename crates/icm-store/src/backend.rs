@@ -916,6 +916,12 @@ impl MemoirStore for Store {
     fn delete_link(&self, id: &str) -> IcmResult<()> {
         dispatch!(self, delete_link(id))
     }
+    fn invalidate_link(&self, id: &str) -> IcmResult<()> {
+        dispatch!(self, invalidate_link(id))
+    }
+    fn get_link_history(&self, concept_id: &str) -> IcmResult<Vec<ConceptLink>> {
+        dispatch!(self, get_link_history(concept_id))
+    }
     fn get_neighbors(
         &self,
         concept_id: &str,

@@ -49,13 +49,13 @@ pub use embedder::Embedder;
 pub use embedding_policy::{EmbeddingDecision, EmbeddingState, META_EMBEDDING_MODEL, decide};
 pub use error::{IcmError, IcmResult};
 pub use facts::{Fact, FactsStats};
-pub use facts_store::FactsStore;
+pub use facts_store::{FactsStore, concept_facts};
 #[cfg(feature = "embeddings")]
 pub use fastembed_embedder::{DEFAULT_MODEL as DEFAULT_EMBEDDING_MODEL, FastEmbedder};
 pub use feedback::{Feedback, FeedbackStats};
 pub use feedback_store::FeedbackStore;
 pub use fusion::{FusedHit, RRF_K, RankedHit, RankedList, RankedQuery, RawRelevance, rrf_fuse};
-pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
+pub use memoir::{Concept, ConceptLink, ENTITY_NAMESPACE, Label, Memoir, MemoirStats, Relation};
 pub use memoir_store::MemoirStore;
 pub use memory::{
     Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,

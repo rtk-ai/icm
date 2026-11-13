@@ -298,6 +298,22 @@ icm memoir export -m "system-architecture" -f json     # Structured JSON with al
 icm memoir export -m "system-architecture" -f dot | dot -Tsvg > graph.svg
 ```
 
+#### Ontology (optional schema per memoir)
+
+A memoir can declare which concept types exist and which relations may
+connect them, so every agent writing into it uses the same vocabulary. A
+concept's type is its `type:<name>` label. Once set, concepts and links that
+break the ontology are rejected; rows already in the memoir are listed, not
+deleted.
+
+```bash
+icm memoir ontology set -m ops --types service,incident,deploy --require-type \
+  --relations 'incident:caused_by:deploy,service:depends_on:service,*:related_to:*'
+icm memoir ontology show ops
+icm memoir ontology check ops     # exit 1 if existing rows break it
+icm memoir ontology clear ops     # back to free-form
+```
+
 ### Transcripts (verbatim session replay)
 
 Store every message exchanged with an agent as-is — no summarization, no extraction.
@@ -366,6 +382,7 @@ memories and memoirs.
 | `icm_memoir_search` | Full-text search, optionally filtered by label |
 | `icm_memoir_search_all` | Search across all memoirs |
 | `icm_memoir_link` | Create typed relation between concepts |
+| `icm_memoir_set_ontology` | Declare allowed concept types and relations (or clear them) |
 | `icm_memoir_inspect` | Inspect concept and graph neighborhood (BFS) |
 | `icm_memoir_export` | Export graph (json, dot, ascii, ai) with confidence levels |
 

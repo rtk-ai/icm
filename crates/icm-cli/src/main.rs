@@ -51,9 +51,9 @@ use serde_json::Value;
 
 use icm_core::{
     Concept, ConceptLink, DEDUP_SIMILARITY_THRESHOLD, Feedback, FeedbackStore, Importance, Label,
-    MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat,
-    WakeUpOptions, build_wake_up, find_similar_memory, format_local, is_preference_topic,
-    keyword_matches, project_matches, topic_matches,
+    MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Ontology, Relation, RelationRule,
+    WakeUpFormat, WakeUpOptions, build_wake_up, find_similar_memory, format_local,
+    is_preference_topic, keyword_matches, project_matches, topic_matches,
 };
 use icm_store::Store;
 
@@ -1164,6 +1164,13 @@ enum MemoirCommands {
         format: String,
     },
 
+    /// Manage the memoir's ontology: allowed concept types and the relations
+    /// permitted between them. Writes that break it are rejected.
+    Ontology {
+        #[command(subcommand)]
+        command: OntologyCommands,
+    },
+
     /// Distill memories from a topic into concepts in a memoir
     Distill {
         /// Source memory topic
@@ -1173,6 +1180,48 @@ enum MemoirCommands {
         /// Target memoir name
         #[arg(long)]
         into: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum OntologyCommands {
+    /// Attach (or replace) the ontology. Existing concepts and links that
+    /// break it are listed but kept.
+    Set {
+        /// Memoir name
+        #[arg(short, long)]
+        memoir: String,
+
+        /// Allowed concept types (comma-separated), carried by `type:<name>` labels
+        #[arg(short, long, value_delimiter = ',')]
+        types: Vec<String>,
+
+        /// Allowed relations: `relation` or `from:relation:to`, `*` = any type
+        /// (e.g. `incident:caused_by:deploy,*:depends_on:service`)
+        #[arg(short, long, value_delimiter = ',')]
+        relations: Vec<String>,
+
+        /// Every concept must carry a `type:` label
+        #[arg(long)]
+        require_type: bool,
+    },
+
+    /// Print the ontology
+    Show {
+        /// Memoir name
+        name: String,
+    },
+
+    /// List existing concepts and links that break the ontology (exit 1 if any)
+    Check {
+        /// Memoir name
+        name: String,
+    },
+
+    /// Remove the ontology: the memoir becomes free-form again
+    Clear {
+        /// Memoir name
+        name: String,
     },
 }
 
@@ -2821,6 +2870,7 @@ fn main() -> Result<()> {
                 cmd_memoir_create(&store, name, description)
             }
             MemoirCommands::List => cmd_memoir_list(&store),
+            MemoirCommands::Ontology { command } => cmd_memoir_ontology(&store, command),
             MemoirCommands::Show { name } => cmd_memoir_show(&store, &name),
             MemoirCommands::Delete { name } => cmd_memoir_delete(&store, &name),
             MemoirCommands::AddConcept {
@@ -12944,6 +12994,110 @@ fn cmd_memoir_list(store: &Store) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn cmd_memoir_ontology(store: &Store, command: OntologyCommands) -> Result<()> {
+    match command {
+        OntologyCommands::Set {
+            memoir,
+            types,
+            relations,
+            require_type,
+        } => {
+            let mut m = resolve_memoir(store, &memoir)?;
+            let relations = relations
+                .iter()
+                .map(|r| r.parse::<RelationRule>())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let ontology = Ontology {
+                types: types.into_iter().map(|t| t.trim().to_string()).collect(),
+                require_type,
+                relations,
+            };
+            if ontology.is_empty() {
+                bail!(
+                    "empty ontology: pass --types, --relations or --require-type (or use `clear`)"
+                );
+            }
+            m.ontology = Some(ontology.clone());
+            m.updated_at = chrono::Utc::now();
+            store.update_memoir(&m)?;
+            println!("Ontology set on memoir '{}'.", m.name);
+            print_ontology(&ontology);
+            let violations = memoir_ontology_violations(store, &m, &ontology)?;
+            if !violations.is_empty() {
+                println!(
+                    "\n{} existing row(s) break it (kept, fix or relabel them):",
+                    violations.len()
+                );
+                for v in &violations {
+                    println!("  - {v}");
+                }
+            }
+            Ok(())
+        }
+        OntologyCommands::Show { name } => {
+            let m = resolve_memoir(store, &name)?;
+            match &m.ontology {
+                Some(o) => print_ontology(o),
+                None => println!("Memoir '{}' has no ontology (free-form).", m.name),
+            }
+            Ok(())
+        }
+        OntologyCommands::Check { name } => {
+            let m = resolve_memoir(store, &name)?;
+            let Some(ontology) = m.ontology.clone() else {
+                println!("Memoir '{}' has no ontology (free-form).", m.name);
+                return Ok(());
+            };
+            let violations = memoir_ontology_violations(store, &m, &ontology)?;
+            if violations.is_empty() {
+                println!("Memoir '{}' conforms to its ontology.", m.name);
+                return Ok(());
+            }
+            for v in &violations {
+                println!("{v}");
+            }
+            std::process::exit(1);
+        }
+        OntologyCommands::Clear { name } => {
+            let mut m = resolve_memoir(store, &name)?;
+            m.ontology = None;
+            m.updated_at = chrono::Utc::now();
+            store.update_memoir(&m)?;
+            println!("Ontology removed from memoir '{}'.", m.name);
+            Ok(())
+        }
+    }
+}
+
+fn memoir_ontology_violations(
+    store: &Store,
+    memoir: &Memoir,
+    ontology: &Ontology,
+) -> Result<Vec<String>> {
+    let concepts = store.list_concepts(&memoir.id)?;
+    let links = store.get_links_for_memoir(&memoir.id)?;
+    Ok(icm_core::ontology_violations(ontology, &concepts, &links))
+}
+
+fn print_ontology(o: &Ontology) {
+    let types = if o.types.is_empty() {
+        "(any)".to_string()
+    } else {
+        o.types.join(", ")
+    };
+    println!("  types:        {types}");
+    println!("  require type: {}", o.require_type);
+    if o.relations.is_empty() {
+        println!("  relations:    (any)");
+    } else {
+        println!("  relations:");
+        for r in &o.relations {
+            println!("    {r}");
+        }
+    }
 }
 
 fn cmd_memoir_show(store: &Store, name: &str) -> Result<()> {

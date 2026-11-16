@@ -1287,15 +1287,10 @@ fn is_keepable_fragment(s: &str) -> bool {
     // should have prevented these from forming, but this is cheap
     // belt-and-suspenders against future regressions.
     let last_word = s.split_whitespace().next_back().unwrap_or("");
-    if last_word.ends_with("://")
+    !(last_word.ends_with("://")
         || last_word.ends_with('/')
         || last_word.ends_with('\\')
-        || last_word.ends_with('=')
-    {
-        return false;
-    }
-
-    true
+        || last_word.ends_with('='))
 }
 
 /// Lowercase prefixes that mark a fragment as the tail of a sentence

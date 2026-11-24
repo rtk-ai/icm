@@ -66,5 +66,6 @@ mod memoir;
 mod memory;
 mod perf;
 mod search;
+mod topic;
 mod transcript;
 mod validation;

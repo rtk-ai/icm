@@ -18,6 +18,7 @@ use icm_core::{
 
 pub use crate::common::{
     CodeArea, ConsolidationJob, HookEvent, HookEventInsert, HookStatsRow, PendingRow,
+    TopicMergeStats,
 };
 use crate::schema::init_db_with_dims;
 pub struct SqliteStore {
@@ -468,4 +469,5 @@ mod patterns;
 mod ranked;
 #[cfg(test)]
 mod tests;
+mod topic;
 mod transcript;

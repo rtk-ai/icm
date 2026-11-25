@@ -381,8 +381,8 @@ fn recall_with_depth(
 }
 
 /// One query's ranking: its own embedding and date window, the ranked
-/// search, the substring fallback when no arm matched, or after the ranked
-/// hits for a query with Hangul.
+/// search, the substring fallback when no arm matched, or fused with the
+/// ranked hits for a query with Hangul.
 fn rank_one(
     store: &Store,
     embedder: Option<&dyn Embedder>,
@@ -420,15 +420,12 @@ fn rank_one(
     };
     let mut ranked = store.search_ranked(&query, keep)?;
     if ranked.is_empty() {
-        ranked = substring_matches(store, text, limit, keep);
+        ranked = substring_matches(store, text, limit, false, keep);
     } else if text.chars().any(is_hangul) {
         // A Korean word glued to another particle is not a whole-word hit,
         // so another query word matching elsewhere must not hide it (#539).
-        let extra: Vec<RankedHit> = substring_matches(store, text, limit, keep)
-            .into_iter()
-            .filter(|h| !ranked.iter().any(|r| r.memory.id == h.memory.id))
-            .collect();
-        ranked.extend(extra);
+        let glued = substring_matches(store, text, limit, true, keep);
+        ranked = fuse_with_substring(ranked, glued);
     }
     Ok((ranked, window))
 }
@@ -465,6 +462,44 @@ fn fuse_queries(lists: Vec<Vec<RankedHit>>) -> Vec<RankedHit> {
         .into_iter()
         .filter_map(|f| {
             let (_, mut hit) = best.remove(&f.id)?;
+            hit.score = f.score;
+            Some(hit)
+        })
+        .collect()
+}
+
+/// A ranked list and a substring list as one by Reciprocal Rank Fusion.
+/// A memory in both keeps its ranked hit, with its arm ranks.
+///
+/// Appended after the ranked hits, a substring match fell past the limit
+/// as soon as another query word ("2023") matched dozens of memories.
+fn fuse_with_substring(ranked: Vec<RankedHit>, substring: Vec<RankedHit>) -> Vec<RankedHit> {
+    if substring.is_empty() {
+        return ranked;
+    }
+    let ids = |l: &[RankedHit]| -> Vec<String> { l.iter().map(|h| h.memory.id.clone()).collect() };
+    let (ranked_ids, substring_ids) = (ids(&ranked), ids(&substring));
+    let lists = [
+        RankedList {
+            name: "ranked",
+            ids: &ranked_ids,
+            weight: 1.0,
+        },
+        RankedList {
+            name: "substring",
+            ids: &substring_ids,
+            weight: 1.0,
+        },
+    ];
+    let fused = rrf_fuse(&lists, RRF_K);
+    let mut hits: HashMap<String, RankedHit> = HashMap::new();
+    for hit in substring.into_iter().chain(ranked) {
+        hits.insert(hit.memory.id.clone(), hit);
+    }
+    fused
+        .into_iter()
+        .filter_map(|f| {
+            let mut hit = hits.remove(&f.id)?;
             hit.score = f.score;
             Some(hit)
         })
@@ -520,7 +555,9 @@ fn substring_words(query: &str) -> Vec<String> {
 }
 
 /// Last resort when no arm matched anything: memories that contain a query
-/// word as a substring of their topic, summary or keywords.
+/// word as a substring of their topic, summary or keywords. With
+/// `hangul_only`, only the words with Hangul are searched, still ordered by
+/// every query word they contain: the other words had the lexical index.
 ///
 /// The lexical index matches whole words and does not stem, so without a
 /// vector arm "deploy" finds nothing in a store that only says
@@ -532,13 +569,18 @@ fn substring_matches(
     store: &Store,
     query: &str,
     limit: usize,
+    hangul_only: bool,
     keep: &dyn Fn(&Memory) -> bool,
 ) -> Vec<RankedHit> {
     let words = substring_words(query);
-    if words.is_empty() {
+    let refs: Vec<&str> = words
+        .iter()
+        .map(String::as_str)
+        .filter(|w| !hangul_only || w.chars().any(is_hangul))
+        .collect();
+    if refs.is_empty() {
         return Vec::new();
     }
-    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
     let mut found = match store.search_by_keywords(&refs, SUBSTRING_POOL) {
         Ok(found) => found,
         Err(e) => {
@@ -1726,21 +1768,40 @@ mod pipeline_tests {
     /// A Korean query word that is not a whole indexed word still finds its
     /// memory when another query word matches elsewhere (#539).
     #[test]
-    fn substring_fallback_follows_ranked_hits_for_korean() {
+    fn substring_fallback_is_fused_with_ranked_hits_for_korean() {
         let s = store();
         let list = add(&s, "ko-fixture", "사건 목록", None);
-        let year = add(&s, "notes", "incident report filed in 2023", None);
+        // "2023" alone fills any limit, as in a store of thousands.
+        for i in 0..60 {
+            add(&s, "notes", &format!("report {i} filed in 2023"), None);
+        }
         let glued = add(&s, "ko-fixture", "사건은 2023년에 발생했습니다", None);
 
-        let out = run(&s, None, &request("사건 2023")).unwrap();
+        let mut req = request("사건 2023");
+        req.limit = 5;
+        let out = run(&s, None, &req).unwrap();
         let ids: Vec<&str> = out.hits.iter().map(|h| h.memory.id.as_str()).collect();
-        assert_eq!(ids.len(), 3, "{ids:?}");
-        // Ranked hits first, then the substring match, each once.
-        assert!(ids[..2].contains(&list.as_str()));
-        assert!(ids[..2].contains(&year.as_str()));
-        assert_eq!(ids[2], glued.as_str());
-        assert_eq!(out.hits[2].score, 0.0);
-        assert!(out.hits[2].fts_rank.is_none());
+        assert_eq!(ids.len(), 5, "{ids:?}");
+        assert!(ids.contains(&glued.as_str()), "{ids:?}");
+        // A memory in both lists keeps its ranked hit, and comes once.
+        let both = out.hits.iter().find(|h| h.memory.id == list).unwrap();
+        assert!(both.fts_rank.is_some());
+        assert_eq!(ids.iter().filter(|id| **id == list.as_str()).count(), 1);
+        assert!(out.hits.iter().all(|h| h.score > 0.0));
+    }
+
+    /// The fused substring list searches only the Korean words: a Latin
+    /// word that the index matched is not searched again as a substring.
+    #[test]
+    fn korean_fusion_does_not_widen_latin_words() {
+        let s = store();
+        let exact = add(&s, "notes", "deploy checklist", None);
+        add(&s, "notes", "deployment broke", None);
+        add(&s, "ko-fixture", "회의는 내일입니다", None);
+
+        let out = run(&s, None, &request("deploy 사건")).unwrap();
+        let ids: Vec<&str> = out.hits.iter().map(|h| h.memory.id.as_str()).collect();
+        assert_eq!(ids, vec![exact.as_str()]);
     }
 
     /// A whole-word match never goes through the fallback.

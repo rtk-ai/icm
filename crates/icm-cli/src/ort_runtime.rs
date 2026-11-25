@@ -19,8 +19,16 @@
 //! latest stable release satisfying that, verify a hard-coded SHA256, and
 //! trust *only* our managed copy (or an explicit user `ORT_DYLIB_PATH`) —
 //! never an ambient system library.
+//!
+//! Source: Microsoft's official `Microsoft.ML.OnnxRuntime` NuGet package. It
+//! holds the native library of every platform under
+//! `runtimes/<rid>/native/`, so it is large (~150 MB); we read only the zip
+//! central directory and the one entry we need through HTTP range requests
+//! (~6-12 MB). The GitHub release archives used before are gone: the
+//! `microsoft/onnxruntime` repository returns 404 since November 2026.
 
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -34,64 +42,77 @@ const ORT_VERSION: &str = "1.29.0";
 
 const ORT_DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 
-/// A supported download target: the Microsoft asset infix, the archive
-/// extension (`tgz` on unix, `zip` on Windows), the pinned SHA256 of
-/// `onnxruntime-<asset>-<ver>.<ext>`, the canonical shared-library filename that
-/// ort's load-dynamic backend looks for, and a human-readable download size for
-/// the first-launch prompt.
+/// URL of the official `Microsoft.ML.OnnxRuntime` NuGet package for `version`.
+fn nupkg_url(version: &str) -> String {
+    format!(
+        "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/{version}/\
+         microsoft.ml.onnxruntime.{version}.nupkg"
+    )
+}
+
+/// A supported download target: the NuGet runtime identifier, the pinned
+/// SHA256 of the shared library itself (as extracted from the package), the
+/// canonical shared-library filename that ort's load-dynamic backend looks
+/// for (also its name inside the package), and a human-readable download size
+/// for the first-launch prompt.
 struct Target {
-    asset: &'static str,
-    archive_ext: &'static str,
+    rid: &'static str,
     sha256: &'static str,
     lib_name: &'static str,
     approx_size: &'static str,
 }
 
-/// Resolve the onnxruntime asset for a given `(os, arch)`, or `None` if
+impl Target {
+    /// Path of the library inside the NuGet package.
+    fn entry_name(&self) -> String {
+        format!("runtimes/{}/native/{}", self.rid, self.lib_name)
+    }
+}
+
+/// Resolve the onnxruntime target for a given `(os, arch)`, or `None` if
 /// unsupported. Windows-on-ARM and exotic arches are deferred (issue #345).
 /// `macos`/`x86_64` (Intel Mac) is deferred too as of the 1.29.0 pin: upstream
-/// onnxruntime stopped publishing `osx-x86_64` prebuilt archives starting
-/// with the first release in our required range (1.24.0) — confirmed no
-/// release from 1.24.0 through 1.29.0 ships one. An Intel-Mac
+/// onnxruntime stopped publishing `osx-x86_64` prebuilt binaries starting
+/// with the first release in our required range (1.24.0) — the 1.29.0 NuGet
+/// package has no `osx-x64` runtime either. An Intel-Mac
 /// `embeddings-dynamic` build still works via an explicit `ORT_DYLIB_PATH`
 /// to a self-built or Homebrew onnxruntime; only the automatic
 /// download-on-first-use path is unavailable.
 /// Split out from [`detect_target`] so the target table is unit-testable across
 /// platforms from any host.
 fn target_for(os: &str, arch: &str) -> Option<Target> {
-    // (asset, sha256, approx_size) — the shared-library name and archive format
-    // are derived from `os` below.
-    let (asset, sha256, approx_size) = match (os, arch) {
+    // (rid, sha256 of the library, approx_size of its compressed entry) — the
+    // shared-library name is derived from `os` below.
+    let (rid, sha256, approx_size) = match (os, arch) {
         ("macos", "aarch64") => (
             "osx-arm64",
-            "d0706fc34f315d8c88639d0a8c81f2e09e815f282cabed3493c06a054352cf92",
-            "~40 MB",
+            "c04fe65021445904a3cae047272cad05e648282c75bf1f9eb7b3440120ae13dc",
+            "~12 MB",
         ),
         ("linux", "x86_64") => (
             "linux-x64",
-            "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba",
+            "5715f06d8992ca8eeeddcce43df3a7d38f97d537052126f558e912cb312460ca",
             "~11 MB",
         ),
         ("linux", "aarch64") => (
-            "linux-aarch64",
-            "e1799098ebc054b370f6176a450f158720f297818c613e5dc99b92e2ec82346f",
+            "linux-arm64",
+            "a27d21126db312aa8f02f3d5eaebe466e991f51f469882e6d0407d5a8b64afda",
             "~10 MB",
         ),
         ("windows", "x86_64") => (
             "win-x64",
-            "c9b4b7086b529ad814f428c1bad028e20a25d7dc0699836775faace4ab5b78b2",
-            "~76 MB",
+            "69d8e6d3879a3b4001cdc74c8ed9ccc7e7f799a5b847059738323404519ec471",
+            "~6 MB",
         ),
         _ => return None,
     };
-    let (archive_ext, lib_name) = match os {
-        "windows" => ("zip", "onnxruntime.dll"),
-        "macos" => ("tgz", "libonnxruntime.dylib"),
-        _ => ("tgz", "libonnxruntime.so"),
+    let lib_name = match os {
+        "windows" => "onnxruntime.dll",
+        "macos" => "libonnxruntime.dylib",
+        _ => "libonnxruntime.so",
     };
     Some(Target {
-        asset,
-        archive_ext,
+        rid,
         sha256,
         lib_name,
         approx_size,
@@ -146,16 +167,137 @@ pub fn activate_if_present() -> bool {
     false
 }
 
-fn download_bytes(url: &str) -> Result<Vec<u8>> {
+const USER_AGENT: &str = "icm-onnxruntime-fetch";
+
+/// Size of one ranged read. The zip reader seeks to the central directory at
+/// the end of the package, then streams the one entry we need; reading in
+/// 1 MiB blocks keeps that to a handful of requests.
+const RANGE_BLOCK: u64 = 1 << 20;
+
+/// GET `bytes=start-end` (inclusive) of `url`. Returns the body and the total
+/// size of the resource, parsed from `Content-Range`. Fails if the server
+/// ignores the range: downloading the whole ~150 MB package is not an option.
+fn http_range(url: &str, start: u64, end: u64) -> Result<(Vec<u8>, u64)> {
     let resp = ureq::get(url)
-        .set("User-Agent", "icm-onnxruntime-fetch")
+        .set("User-Agent", USER_AGENT)
+        .set("Range", &format!("bytes={start}-{end}"))
         .call()
         .with_context(|| format!("failed to download {url}"))?;
+    if resp.status() != 206 {
+        bail!(
+            "{url} answered {} instead of 206 Partial Content: byte ranges unsupported",
+            resp.status()
+        );
+    }
+    let total = resp
+        .header("Content-Range")
+        .and_then(|v| v.rsplit('/').next())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("{url}: missing or invalid Content-Range header"))?;
     let mut buf = Vec::new();
     resp.into_reader()
         .read_to_end(&mut buf)
         .context("failed to read download body")?;
+    Ok((buf, total))
+}
+
+/// `Read + Seek` over a remote file of known length, fetched lazily in
+/// [`RANGE_BLOCK`]-sized blocks through `fetch(start, end_inclusive)`. Lets
+/// the `zip` crate parse a remote archive while downloading only what it
+/// actually reads.
+struct RangeReader<F> {
+    fetch: F,
+    len: u64,
+    pos: u64,
+    blocks: HashMap<u64, Vec<u8>>,
+    /// Bytes actually downloaded, for the progress line.
+    fetched: u64,
+}
+
+impl<F: FnMut(u64, u64) -> Result<Vec<u8>>> RangeReader<F> {
+    fn new(len: u64, fetch: F) -> Self {
+        Self {
+            fetch,
+            len,
+            pos: 0,
+            blocks: HashMap::new(),
+            fetched: 0,
+        }
+    }
+
+    fn block(&mut self, idx: u64) -> std::io::Result<&[u8]> {
+        if !self.blocks.contains_key(&idx) {
+            let start = idx * RANGE_BLOCK;
+            let end = (start + RANGE_BLOCK).min(self.len) - 1;
+            let data = (self.fetch)(start, end).map_err(std::io::Error::other)?;
+            if data.len() as u64 != end - start + 1 {
+                return Err(std::io::Error::other(format!(
+                    "short range read: asked {start}-{end}, got {} bytes",
+                    data.len()
+                )));
+            }
+            self.fetched += data.len() as u64;
+            self.blocks.insert(idx, data);
+        }
+        Ok(&self.blocks[&idx])
+    }
+}
+
+impl<F: FnMut(u64, u64) -> Result<Vec<u8>>> Read for RangeReader<F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let idx = self.pos / RANGE_BLOCK;
+        let off = (self.pos % RANGE_BLOCK) as usize;
+        let block = self.block(idx)?;
+        let n = buf.len().min(block.len() - off);
+        buf[..n].copy_from_slice(&block[off..off + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<F> Seek for RangeReader<F> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos = target.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start")
+        })?;
+        Ok(self.pos)
+    }
+}
+
+/// Read `entry` out of a zip archive (the NuGet package). The `zip` crate
+/// checks the entry's CRC32 once fully read.
+fn extract_entry<R: Read + Seek>(archive: R, entry: &str) -> Result<Vec<u8>> {
+    let mut zip = zip::ZipArchive::new(archive).context("reading the onnxruntime package")?;
+    let mut file = zip
+        .by_name(entry)
+        .with_context(|| format!("{entry} not found in the onnxruntime package"))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .with_context(|| format!("extracting {entry}"))?;
+    if buf.is_empty() {
+        bail!("{entry} is empty in the onnxruntime package");
+    }
     Ok(buf)
+}
+
+/// Fetch only `entry` from the remote zip at `url`. Returns the entry bytes
+/// and how many bytes were downloaded.
+fn fetch_remote_entry(url: &str, entry: &str) -> Result<(Vec<u8>, u64)> {
+    // A one-byte probe gives the package size.
+    let (_, len) = http_range(url, 0, 0)?;
+    let mut reader = RangeReader::new(len, |start, end| {
+        http_range(url, start, end).map(|(data, _)| data)
+    });
+    let bytes = extract_entry(&mut reader, entry)?;
+    Ok((bytes, reader.fetched))
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -172,74 +314,6 @@ fn verify_sha(bytes: &[u8], expected: &str, what: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Does this archive entry's file name identify the onnxruntime library we want?
-///
-/// - unix `.tgz`: `libonnxruntime.<ver>.{dylib,so}` (a regular file; the
-///   `libonnxruntime_providers_*` siblings start with an underscore, so the
-///   `"libonnxruntime."` prefix excludes them).
-/// - Windows `.zip`: `onnxruntime.dll` exactly (the `onnxruntime_providers_*.dll`
-///   siblings start with an underscore, so an exact match excludes them).
-fn is_onnxruntime_lib(name: &str) -> bool {
-    let unix =
-        name.starts_with("libonnxruntime.") && (name.contains(".dylib") || name.contains(".so"));
-    unix || name == "onnxruntime.dll"
-}
-
-/// Extract the real onnxruntime shared library from the downloaded archive,
-/// dispatching on `archive_ext` (`tgz` on unix, `zip` on Windows).
-fn extract_lib(archive: &[u8], archive_ext: &str) -> Result<Vec<u8>> {
-    if archive_ext == "zip" {
-        return extract_lib_zip(archive);
-    }
-    use flate2::read::GzDecoder;
-    let mut tar = tar::Archive::new(GzDecoder::new(archive));
-    for entry in tar.entries().context("reading onnxruntime archive")? {
-        let mut entry = entry.context("reading archive entry")?;
-        if entry.header().entry_type() != tar::EntryType::Regular {
-            continue; // skip the unversioned symlink
-        }
-        let name = entry
-            .path()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_default();
-        if is_onnxruntime_lib(&name) {
-            let mut buf = Vec::new();
-            entry
-                .read_to_end(&mut buf)
-                .context("reading library bytes")?;
-            if !buf.is_empty() {
-                return Ok(buf);
-            }
-        }
-    }
-    bail!("libonnxruntime not found in onnxruntime archive")
-}
-
-/// Extract `onnxruntime.dll` from the Windows `.zip` asset.
-fn extract_lib_zip(archive: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Cursor;
-    let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("reading onnxruntime zip")?;
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).context("reading zip entry")?;
-        if !entry.is_file() {
-            continue;
-        }
-        let name = entry
-            .enclosed_name()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_default();
-        if is_onnxruntime_lib(&name) {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).context("reading dll bytes")?;
-            if !buf.is_empty() {
-                return Ok(buf);
-            }
-        }
-    }
-    bail!("onnxruntime.dll not found in onnxruntime archive")
 }
 
 /// Write the verified library bytes to `tmp`, refusing to follow a
@@ -291,19 +365,19 @@ pub fn download(progress: bool) -> Result<PathBuf> {
     let dir = managed_dir().ok_or_else(|| anyhow!("cannot resolve the icm data directory"))?;
     let lib_path = dir.join(target.lib_name);
 
-    let asset = format!(
-        "onnxruntime-{}-{ORT_VERSION}.{}",
-        target.asset, target.archive_ext
-    );
-    let url = format!(
-        "https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{asset}"
-    );
+    let url = nupkg_url(ORT_VERSION);
+    let entry = target.entry_name();
     if progress {
-        eprintln!("Downloading {asset} ({}, one time)…", target.approx_size);
+        eprintln!(
+            "Downloading onnxruntime {ORT_VERSION} for {} ({}, one time)…",
+            target.rid, target.approx_size
+        );
     }
-    let bytes = download_bytes(&url)?;
-    verify_sha(&bytes, target.sha256, &asset)?;
-    let lib_bytes = extract_lib(&bytes, target.archive_ext)?;
+    let (lib_bytes, fetched) = fetch_remote_entry(&url, &entry)?;
+    verify_sha(&lib_bytes, target.sha256, &entry)?;
+    if progress {
+        eprintln!("Fetched {:.1} MB from api.nuget.org", fetched as f64 / 1e6);
+    }
 
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     // Write to a temp sibling then rename, so a concurrent reader never sees a
@@ -451,10 +525,10 @@ mod tests {
         if let Some(t) = detect_target() {
             if cfg!(target_os = "macos") {
                 assert_eq!(t.lib_name, "libonnxruntime.dylib");
-                assert!(t.asset.starts_with("osx-"));
+                assert!(t.rid.starts_with("osx-"));
             } else if cfg!(target_os = "linux") {
                 assert_eq!(t.lib_name, "libonnxruntime.so");
-                assert!(t.asset.starts_with("linux-"));
+                assert!(t.rid.starts_with("linux-"));
             }
             assert_eq!(t.sha256.len(), 64, "pinned sha256 must be 64 hex chars");
         }
@@ -482,71 +556,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_lib_picks_versioned_regular_file() {
-        // Build a tiny .tgz: a providers sibling (must be ignored) + the real
-        // versioned library. No symlink entry (tar builder appends regular
-        // files), which still exercises the prefix/underscore filtering.
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-
-        fn tar_entry(builder: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8]) {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_entry_type(tar::EntryType::Regular);
-            header.set_cksum();
-            builder.append_data(&mut header, path, data).unwrap();
-        }
-
-        let mut builder = tar::Builder::new(Vec::new());
-        tar_entry(
-            &mut builder,
-            "onnxruntime-osx-arm64-1.29.0/lib/libonnxruntime_providers_shared.dylib",
-            b"PROVIDER",
-        );
-        tar_entry(
-            &mut builder,
-            "onnxruntime-osx-arm64-1.29.0/lib/libonnxruntime.1.29.0.dylib",
-            b"REAL-LIBRARY-BYTES",
-        );
-        let tar_bytes = builder.into_inner().unwrap();
-
-        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
-        gz.write_all(&tar_bytes).unwrap();
-        let tgz = gz.finish().unwrap();
-
-        let extracted = extract_lib(&tgz, "tgz").expect("should find the versioned library");
-        assert_eq!(extracted, b"REAL-LIBRARY-BYTES");
-    }
-
-    #[test]
     fn target_table_covers_all_supported_platforms() {
-        // Every shipped target must have a 64-hex sha, a matching archive
-        // format, and the canonical lib name ort's load-dynamic backend expects.
+        // Every shipped target must have a 64-hex sha, the NuGet runtime
+        // identifier, and the canonical lib name ort's load-dynamic backend
+        // expects (also its name inside the package).
         let cases = [
-            (
-                "macos",
-                "aarch64",
-                "tgz",
-                "libonnxruntime.dylib",
-                "osx-arm64",
-            ),
-            ("linux", "x86_64", "tgz", "libonnxruntime.so", "linux-x64"),
-            (
-                "linux",
-                "aarch64",
-                "tgz",
-                "libonnxruntime.so",
-                "linux-aarch64",
-            ),
-            ("windows", "x86_64", "zip", "onnxruntime.dll", "win-x64"),
+            ("macos", "aarch64", "libonnxruntime.dylib", "osx-arm64"),
+            ("linux", "x86_64", "libonnxruntime.so", "linux-x64"),
+            ("linux", "aarch64", "libonnxruntime.so", "linux-arm64"),
+            ("windows", "x86_64", "onnxruntime.dll", "win-x64"),
         ];
-        for (os, arch, ext, lib, asset) in cases {
+        for (os, arch, lib, rid) in cases {
             let t = target_for(os, arch)
                 .unwrap_or_else(|| panic!("{os}/{arch} must be a supported target"));
-            assert_eq!(t.archive_ext, ext, "{os}/{arch} archive ext");
             assert_eq!(t.lib_name, lib, "{os}/{arch} lib name");
-            assert_eq!(t.asset, asset, "{os}/{arch} asset infix");
+            assert_eq!(t.rid, rid, "{os}/{arch} runtime identifier");
+            assert_eq!(t.entry_name(), format!("runtimes/{rid}/native/{lib}"));
             assert_eq!(t.sha256.len(), 64, "{os}/{arch} sha must be 64 hex chars");
         }
         // Windows-on-ARM and exotic arches are deferred (issue #345).
@@ -558,41 +583,106 @@ mod tests {
         assert!(target_for("macos", "x86_64").is_none());
     }
 
-    #[test]
-    fn is_onnxruntime_lib_excludes_provider_siblings() {
-        assert!(is_onnxruntime_lib("libonnxruntime.1.29.0.dylib"));
-        assert!(is_onnxruntime_lib("libonnxruntime.so.1.29.0"));
-        assert!(is_onnxruntime_lib("onnxruntime.dll"));
-        // The providers siblings must never be picked.
-        assert!(!is_onnxruntime_lib("libonnxruntime_providers_shared.dylib"));
-        assert!(!is_onnxruntime_lib("onnxruntime_providers_shared.dll"));
-        assert!(!is_onnxruntime_lib("README.md"));
-    }
-
-    #[test]
-    fn extract_lib_zip_picks_the_dll() {
-        // Build a tiny .zip mirroring the Windows asset layout: a providers
-        // sibling (must be ignored) + the real onnxruntime.dll.
+    /// A tiny zip mirroring the NuGet package layout: a padding entry large
+    /// enough to span several range blocks, the providers sibling (must be
+    /// ignored) and the real library.
+    fn fake_nupkg(lib: &[u8]) -> Vec<u8> {
         use std::io::Cursor;
         use zip::write::SimpleFileOptions;
 
         let mut buf = Vec::new();
         {
             let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = SimpleFileOptions::default();
+            let stored =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let deflated = SimpleFileOptions::default();
+            w.start_file("runtimes/android/native/onnxruntime.aar", stored)
+                .unwrap();
+            w.write_all(&vec![7u8; (RANGE_BLOCK * 2 + 123) as usize])
+                .unwrap();
             w.start_file(
-                "onnxruntime-win-x64-1.29.0/lib/onnxruntime_providers_shared.dll",
-                opts,
+                "runtimes/linux-x64/native/libonnxruntime_providers_shared.so",
+                deflated,
             )
             .unwrap();
             w.write_all(b"PROVIDER").unwrap();
-            w.start_file("onnxruntime-win-x64-1.29.0/lib/onnxruntime.dll", opts)
+            w.start_file("runtimes/linux-x64/native/libonnxruntime.so", deflated)
                 .unwrap();
-            w.write_all(b"REAL-DLL-BYTES").unwrap();
+            w.write_all(lib).unwrap();
             w.finish().unwrap();
         }
-        let extracted = extract_lib(&buf, "zip").expect("should find onnxruntime.dll");
-        assert_eq!(extracted, b"REAL-DLL-BYTES");
+        buf
+    }
+
+    #[test]
+    fn extract_entry_picks_the_exact_entry() {
+        let pkg = fake_nupkg(b"REAL-LIBRARY-BYTES");
+        let t = target_for("linux", "x86_64").unwrap();
+        let got = extract_entry(std::io::Cursor::new(&pkg), &t.entry_name()).unwrap();
+        assert_eq!(got, b"REAL-LIBRARY-BYTES");
+        assert!(
+            extract_entry(
+                std::io::Cursor::new(&pkg),
+                "runtimes/osx-arm64/native/libonnxruntime.dylib"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn range_reader_extracts_without_reading_everything() {
+        // The library sits after a >2-block padding entry: reading it through
+        // the range reader must not download the padding from the start.
+        let lib = b"REAL-LIBRARY-BYTES".repeat(1000);
+        let pkg = fake_nupkg(&lib);
+        let mut calls = Vec::new();
+        let mut reader = RangeReader::new(pkg.len() as u64, |start: u64, end: u64| {
+            calls.push((start, end));
+            Ok(pkg[start as usize..=end as usize].to_vec())
+        });
+        let got = extract_entry(&mut reader, "runtimes/linux-x64/native/libonnxruntime.so")
+            .expect("entry readable through ranges");
+        assert_eq!(got, lib);
+        assert!(
+            reader.fetched < pkg.len() as u64,
+            "fetched {} of {} bytes",
+            reader.fetched,
+            pkg.len()
+        );
+        drop(reader);
+        // Block 0 holds only the start of the padding entry: never fetched.
+        // (The zip end-of-archive scan covers the last 64 KiB, which is why
+        // the block before the last one may be read.)
+        assert!(!calls.contains(&(0, RANGE_BLOCK - 1)), "calls: {calls:?}");
+    }
+
+    #[test]
+    fn range_reader_rejects_short_reads() {
+        let mut reader = RangeReader::new(10, |_, _| Ok(vec![0u8; 3]));
+        let mut buf = [0u8; 4];
+        assert!(reader.read(&mut buf).is_err());
+    }
+
+    #[test]
+    fn range_reader_seek_and_eof() {
+        let data: Vec<u8> = (0..=255u8).collect();
+        let mut reader = RangeReader::new(data.len() as u64, |s: u64, e: u64| {
+            Ok(data[s as usize..=e as usize].to_vec())
+        });
+        assert_eq!(reader.seek(SeekFrom::End(-6)).unwrap(), 250);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, vec![250, 251, 252, 253, 254, 255]);
+        assert!(reader.seek(SeekFrom::Current(-1000)).is_err());
+    }
+
+    #[test]
+    fn nupkg_url_points_at_the_official_package() {
+        assert_eq!(
+            nupkg_url("1.29.0"),
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.29.0/\
+             microsoft.ml.onnxruntime.1.29.0.nupkg"
+        );
     }
 
     /// Audit regression: `write_lib_tmp` must not follow a pre-existing

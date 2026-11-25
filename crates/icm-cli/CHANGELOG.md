@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.11.6](https://github.com/rtk-ai/icm/compare/icm-v0.11.5...icm-v0.11.6) (2026-11-25)
+
+
+### Features
+
+* **hooks:** keyword pass over the agent's last turn on each prompt ([2dd92c3](https://github.com/rtk-ai/icm/commit/2dd92c3763bfbd7a60c0681f075fdd3c661e2f92))
+* **hooks:** keyword pass over the agent's last turn on each prompt ([d98a486](https://github.com/rtk-ai/icm/commit/d98a486ed910d04b621a7427169c0a138f72a8e1))
+* **serve:** HTTPS and hardening for icm serve --http ([856b31a](https://github.com/rtk-ai/icm/commit/856b31a2b3f3ea5ea91cc072bc9b6accd68f6bb3))
+* **serve:** HTTPS for icm serve --http ([d909052](https://github.com/rtk-ai/icm/commit/d9090529dc02bae4a9a9b71c345e92924ce77904))
+
+
+### Bug Fixes
+
+* **embeddings:** download onnxruntime from NuGet, GitHub releases are gone ([97f301e](https://github.com/rtk-ai/icm/commit/97f301e6f531b8e6f5255e548c81d26c2cf0c6cc))
+* **embeddings:** download onnxruntime from NuGet, GitHub releases are gone ([9d1ca4a](https://github.com/rtk-ai/icm/commit/9d1ca4a6515f0d90fcf1ed6f3e0082c98004b71f)), closes [#562](https://github.com/rtk-ai/icm/issues/562)
+* extraction limits, init flags, duplicate preferences, local auto fallback ([e5bda6c](https://github.com/rtk-ai/icm/commit/e5bda6c873e44007d93752ba21bf8b501dd26d4e))
+* **extraction:** auto provider stays local under unrecognised agents ([6d5a8d2](https://github.com/rtk-ai/icm/commit/6d5a8d2fb337b9827436578cb34dbca0eb6075e7))
+* honor extraction limits, persist init flags, no duplicate preferences ([e3f3db2](https://github.com/rtk-ai/icm/commit/e3f3db22d0efcfac27e141fa1cd98e87b9de2edb))
+* **recall:** find Korean words with particles in the substring fallback ([6b175ca](https://github.com/rtk-ai/icm/commit/6b175cab3123bee4ece38f98b3af43c4c647f969))
+* **recall:** find Korean words with particles in the substring fallback ([f518c29](https://github.com/rtk-ai/icm/commit/f518c299d0692f4426d559968ca9a5bcb926a608)), closes [#539](https://github.com/rtk-ai/icm/issues/539)
+* **recall:** keep Korean substring matches when another word is ranked ([e77e202](https://github.com/rtk-ai/icm/commit/e77e2024e735b6df4a139188bc65726e2d126025)), closes [#539](https://github.com/rtk-ai/icm/issues/539)
+* **serve:** harden icm serve --http for a public bind ([00952c2](https://github.com/rtk-ai/icm/commit/00952c2af0135e230324ec6a929441c4cb2d2eed))
+
 ## [0.11.5](https://github.com/rtk-ai/icm/compare/icm-v0.11.4...icm-v0.11.5) (2026-10-21)
 
 

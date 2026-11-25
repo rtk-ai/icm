@@ -20,6 +20,7 @@ use icm_core::{
 
 use crate::common::{
     CodeArea, ConsolidationJob, HookEvent, HookEventInsert, HookStatsRow, PendingRow,
+    TopicMergeStats,
 };
 
 #[cfg(feature = "backend-sqlite")]
@@ -250,6 +251,34 @@ impl Store {
             _ => Err(IcmError::Config(
                 "rebuild_search_indexes is only supported on the SQLite backend".into(),
             )),
+        }
+    }
+
+    /// Merge every memory in `from` into `into` (SQLite backend only).
+    /// Remote backends return [`IcmError::Unsupported`].
+    pub fn merge_topics(
+        &self,
+        from: &str,
+        into: &str,
+        dedupe: bool,
+        dry_run: bool,
+    ) -> IcmResult<TopicMergeStats> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.merge_topics(from, into, dedupe, dry_run),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Unsupported("topic merge".into())),
+        }
+    }
+
+    /// Rename `old` to `new` (SQLite backend only). The target must not
+    /// already exist; use [`Self::merge_topics`] to combine two live topics.
+    pub fn rename_topic(&self, old: &str, new: &str, dry_run: bool) -> IcmResult<TopicMergeStats> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.rename_topic(old, new, dry_run),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Unsupported("topic rename".into())),
         }
     }
 

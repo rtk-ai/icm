@@ -55,7 +55,7 @@ use icm_core::{
     WakeUpOptions, build_wake_up, find_similar_memory, format_local, is_preference_topic,
     keyword_matches, project_matches, topic_matches,
 };
-use icm_store::Store;
+use icm_store::{Store, TopicMergeStats};
 
 #[derive(Parser)]
 #[command(
@@ -290,6 +290,12 @@ enum Commands {
 
     /// List all topics
     Topics,
+
+    /// Merge or rename topics
+    Topic {
+        #[command(subcommand)]
+        action: TopicAction,
+    },
 
     /// Show global statistics
     Stats,
@@ -967,6 +973,39 @@ enum Commands {
     #[cfg(feature = "tui")]
     #[command(hide = true)]
     Tui,
+}
+
+#[derive(Subcommand)]
+enum TopicAction {
+    /// Merge every memory from one topic into another
+    Merge {
+        /// Topic to merge from
+        from: String,
+        /// Topic to merge into
+        into: String,
+        /// Preview without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Drop source memories whose summary already exists in the target
+        #[arg(long)]
+        dedupe: bool,
+        /// Apply the change (default is a preview)
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Rename a topic (the target must not exist yet)
+    Rename {
+        /// Current topic name
+        old: String,
+        /// New topic name
+        new: String,
+        /// Preview without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply the change (default is a preview)
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2698,6 +2737,21 @@ fn main() -> Result<()> {
             min_cluster_size,
         } => cmd_extract_patterns(&store, &topic, memoir.as_deref(), min_cluster_size),
         Commands::Topics => cmd_topics(&store),
+        Commands::Topic { action } => match action {
+            TopicAction::Merge {
+                from,
+                into,
+                dry_run,
+                dedupe,
+                apply,
+            } => cmd_topic_merge(&store, &from, &into, dedupe, dry_run, apply),
+            TopicAction::Rename {
+                old,
+                new,
+                dry_run,
+                apply,
+            } => cmd_topic_rename(&store, &old, &new, dry_run, apply),
+        },
         Commands::Stats => cmd_stats(&store),
         Commands::ExtractPending {
             limit,
@@ -5852,6 +5906,53 @@ fn cmd_topics(store: &Store) -> Result<()> {
         println!("{topic:<30} {count}");
     }
     Ok(())
+}
+
+fn cmd_topic_merge(
+    store: &Store,
+    from: &str,
+    into: &str,
+    dedupe: bool,
+    dry_run: bool,
+    apply: bool,
+) -> Result<()> {
+    if apply && dry_run {
+        bail!("--apply and --dry-run are mutually exclusive");
+    }
+    // Default is a preview: a bulk move is destructive and hard to reverse,
+    // so the caller opts in with --apply (same contract as `icm upgrade`).
+    let preview = !apply;
+    let stats = store.merge_topics(from, into, dedupe, preview)?;
+    print_topic_merge_stats("merge", from, into, &stats, preview);
+    Ok(())
+}
+
+fn cmd_topic_rename(store: &Store, old: &str, new: &str, dry_run: bool, apply: bool) -> Result<()> {
+    if apply && dry_run {
+        bail!("--apply and --dry-run are mutually exclusive");
+    }
+    let preview = !apply;
+    let stats = store.rename_topic(old, new, preview)?;
+    print_topic_merge_stats("rename", old, new, &stats, preview);
+    Ok(())
+}
+
+fn print_topic_merge_stats(
+    kind: &str,
+    from: &str,
+    into: &str,
+    stats: &TopicMergeStats,
+    preview: bool,
+) {
+    println!("Topic {kind}: {from} -> {into}");
+    println!("  scanned:           {}", stats.scanned);
+    println!("  moved:             {}", stats.moved);
+    println!("  duplicates skipped: {}", stats.duplicates_skipped);
+    println!("  target before:     {}", stats.target_before);
+    println!("  target after:      {}", stats.target_after);
+    if preview {
+        println!("(dry run — no changes made; pass --apply to execute)");
+    }
 }
 
 fn cmd_stats(store: &Store) -> Result<()> {

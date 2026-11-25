@@ -43,7 +43,7 @@ mod postgres;
 mod opensearch;
 
 // Shared row types (backend-agnostic).
-pub use common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
+pub use common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow, TopicMergeStats};
 
 // The runtime-dispatched store and the backend selector.
 pub use backend::{BackendKind, Store};

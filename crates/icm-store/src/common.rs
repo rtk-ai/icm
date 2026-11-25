@@ -84,3 +84,23 @@ pub struct ConsolidationJob {
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }
+
+/// Outcome of a topic merge / rename (`icm topic merge|rename`).
+///
+/// Counts are reported by the CLI so a caller can verify the move before
+/// and after; `target_before` + `moved` should equal `target_after` unless
+/// duplicates were skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TopicMergeStats {
+    /// Memories found in the source topic.
+    pub scanned: usize,
+    /// Memories moved into the target topic.
+    pub moved: usize,
+    /// Source memories dropped because the target already had the same
+    /// summary (`--dedupe`). Zero when dedupe is off.
+    pub duplicates_skipped: usize,
+    /// Memories already in the target topic before the operation.
+    pub target_before: usize,
+    /// Memories in the target topic after the operation.
+    pub target_after: usize,
+}

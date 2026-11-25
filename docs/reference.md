@@ -264,6 +264,12 @@ icm consolidate --topic "my-project"
 icm topics
 icm stats
 
+# Merge / rename topics (preview by default; --apply executes)
+icm topic merge "old-project" "my-project"          # preview
+icm topic merge "old-project" "my-project" --apply
+icm topic merge "old-project" "my-project" --apply --dedupe
+icm topic rename "old-topic" "new-topic" --apply
+
 # Extract facts from text (rule-based, zero LLM cost)
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```

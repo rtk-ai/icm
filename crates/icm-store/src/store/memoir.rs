@@ -287,6 +287,29 @@ impl MemoirStore for SqliteStore {
         collect_rows(rows)
     }
 
+    fn rank_concepts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
+        let any = sanitize_fts_query_any(query);
+        if any.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cols = CONCEPT_COLS
+            .split(", ")
+            .map(|c| format!("c.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {cols} FROM concepts_fts f JOIN concepts c ON c.rowid = f.rowid
+             WHERE concepts_fts MATCH ?1
+             ORDER BY bm25(concepts_fts), c.confidence DESC
+             LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![any, limit as i64], row_to_concept)
+            .map_err(db_err)?;
+        collect_rows(rows)
+    }
+
     fn search_all_concepts_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
         let sanitized = sanitize_fts_query(query);
         if sanitized.is_empty() {

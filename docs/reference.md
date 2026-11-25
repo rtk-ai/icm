@@ -288,6 +288,10 @@ icm memoir search -m "system-architecture" "service" --label "domain:auth"
 # Inspect neighborhood
 icm memoir inspect -m "system-architecture" "auth-service" -D 2
 
+# Recall with graph context: also prints the memoir concepts the query is
+# about, with their typed relations (MCP: "concepts": true on icm_memory_recall)
+icm recall "why is checkout slow" --concepts
+
 # Export graph (formats: json, dot, ascii, ai)
 icm memoir export -m "system-architecture" -f ascii   # Box-drawing with confidence bars
 icm memoir export -m "system-architecture" -f dot      # Graphviz DOT (color = confidence level)

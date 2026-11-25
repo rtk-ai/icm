@@ -896,6 +896,9 @@ impl MemoirStore for Store {
     fn search_all_concepts_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
         dispatch!(self, search_all_concepts_fts(query, limit))
     }
+    fn rank_concepts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
+        dispatch!(self, rank_concepts(query, limit))
+    }
     fn refine_concept(
         &self,
         id: &str,

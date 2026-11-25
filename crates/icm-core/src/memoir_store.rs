@@ -35,6 +35,16 @@ pub trait MemoirStore {
     /// Search concepts across all memoirs via FTS.
     fn search_all_concepts_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>>;
 
+    /// Concepts across all memoirs ranked by relevance to a natural-language
+    /// query: any query word may match (OR), best BM25 first. Unlike
+    /// [`Self::search_all_concepts_fts`], which needs every word to match.
+    fn rank_concepts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
+        let _ = (query, limit);
+        Err(crate::IcmError::Unsupported(
+            "memoir.rank_concepts".to_string(),
+        ))
+    }
+
     // --- Refinement ---
     fn refine_concept(
         &self,

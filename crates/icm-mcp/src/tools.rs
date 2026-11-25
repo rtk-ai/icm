@@ -216,6 +216,11 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                         "enum": ["text", "json"],
                         "default": "text",
                         "description": "Output shape. `json` returns an array of records with `id`, `topic`, `summary`, `importance`, `weight`, `keywords`, `related_ids` and timestamps, for clients that parse the result"
+                    },
+                    "concepts": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Also append the memoir concepts the query is about (up to 3), with their typed relations (depends_on, caused_by...). Text format only."
                     }
                 },
                 "required": ["query"]
@@ -1511,7 +1516,55 @@ fn tool_recall(
         Ok(engine) => engine,
         Err(e) => return ToolResult::error(format!("{e}")),
     };
-    tool_recall_on(store, embedder, args, compact, engine, max_tokens)
+    let mut result = tool_recall_on(store, embedder, args, compact, engine, max_tokens);
+    append_concept_context(store, args, &mut result);
+    result
+}
+
+/// Most memoir concepts a recall with `concepts: true` appends.
+const RECALL_CONCEPTS: usize = 3;
+
+/// `concepts: true` on a text recall: append the memoir concepts the query
+/// is about, with their direct relations. Off by default so the recall
+/// output, and its token cost, do not change for existing callers. A JSON
+/// recall is left untouched (its body is a bare array).
+fn append_concept_context(store: &Store, args: &Value, result: &mut ToolResult) {
+    let wanted = args
+        .get("concepts")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !wanted || result.is_error || !matches!(output_format(args), Ok(OutputFormat::Text)) {
+        return;
+    }
+    let query: Vec<&str> = get_str(args, "query")
+        .into_iter()
+        .chain(
+            args.get("queries")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
+        .collect();
+    let items = match icm_core::concept_context(store, &query.join(" "), RECALL_CONCEPTS) {
+        Ok(items) => items,
+        // A backend without memoirs, or no concept FTS yet: recall stands alone.
+        Err(e) => {
+            tracing::debug!(error = %e, "recall: no concept context");
+            return;
+        }
+    };
+    let extra = icm_core::format_concept_context(&items);
+    if extra.is_empty() {
+        return;
+    }
+    if let Some(first) = result.content.first_mut() {
+        if first.text == MSG_NO_MEMORIES {
+            first.text = extra.trim_start().to_string();
+        } else {
+            first.text.push_str(&extra);
+        }
+    }
 }
 
 /// Most queries one `icm_memory_recall` call ranks (the schema's maxItems).
@@ -3297,6 +3350,49 @@ mod tests {
             1,
             "error prefix must not be doubled: {text}"
         );
+    }
+
+    #[test]
+    fn recall_appends_concepts_only_when_asked() {
+        let store = test_store();
+        let call = |name: &str, args: Value| call_tool(&store, None, name, &args, false);
+        call("icm_memoir_create", json!({"name": "ops"}));
+        call(
+            "icm_memoir_add_concept",
+            json!({"memoir": "ops", "name": "checkout-api", "definition": "Payment checkout service"}),
+        );
+        call(
+            "icm_memoir_add_concept",
+            json!({"memoir": "ops", "name": "redis", "definition": "Session cache"}),
+        );
+        call(
+            "icm_memoir_link",
+            json!({"memoir": "ops", "from": "checkout-api", "to": "redis", "relation": "depends_on"}),
+        );
+        call(
+            "icm_memory_store",
+            json!({"topic": "decisions-shop", "content": "checkout latency spikes come from cold caches"}),
+        );
+
+        let base = json!({"query": "checkout latency", "project": ""});
+        let plain = call("icm_memory_recall", base.clone());
+        assert!(!plain.content[0].text.contains("Related concepts"));
+
+        let mut with = base.clone();
+        with["concepts"] = json!(true);
+        let text = call("icm_memory_recall", with).content[0].text.clone();
+        assert!(text.contains("Related concepts (memoirs):"), "{text}");
+        assert!(text.contains("[ops] checkout-api"), "{text}");
+        assert!(
+            text.contains("checkout-api --depends_on--> redis"),
+            "{text}"
+        );
+
+        let mut json_fmt = base;
+        json_fmt["concepts"] = json!(true);
+        json_fmt["format"] = json!("json");
+        let out = call("icm_memory_recall", json_fmt).content[0].text.clone();
+        assert!(serde_json::from_str::<Value>(&out).is_ok(), "{out}");
     }
 
     /// Manual-testing finding (against a real local Postgres backend):

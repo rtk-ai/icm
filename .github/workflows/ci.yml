@@ -134,7 +134,7 @@ jobs:
           "$bin" --no-embeddings --db "$db" recall delta | grep -qi delta \
             && echo "OK: degraded to keyword-only without crashing" \
             || { echo "FAIL: memory not stored / recall failed"; exit 1; }
-      - name: Opt-in download + semantic search (onnxruntime 1.20.1 ↔ ort ABI)
+      - name: Opt-in download + semantic search (pinned onnxruntime ↔ ort ABI)
         # The highest-risk regression: the pinned onnxruntime must load under the
         # `ort` version fastembed uses, or ort's version assertion aborts. Prove
         # it end-to-end — download the runtime, then embed with a small model and
@@ -207,7 +207,7 @@ jobs:
           "$bin" --no-embeddings --db "$db" recall delta | grep -qi delta \
             && echo "OK: degraded to keyword-only without crashing" \
             || { echo "FAIL: memory not stored / recall failed"; exit 1; }
-      - name: Opt-in download + semantic search (onnxruntime 1.20.1 ↔ ort ABI)
+      - name: Opt-in download + semantic search (pinned onnxruntime ↔ ort ABI)
         # Highest-risk regression on Windows: the pinned onnxruntime.dll must load
         # under the `ort` version fastembed uses, or ort's version assertion
         # aborts. Prove it end-to-end with a purely semantic recall.

@@ -4,7 +4,7 @@ Components built into the `icm` binary that are not Rust crates. This file is ke
 
 ## ONNX Runtime (Microsoft)
 
-Linked statically into the builds that ship semantic search (aarch64-apple-darwin, x86_64-pc-windows-msvc), through the `ort` crate. The other builds load it at run time after `icm embeddings download`, which fetches Microsoft's release. ONNX Runtime carries its own notices for the components it includes: https://github.com/microsoft/onnxruntime/blob/main/ThirdPartyNotices.txt
+Linked statically into the builds that ship semantic search (aarch64-apple-darwin, x86_64-pc-windows-msvc), through the `ort` crate. The other builds load it at run time after `icm embeddings download`, which fetches the library from Microsoft's official `Microsoft.ML.OnnxRuntime` NuGet package. ONNX Runtime carries its own notices for the components it includes, in the `ThirdPartyNotices.txt` file of that package: https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime
 
 ```
 MIT License

@@ -27,6 +27,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -74,7 +75,31 @@ pub struct AppState {
     mcp_instructions: Option<Arc<str>>,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
+    /// Bound to a non-loopback address: tools that read the server's
+    /// filesystem are refused over `/mcp`.
+    remote: bool,
+    /// One permit per request in flight (`[http] max_concurrent`).
+    slots: Arc<tokio::sync::Semaphore>,
 }
+
+/// How `icm serve --http` runs (`[http]`, `--tls`).
+pub struct ServeOptions {
+    pub tls: Option<crate::tls::TlsFiles>,
+    pub mcp: bool,
+    pub request_timeout: std::time::Duration,
+    pub header_timeout: std::time::Duration,
+    pub max_concurrent: usize,
+}
+
+/// Shortest bearer token accepted on a non-loopback bind.
+pub const MIN_REMOTE_TOKEN_CHARS: usize = 32;
+
+/// Largest `raw` excerpt `POST /store` takes (as `content`, 64 KB).
+const MAX_RAW_BYTES: usize = 64 * 1024;
+
+/// MCP tools that read the server's filesystem (`icm_learn` scans the
+/// directory it is given): refused when the server listens beyond loopback.
+const LOCAL_ONLY_TOOLS: [&str; 1] = ["icm_learn"];
 
 /// Audit finding: every store access here treated a poisoned Mutex as a
 /// *permanent* fault ("store poisoned", 500) rather than recovering, unlike
@@ -228,16 +253,55 @@ pub struct McpQuery {
 // Server entry
 // ---------------------------------------------------------------------------
 
+/// The bearer token: `--token`, else `$ICM_HTTP_TOKEN`, else the first line
+/// of `[http] token_file`. Blank means none, so `--token ""` cannot pass
+/// for a token on a public bind.
+pub fn resolve_token(
+    flag: Option<&str>,
+    env: Option<String>,
+    token_file: &str,
+) -> Result<Option<String>> {
+    let token = match (flag, env) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(t)) => t,
+        (None, None) if !token_file.trim().is_empty() => {
+            let path = token_file.trim();
+            let path = match path.strip_prefix("~/") {
+                Some(rest) => directories::BaseDirs::new()
+                    .map_or_else(|| PathBuf::from(path), |d| d.home_dir().join(rest)),
+                None => PathBuf::from(path),
+            };
+            std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("[http] token_file {}: {e}", path.display()))?
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        }
+        (None, None) => String::new(),
+    };
+    let token = token.trim();
+    Ok((!token.is_empty()).then(|| token.to_string()))
+}
+
 /// Pure guard, factored out for unit testing: reject a non-loopback bind
-/// with no token. Returns `Err(message)` when the combination is unsafe.
-fn check_bind_requires_token(addr: &SocketAddr, token: &Option<String>) -> Result<(), String> {
-    if token.is_none() && !addr.ip().is_loopback() {
-        return Err(format!(
+/// with no token, or with one short enough to guess. Returns
+/// `Err(message)` when the combination is unsafe.
+pub fn check_bind_requires_token(addr: &SocketAddr, token: &Option<String>) -> Result<(), String> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    match token {
+        None => Err(format!(
             "refusing to bind {addr}: only loopback addresses (127.0.0.1, ::1) may run \
              without --token. Pass --token <TOKEN> to expose on other interfaces."
-        ));
+        )),
+        Some(t) if t.chars().count() < MIN_REMOTE_TOKEN_CHARS => Err(format!(
+            "refusing to bind {addr}: the --token must be at least {MIN_REMOTE_TOKEN_CHARS} \
+             characters on a non-loopback address (e.g. `openssl rand -hex 32`)."
+        )),
+        Some(_) => Ok(()),
     }
-    Ok(())
 }
 
 /// Run the HTTP server until it's interrupted. Loads NOTHING beyond
@@ -251,6 +315,7 @@ pub async fn run_http_server(
     token: Option<String>,
     auto_consolidate: icm_mcp::AutoConsolidate,
     mcp_instructions: Option<String>,
+    opts: ServeOptions,
 ) -> Result<()> {
     // A non-loopback bind with no token exposes the full memory store —
     // recall, store, consolidate — to anyone who can reach the interface,
@@ -260,6 +325,13 @@ pub async fn run_http_server(
     if let Err(msg) = check_bind_requires_token(&addr, &token) {
         anyhow::bail!(msg);
     }
+    let remote = !addr.ip().is_loopback();
+    if remote && opts.tls.is_none() {
+        eprintln!(
+            "[icm http] warning: {addr} is not loopback and TLS is off: the bearer token \
+             and memories travel in clear text. Use --tls or a TLS reverse proxy."
+        );
+    }
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         embedder: embedder.map(Arc::from),
@@ -267,34 +339,128 @@ pub async fn run_http_server(
         auto_consolidate,
         mcp_instructions: mcp_instructions.map(Arc::from),
         token,
+        remote,
+        slots: Arc::new(tokio::sync::Semaphore::new(opts.max_concurrent.max(1))),
     };
 
-    let app = Router::new()
-        .route("/mcp", post(handle_mcp))
+    let mut app = Router::new();
+    if opts.mcp {
+        app = app.route("/mcp", post(handle_mcp));
+    }
+    let app = app
         .route("/recall", post(handle_recall))
         .route("/store", post(handle_store))
         .route("/consolidate", post(handle_consolidate))
         .route("/stats", get(handle_stats))
         .route("/topics", get(handle_topics))
         .route("/health", get(handle_health))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            opts.request_timeout,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            limit_middleware,
+        ))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
+    // Bound here, before the "listening" line, so a caller that waits for
+    // it can connect at once.
+    let listener = std::net::TcpListener::bind(addr)
+        .and_then(|l| l.set_nonblocking(true).map(|()| l))
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
     let local = listener.local_addr().unwrap_or(addr);
-    eprintln!("[icm http] listening on http://{local}");
 
-    axum::serve(listener, app).await?;
+    match &opts.tls {
+        Some(tls) => {
+            let config = load_tls(tls).await?;
+            eprintln!(
+                "[icm http] listening on https://{local} (certificate {})",
+                tls.cert.display()
+            );
+            let mut server = axum_server::from_tcp_rustls(listener, config);
+            limit_headers(server.http_builder(), opts.header_timeout);
+            server
+                .serve(app.into_make_service())
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to serve https on {local}: {e}"))?;
+        }
+        None => {
+            eprintln!("[icm http] listening on http://{local}");
+            let mut server = axum_server::from_tcp(listener);
+            limit_headers(server.http_builder(), opts.header_timeout);
+            server
+                .serve(app.into_make_service())
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to serve http on {local}: {e}"))?;
+        }
+    }
     Ok(())
+}
+
+/// Close an HTTP/1 connection whose request headers take longer than
+/// `timeout` (slowloris); TLS handshakes have their own 10 s limit.
+fn limit_headers(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    timeout: std::time::Duration,
+) {
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(timeout);
+}
+
+/// The certificate of `[http.tls]`, for rustls on ring.
+async fn load_tls(tls: &crate::tls::TlsFiles) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    // Another part of the process may have installed a provider already.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "[http.tls]: loading {} / {}: {e}",
+                tls.cert.display(),
+                tls.key.display()
+            )
+        })?;
+    if tls.generated {
+        eprintln!(
+            "[icm http] generated a self-signed certificate: {} (clients must trust it)",
+            tls.cert.display()
+        );
+    }
+    Ok(config)
+}
+
+/// At most `[http] max_concurrent` requests at once; the next one gets 503
+/// at once rather than waiting behind the store lock.
+async fn limit_middleware(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    match state.slots.clone().try_acquire_owned() {
+        Ok(_permit) => next.run(request).await,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server busy, retry later\n",
+        )
+            .into_response(),
+    }
 }
 
 pub fn run_mcp_stdio_proxy(base_url: &str, token: Option<&str>, compact: bool) -> Result<()> {
     let endpoint = mcp_proxy_endpoint(base_url, compact)?;
+    if token.is_some() && sends_in_clear(&endpoint) {
+        eprintln!(
+            "[icm http] warning: {base_url} is plain http to a non-loopback host: \
+             the bearer token travels in clear text. Use https://."
+        );
+    }
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -327,6 +493,21 @@ pub fn run_mcp_stdio_proxy(base_url: &str, token: Option<&str>, compact: bool) -
 // Auth middleware
 // ---------------------------------------------------------------------------
 
+/// `localhost`, `127.x.y.z` or `[::1]`, with or without a port.
+fn is_loopback_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 async fn auth_middleware(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -338,6 +519,22 @@ async fn auth_middleware(
         return next.run(request).await;
     }
     let Some(expected) = state.token.as_deref() else {
+        // No token (loopback only): a web page whose name was rebound to
+        // 127.0.0.1 must not reach the store, so the Host has to be local.
+        // HTTP/2 carries the host as the `:authority`, in the URI.
+        let host = request
+            .uri()
+            .authority()
+            .map(|a| a.as_str().to_string())
+            .or_else(|| {
+                headers
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            });
+        if host.is_some_and(|host| !is_loopback_host(&host)) {
+            return (StatusCode::FORBIDDEN, "non-local Host without a token\n").into_response();
+        }
         return next.run(request).await;
     };
     let presented = headers
@@ -387,6 +584,23 @@ async fn handle_mcp(
             return Json(response).into_response();
         }
     };
+
+    if state.remote
+        && msg.method.as_deref() == Some("tools/call")
+        && let Some(name) = msg
+            .params
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+        && LOCAL_ONLY_TOOLS.contains(&name)
+    {
+        let response = JsonRpcResponse::err(
+            msg.id.clone().unwrap_or(Value::Null),
+            -32601,
+            format!("{name} reads the server's files and is off when icm listens beyond loopback"),
+        );
+        return Json(response).into_response();
+    }
 
     let header = headers
         .get("mcp-protocol-version")
@@ -460,6 +674,15 @@ fn mcp_proxy_endpoint(base_url: &str, compact: bool) -> Result<String> {
     endpoint.push_str("compact=");
     endpoint.push_str(if compact { "true" } else { "false" });
     Ok(endpoint)
+}
+
+/// `http://` to a host that is not loopback.
+fn sends_in_clear(endpoint: &str) -> bool {
+    let Some(rest) = endpoint.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?']).next().unwrap_or("");
+    !is_loopback_host(host)
 }
 
 fn post_mcp_json_rpc(endpoint: &str, token: Option<&str>, body: &str) -> Result<Option<String>> {
@@ -773,6 +996,13 @@ async fn handle_store(
         mem.created_at = t;
     }
     if let Some(raw) = req.raw.as_deref().filter(|s| !s.is_empty()) {
+        if raw.len() > MAX_RAW_BYTES {
+            return err_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("raw is {} bytes, at most {MAX_RAW_BYTES}", raw.len()),
+                format,
+            );
+        }
         mem.raw_excerpt = Some(raw.to_string());
     }
     if let Some(emb) = state.embedder_ref()
@@ -1178,7 +1408,70 @@ mod tests {
     #[test]
     fn non_loopback_bind_with_token_is_allowed() {
         let addr: SocketAddr = "0.0.0.0:8420".parse().unwrap();
-        assert!(check_bind_requires_token(&addr, &Some("secret".into())).is_ok());
+        let long = "k".repeat(MIN_REMOTE_TOKEN_CHARS);
+        assert!(check_bind_requires_token(&addr, &Some(long)).is_ok());
+    }
+
+    /// A short token is guessable once the server is reachable.
+    #[test]
+    fn non_loopback_bind_with_a_short_token_is_rejected() {
+        let addr: SocketAddr = "0.0.0.0:8420".parse().unwrap();
+        let err = check_bind_requires_token(&addr, &Some("secret".into())).unwrap_err();
+        assert!(err.contains("32"), "{err}");
+        let loopback: SocketAddr = "127.0.0.1:8420".parse().unwrap();
+        assert!(check_bind_requires_token(&loopback, &Some("secret".into())).is_ok());
+    }
+
+    #[test]
+    fn the_token_comes_from_the_flag_then_the_env_then_the_file() {
+        let dir = std::env::temp_dir().join(format!("icm-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(&file, "from-file  \nsecond line\n").unwrap();
+        let path = file.display().to_string();
+        let r = |flag: Option<&str>, env: Option<&str>| {
+            resolve_token(flag, env.map(str::to_string), &path).unwrap()
+        };
+        assert_eq!(r(Some("flag"), Some("env")).as_deref(), Some("flag"));
+        assert_eq!(r(None, Some("env")).as_deref(), Some("env"));
+        assert_eq!(r(None, None).as_deref(), Some("from-file"));
+        // Blank is no token, never an empty one a public bind would accept.
+        assert_eq!(r(Some(" "), None), None);
+        assert_eq!(resolve_token(None, None, "").unwrap(), None);
+        assert!(resolve_token(None, None, "/nonexistent/icm-token").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loopback_hosts_are_told_apart() {
+        for host in [
+            "localhost",
+            "LOCALHOST:8420",
+            "127.0.0.1",
+            "127.0.0.1:11435",
+            "[::1]:80",
+            "::1",
+        ] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in [
+            "attacker.example",
+            "attacker.example:11435",
+            "10.0.0.1",
+            "[2001:db8::1]:80",
+            "",
+        ] {
+            assert!(!is_loopback_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn plain_http_to_a_remote_host_is_flagged() {
+        assert!(sends_in_clear(
+            "http://icm.example.com:11435/mcp?compact=true"
+        ));
+        assert!(!sends_in_clear("http://127.0.0.1:11435/mcp?compact=true"));
+        assert!(!sends_in_clear("https://icm.example.com/mcp"));
     }
 
     #[test]
@@ -1207,6 +1500,8 @@ mod tests {
             },
             mcp_instructions: None,
             token: None,
+            remote: false,
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
         };
 
         // Poison the mutex: panic while holding the guard on another thread.
@@ -1276,6 +1571,8 @@ mod tests {
             },
             mcp_instructions: None,
             token: None,
+            remote: false,
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
         };
 
         let resp = handle_consolidate(
@@ -1471,7 +1768,127 @@ mod tests {
             },
             mcp_instructions: None,
             token: None,
+            remote: false,
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The router as `run_http_server` layers it, without a socket.
+    fn guarded_app(state: AppState) -> Router {
+        Router::new()
+            .route("/store", post(handle_store))
+            .route("/health", get(handle_health))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                limit_middleware,
+            ))
+            .with_state(state)
+    }
+
+    fn store_request(host: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri("/store")
+            .method("POST")
+            .header(header::HOST, host)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"topic":"t","content":"c"}"#))
+            .unwrap()
+    }
+
+    /// `icm_learn` scans a server directory: off once icm listens beyond
+    /// loopback, still there on loopback (the stdio proxy uses it).
+    #[tokio::test]
+    async fn a_remote_server_refuses_the_filesystem_tool() {
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "icm_learn", "arguments": {"directory": "/"}}});
+        let mut state = test_state(Store::in_memory().unwrap(), false);
+        state.remote = true;
+        let resp = handle_mcp(
+            State(state),
+            Query(McpQuery { compact: false }),
+            HeaderMap::new(),
+            Json(call.clone()),
+        )
+        .await;
+        let body = body_text(resp).await;
+        assert!(
+            body.contains("-32601") && body.contains("icm_learn"),
+            "{body}"
+        );
+
+        let dir = std::env::temp_dir().join(format!("icm-learn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut local = call;
+        local["params"]["arguments"]["directory"] = json!(dir.display().to_string());
+        let resp = handle_mcp(
+            State(test_state(Store::in_memory().unwrap(), false)),
+            Query(McpQuery { compact: false }),
+            HeaderMap::new(),
+            Json(local),
+        )
+        .await;
+        let body = body_text(resp).await;
+        assert!(!body.contains("-32601"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_raw_excerpt_is_refused() {
+        use tower::ServiceExt;
+        let app = guarded_app(test_state(Store::in_memory().unwrap(), false));
+        let body = json!({"topic": "t", "content": "c", "raw": "x".repeat(MAX_RAW_BYTES + 1)});
+        let req = axum::extract::Request::builder()
+            .uri("/store")
+            .method("POST")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Without a token only a local Host gets in (DNS rebinding).
+    #[tokio::test]
+    async fn without_a_token_a_foreign_host_is_refused() {
+        use tower::ServiceExt;
+        let app = guarded_app(test_state(Store::in_memory().unwrap(), false));
+        let resp = app
+            .clone()
+            .oneshot(store_request("attacker.example"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = app.oneshot(store_request("127.0.0.1:11435")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_full_server_answers_503() {
+        use tower::ServiceExt;
+        let mut state = test_state(Store::in_memory().unwrap(), false);
+        state.slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = state.slots.clone().try_acquire_owned().unwrap();
+        let app = guarded_app(state);
+        let resp = app
+            .clone()
+            .oneshot(store_request("localhost"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+        let resp = app.oneshot(store_request("localhost")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// 120 embedded memories that all match "deploy", about 50 tokens each.

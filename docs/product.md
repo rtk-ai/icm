@@ -40,7 +40,7 @@ Rule-based pattern matching detects architecture decisions, error resolutions, a
 
 **4. Local-first, single file**
 
-Everything in one SQLite file. No cloud service, no API key for storage, no network dependency. Your memory stays on your machine. Works offline.
+Everything in one SQLite file. No cloud service, no API key for storage, no network dependency. Storage and recall work offline. One exception, and you can turn it off: with the default `[extraction.summarizer] provider = "auto"`, captured tool output is handed to the command-line tool of the agent that fired the hook (Claude Code, Codex or Gemini CLI), which sends it to that same vendor. With any other agent, or `provider = "none"`, nothing leaves your machine. See [what leaves your machine](reference.md#what-leaves-your-machine).
 
 **5. Universal tool support**
 

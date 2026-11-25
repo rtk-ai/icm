@@ -47,6 +47,12 @@ const NEIGHBOR_FETCH_FACTOR: usize = 4;
 /// Shortest query word the substring fallback searches for: shorter ones
 /// ("a", "do", "to") are inside almost every text.
 const SUBSTRING_MIN_CHARS: usize = 3;
+/// Same floor for a word with a Hangul, Han or kana character: there one
+/// character is a syllable or a whole word, so two are already specific.
+const SUBSTRING_MIN_CHARS_CJK: usize = 2;
+/// Trailing Hangul syllables the fallback also tries cutting off a word:
+/// Korean attaches particles and endings ("사건은", "사건을") to the noun.
+const HANGUL_SUFFIX_MAX: usize = 2;
 /// Memories the substring fallback fetches before ordering them; the most
 /// `search_by_keywords` returns.
 const SUBSTRING_POOL: usize = 100;
@@ -375,7 +381,8 @@ fn recall_with_depth(
 }
 
 /// One query's ranking: its own embedding and date window, the ranked
-/// search, the substring fallback when no arm matched.
+/// search, the substring fallback when no arm matched, or after the ranked
+/// hits for a query with Hangul.
 fn rank_one(
     store: &Store,
     embedder: Option<&dyn Embedder>,
@@ -414,6 +421,14 @@ fn rank_one(
     let mut ranked = store.search_ranked(&query, keep)?;
     if ranked.is_empty() {
         ranked = substring_matches(store, text, limit, keep);
+    } else if text.chars().any(is_hangul) {
+        // A Korean word glued to another particle is not a whole-word hit,
+        // so another query word matching elsewhere must not hide it (#539).
+        let extra: Vec<RankedHit> = substring_matches(store, text, limit, keep)
+            .into_iter()
+            .filter(|h| !ranked.iter().any(|r| r.memory.id == h.memory.id))
+            .collect();
+        ranked.extend(extra);
     }
     Ok((ranked, window))
 }
@@ -456,6 +471,54 @@ fn fuse_queries(lists: Vec<Vec<RankedHit>>) -> Vec<RankedHit> {
         .collect()
 }
 
+fn is_hangul(c: char) -> bool {
+    ('\u{AC00}'..='\u{D7A3}').contains(&c)
+}
+
+/// Hangul syllables and jamo, Han and kana: scripts where a character is a
+/// syllable or a word.
+fn is_cjk(c: char) -> bool {
+    is_hangul(c)
+        || ('\u{1100}'..='\u{11FF}').contains(&c)
+        || ('\u{3130}'..='\u{318F}').contains(&c)
+        || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        || ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        || ('\u{3040}'..='\u{30FF}').contains(&c)
+}
+
+/// Words the substring fallback searches for: the query's words, plus for a
+/// word ending in Hangul the same word without its last one or two syllables.
+///
+/// The lexical index keeps "사건은" as one token, so "사건" or "사건을" match
+/// nothing; the stem, as a substring, finds the stored "사건은".
+fn substring_words(query: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut push = |word: String, min: usize| {
+        if word.chars().count() >= min && !words.contains(&word) {
+            words.push(word);
+        }
+    };
+    for word in query.split(|c: char| !c.is_alphanumeric()) {
+        let word = word.to_lowercase();
+        let chars: Vec<char> = word.chars().collect();
+        let min = if chars.iter().any(|c| is_cjk(*c)) {
+            SUBSTRING_MIN_CHARS_CJK
+        } else {
+            SUBSTRING_MIN_CHARS
+        };
+        let hangul_tail = chars.iter().rev().take_while(|c| is_hangul(**c)).count();
+        push(word, min);
+        // Stems never go under the floor.
+        let longest = HANGUL_SUFFIX_MAX
+            .min(hangul_tail)
+            .min(chars.len().saturating_sub(min));
+        for cut in 1..=longest {
+            push(chars[..chars.len() - cut].iter().collect(), min);
+        }
+    }
+    words
+}
+
 /// Last resort when no arm matched anything: memories that contain a query
 /// word as a substring of their topic, summary or keywords.
 ///
@@ -471,13 +534,7 @@ fn substring_matches(
     limit: usize,
     keep: &dyn Fn(&Memory) -> bool,
 ) -> Vec<RankedHit> {
-    let mut words: Vec<String> = Vec::new();
-    for word in query.split(|c: char| !c.is_alphanumeric()) {
-        let word = word.to_lowercase();
-        if word.chars().count() >= SUBSTRING_MIN_CHARS && !words.contains(&word) {
-            words.push(word);
-        }
-    }
+    let words = substring_words(query);
     if words.is_empty() {
         return Vec::new();
     }
@@ -1638,6 +1695,52 @@ mod pipeline_tests {
         // Words under three characters are not searched, though "st" is
         // inside "grocery list".
         assert!(run(&s, None, &request("st")).unwrap().hits.is_empty());
+    }
+
+    /// Korean glues particles and endings onto the noun, and the lexical
+    /// index keeps the glued word as one token (#539).
+    #[test]
+    fn substring_fallback_finds_korean_nouns_with_other_particles() {
+        let s = store();
+        let id = add(&s, "ko-fixture", "사건은 2023년에 발생했습니다", None);
+        add(&s, "ko-fixture", "회의는 내일입니다", None);
+
+        for query in ["사건은", "사건", "사건을", "발생"] {
+            let out = run(&s, None, &request(query)).unwrap();
+            let ids: Vec<&str> = out.hits.iter().map(|h| h.memory.id.as_str()).collect();
+            assert_eq!(ids, vec![id.as_str()], "query {query}");
+        }
+        // One syllable is too short, and no stem goes under two.
+        assert!(run(&s, None, &request("사")).unwrap().hits.is_empty());
+    }
+
+    #[test]
+    fn substring_words_stem_hangul_only() {
+        assert_eq!(substring_words("사건을"), vec!["사건을", "사건"]);
+        assert_eq!(substring_words("사건"), vec!["사건"]);
+        assert!(substring_words("사").is_empty());
+        // Latin words keep the three-character floor and are never cut.
+        assert_eq!(substring_words("deploy to"), vec!["deploy"]);
+    }
+
+    /// A Korean query word that is not a whole indexed word still finds its
+    /// memory when another query word matches elsewhere (#539).
+    #[test]
+    fn substring_fallback_follows_ranked_hits_for_korean() {
+        let s = store();
+        let list = add(&s, "ko-fixture", "사건 목록", None);
+        let year = add(&s, "notes", "incident report filed in 2023", None);
+        let glued = add(&s, "ko-fixture", "사건은 2023년에 발생했습니다", None);
+
+        let out = run(&s, None, &request("사건 2023")).unwrap();
+        let ids: Vec<&str> = out.hits.iter().map(|h| h.memory.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        // Ranked hits first, then the substring match, each once.
+        assert!(ids[..2].contains(&list.as_str()));
+        assert!(ids[..2].contains(&year.as_str()));
+        assert_eq!(ids[2], glued.as_str());
+        assert_eq!(out.hits[2].score, 0.0);
+        assert!(out.hits[2].fts_rank.is_none());
     }
 
     /// A whole-word match never goes through the fallback.

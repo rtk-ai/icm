@@ -107,7 +107,13 @@ pub fn build_wake_up_from_memories(memories: Vec<Memory>, opts: &WakeUpOptions<'
     let mut candidates: Vec<ScoredMemory> = memories
         .into_iter()
         .filter(|m| {
-            let is_pref = opts.include_preferences && is_preference_topic(&m.topic);
+            let is_pref = is_preference_topic(&m.topic);
+            // Off = no preference at all, critical ones included (they used
+            // to pass on importance alone, so the SessionStart hook printed
+            // them twice: in its snapshot and again here).
+            if is_pref && !opts.include_preferences {
+                return false;
+            }
             // Critical/high are always eligible; preferences always eligible
             // when the option is set (they may be medium-importance).
             matches!(m.importance, Importance::Critical | Importance::High) || is_pref
@@ -617,6 +623,11 @@ mod tests {
         let memories = vec![
             mem("decisions-icm", "Critical decision", Importance::Critical),
             mem("preferences", "User prefers French", Importance::Medium),
+            mem(
+                "preferences",
+                "User prefers French dates",
+                Importance::Critical,
+            ),
         ];
         let opts = WakeUpOptions {
             include_preferences: false,

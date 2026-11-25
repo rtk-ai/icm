@@ -25,6 +25,8 @@ mod import;
 mod install_manifest;
 #[cfg(test)]
 mod learn_tests;
+#[cfg(feature = "http-api")]
+mod tls;
 // First-launch onnxruntime resolution for the load-dynamic embeddings build
 // (issue #345). Only the dynamic build needs a runtime downloaded at execution
 // time; the static build links onnxruntime in.
@@ -906,10 +908,19 @@ enum Commands {
         #[arg(long = "http-proxy", value_name = "URL", conflicts_with = "http")]
         http_proxy: Option<String>,
 
-        /// Bearer token used by the HTTP server or proxy.
+        /// Bearer token used by the HTTP server or proxy. Prefer
+        /// `$ICM_HTTP_TOKEN` or `[http] token_file`: a flag shows in `ps`.
+        /// A non-loopback bind needs one of at least 32 characters.
         #[cfg(feature = "http-api")]
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
+
+        /// Serve `--http` over HTTPS, as `[http.tls] enabled = true` does:
+        /// the certificate set in `[http.tls]`, else `cert.pem` + `key.pem`
+        /// in its `dir`, else a self-signed one generated there.
+        #[cfg(feature = "http-api")]
+        #[arg(long, requires = "http")]
+        tls: bool,
     },
 
     /// Hook handlers shared across Claude Code, Codex, Gemini, and
@@ -995,6 +1006,20 @@ enum HookCommands {
     },
     /// SessionEnd hook: extract memories from transcript before the session closes
     End,
+    /// Keyword pass over the agent's last turn (`[extraction] each_prompt`),
+    /// spawned detached by the prompt hook.
+    #[command(hide = true)]
+    Turn {
+        /// Transcript file (JSONL).
+        #[arg(long)]
+        transcript: String,
+        /// Its length in bytes when the prompt hook fired.
+        #[arg(long)]
+        until: u64,
+        /// Project the memories are stored under.
+        #[arg(long)]
+        project: String,
+    },
     /// Remove ICM's hooks from every detected AI tool (Claude Code, Gemini,
     /// Codex, Copilot, OpenCode), keeping the MCP config and your memory DB.
     /// Reverse of `icm init --mode hook`; re-enable with the same command.
@@ -2240,6 +2265,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load_config()?;
+    extract::set_limits(cfg.extraction.min_score, cfg.extraction.max_facts);
 
     #[cfg(feature = "http-api")]
     if let Commands::Serve {
@@ -2249,6 +2275,11 @@ fn main() -> Result<()> {
         ..
     } = &cli.command
     {
+        let token = http_api::resolve_token(
+            token.as_deref(),
+            std::env::var("ICM_HTTP_TOKEN").ok(),
+            &cfg.http.token_file,
+        )?;
         return http_api::run_mcp_stdio_proxy(
             base_url,
             token.as_deref(),
@@ -2303,6 +2334,8 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
+    let init_db = cli_db.clone();
+    let init_no_embeddings = cli.no_embeddings;
     // `db_path` centralizes hierarchical resolution (issue #257): --db flag,
     // $ICM_DB env var, global config, project-local .icm/, then the platform
     // default. It feeds the extract-pending worker lock (#322), doctor/repair/
@@ -2311,6 +2344,7 @@ fn main() -> Result<()> {
     // unused in the leanest builds.
     #[allow(unused_variables)]
     let db_path = resolve_db_path(cli_db.clone(), &cfg);
+    let _ = WORKER_DB.set(db_path.clone());
     // The database, not the configuration, decides which embedding model
     // may run against it (see `plan_embeddings`). This first pass only
     // works out which dimension to open with, from a peek at the file; the
@@ -2832,7 +2866,15 @@ fn main() -> Result<()> {
             force,
             per_project,
             with_codex_post_hook,
-        } => cmd_init(mode, force, per_project, with_codex_post_hook, &db_path),
+        } => cmd_init(
+            mode,
+            force,
+            per_project,
+            with_codex_post_hook,
+            &db_path,
+            init_db.as_deref(),
+            init_no_embeddings,
+        ),
         // Doctor, Repair and Backup are dispatched before `open_store` above;
         // these arms exist only for match exhaustiveness and are unreachable.
         Commands::Doctor => unreachable!("dispatched before open_store"),
@@ -2984,6 +3026,8 @@ fn main() -> Result<()> {
                 http_proxy: _,
             #[cfg(feature = "http-api")]
             token,
+            #[cfg(feature = "http-api")]
+            tls,
         } => {
             #[cfg(feature = "web")]
             if expose {
@@ -3001,6 +3045,19 @@ fn main() -> Result<()> {
             // stdio, so it's an `if let`, not an `else if expose`.
             #[cfg(feature = "http-api")]
             if let Some(addr) = http {
+                let token = http_api::resolve_token(
+                    token.as_deref(),
+                    std::env::var("ICM_HTTP_TOKEN").ok(),
+                    &cfg.http.token_file,
+                )?;
+                // Before generating any certificate for a server that
+                // would not start.
+                http_api::check_bind_requires_token(&addr, &token).map_err(anyhow::Error::msg)?;
+                let tls = if tls || cfg.http.tls.enabled {
+                    Some(tls::resolve(&cfg.http.tls, tls::default_dir())?)
+                } else {
+                    None
+                };
                 let boxed_emb: Option<Box<dyn icm_core::Embedder + Send + Sync>> =
                     embedder.map(|e| Box::new(e) as Box<dyn icm_core::Embedder + Send + Sync>);
                 let auto_consolidate = icm_mcp::AutoConsolidate {
@@ -3015,6 +3072,17 @@ fn main() -> Result<()> {
                     token,
                     auto_consolidate,
                     cfg.mcp.instructions.clone(),
+                    http_api::ServeOptions {
+                        tls,
+                        mcp: cfg.http.mcp,
+                        request_timeout: std::time::Duration::from_secs(
+                            cfg.http.request_timeout_secs.max(1),
+                        ),
+                        header_timeout: std::time::Duration::from_secs(
+                            cfg.http.header_timeout_secs.max(1),
+                        ),
+                        max_concurrent: cfg.http.max_concurrent,
+                    },
                 );
             }
             #[cfg(feature = "embeddings")]
@@ -3060,6 +3128,7 @@ fn main() -> Result<()> {
                 HookCommands::Prompt => "prompt",
                 HookCommands::Start { .. } => "start",
                 HookCommands::End => "end",
+                HookCommands::Turn { .. } => "turn",
                 HookCommands::Disable { .. } => "disable",
             };
             let started = std::time::Instant::now();
@@ -3117,6 +3186,26 @@ fn main() -> Result<()> {
                         &cfg.memory,
                         &cfg.consolidate,
                         &cfg.extraction,
+                    )
+                }
+                HookCommands::Turn {
+                    transcript,
+                    until,
+                    project,
+                } => {
+                    #[cfg(feature = "embeddings")]
+                    let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                    #[cfg(not(feature = "embeddings"))]
+                    let emb_ref: Option<&dyn icm_core::Embedder> = None;
+                    cmd_hook_turn(
+                        &store,
+                        emb_ref,
+                        &cfg.memory,
+                        &cfg.consolidate,
+                        &cfg.extraction,
+                        &transcript,
+                        until,
+                        &project,
                     )
                 }
                 // Dispatched before `open_store`; this arm only exists for
@@ -4896,6 +4985,9 @@ fn cmd_hook_end(
         // Mark the worker subtree (#322) so any hook fired by an LLM
         // CLI it spawns short-circuits instead of forking again.
         cmd.env("ICM_WORKER", "1");
+        if let Some(db) = WORKER_DB.get() {
+            cmd.env("ICM_DB", db);
+        }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -4945,6 +5037,11 @@ fn cmd_hook_end(
     )
 }
 
+/// The database this process opened, handed to the workers it spawns: a
+/// `--db` given to the hook would otherwise be lost and the worker would
+/// write to the default database.
+static WORKER_DB: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// Fork a detached, `ICM_WORKER`-tagged copy of this binary running
 /// `args`, redirected to `/dev/null` and set to outlive the parent (Unix:
 /// new session via `setsid`). Used by the SessionEnd hook to drain async
@@ -4962,6 +5059,9 @@ fn spawn_detached_worker(args: &[&str], label: &str) {
     // Mark the worker subtree (#322) so any hook fired by an LLM CLI it
     // spawns short-circuits instead of forking again.
     cmd.env("ICM_WORKER", "1");
+    if let Some(db) = WORKER_DB.get() {
+        cmd.env("ICM_DB", db);
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -5032,52 +5132,10 @@ fn extract_from_hook_transcript(
     };
     let mut assistant_text = String::new();
     for line in recent_lines.iter().copied() {
-        // Supported formats:
-        //   Claude Code: {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
-        //   Codex:       {"type":"response_item","payload":{"role":"developer","content":[{"type":"text","text":"..."}]}}
-        //   Simple:      {"role":"assistant","content":"..."}
-        if let Ok(entry) = serde_json::from_str::<Value>(line) {
-            // Find the message object (varies by format)
-            let msg = if entry.get("type").and_then(|t| t.as_str()) == Some("assistant") {
-                // Claude Code: type=assistant, content in message.*
-                entry.get("message")
-            } else if entry.get("type").and_then(|t| t.as_str()) == Some("response_item") {
-                // Codex: type=response_item, content in payload.*
-                entry.get("payload")
-            } else if entry.get("role").is_some() {
-                // Simple format: role+content at top level
-                Some(&entry)
-            } else {
-                None
-            };
-
-            let msg = match msg {
-                Some(m) => m,
-                None => continue,
-            };
-
-            // Check role (assistant, developer, model — varies by tool)
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if !matches!(role, "assistant" | "developer" | "model") {
-                continue;
-            }
-
-            // Content as array of {type: "text", text: "..."}
-            if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
-                for block in arr {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text")
-                        && let Some(text) = block.get("text").and_then(|t| t.as_str())
-                    {
-                        assistant_text.push_str(text);
-                        assistant_text.push('\n');
-                    }
-                }
-            }
-            // Content as plain string
-            else if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                assistant_text.push_str(content);
-                assistant_text.push('\n');
-            }
+        if let Ok(entry) = serde_json::from_str::<Value>(line)
+            && let Some(text) = assistant_text_of(&entry)
+        {
+            assistant_text.push_str(&text);
         }
     }
 
@@ -5085,10 +5143,146 @@ fn extract_from_hook_transcript(
         return Ok(());
     }
 
-    // Truncate to last 4000 bytes to keep extraction reasonable. The bare
-    // tail slice `&assistant_text[len-4000..]` panics when the cut lands
-    // inside a multibyte UTF-8 char; the helper char-aligns instead.
-    let truncated: &str = truncate_tail_at_char_boundary(&assistant_text, 4000);
+    let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
+    // Last 4000 bytes, to keep extraction reasonable.
+    extract_assistant_text(
+        store,
+        embedder,
+        memory_cfg,
+        consolidate_cfg,
+        source,
+        &assistant_text,
+        4000,
+        &project,
+        true,
+    );
+    Ok(())
+}
+
+/// The text of an assistant message in a transcript `entry`, one line per
+/// text block, or `None` when the entry is not one.
+///
+/// Supported formats:
+///   Claude Code: {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
+///   Codex:       {"type":"response_item","payload":{"role":"developer","content":[{"type":"text","text":"..."}]}}
+///   Simple:      {"role":"assistant","content":"..."}
+fn assistant_text_of(entry: &Value) -> Option<String> {
+    // Find the message object (varies by format)
+    let msg = if entry.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+        // Claude Code: type=assistant, content in message.*
+        entry.get("message")?
+    } else if entry.get("type").and_then(|t| t.as_str()) == Some("response_item") {
+        // Codex: type=response_item, content in payload.*
+        entry.get("payload")?
+    } else if entry.get("role").is_some() {
+        // Simple format: role+content at top level
+        entry
+    } else {
+        return None;
+    };
+
+    // Check role (assistant, developer, model — varies by tool)
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if !matches!(role, "assistant" | "developer" | "model") {
+        return None;
+    }
+
+    let mut text = String::new();
+    // Content as array of {type: "text", text: "..."}
+    if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+        for block in arr {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(t) = block.get("text").and_then(|t| t.as_str())
+            {
+                text.push_str(t);
+                text.push('\n');
+            }
+        }
+    }
+    // Content as plain string
+    else if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+        text.push_str(content);
+        text.push('\n');
+    }
+    Some(text)
+}
+
+/// Whether a transcript `entry` is a prompt the user typed: not a tool
+/// result, not a message the harness injected (`isMeta`), not a subagent's.
+fn is_user_prompt(entry: &Value) -> bool {
+    if entry.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+        || entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return false;
+    }
+    let msg = if entry.get("type").and_then(|t| t.as_str()) == Some("user") {
+        entry.get("message")
+    } else if entry.get("type").is_none() {
+        Some(entry)
+    } else {
+        None
+    };
+    let Some(msg) = msg else {
+        return false;
+    };
+    if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    match msg.get("content") {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(blocks)) => !blocks
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")),
+        _ => false,
+    }
+}
+
+/// What the agent wrote in its last turn: the assistant text after the
+/// last user prompt that precedes it, in order. A prompt with no assistant
+/// text after it (the one being submitted, when the harness has already
+/// written it) is passed over. Subagent messages are left out.
+fn assistant_text_of_last_turn(transcript: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for line in transcript.lines().rev() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if is_user_prompt(&entry) {
+            if parts.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        if let Some(text) = assistant_text_of(&entry)
+            && !text.trim().is_empty()
+        {
+            parts.push(text);
+        }
+    }
+    parts.reverse();
+    parts.concat()
+}
+
+/// Run the keyword pass over `assistant_text` (its last `max_bytes`) and
+/// store what it finds under `project`, clamped to Medium importance.
+#[allow(clippy::too_many_arguments)]
+fn extract_assistant_text(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
+    source: &str,
+    assistant_text: &str,
+    max_bytes: usize,
+    project: &str,
+    store_raw: bool,
+) {
+    // The bare tail slice `&assistant_text[len-max..]` panics when the cut
+    // lands inside a multibyte UTF-8 char; the helper char-aligns instead.
+    let truncated: &str = truncate_tail_at_char_boundary(assistant_text, max_bytes);
 
     // Audit R7: if the byte truncation cut the transcript mid-fence
     // (the opening ```lang line lives in the dropped prefix), the
@@ -5108,8 +5302,6 @@ fn extract_from_hook_transcript(
         truncated
     };
 
-    let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
-
     // Hook path is the prompt-injection surface: any assistant message in
     // the transcript can be crafted to trigger decision/error keywords and
     // self-promote to High. Clamp to Medium so wake-up never surfaces
@@ -5118,8 +5310,8 @@ fn extract_from_hook_transcript(
     match extract::extract_and_store_with_embedder(
         store,
         text,
-        &project,
-        true,
+        project,
+        store_raw,
         icm_core::Importance::Medium,
         embedder,
     ) {
@@ -5133,7 +5325,62 @@ fn extract_from_hook_transcript(
         }
         _ => {}
     }
+}
 
+/// Read the transcript at `path` up to byte `until` (its length when the
+/// prompt hook fired: what is appended later is not this turn), the last
+/// `MAX_TRANSCRIPT_BYTES` at most. A first line cut by the window is
+/// dropped.
+fn read_transcript_until(path: &str, until: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let until = until.min(f.metadata()?.len());
+    let start = until.saturating_sub(MAX_TRANSCRIPT_BYTES);
+    f.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    f.take(until - start).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        return Ok(text
+            .split_once('\n')
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_default());
+    }
+    Ok(text)
+}
+
+/// `icm hook turn` (spawned by the prompt hook when `[extraction]
+/// each_prompt` is on): the keyword pass over what the agent wrote in its
+/// last turn. Detached, so the embedding model loads off the prompt's path.
+#[allow(clippy::too_many_arguments)]
+fn cmd_hook_turn(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
+    extraction_cfg: &crate::config::ExtractionConfig,
+    transcript: &str,
+    until: u64,
+    project: &str,
+) -> Result<()> {
+    let Ok(text) = read_transcript_until(transcript, until) else {
+        return Ok(());
+    };
+    let turn = assistant_text_of_last_turn(&text);
+    if turn.trim().is_empty() {
+        return Ok(());
+    }
+    extract_assistant_text(
+        store,
+        embedder,
+        memory_cfg,
+        consolidate_cfg,
+        "turn",
+        &turn,
+        extraction_cfg.each_prompt_chars.max(1),
+        project,
+        false,
+    );
     Ok(())
 }
 
@@ -5291,6 +5538,33 @@ fn cmd_hook_prompt(
         spawn_detached_worker(&["extract-pending", "--limit", "20"], "extraction");
     }
 
+    // Keyword pass over the agent's last turn (opt-in, `[extraction]
+    // each_prompt`), in a detached process: it loads the embedding model.
+    // The transcript's length now bounds the turn, so a reply the agent
+    // starts writing meanwhile is left for the next prompt.
+    if extraction_cfg.enabled
+        && extraction_cfg.each_prompt
+        && std::env::var_os("ICM_WORKER").is_none()
+        && let Some(path) = json.get("transcript_path").and_then(|v| v.as_str())
+        && let Ok(meta) = std::fs::metadata(path)
+    {
+        let until = meta.len().to_string();
+        let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
+        spawn_detached_worker(
+            &[
+                "hook",
+                "turn",
+                "--transcript",
+                path,
+                "--until",
+                &until,
+                "--project",
+                &project,
+            ],
+            "turn extraction",
+        );
+    }
+
     Ok(())
 }
 
@@ -5440,7 +5714,8 @@ fn build_hook_start_pack(store: &Store, stdin_json: &str, max_tokens: usize) -> 
         project: project_name.as_deref(),
         max_tokens: wake_up_budget,
         format: icm_core::WakeUpFormat::Markdown,
-        include_preferences: true,
+        // The snapshot above already lists them: printed twice otherwise.
+        include_preferences: snapshot.is_empty(),
     };
 
     // Compute the live static pack first, so its emptiness reflects the CURRENT
@@ -5845,6 +6120,8 @@ fn cmd_init(
     per_project: bool,
     with_codex_post_hook: bool,
     db_path: &Path,
+    cli_db: Option<&Path>,
+    no_embeddings: bool,
 ) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
@@ -6905,6 +7182,14 @@ description: ICM persistent memory — /{name}
             } else {
                 println!("[project] .icm/ already exists at {}", root.display());
             }
+        }
+    }
+
+    // The hooks and MCP server registered above run without --db /
+    // --no-embeddings: persist them, or init silently ignored both.
+    if cli_db.is_some() || no_embeddings {
+        for note in config::persist_init_overrides(cli_db, no_embeddings)? {
+            println!("[config] {note}");
         }
     }
 
@@ -9290,6 +9575,8 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
     println!("  max_facts = {}", cfg.extraction.max_facts);
     println!("  extract_every = {}", cfg.extraction.extract_every);
     println!("  store_raw = {}", cfg.extraction.store_raw);
+    println!("  each_prompt = {}", cfg.extraction.each_prompt);
+    println!("  each_prompt_chars = {}", cfg.extraction.each_prompt_chars);
     let conv = &cfg.extraction.conversation;
     println!();
     println!("[extraction.conversation]");
@@ -13920,6 +14207,11 @@ mod hook_start_tests {
             "wake-up section dropped from concatenated pack: {pack}",
         );
         assert!(pack.contains("SQLite"));
+        assert_eq!(
+            pack.matches("French").count(),
+            1,
+            "preference printed by both the snapshot and the wake-up: {pack}",
+        );
     }
 
     /// Snapshot must NOT appear when only decisions exist (no
@@ -20130,5 +20422,107 @@ mod opencode_plugin_tests {
         assert!(!is_icm_opencode_plugin(
             "export default definePlugin({ id: \"mine\" })"
         ));
+    }
+}
+
+#[cfg(test)]
+mod each_prompt_tests {
+    use super::*;
+    use icm_core::MemoryStore;
+    use icm_store::Store;
+
+    fn entry(kind: &str, content: Value) -> String {
+        serde_json::json!({
+            "type": kind,
+            "message": {"role": kind, "content": content},
+        })
+        .to_string()
+    }
+
+    fn text(kind: &str, t: &str) -> String {
+        entry(kind, serde_json::json!([{"type": "text", "text": t}]))
+    }
+
+    /// The agent's last turn: its text after the last prompt, tool results
+    /// and harness messages included in the turn, the prompt being
+    /// submitted and subagents left out.
+    #[test]
+    fn last_turn_is_the_assistant_text_since_the_previous_prompt() {
+        let mut sidechain: Value = serde_json::from_str(&text("assistant", "subagent")).unwrap();
+        sidechain["isSidechain"] = Value::Bool(true);
+        let mut meta: Value = serde_json::from_str(&entry("user", "<reminder>".into())).unwrap();
+        meta["isMeta"] = Value::Bool(true);
+        let transcript = [
+            entry("user", "first prompt".into()),
+            text("assistant", "old reply"),
+            entry("user", "second prompt".into()),
+            text("assistant", "looking"),
+            entry(
+                "user",
+                serde_json::json!([{"type": "tool_result", "content": "ok"}]),
+            ),
+            sidechain.to_string(),
+            meta.to_string(),
+            text("assistant", "done"),
+            entry("user", "third prompt".into()),
+        ]
+        .join("\n");
+        assert_eq!(assistant_text_of_last_turn(&transcript), "looking\ndone\n");
+        // Without the prompt being submitted, the same turn.
+        let cut = transcript.rsplit_once('\n').unwrap().0;
+        assert_eq!(assistant_text_of_last_turn(cut), "looking\ndone\n");
+        assert_eq!(assistant_text_of_last_turn(""), "");
+    }
+
+    /// `hook turn` stores what the keyword pass finds in the last turn,
+    /// and nothing written after `until`.
+    #[test]
+    fn hook_turn_stores_the_last_turn_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let reply = "We decided to use PostgreSQL for the job queue because SQLite \
+                     locks under concurrent writes. Fixed the build error: OPENSSL_DIR \
+                     was not set on the runner, so we now export it in CI.";
+        let turn = format!(
+            "{}\n{}\n",
+            entry("user", "set up the queue".into()),
+            text("assistant", reply)
+        );
+        let later = text("assistant", "We decided to deploy on Fridays from now on.");
+        std::fs::write(&path, format!("{turn}{later}\n")).unwrap();
+        let store = Store::in_memory().unwrap();
+        let cfg = crate::config::Config::default();
+        cmd_hook_turn(
+            &store,
+            None,
+            &cfg.memory,
+            &cfg.consolidate,
+            &cfg.extraction,
+            path.to_str().unwrap(),
+            turn.len() as u64,
+            "myproj",
+        )
+        .unwrap();
+        let stored = store.list_all().unwrap();
+        assert!(!stored.is_empty(), "the turn's facts are stored");
+        assert!(stored.iter().all(|m| m.topic == "context-myproj"));
+        assert!(stored.iter().all(|m| !m.summary.contains("Fridays")));
+        assert!(
+            stored
+                .iter()
+                .all(|m| m.importance != icm_core::Importance::High
+                    && m.importance != icm_core::Importance::Critical)
+        );
+    }
+
+    /// A window that starts mid-file drops its cut first line.
+    #[test]
+    fn read_transcript_until_bounds_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(read_transcript_until(p, 4).unwrap(), "a\nb\n");
+        assert_eq!(read_transcript_until(p, 99).unwrap(), "a\nb\nc\n");
     }
 }

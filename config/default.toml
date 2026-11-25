@@ -80,10 +80,10 @@ prune_threshold = 0.1
 enabled = true
 
 # Minimum keyword score to keep a fact
-min_score = 3.0
+min_score = 2.0
 
 # Maximum facts per extraction pass
-max_facts = 10
+max_facts = 20
 
 # Extract every N PostToolUse hook fires (i.e. every N tool calls in a
 # Claude Code / Gemini / Codex / Copilot session). Lower = more
@@ -95,6 +95,15 @@ extract_every = 3
 # rule-based extractor produces no facts. Useful as a coarse safety
 # net; set to `false` if you only want signal-rich extractions.
 store_raw = true
+
+# On each prompt, run the keyword pass above (no LLM) over what the agent
+# wrote since your previous prompt, in a background process, so what was
+# said early in a session can be recalled before any compaction. Off by
+# default: it loads the embedding model once per prompt and stores more
+# memories. `each_prompt_chars` bounds the text examined (the most recent
+# characters are kept).
+each_prompt = false
+each_prompt_chars = 65536
 
 # LLM summarizer used by the async extraction queue (`icm extract-pending`).
 # Same keys as [consolidate.summarizer] below. Default provider: "auto".
@@ -123,7 +132,9 @@ tool_chars = 1500
 #
 # provider:
 #   "none"                          — no LLM, lexical join (default)
-#   "auto"                          — detect the invoking tool's CLI; never
+#   "auto"                          — the CLI of the agent that fired the
+#                                     hook (Claude Code, Codex, Gemini);
+#                                     "none" under any other agent; never
 #                                     picks an API-key provider
 #   "claude" | "codex" | "gemini"   — the CLI you are logged into (no key)
 #   "ollama"                        — local Ollama daemon (model required)

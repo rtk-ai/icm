@@ -2,7 +2,7 @@
 
 이 문서는 README.md(영어)의 번역본이며, 기준 문서는 영어 원문입니다. 두 문서가 다를 경우 영어판이 맞습니다.
 
-<h1 align="center">ICM</h1>
+<h1 align="center">ICM — Infinite Context Memory</h1>
 
 <p align="center">
   <b>AI 코딩 에이전트를 위한 장기 메모리, 사용하는 여러 도구가 함께 공유합니다.</b><br>

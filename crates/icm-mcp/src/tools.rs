@@ -2834,6 +2834,18 @@ fn tool_memoir_inspect(store: &Store, args: &Value) -> ToolResult {
         output.push_str(&format!("  labels: {labels_str}\n"));
     }
 
+    if let Ok(facts) = icm_core::concept_facts(store, &concept)
+        && !facts.is_empty()
+    {
+        output.push_str("  facts:\n");
+        for f in &facts {
+            output.push_str(&format!(
+                "    {}.{} = {}  [{}]\n",
+                f.entity, f.key, f.value, f.source
+            ));
+        }
+    }
+
     let (neighbors, links) = match store.get_neighborhood(&concept.id, depth) {
         Ok(r) => r,
         Err(e) => return ToolResult::error(format!("graph error: {e}")),
@@ -3297,6 +3309,30 @@ mod tests {
             1,
             "error prefix must not be doubled: {text}"
         );
+    }
+
+    #[test]
+    fn memoir_inspect_shows_the_concept_facts() {
+        use icm_core::FactsStore;
+        let store = test_store();
+        let call = |name: &str, args: Value| call_tool(&store, None, name, &args, false);
+        call("icm_memoir_create", json!({"name": "m"}));
+        call(
+            "icm_memoir_add_concept",
+            json!({"memoir": "m", "name": "api", "definition": "d",
+                   "labels": "entity:service:api"}),
+        );
+        store
+            .set_fact("service:api", "owner", "team-core", "test")
+            .unwrap();
+        store.set_fact("api", "port", "8080", "test").unwrap();
+        store.set_fact("other", "port", "1", "test").unwrap();
+
+        let out = call("icm_memoir_inspect", json!({"memoir": "m", "name": "api"}));
+        let text = &out.content[0].text;
+        assert!(text.contains("service:api.owner = team-core"), "{text}");
+        assert!(text.contains("api.port = 8080"), "{text}");
+        assert!(!text.contains("other.port"), "{text}");
     }
 
     /// Manual-testing finding (against a real local Postgres backend):

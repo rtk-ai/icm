@@ -39,3 +39,16 @@ pub trait FactsStore {
     /// Aggregate stats for the `icm facts stats` command.
     fn facts_stats(&self) -> IcmResult<FactsStats>;
 }
+
+/// Active facts of every entity a concept stands for (see
+/// [`crate::Concept::fact_entities`]), grouped in that order, keys sorted.
+pub fn concept_facts<S: FactsStore + ?Sized>(
+    store: &S,
+    concept: &crate::Concept,
+) -> IcmResult<Vec<Fact>> {
+    let mut out = Vec::new();
+    for entity in concept.fact_entities() {
+        out.extend(store.list_facts(&entity, None)?);
+    }
+    Ok(out)
+}

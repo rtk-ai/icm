@@ -136,6 +136,32 @@ impl Concept {
     }
 }
 
+/// Label namespace that ties a concept to entities of the facts layer
+/// (`entity:service:api` -> facts recorded under entity `service:api`).
+pub const ENTITY_NAMESPACE: &str = "entity";
+
+impl Concept {
+    /// The facts-layer entities this concept stands for: every
+    /// `entity:<name>` label, then the concept name itself, deduplicated in
+    /// that order. This is how a concept (the graph node) finds its exact
+    /// attributes (`icm facts`) without a schema change on either side.
+    pub fn fact_entities(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let candidates = self
+            .labels
+            .iter()
+            .filter(|l| l.namespace == ENTITY_NAMESPACE)
+            .map(|l| l.value.trim().to_string())
+            .chain(std::iter::once(self.name.trim().to_string()));
+        for e in candidates {
+            if !e.is_empty() && !out.contains(&e) {
+                out.push(e);
+            }
+        }
+        out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Relation
 // ---------------------------------------------------------------------------
@@ -226,4 +252,21 @@ pub struct MemoirStats {
     pub total_links: usize,
     pub avg_confidence: f32,
     pub label_counts: Vec<(String, usize)>,
+}
+
+#[cfg(test)]
+mod fact_entity_tests {
+    use super::*;
+
+    #[test]
+    fn entity_labels_come_first_then_the_name() {
+        let mut c = Concept::new("m".into(), "api".into(), "d".into());
+        assert_eq!(c.fact_entities(), vec!["api"]);
+        // `Label::from_str` splits on the first ':', so the value keeps
+        // the entity's own namespace.
+        c.labels.push("entity:service:api".parse().unwrap());
+        c.labels.push(Label::new("entity", "api"));
+        c.labels.push(Label::new("domain", "auth"));
+        assert_eq!(c.fact_entities(), vec!["service:api", "api"]);
+    }
 }

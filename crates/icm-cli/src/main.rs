@@ -13144,6 +13144,7 @@ fn cmd_memoir_inspect(
         .ok_or_else(|| anyhow::anyhow!("concept not found: {concept_name}"))?;
 
     print_concept(&concept);
+    print_concept_facts(store, &concept);
 
     let (neighbors, links) = store.get_neighborhood(&concept.id, depth)?;
 
@@ -13410,6 +13411,23 @@ fn cmd_memoir_distill(store: &Store, from_topic: &str, into_name: &str) -> Resul
 // ---------------------------------------------------------------------------
 // Display helpers
 // ---------------------------------------------------------------------------
+
+/// Exact attributes of the concept from the facts layer (`icm facts`), found
+/// through its `entity:` labels or its name. Silent when there are none or
+/// when the backend has no facts layer.
+fn print_concept_facts(store: &Store, concept: &Concept) {
+    let Ok(facts) = icm_core::concept_facts(store, concept) else {
+        return;
+    };
+    if facts.is_empty() {
+        return;
+    }
+    println!("  Facts:");
+    for f in &facts {
+        println!("    {}.{} = {}  [{}]", f.entity, f.key, f.value, f.source);
+    }
+    println!();
+}
 
 fn print_concept(c: &Concept) {
     println!("--- {} ---", c.name);

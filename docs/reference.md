@@ -288,6 +288,12 @@ icm memoir search -m "system-architecture" "service" --label "domain:auth"
 # Inspect neighborhood
 icm memoir inspect -m "system-architecture" "auth-service" -D 2
 
+# A concept shows the exact attributes stored for it in the facts layer:
+# facts under each `entity:<name>` label of the concept, then under its name
+icm memoir add-concept -m "system-architecture" -n "auth-service" -d "..." -l "entity:service:auth"
+icm facts set service:auth owner team-core
+icm memoir inspect -m "system-architecture" "auth-service"   # lists service:auth.owner = team-core
+
 # Export graph (formats: json, dot, ascii, ai)
 icm memoir export -m "system-architecture" -f ascii   # Box-drawing with confidence bars
 icm memoir export -m "system-architecture" -f dot      # Graphviz DOT (color = confidence level)

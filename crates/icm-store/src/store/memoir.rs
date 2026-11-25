@@ -15,10 +15,22 @@ fn row_to_memoir(row: &rusqlite::Row) -> rusqlite::Result<Memoir> {
         created_at: parse_dt(&row.get::<_, String>(3)?),
         updated_at: parse_dt(&row.get::<_, String>(4)?),
         consolidation_threshold: row.get::<_, u32>(5)?,
+        ontology: row
+            .get::<_, Option<String>>(6)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
-const MEMOIR_COLS: &str = "id, name, description, created_at, updated_at, consolidation_threshold";
+const MEMOIR_COLS: &str =
+    "id, name, description, created_at, updated_at, consolidation_threshold, ontology";
+
+/// JSON column value for a memoir's ontology; an empty one is stored as NULL.
+fn ontology_json(memoir: &Memoir) -> IcmResult<Option<String>> {
+    match &memoir.ontology {
+        Some(o) if !o.is_empty() => Ok(Some(serde_json::to_string(o)?)),
+        _ => Ok(None),
+    }
+}
 
 fn row_to_concept(row: &rusqlite::Row) -> rusqlite::Result<Concept> {
     let labels_json: String = row.get(4)?;
@@ -60,6 +72,43 @@ fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<ConceptLink> {
 
 const LINK_COLS: &str = "id, source_id, target_id, relation, weight, created_at";
 
+// Ontology enforcement
+
+impl SqliteStore {
+    /// Rejects a concept whose `type:` labels break its memoir's ontology.
+    /// A memoir without ontology (or a missing memoir, which the foreign key
+    /// reports on insert) accepts anything.
+    fn check_concept_ontology(&self, concept: &Concept) -> IcmResult<()> {
+        let Some(ontology) = self
+            .get_memoir(&concept.memoir_id)?
+            .and_then(|m| m.ontology)
+        else {
+            return Ok(());
+        };
+        ontology
+            .validate_concept(concept)
+            .map_err(IcmError::InvalidInput)
+    }
+
+    /// Rejects a link whose relation and endpoint types match no rule of the
+    /// source concept's memoir ontology.
+    fn check_link_ontology(&self, link: &ConceptLink) -> IcmResult<()> {
+        let (Some(source), Some(target)) = (
+            self.get_concept(&link.source_id)?,
+            self.get_concept(&link.target_id)?,
+        ) else {
+            // Unknown endpoints are reported by the foreign keys on insert.
+            return Ok(());
+        };
+        let Some(ontology) = self.get_memoir(&source.memoir_id)?.and_then(|m| m.ontology) else {
+            return Ok(());
+        };
+        ontology
+            .validate_link(link.relation, &source, &target)
+            .map_err(IcmError::InvalidInput)
+    }
+}
+
 // MemoirStore impl
 
 impl MemoirStore for SqliteStore {
@@ -68,8 +117,9 @@ impl MemoirStore for SqliteStore {
     fn create_memoir(&self, memoir: Memoir) -> IcmResult<String> {
         self.conn
             .execute(
-                "INSERT INTO memoirs (id, name, description, created_at, updated_at, consolidation_threshold)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO memoirs (id, name, description, created_at, updated_at,
+                 consolidation_threshold, ontology)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     memoir.id,
                     memoir.name,
@@ -77,6 +127,7 @@ impl MemoirStore for SqliteStore {
                     memoir.created_at.to_rfc3339(),
                     memoir.updated_at.to_rfc3339(),
                     memoir.consolidation_threshold,
+                    ontology_json(&memoir)?,
                 ],
             )
             .map_err(db_err)?;
@@ -108,13 +159,14 @@ impl MemoirStore for SqliteStore {
             .conn
             .execute(
                 "UPDATE memoirs SET name = ?2, description = ?3, updated_at = ?4,
-                 consolidation_threshold = ?5 WHERE id = ?1",
+                 consolidation_threshold = ?5, ontology = ?6 WHERE id = ?1",
                 params![
                     memoir.id,
                     memoir.name,
                     memoir.description,
                     memoir.updated_at.to_rfc3339(),
                     memoir.consolidation_threshold,
+                    ontology_json(memoir)?,
                 ],
             )
             .map_err(db_err)?;
@@ -153,6 +205,7 @@ impl MemoirStore for SqliteStore {
     // Concept CRUD
 
     fn add_concept(&self, concept: Concept) -> IcmResult<String> {
+        self.check_concept_ontology(&concept)?;
         let labels_json = serde_json::to_string(&concept.labels)?;
         let source_ids_json = serde_json::to_string(&concept.source_memory_ids)?;
 
@@ -201,6 +254,7 @@ impl MemoirStore for SqliteStore {
     }
 
     fn update_concept(&self, concept: &Concept) -> IcmResult<()> {
+        self.check_concept_ontology(concept)?;
         let labels_json = serde_json::to_string(&concept.labels)?;
         let source_ids_json = serde_json::to_string(&concept.source_memory_ids)?;
 
@@ -395,6 +449,7 @@ impl MemoirStore for SqliteStore {
         // The BFS is bounded by the number of links currently in the
         // memoir, so worst-case it touches every link once. For typical
         // memoirs (<10k links) this is sub-millisecond.
+        self.check_link_ontology(&link)?;
         if self.would_create_cycle(&link.source_id, &link.target_id)? {
             return Err(IcmError::InvalidInput(format!(
                 "concept link rejected: {} → {} would create a cycle in the graph",

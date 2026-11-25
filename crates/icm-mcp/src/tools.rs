@@ -3,10 +3,10 @@ use serde_json::{Value, json};
 
 use icm_core::{
     AutoLinkOptions, Concept, ConceptLink, DEDUP_SIMILARITY_THRESHOLD, Embedder, Feedback,
-    FeedbackStore, Label, MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Relation,
-    WakeUpFormat, WakeUpOptions, add_backrefs, auto_link_memory, build_wake_up,
-    find_similar_memory, format_local, is_preference_topic, keyword_matches, project_matches,
-    topic_matches,
+    FeedbackStore, Label, MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Ontology,
+    Relation, RelationRule, WakeUpFormat, WakeUpOptions, add_backrefs, auto_link_memory,
+    build_wake_up, find_similar_memory, format_local, is_preference_topic, keyword_matches,
+    project_matches, topic_matches,
 };
 use icm_store::{RecallEngine, RecallRequest, Store};
 
@@ -401,6 +401,33 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     }
                 },
                 "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "icm_memoir_set_ontology",
+            "description": "Attach a schema to a memoir so every agent uses the same vocabulary: the allowed concept types (carried by `type:<name>` labels) and the relations allowed between them (`from:relation:to`, `*` = any type). Later concepts and links that break it are rejected. Existing rows that break it are listed, not deleted. Pass clear=true to make the memoir free-form again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memoir": { "type": "string", "description": "Memoir name" },
+                    "types": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "Allowed concept types, e.g. [\"service\", \"incident\", \"deploy\"]. Empty = any."
+                    },
+                    "relations": {
+                        "type": "array", "items": { "type": "string" },
+                        "description": "Allowed relations: 'relation' or 'from:relation:to', e.g. ['incident:caused_by:deploy', '*:depends_on:service']. Empty = any."
+                    },
+                    "require_type": {
+                        "type": "boolean", "default": false,
+                        "description": "Every concept must carry a type: label"
+                    },
+                    "clear": {
+                        "type": "boolean", "default": false,
+                        "description": "Remove the ontology instead of setting one"
+                    }
+                },
+                "required": ["memoir"]
             }
         }),
         json!({
@@ -893,6 +920,7 @@ pub fn call_tool_with_config(
         "icm_memoir_search" => tool_memoir_search(store, args),
         "icm_memoir_search_all" => tool_memoir_search_all(store, args),
         "icm_memoir_link" => tool_memoir_link(store, args),
+        "icm_memoir_set_ontology" => tool_memoir_set_ontology(store, args),
         "icm_memoir_inspect" => tool_memoir_inspect(store, args),
         "icm_memoir_export" => tool_memoir_export(store, args),
         // Learn tool
@@ -2477,6 +2505,96 @@ fn tool_memoir_create(store: &Store, args: &Value) -> ToolResult {
     }
 }
 
+fn str_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tool_memoir_set_ontology(store: &Store, args: &Value) -> ToolResult {
+    let Some(name) = get_str(args, "memoir") else {
+        return ToolResult::error("missing required field: memoir".into());
+    };
+    let mut memoir = match resolve_memoir(store, name) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ontology = if clear {
+        None
+    } else {
+        let relations = match str_list(args, "relations")
+            .iter()
+            .map(|r| r.parse::<RelationRule>())
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(r) => r,
+            Err(e) => return ToolResult::error(e),
+        };
+        let o = Ontology {
+            types: str_list(args, "types"),
+            require_type: args
+                .get("require_type")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            relations,
+        };
+        if o.is_empty() {
+            return ToolResult::error(
+                "empty ontology: pass types, relations or require_type (or clear=true)".into(),
+            );
+        }
+        Some(o)
+    };
+    memoir.ontology = ontology.clone();
+    memoir.updated_at = chrono::Utc::now();
+    if let Err(e) = store.update_memoir(&memoir) {
+        return ToolResult::error(format!("failed to update memoir: {e}"));
+    }
+    let Some(ontology) = ontology else {
+        return ToolResult::text(format!("Ontology removed from memoir '{name}'."));
+    };
+    let mut out = format!(
+        "Ontology set on memoir '{name}'.\n{}",
+        format_ontology(&ontology)
+    );
+    let violations = match (
+        store.list_concepts(&memoir.id),
+        store.get_links_for_memoir(&memoir.id),
+    ) {
+        (Ok(c), Ok(l)) => icm_core::ontology_violations(&ontology, &c, &l),
+        _ => Vec::new(),
+    };
+    if !violations.is_empty() {
+        out.push_str(&format!(
+            "{} existing row(s) break it (kept):\n",
+            violations.len()
+        ));
+        for v in &violations {
+            out.push_str(&format!("  - {v}\n"));
+        }
+    }
+    ToolResult::text(out)
+}
+
+fn format_ontology(o: &Ontology) -> String {
+    let any = |empty: bool, s: String| if empty { "(any)".to_string() } else { s };
+    let rels: Vec<String> = o.relations.iter().map(|r| r.to_string()).collect();
+    format!(
+        "Ontology: types={} require_type={} relations={}\n",
+        any(o.types.is_empty(), o.types.join(", ")),
+        o.require_type,
+        any(rels.is_empty(), rels.join(", "))
+    )
+}
+
 fn tool_memoir_list(store: &Store) -> ToolResult {
     let memoirs = match store.list_memoirs() {
         Ok(m) => m,
@@ -2526,6 +2644,9 @@ fn tool_memoir_show(store: &Store, args: &Value) -> ToolResult {
         stats.total_links,
         stats.avg_confidence
     );
+    if let Some(o) = &memoir.ontology {
+        output.push_str(&format_ontology(o));
+    }
 
     if !stats.label_counts.is_empty() {
         output.push_str("Labels:\n");
@@ -3297,6 +3418,57 @@ mod tests {
             1,
             "error prefix must not be doubled: {text}"
         );
+    }
+
+    #[test]
+    fn memoir_ontology_is_enforced_through_mcp() {
+        let store = test_store();
+        let call = |name: &str, args: Value| call_tool(&store, None, name, &args, false);
+        call("icm_memoir_create", json!({"name": "ops"}));
+        let set = call(
+            "icm_memoir_set_ontology",
+            json!({"memoir": "ops", "types": ["incident", "deploy"],
+                   "relations": ["incident:caused_by:deploy"], "require_type": true}),
+        );
+        assert!(!set.is_error, "{}", set.content[0].text);
+
+        let bad = call(
+            "icm_memoir_add_concept",
+            json!({"memoir": "ops", "name": "x", "definition": "d"}),
+        );
+        assert!(bad.is_error, "untyped concept must be refused");
+
+        for (n, t) in [("outage", "incident"), ("v42", "deploy")] {
+            let r = call(
+                "icm_memoir_add_concept",
+                json!({"memoir": "ops", "name": n, "definition": "d", "labels": format!("type:{t}")}),
+            );
+            assert!(!r.is_error, "{}", r.content[0].text);
+        }
+        let ok = call(
+            "icm_memoir_link",
+            json!({"memoir": "ops", "from": "outage", "to": "v42", "relation": "caused_by"}),
+        );
+        assert!(!ok.is_error, "{}", ok.content[0].text);
+        let rev = call(
+            "icm_memoir_link",
+            json!({"memoir": "ops", "from": "v42", "to": "outage", "relation": "caused_by"}),
+        );
+        assert!(rev.is_error);
+
+        let show = call("icm_memoir_show", json!({"name": "ops"}));
+        assert!(show.content[0].text.contains("incident:caused_by:deploy"));
+
+        let clear = call(
+            "icm_memoir_set_ontology",
+            json!({"memoir": "ops", "clear": true}),
+        );
+        assert!(!clear.is_error);
+        let free = call(
+            "icm_memoir_add_concept",
+            json!({"memoir": "ops", "name": "x", "definition": "d"}),
+        );
+        assert!(!free.is_error, "{}", free.content[0].text);
     }
 
     /// Manual-testing finding (against a real local Postgres backend):

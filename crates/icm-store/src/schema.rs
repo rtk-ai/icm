@@ -105,7 +105,7 @@ fn init_db(conn: &Connection) -> Result<(), IcmError> {
 /// the migrations, so a step added without a bump never reaches existing
 /// databases. `schema_fingerprint_is_paired_with_schema_version` fails
 /// when the schema objects change and this constant does not.
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 /// True when the database already carries the schema this binary would
 /// produce, so the migrations can be skipped. Reads only.
@@ -232,7 +232,8 @@ fn migrate_schema(conn: &Connection, embedding_dims: usize) -> Result<(), IcmErr
             description TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            consolidation_threshold INTEGER NOT NULL DEFAULT 50
+            consolidation_threshold INTEGER NOT NULL DEFAULT 50,
+            ontology TEXT -- JSON Ontology, NULL = free-form memoir
         );
 
         CREATE TABLE IF NOT EXISTS concepts (
@@ -714,6 +715,9 @@ fn migrate_schema(conn: &Connection, embedding_dims: usize) -> Result<(), IcmErr
     if !has_embedding {
         add_column_if_missing(conn, "ALTER TABLE memories ADD COLUMN embedding BLOB")?;
     }
+
+    // Migration: per-memoir ontology (NULL keeps a memoir free-form).
+    add_column_if_missing(conn, "ALTER TABLE memoirs ADD COLUMN ontology TEXT")?;
 
     // Migration: scope FTS UPDATE trigger to indexed columns only (fixes #44).
     // The old trigger fired on ANY update (including update_access, apply_decay)
@@ -1549,8 +1553,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let expected = (
-            1,
-            "284f33e4efbe6dff1db12896084e1ce81813059ed3378449cc9f2c9d3a5b1b8c",
+            2,
+            "cdf0cba2cc666acb164671e5d7d2bf83492c2f77c62e732c61780c4df5ba75e1",
         );
         assert_eq!(
             (SCHEMA_VERSION, schema_fingerprint(&conn).as_str()),

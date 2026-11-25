@@ -1616,6 +1616,11 @@ server_url = ""
 server_token_env = ""
 server_limit = 10
 server_timeout_ms = 800
+# Pas de rappel pour les prompts de moins de 3 mots ("ok", "oui"). 0 : tous.
+min_prompt_words = 3
+# Ne pas reinjecter un souvenir deja injecte plus tot dans la session (il est
+# encore dans le contexte). Remis a zero au demarrage et au compactage.
+skip_seen = true
 
 [mcp]
 # Transport du serveur MCP

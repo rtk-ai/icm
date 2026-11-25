@@ -270,19 +270,18 @@ pub fn recall_context(
     recall_context_on(store, query, project, limit, engine)
 }
 
-/// The recall context from a running `icm serve --http` at `base_url`:
-/// hybrid recall over a warm embedding model, read-only, at most `limit`
-/// memories of `project`, rendered like [`recall_context`]. `None` when the
-/// server does not answer within `timeout`, fails, or has no memory: the
-/// caller falls back to its own recall.
-pub fn recall_context_from_server(
+/// The memories from a running `icm serve --http` at `base_url`: hybrid
+/// recall over a warm embedding model, read-only, at most `limit` memories
+/// of `project`. `None` when the server does not answer within `timeout`,
+/// fails, or has no memory: the caller falls back to its own recall.
+pub fn recall_memories_from_server(
     base_url: &str,
     token: Option<&str>,
     query: &str,
     project: Option<&str>,
     limit: usize,
     timeout: std::time::Duration,
-) -> Option<String> {
+) -> Option<Vec<Memory>> {
     let endpoint = format!("{}/recall?format=json", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "query": query,
@@ -297,11 +296,7 @@ pub fn recall_context_from_server(
     let text = request.send_json(body).ok()?.into_string().ok()?;
     // No memory comes back as `{"message": …, "results": []}`, not an array.
     let memories: Vec<Memory> = serde_json::from_str(&text).ok()?;
-    if memories.is_empty() {
-        return None;
-    }
-    let ctx = render_recall_context(memories);
-    (!ctx.is_empty()).then_some(ctx)
+    (!memories.is_empty()).then_some(memories)
 }
 
 /// [`recall_context`] on a given engine.
@@ -312,11 +307,34 @@ fn recall_context_on(
     limit: usize,
     engine: RecallEngine,
 ) -> Result<String> {
-    let candidate = match engine {
-        RecallEngine::V2 => ranked_candidates(store, query, project, limit)?,
-        RecallEngine::Legacy => legacy_candidates(store, query, project, limit)?,
-    };
-    Ok(render_recall_context(candidate))
+    Ok(render_recall_context(recall_memories_on(
+        store, query, project, limit, engine,
+    )?))
+}
+
+/// The memories [`recall_context`] renders, before rendering, so the hook
+/// can leave out the ones it already injected in the session.
+pub fn recall_memories(
+    store: &Store,
+    query: &str,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let engine = RecallEngine::resolve(None, false).unwrap_or(RecallEngine::V2);
+    recall_memories_on(store, query, project, limit, engine)
+}
+
+fn recall_memories_on(
+    store: &Store,
+    query: &str,
+    project: Option<&str>,
+    limit: usize,
+    engine: RecallEngine,
+) -> Result<Vec<Memory>> {
+    match engine {
+        RecallEngine::V2 => ranked_candidates(store, query, project, limit),
+        RecallEngine::Legacy => legacy_candidates(store, query, project, limit),
+    }
 }
 
 /// Candidates from the v2 pipeline, with the same three tiers as the
@@ -475,7 +493,7 @@ fn legacy_candidates(
 /// Render recall candidates, most relevant first, as the context preamble:
 /// near-paraphrases dropped, each memory and the whole block capped in
 /// characters. Empty when there is no candidate.
-fn render_recall_context(candidate: Vec<Memory>) -> String {
+pub fn render_recall_context(candidate: Vec<Memory>) -> String {
     // Audit #185 medium: deduplicate near-paraphrases before
     // rendering. Without this, storing 10 paraphrases of "Patrick
     // prefers Rust over Go" returns 5 near-identical bullets in

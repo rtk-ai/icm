@@ -194,6 +194,11 @@ server_token_env = ""
 # Maximum memories to inject from the server.
 server_limit = 10
 server_timeout_ms = 800
+# Prompts with fewer words get no recall ("ok", "oui"). 0: every prompt.
+min_prompt_words = 3
+# Leave out memories already injected earlier in the same session (they
+# are still in the context). Reset when the session starts or compacts.
+skip_seen = true
 
 [wakeup]
 # SessionStart hook (Layer 1): wake-up pack of critical/high-importance

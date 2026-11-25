@@ -405,3 +405,51 @@ fn test_search_concepts_by_label_escapes_wildcards() {
 }
 
 // === Vector search tests ===
+
+#[test]
+fn invalidated_link_is_kept_as_history_but_ignored() {
+    let store = test_store();
+    let mid = store.create_memoir(make_memoir("hist")).unwrap();
+    let a = store.add_concept(make_concept(&mid, "api", "d")).unwrap();
+    let b = store.add_concept(make_concept(&mid, "redis", "d")).unwrap();
+    let link_id = store
+        .add_link(ConceptLink::new(a.clone(), b.clone(), Relation::DependsOn).with_source("pr:42"))
+        .unwrap();
+
+    let active = store.get_links_from(&a).unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].source.as_deref(), Some("pr:42"));
+
+    store.invalidate_link(&link_id).unwrap();
+    assert!(store.get_links_from(&a).unwrap().is_empty());
+    assert!(store.get_neighbors(&a, None).unwrap().is_empty());
+    assert_eq!(store.memoir_stats(&mid).unwrap().total_links, 0);
+    assert!(store.get_links_for_memoir(&mid).unwrap().is_empty());
+    // Invalidating twice reports NotFound.
+    assert!(matches!(
+        store.invalidate_link(&link_id),
+        Err(IcmError::NotFound(_))
+    ));
+
+    let hist = store.get_link_history(&a).unwrap();
+    assert_eq!(hist.len(), 1);
+    assert!(hist[0].invalidated_at.is_some());
+
+    // An invalidated edge does not block the reverse edge (no stale cycle).
+    store
+        .add_link(ConceptLink::new(b.clone(), a.clone(), Relation::DependsOn))
+        .unwrap();
+
+    // Re-asserting the edge revives the same row instead of failing on UNIQUE.
+    store
+        .invalidate_link(&store.get_links_from(&b).unwrap()[0].id)
+        .unwrap();
+    let revived = store
+        .add_link(ConceptLink::new(a.clone(), b.clone(), Relation::DependsOn).with_source("pr:57"))
+        .unwrap();
+    assert_eq!(revived, link_id);
+    let now = store.get_links_from(&a).unwrap();
+    assert_eq!(now.len(), 1);
+    assert_eq!(now[0].source.as_deref(), Some("pr:57"));
+    assert!(now[0].is_active());
+}

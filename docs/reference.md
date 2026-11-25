@@ -288,6 +288,12 @@ icm memoir search -m "system-architecture" "service" --label "domain:auth"
 # Inspect neighborhood
 icm memoir inspect -m "system-architecture" "auth-service" -D 2
 
+# Links carry provenance and a history: an invalidated link is kept with its
+# end date but ignored by traversal, neighbors and stats
+icm memoir link -m "system-architecture" --from "api-gateway" --to "redis" -r depends-on -s "pr:42"
+icm memoir unlink -m "system-architecture" --from "api-gateway" --to "redis" -r depends-on
+icm memoir inspect -m "system-architecture" "api-gateway" --history
+
 # Export graph (formats: json, dot, ascii, ai)
 icm memoir export -m "system-architecture" -f ascii   # Box-drawing with confidence bars
 icm memoir export -m "system-architecture" -f dot      # Graphviz DOT (color = confidence level)
@@ -365,7 +371,8 @@ memories and memoirs.
 | `icm_memoir_refine` | Update a concept's definition |
 | `icm_memoir_search` | Full-text search, optionally filtered by label |
 | `icm_memoir_search_all` | Search across all memoirs |
-| `icm_memoir_link` | Create typed relation between concepts |
+| `icm_memoir_link` | Create typed relation between concepts (optional `source` for provenance) |
+| `icm_memoir_unlink` | Invalidate a relation (kept as history) or delete it with `hard` |
 | `icm_memoir_inspect` | Inspect concept and graph neighborhood (BFS) |
 | `icm_memoir_export` | Export graph (json, dot, ascii, ai) with confidence levels |
 

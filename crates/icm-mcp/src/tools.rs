@@ -522,7 +522,30 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                         "type": "string",
                         "enum": ["part_of", "depends_on", "related_to", "contradicts", "refines", "alternative_to", "caused_by", "instance_of", "superseded_by"],
                         "description": "Relation type"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Where the link comes from (e.g. 'user', 'pr:42', 'memory:<id>', 'session:<id>')"
                     }
+                },
+                "required": ["memoir", "from", "to", "relation"]
+            }
+        }),
+        json!({
+            "name": "icm_memoir_unlink",
+            "description": "Mark a link between two concepts as no longer true. By default it is kept as history (visible in icm_memoir_inspect with history=true) and ignored by traversal and stats; hard=true deletes it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memoir": { "type": "string", "description": "Memoir name" },
+                    "from": { "type": "string", "description": "Source concept name" },
+                    "to": { "type": "string", "description": "Target concept name" },
+                    "relation": {
+                        "type": "string",
+                        "enum": ["part_of", "depends_on", "related_to", "contradicts", "refines", "alternative_to", "caused_by", "instance_of", "superseded_by"],
+                        "description": "Relation type"
+                    },
+                    "hard": { "type": "boolean", "default": false, "description": "Delete instead of invalidating" }
                 },
                 "required": ["memoir", "from", "to", "relation"]
             }
@@ -545,6 +568,11 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                         "type": "integer",
                         "default": 1,
                         "description": "BFS depth"
+                    },
+                    "history": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Also list every link the concept ever had, with since/until dates and source"
                     }
                 },
                 "required": ["memoir", "name"]
@@ -893,6 +921,7 @@ pub fn call_tool_with_config(
         "icm_memoir_search" => tool_memoir_search(store, args),
         "icm_memoir_search_all" => tool_memoir_search_all(store, args),
         "icm_memoir_link" => tool_memoir_link(store, args),
+        "icm_memoir_unlink" => tool_memoir_unlink(store, args),
         "icm_memoir_inspect" => tool_memoir_inspect(store, args),
         "icm_memoir_export" => tool_memoir_export(store, args),
         // Learn tool
@@ -2751,54 +2780,76 @@ fn tool_memoir_search_all(store: &Store, args: &Value) -> ToolResult {
     ToolResult::text(output)
 }
 
+/// Resolves the `memoir`, `from`, `to` and `relation` arguments shared by
+/// the link and unlink tools.
+fn resolve_link_args(
+    store: &Store,
+    args: &Value,
+) -> Result<(Concept, Concept, Relation), ToolResult> {
+    let field = |key: &str| {
+        get_str(args, key)
+            .ok_or_else(|| ToolResult::error(format!("missing required field: {key}")))
+    };
+    let (memoir_name, from_name, to_name) = (field("memoir")?, field("from")?, field("to")?);
+    // `Relation::from_str`'s error already reads "invalid relation: <value>"
+    // — re-prefixing here doubled it.
+    let relation: Relation = field("relation")?.parse().map_err(ToolResult::error)?;
+    let memoir = resolve_memoir(store, memoir_name)?;
+    let concept = |name: &str| match store.get_concept_by_name(&memoir.id, name) {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => Err(ToolResult::error(format!("concept not found: {name}"))),
+        Err(e) => Err(ToolResult::error(format!("db error: {e}"))),
+    };
+    Ok((concept(from_name)?, concept(to_name)?, relation))
+}
+
 fn tool_memoir_link(store: &Store, args: &Value) -> ToolResult {
-    let memoir_name = match get_str(args, "memoir") {
-        Some(n) => n,
-        None => return ToolResult::error("missing required field: memoir".into()),
-    };
-    let from_name = match get_str(args, "from") {
-        Some(n) => n,
-        None => return ToolResult::error("missing required field: from".into()),
-    };
-    let to_name = match get_str(args, "to") {
-        Some(n) => n,
-        None => return ToolResult::error("missing required field: to".into()),
-    };
-    let relation_str = match get_str(args, "relation") {
-        Some(r) => r,
-        None => return ToolResult::error("missing required field: relation".into()),
-    };
-
-    let relation: Relation = match relation_str.parse() {
-        Ok(r) => r,
-        // `Relation::from_str`'s error already reads "invalid relation:
-        // <value>" — re-prefixing here doubled it to "invalid relation:
-        // invalid relation: <value>".
-        Err(e) => return ToolResult::error(e),
-    };
-
-    let memoir = match resolve_memoir(store, memoir_name) {
-        Ok(m) => m,
+    let (from, to, relation) = match resolve_link_args(store, args) {
+        Ok(v) => v,
         Err(e) => return e,
     };
-
-    let from = match store.get_concept_by_name(&memoir.id, from_name) {
-        Ok(Some(c)) => c,
-        Ok(None) => return ToolResult::error(format!("concept not found: {from_name}")),
-        Err(e) => return ToolResult::error(format!("db error: {e}")),
-    };
-    let to = match store.get_concept_by_name(&memoir.id, to_name) {
-        Ok(Some(c)) => c,
-        Ok(None) => return ToolResult::error(format!("concept not found: {to_name}")),
-        Err(e) => return ToolResult::error(format!("db error: {e}")),
-    };
-
-    let link = ConceptLink::new(from.id, to.id, relation);
+    let mut link = ConceptLink::new(from.id, to.id, relation);
+    if let Some(src) = get_str(args, "source") {
+        link = link.with_source(src);
+    }
     match store.add_link(link) {
         Ok(id) => ToolResult::text(format!(
-            "Linked: {from_name} --{relation}--> {to_name} ({id})"
+            "Linked: {} --{relation}--> {} ({id})",
+            from.name, to.name
         )),
         Err(e) => ToolResult::error(format!("failed to link: {e}")),
+    }
+}
+
+fn tool_memoir_unlink(store: &Store, args: &Value) -> ToolResult {
+    let (from, to, relation) = match resolve_link_args(store, args) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let link = match store.get_links_from(&from.id) {
+        Ok(links) => links
+            .into_iter()
+            .find(|l| l.target_id == to.id && l.relation == relation),
+        Err(e) => return ToolResult::error(format!("db error: {e}")),
+    };
+    let Some(link) = link else {
+        return ToolResult::error(format!(
+            "no active link {} --{relation}--> {}",
+            from.name, to.name
+        ));
+    };
+    let hard = args.get("hard").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (res, verb) = if hard {
+        (store.delete_link(&link.id), "Deleted")
+    } else {
+        (
+            store.invalidate_link(&link.id),
+            "Invalidated (kept as history)",
+        )
+    };
+    match res {
+        Ok(()) => ToolResult::text(format!("{verb}: {} --{relation}--> {}", from.name, to.name)),
+        Err(e) => ToolResult::error(format!("failed to unlink: {e}")),
     }
 }
 
@@ -2850,7 +2901,55 @@ fn tool_memoir_inspect(store: &Store, args: &Value) -> ToolResult {
         for link in &links {
             let src = name_map.get(link.source_id.as_str()).unwrap_or(&"?");
             let tgt = name_map.get(link.target_id.as_str()).unwrap_or(&"?");
-            output.push_str(&format!("  {src} --{}--> {tgt}\n", link.relation));
+            let via = link
+                .source
+                .as_deref()
+                .map(|s| format!("  [{s}]"))
+                .unwrap_or_default();
+            output.push_str(&format!("  {src} --{}--> {tgt}{via}\n", link.relation));
+        }
+    }
+
+    if args
+        .get("history")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        match store.get_link_history(&concept.id) {
+            Ok(history) if !history.is_empty() => {
+                let name_of = |id: &str| -> String {
+                    if id == concept.id {
+                        return concept.name.clone();
+                    }
+                    store
+                        .get_concept(id)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.name)
+                        .unwrap_or_else(|| "?".to_string())
+                };
+                output.push_str("\nLink history:\n");
+                for l in &history {
+                    let until = l
+                        .invalidated_at
+                        .map(|t| format!(" until {}", t.format("%Y-%m-%d")))
+                        .unwrap_or_else(|| " (active)".to_string());
+                    let via = l
+                        .source
+                        .as_deref()
+                        .map(|s| format!(" [{s}]"))
+                        .unwrap_or_default();
+                    output.push_str(&format!(
+                        "  {} --{}--> {} since {}{until}{via}\n",
+                        name_of(&l.source_id),
+                        l.relation,
+                        name_of(&l.target_id),
+                        l.created_at.format("%Y-%m-%d"),
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return ToolResult::error(format!("history error: {e}")),
         }
     }
 
@@ -3297,6 +3396,36 @@ mod tests {
             1,
             "error prefix must not be doubled: {text}"
         );
+    }
+
+    #[test]
+    fn memoir_unlink_keeps_history_with_source() {
+        let store = test_store();
+        let call = |name: &str, args: Value| call_tool(&store, None, name, &args, false);
+        call("icm_memoir_create", json!({"name": "m"}));
+        for n in ["api", "redis"] {
+            call(
+                "icm_memoir_add_concept",
+                json!({"memoir": "m", "name": n, "definition": n}),
+            );
+        }
+        let link = json!({"memoir": "m", "from": "api", "to": "redis",
+                          "relation": "depends_on", "source": "pr:42"});
+        assert!(!call("icm_memoir_link", link.clone()).is_error);
+
+        let unlink = call("icm_memoir_unlink", link.clone());
+        assert!(!unlink.is_error, "{}", unlink.content[0].text);
+        assert!(call("icm_memoir_unlink", link).is_error, "already inactive");
+
+        let plain = call("icm_memoir_inspect", json!({"memoir": "m", "name": "api"}));
+        assert!(plain.content[0].text.contains("(no links)"));
+        let hist = call(
+            "icm_memoir_inspect",
+            json!({"memoir": "m", "name": "api", "history": true}),
+        );
+        let text = &hist.content[0].text;
+        assert!(text.contains("api --depends_on--> redis"), "{text}");
+        assert!(text.contains("until") && text.contains("[pr:42]"), "{text}");
     }
 
     /// Manual-testing finding (against a real local Postgres backend):

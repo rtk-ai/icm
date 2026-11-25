@@ -201,6 +201,14 @@ pub struct ConceptLink {
     pub relation: Relation,
     pub weight: f32,
     pub created_at: DateTime<Utc>,
+    /// Where the link came from: `user`, `session:<id>`, `memory:<id>`,
+    /// a ticket, a PR... Free-form, shown by inspect/export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Set when the link stopped being true. Invalidated links are kept as
+    /// history but ignored by traversal, neighbors, stats and cycle checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidated_at: Option<DateTime<Utc>>,
 }
 
 impl ConceptLink {
@@ -212,7 +220,22 @@ impl ConceptLink {
             relation,
             weight: 1.0,
             created_at: Utc::now(),
+            source: None,
+            invalidated_at: None,
         }
+    }
+
+    /// Records where the link came from.
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        let s = source.into();
+        self.source = (!s.trim().is_empty()).then_some(s);
+        self
+    }
+
+    /// True while the link has not been invalidated.
+    pub fn is_active(&self) -> bool {
+        self.invalidated_at.is_none()
     }
 }
 

@@ -432,6 +432,11 @@ pub struct HttpConfig {
     pub header_timeout_secs: u64,
     /// Requests handled at once; more get 503 instead of queuing.
     pub max_concurrent: usize,
+    /// Serve the Agent Memory Leaderboard API (`POST /aml/add`,
+    /// `POST /aml/search`), one database per `user_id` in `aml_dir`.
+    pub aml: bool,
+    /// Where the leaderboard databases go. Empty: `<data dir>/aml`.
+    pub aml_dir: String,
     pub tls: TlsConfig,
 }
 
@@ -443,6 +448,8 @@ impl Default for HttpConfig {
             request_timeout_secs: 60,
             header_timeout_secs: 10,
             max_concurrent: 32,
+            aml: false,
+            aml_dir: String::new(),
             tls: TlsConfig::default(),
         }
     }
